@@ -308,3 +308,83 @@ fn test_oma_list_empty() {
         stdout
     );
 }
+
+#[test]
+fn test_oma_spawn_and_kill() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    cleanup_test_sessions();
+
+    // Also clean up any oma-agent- sessions from previous test runs
+    if let Ok(output) = tmux(&["list-sessions", "-F", "#{session_name}"]) {
+        for line in output.lines() {
+            if line.starts_with("oma-agent-") {
+                let _ = tmux(&["kill-session", "-t", line]);
+            }
+        }
+    }
+
+    // Spawn a new agent
+    let output = Command::new("cargo")
+        .args(["run", "--", "spawn", "-n", "test-spawn", "-c", "sleep 60"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Failed to run oma spawn");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Spawned agent: test-spawn"),
+        "Should confirm spawn: {}",
+        stdout
+    );
+
+    // Verify session exists
+    thread::sleep(Duration::from_millis(200));
+    let result = Command::new("tmux")
+        .args(["has-session", "-t", "oma-agent-test-spawn"])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "Session should exist after spawn");
+
+    // List should show the agent
+    let output = Command::new("cargo")
+        .args(["run", "--", "list"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Failed to run oma list");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("test-spawn"),
+        "List should show spawned agent: {}",
+        stdout
+    );
+
+    // Kill the agent
+    let output = Command::new("cargo")
+        .args(["run", "--", "kill", "test-spawn"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Failed to run oma kill");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Killed agent: test-spawn"),
+        "Should confirm kill: {}",
+        stdout
+    );
+
+    // Verify session is gone
+    thread::sleep(Duration::from_millis(100));
+    let result = Command::new("tmux")
+        .args(["has-session", "-t", "oma-agent-test-spawn"])
+        .output()
+        .unwrap();
+    assert!(
+        !result.status.success(),
+        "Session should not exist after kill"
+    );
+}
