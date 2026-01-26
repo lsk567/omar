@@ -165,6 +165,9 @@ impl App {
 
     /// Spawn a new agent with default settings
     pub fn spawn_agent(&mut self) -> Result<()> {
+        // Refresh first to get current state
+        self.refresh()?;
+
         let name = self.generate_agent_name();
         let workdir = if self.default_workdir == "." {
             std::env::current_dir()
