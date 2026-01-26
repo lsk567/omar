@@ -209,8 +209,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Char('n') => {
-                            // Spawn new agent - for now just show message
-                            app.set_status("Use 'oma spawn -n <name>' to create agents");
+                            if let Err(e) = app.spawn_agent() {
+                                app.set_status(format!("Error: {}", e));
+                            }
                         }
                         KeyCode::Char('d') => {
                             if app.selected_agent().is_some() {

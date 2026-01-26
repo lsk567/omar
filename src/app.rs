@@ -24,6 +24,9 @@ pub struct App {
     pub status_message: Option<String>,
     client: TmuxClient,
     health_checker: HealthChecker,
+    default_command: String,
+    default_workdir: String,
+    session_prefix: String,
 }
 
 impl App {
@@ -46,6 +49,9 @@ impl App {
             status_message: None,
             client,
             health_checker,
+            default_command: config.agent.default_command.clone(),
+            default_workdir: config.agent.default_workdir.clone(),
+            session_prefix: config.dashboard.session_prefix.clone(),
         }
     }
 
@@ -130,6 +136,56 @@ impl App {
             self.refresh()?;
         }
         self.show_confirm_kill = false;
+        Ok(())
+    }
+
+    /// Generate a unique agent name
+    fn generate_agent_name(&self) -> String {
+        let existing: std::collections::HashSet<_> = self
+            .agents
+            .iter()
+            .map(|a| a.session.name.as_str())
+            .collect();
+
+        for i in 1..1000 {
+            let name = format!("{}{}", self.session_prefix, i);
+            if !existing.contains(name.as_str()) {
+                return name;
+            }
+        }
+        format!(
+            "{}{}",
+            self.session_prefix,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        )
+    }
+
+    /// Spawn a new agent with default settings
+    pub fn spawn_agent(&mut self) -> Result<()> {
+        let name = self.generate_agent_name();
+        let workdir = if self.default_workdir == "." {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        } else {
+            self.default_workdir.clone()
+        };
+
+        self.client
+            .new_session(&name, &self.default_command, Some(&workdir))?;
+
+        let short_name = name.strip_prefix(&self.session_prefix).unwrap_or(&name);
+        self.status_message = Some(format!("Spawned agent: {}", short_name));
+        self.refresh()?;
+
+        // Select the new agent
+        if let Some(pos) = self.agents.iter().position(|a| a.session.name == name) {
+            self.selected = pos;
+        }
+
         Ok(())
     }
 
