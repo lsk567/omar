@@ -79,7 +79,7 @@ fn default_error_patterns() -> Vec<String> {
 }
 
 fn default_command() -> String {
-    "claude".to_string()
+    "claude --dangerously-skip-permissions".to_string()
 }
 
 fn default_workdir() -> String {

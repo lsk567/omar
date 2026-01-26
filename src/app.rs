@@ -202,20 +202,22 @@ impl App {
         self.status_message = None;
     }
 
-    /// Get counts by health state
-    pub fn health_counts(&self) -> (usize, usize, usize) {
-        let mut ok = 0;
+    /// Get counts by health state: (working, waiting, idle, stuck)
+    pub fn health_counts(&self) -> (usize, usize, usize, usize) {
+        let mut working = 0;
+        let mut waiting = 0;
         let mut idle = 0;
         let mut stuck = 0;
 
         for agent in &self.agents {
             match agent.health {
-                HealthState::Ok => ok += 1,
+                HealthState::Working => working += 1,
+                HealthState::WaitingForInput => waiting += 1,
                 HealthState::Idle => idle += 1,
                 HealthState::Stuck => stuck += 1,
             }
         }
 
-        (ok, idle, stuck)
+        (working, waiting, idle, stuck)
     }
 }

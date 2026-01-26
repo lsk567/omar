@@ -35,7 +35,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let (ok, idle, stuck) = app.health_counts();
+    let (working, waiting, idle, stuck) = app.health_counts();
     let total = app.agents.len();
 
     let status_text = vec![
@@ -43,7 +43,15 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw("| Agents: "),
         Span::styled(format!("{}", total), Style::default().fg(Color::White)),
         Span::raw(" | "),
-        Span::styled(format!("{} OK", ok), Style::default().fg(Color::Green)),
+        Span::styled(
+            format!("{} Working", working),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{} Waiting", waiting),
+            Style::default().fg(Color::Blue),
+        ),
         Span::raw(" "),
         Span::styled(format!("{} Idle", idle), Style::default().fg(Color::Yellow)),
         Span::raw(" "),
@@ -122,7 +130,8 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_agent_card(frame: &mut Frame, agent: &AgentInfo, area: Rect, selected: bool) {
     let (border_color, status_icon) = match agent.health {
-        HealthState::Ok => (Color::Green, "●"),
+        HealthState::Working => (Color::Green, "●"),
+        HealthState::WaitingForInput => (Color::Blue, "◆"),
         HealthState::Idle => (Color::Yellow, "○"),
         HealthState::Stuck => (Color::Red, "✖"),
     };
@@ -156,7 +165,8 @@ fn render_agent_card(frame: &mut Frame, agent: &AgentInfo, area: Rect, selected:
 
     let idle_display = agent.health_info.idle_display();
     let status_color = match agent.health {
-        HealthState::Ok => Color::Green,
+        HealthState::Working => Color::Green,
+        HealthState::WaitingForInput => Color::Blue,
         HealthState::Idle => Color::Yellow,
         HealthState::Stuck => Color::Red,
     };
