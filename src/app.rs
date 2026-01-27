@@ -97,9 +97,11 @@ impl App {
             }
         });
 
-        // Update agents list (excluding manager)
+        // Update agents list (excluding manager and attached sessions)
+        // Attached sessions are likely the user's main terminal, not agents
         self.agents = other_sessions
             .into_iter()
+            .filter(|session| !session.attached) // Don't show user's attached sessions
             .map(|session| {
                 let health_info = self.health_checker.check_detailed(&session);
                 let health = health_info.state;
@@ -222,6 +224,20 @@ impl App {
     /// Kill the selected agent
     pub fn kill_selected(&mut self) -> Result<()> {
         if let Some(agent) = self.selected_agent() {
+            // Safety: don't kill attached sessions (user's terminal)
+            if agent.session.attached {
+                self.status_message = Some("Cannot kill attached session".to_string());
+                self.show_confirm_kill = false;
+                return Ok(());
+            }
+
+            // Safety: don't kill manager from 'd' key (use separate mechanism)
+            if agent.session.name == MANAGER_SESSION {
+                self.status_message = Some("Cannot kill manager with 'd'".to_string());
+                self.show_confirm_kill = false;
+                return Ok(());
+            }
+
             let name = agent.session.name.clone();
             self.client.kill_session(&name)?;
             self.status_message = Some(format!("Killed agent: {}", name));
