@@ -1,3 +1,4 @@
+mod api;
 mod app;
 mod config;
 mod event;
@@ -6,6 +7,7 @@ mod tmux;
 mod ui;
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -16,6 +18,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use tokio::sync::Mutex;
 
 use app::App;
 use config::Config;
@@ -149,6 +152,17 @@ fn kill_agent(client: &TmuxClient, name: &str) -> Result<()> {
 }
 
 async fn run_dashboard(config: Config) -> Result<()> {
+    // Start API server if enabled
+    if config.api.enabled {
+        let api_config = config.api.clone();
+        let api_app = Arc::new(Mutex::new(App::new(&config)));
+        tokio::spawn(async move {
+            if let Err(e) = api::start_server(api_app, &api_config).await {
+                eprintln!("API server error: {}", e);
+            }
+        });
+    }
+
     // Initialize terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -156,7 +170,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app
+    // Create app for dashboard (separate instance)
     let mut app = App::new(&config);
 
     // Initial refresh

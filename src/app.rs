@@ -8,6 +8,12 @@ use crate::config::Config;
 use crate::manager::MANAGER_SESSION;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 
+// Re-export for API handlers
+pub use crate::manager::MANAGER_SESSION as MANAGER_SESSION_NAME;
+
+/// Shared app state for API access
+pub type SharedApp = App;
+
 /// Information about an agent for display
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
@@ -161,6 +167,21 @@ impl App {
         &self.agents
     }
 
+    /// Get all agents (for API)
+    pub fn agents(&self) -> &[AgentInfo] {
+        &self.agents
+    }
+
+    /// Get manager info (for API)
+    pub fn manager(&self) -> Option<&AgentInfo> {
+        self.manager.as_ref()
+    }
+
+    /// Get default command
+    pub fn default_command(&self) -> &str {
+        &self.default_command
+    }
+
     /// Move selection down
     pub fn next(&mut self) {
         if self.manager_selected {
@@ -248,7 +269,7 @@ impl App {
     }
 
     /// Generate a unique agent name
-    fn generate_agent_name(&self) -> String {
+    pub fn generate_agent_name(&self) -> String {
         let existing: std::collections::HashSet<_> = self
             .agents
             .iter()

@@ -14,6 +14,9 @@ pub struct Config {
 
     #[serde(default)]
     pub agent: AgentConfig,
+
+    #[serde(default)]
+    pub api: ApiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +56,21 @@ pub struct AgentConfig {
     pub default_workdir: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Whether to enable the HTTP API
+    #[serde(default = "default_api_enabled")]
+    pub enabled: bool,
+
+    /// Host to bind to
+    #[serde(default = "default_api_host")]
+    pub host: String,
+
+    /// Port to listen on
+    #[serde(default = "default_api_port")]
+    pub port: u16,
+}
+
 fn default_refresh_interval() -> u64 {
     2
 }
@@ -86,6 +104,18 @@ fn default_workdir() -> String {
     ".".to_string()
 }
 
+fn default_api_enabled() -> bool {
+    true
+}
+
+fn default_api_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_api_port() -> u16 {
+    9876
+}
+
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
@@ -110,6 +140,16 @@ impl Default for AgentConfig {
         Self {
             default_command: default_command(),
             default_workdir: default_workdir(),
+        }
+    }
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_api_enabled(),
+            host: default_api_host(),
+            port: default_api_port(),
         }
     }
 }
