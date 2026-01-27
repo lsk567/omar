@@ -10,10 +10,11 @@ use std::time::Duration;
 use crate::tmux::TmuxClient;
 use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 
-const MANAGER_SESSION: &str = "oma-manager";
+/// Manager session name (exported for use in app.rs)
+pub const MANAGER_SESSION: &str = "oma-manager";
 
 /// System prompt for the manager agent
-const MANAGER_SYSTEM_PROMPT: &str = r#"You are a Manager Agent in the OMA (One Man Army) system. Your role is to:
+pub const MANAGER_SYSTEM_PROMPT: &str = r#"You are a Manager Agent in the OMA (One Man Army) system. Your role is to:
 
 1. UNDERSTAND the user's high-level request
 2. BREAK IT DOWN into parallel sub-tasks for worker agents

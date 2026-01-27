@@ -1,8 +1,11 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
+use std::thread;
+use std::time::Duration;
 
 use crate::config::Config;
+use crate::manager::MANAGER_SESSION;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 
 /// Information about an agent for display
@@ -16,7 +19,9 @@ pub struct AgentInfo {
 /// Application state
 pub struct App {
     pub agents: Vec<AgentInfo>,
+    pub manager: Option<AgentInfo>,
     pub selected: usize,
+    pub manager_selected: bool,
     pub should_quit: bool,
     pub show_help: bool,
     pub show_confirm_kill: bool,
@@ -41,7 +46,9 @@ impl App {
 
         Self {
             agents: Vec::new(),
+            manager: None,
             selected: 0,
+            manager_selected: false,
             should_quit: false,
             show_help: false,
             show_confirm_kill: false,
@@ -61,9 +68,37 @@ impl App {
 
     /// Refresh the list of agents
     pub fn refresh(&mut self) -> Result<()> {
-        let sessions = self.client.list_sessions()?;
+        // Ensure manager exists
+        self.ensure_manager()?;
 
-        self.agents = sessions
+        // Get all sessions
+        let sessions = self.client.list_all_sessions()?;
+
+        // Separate manager from other agents
+        let mut manager_session = None;
+        let mut other_sessions = Vec::new();
+
+        for session in sessions {
+            if session.name == MANAGER_SESSION {
+                manager_session = Some(session);
+            } else {
+                other_sessions.push(session);
+            }
+        }
+
+        // Update manager info
+        self.manager = manager_session.map(|session| {
+            let health_info = self.health_checker.check_detailed(&session);
+            let health = health_info.state;
+            AgentInfo {
+                session,
+                health,
+                health_info,
+            }
+        });
+
+        // Update agents list (excluding manager)
+        self.agents = other_sessions
             .into_iter()
             .map(|session| {
                 let health_info = self.health_checker.check_detailed(&session);
@@ -91,6 +126,34 @@ impl App {
         Ok(())
     }
 
+    /// Ensure manager session exists, start if not
+    fn ensure_manager(&self) -> Result<()> {
+        if self.client.has_session(MANAGER_SESSION)? {
+            return Ok(());
+        }
+
+        // Start manager session
+        let workdir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        self.client.new_session(
+            MANAGER_SESSION,
+            "claude --dangerously-skip-permissions",
+            Some(&workdir),
+        )?;
+
+        // Give it time to start
+        thread::sleep(Duration::from_secs(1));
+
+        // Send manager system prompt
+        self.client
+            .send_keys_literal(MANAGER_SESSION, crate::manager::MANAGER_SYSTEM_PROMPT)?;
+        self.client.send_keys(MANAGER_SESSION, "Enter")?;
+
+        Ok(())
+    }
+
     /// Get filtered agents
     pub fn visible_agents(&self) -> &[AgentInfo] {
         &self.agents
@@ -98,24 +161,53 @@ impl App {
 
     /// Move selection down
     pub fn next(&mut self) {
-        if !self.agents.is_empty() {
-            self.selected = (self.selected + 1) % self.agents.len();
+        if self.manager_selected {
+            // From manager, wrap to first agent (if any) or stay on manager
+            if !self.agents.is_empty() {
+                self.manager_selected = false;
+                self.selected = 0;
+            }
+        } else if !self.agents.is_empty() {
+            if self.selected + 1 >= self.agents.len() {
+                // From last agent, go to manager
+                self.manager_selected = true;
+            } else {
+                self.selected += 1;
+            }
+        } else {
+            // No agents, select manager
+            self.manager_selected = true;
         }
     }
 
     /// Move selection up
     pub fn previous(&mut self) {
-        if !self.agents.is_empty() {
-            self.selected = self
-                .selected
-                .checked_sub(1)
-                .unwrap_or(self.agents.len().saturating_sub(1));
+        if self.manager_selected {
+            // From manager, go to last agent (if any) or stay on manager
+            if !self.agents.is_empty() {
+                self.manager_selected = false;
+                self.selected = self.agents.len() - 1;
+            }
+        } else if !self.agents.is_empty() {
+            if self.selected == 0 {
+                // From first agent, go to manager
+                self.manager_selected = true;
+            } else {
+                self.selected -= 1;
+            }
+        } else {
+            // No agents, select manager
+            self.manager_selected = true;
         }
     }
 
-    /// Get currently selected agent
+    /// Get currently selected agent (could be manager)
     pub fn selected_agent(&self) -> Option<&AgentInfo> {
-        self.agents.get(self.selected)
+        if self.manager_selected {
+            self.manager.as_ref()
+        } else {
+            self.agents.get(self.selected)
+        }
     }
 
     /// Attach to the selected agent via popup
@@ -203,12 +295,14 @@ impl App {
     }
 
     /// Get counts by health state: (working, waiting, idle, stuck)
+    /// Includes manager in the count
     pub fn health_counts(&self) -> (usize, usize, usize, usize) {
         let mut working = 0;
         let mut waiting = 0;
         let mut idle = 0;
         let mut stuck = 0;
 
+        // Count regular agents
         for agent in &self.agents {
             match agent.health {
                 HealthState::Working => working += 1,
@@ -218,6 +312,21 @@ impl App {
             }
         }
 
+        // Count manager
+        if let Some(ref manager) = self.manager {
+            match manager.health {
+                HealthState::Working => working += 1,
+                HealthState::WaitingForInput => waiting += 1,
+                HealthState::Idle => idle += 1,
+                HealthState::Stuck => stuck += 1,
+            }
+        }
+
         (working, waiting, idle, stuck)
+    }
+
+    /// Get total agent count (including manager)
+    pub fn total_agents(&self) -> usize {
+        self.agents.len() + if self.manager.is_some() { 1 } else { 0 }
     }
 }

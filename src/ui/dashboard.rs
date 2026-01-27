@@ -16,13 +16,15 @@ pub fn render(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3), // Status bar
             Constraint::Min(0),    // Agent grid
+            Constraint::Length(7), // Manager panel
             Constraint::Length(1), // Help bar
         ])
         .split(frame.area());
 
     render_status_bar(frame, app, chunks[0]);
     render_agent_grid(frame, app, chunks[1]);
-    render_help_bar(frame, chunks[2]);
+    render_manager_panel(frame, app, chunks[2]);
+    render_help_bar(frame, chunks[3]);
 
     // Render overlays
     if app.show_help {
@@ -36,7 +38,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let (working, waiting, idle, stuck) = app.health_counts();
-    let total = app.agents.len();
+    let total = app.total_agents();
 
     let status_text = vec![
         Span::styled("OMA ", Style::default().add_modifier(Modifier::BOLD)),
@@ -122,9 +124,92 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
             .split(row_chunks[row]);
 
         if col < col_chunks.len() {
-            let is_selected = i == app.selected;
+            let is_selected = !app.manager_selected && i == app.selected;
             render_agent_card(frame, agent, col_chunks[col], is_selected);
         }
+    }
+}
+
+fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(ref manager) = app.manager {
+        let is_selected = app.manager_selected;
+
+        let (border_color, status_icon) = match manager.health {
+            HealthState::Working => (Color::Green, "●"),
+            HealthState::WaitingForInput => (Color::Blue, "◆"),
+            HealthState::Idle => (Color::Yellow, "○"),
+            HealthState::Stuck => (Color::Red, "✖"),
+        };
+
+        let border_style = if is_selected {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(border_color)
+        };
+
+        let title = if is_selected {
+            " [MANAGER] ".to_string()
+        } else {
+            " MANAGER ".to_string()
+        };
+
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(border_style);
+
+        let idle_display = manager.health_info.idle_display();
+        let status_color = match manager.health {
+            HealthState::Working => Color::Green,
+            HealthState::WaitingForInput => Color::Blue,
+            HealthState::Idle => Color::Yellow,
+            HealthState::Stuck => Color::Red,
+        };
+
+        let content = vec![
+            Line::from(vec![
+                Span::styled(status_icon, Style::default().fg(status_color)),
+                Span::raw(" "),
+                Span::styled(
+                    manager.health.as_str().to_uppercase(),
+                    Style::default().fg(status_color),
+                ),
+                Span::raw("  |  Idle: "),
+                Span::styled(idle_display, Style::default().fg(Color::White)),
+                Span::raw("  |  "),
+                Span::styled(
+                    "Orchestrates worker agents",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(Span::styled(
+                truncate(
+                    &manager.health_info.last_output,
+                    area.width.saturating_sub(4) as usize,
+                ),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let paragraph = Paragraph::new(content)
+            .block(block)
+            .wrap(Wrap { trim: true });
+
+        frame.render_widget(paragraph, area);
+    } else {
+        // Manager not available (shouldn't happen normally)
+        let block = Block::default()
+            .title(" MANAGER ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+
+        let paragraph = Paragraph::new("Starting manager...")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(block);
+
+        frame.render_widget(paragraph, area);
     }
 }
 
