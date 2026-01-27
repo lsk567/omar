@@ -52,7 +52,7 @@ impl TmuxClient {
 
         let sessions = output
             .lines()
-            .filter(|line| line.starts_with(&self.prefix))
+            .filter(|line| self.prefix.is_empty() || line.starts_with(&self.prefix))
             .filter_map(|line| {
                 let parts: Vec<&str> = line.split('|').collect();
                 if parts.len() != 4 {
@@ -205,8 +205,8 @@ mod tests {
 
     #[test]
     fn test_client_creation() {
-        let client = TmuxClient::new("oma-agent-");
-        assert_eq!(client.prefix(), "oma-agent-");
+        let client = TmuxClient::new("");
+        assert_eq!(client.prefix(), "");
     }
 
     #[test]

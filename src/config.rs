@@ -58,7 +58,7 @@ fn default_refresh_interval() -> u64 {
 }
 
 fn default_session_prefix() -> String {
-    "oma-agent-".to_string()
+    String::new() // No prefix - session name matches agent name
 }
 
 fn default_idle_warning() -> i64 {
@@ -155,7 +155,7 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.dashboard.refresh_interval, 2);
-        assert_eq!(config.dashboard.session_prefix, "oma-agent-");
+        assert_eq!(config.dashboard.session_prefix, ""); // No prefix by default
         assert_eq!(config.health.idle_warning, 60);
         assert_eq!(config.health.idle_critical, 300);
     }
