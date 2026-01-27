@@ -5,6 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+use regex::Regex;
 
 use crate::app::{AgentInfo, App};
 use crate::tmux::HealthState;
@@ -14,17 +15,17 @@ pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Status bar
-            Constraint::Min(0),    // Agent grid
-            Constraint::Length(7), // Manager panel
-            Constraint::Length(1), // Help bar
+            Constraint::Length(3),      // Status bar
+            Constraint::Percentage(40), // Agent grid
+            Constraint::Min(10),        // Manager panel (takes remaining ~50%)
+            Constraint::Length(1),      // Help bar
         ])
         .split(frame.area());
 
     render_status_bar(frame, app, chunks[0]);
     render_agent_grid(frame, app, chunks[1]);
     render_manager_panel(frame, app, chunks[2]);
-    render_help_bar(frame, chunks[3]);
+    render_help_bar(frame, app, chunks[3]);
 
     // Render overlays
     if app.show_help {
@@ -131,71 +132,52 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
-    if let Some(ref manager) = app.manager {
+    if app.manager.is_some() {
         let is_selected = app.manager_selected;
+        let is_interactive = app.interactive_mode;
 
-        let (border_color, status_icon) = match manager.health {
-            HealthState::Working => (Color::Green, "●"),
-            HealthState::WaitingForInput => (Color::Blue, "◆"),
-            HealthState::Idle => (Color::Yellow, "○"),
-            HealthState::Stuck => (Color::Red, "✖"),
+        // Different styles for different states
+        let (border_color, title) = if is_interactive {
+            (Color::Cyan, " MANAGER [INTERACTIVE - Esc to exit] ")
+        } else if is_selected {
+            (Color::Magenta, " [MANAGER] - Press 'i' to type ")
+        } else {
+            (Color::Blue, " MANAGER ")
         };
 
-        let border_style = if is_selected {
+        let border_style =
             Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(border_color)
-        };
-
-        let title = if is_selected {
-            " [MANAGER] ".to_string()
-        } else {
-            " MANAGER ".to_string()
-        };
+                .fg(border_color)
+                .add_modifier(if is_selected || is_interactive {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                });
 
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
             .border_style(border_style);
 
-        let idle_display = manager.health_info.idle_display();
-        let status_color = match manager.health {
-            HealthState::Working => Color::Green,
-            HealthState::WaitingForInput => Color::Blue,
-            HealthState::Idle => Color::Yellow,
-            HealthState::Stuck => Color::Red,
-        };
+        // Get manager output - more lines to fill the panel
+        let available_lines = area.height.saturating_sub(2) as i32; // -2 for borders
+        let output = app
+            .get_manager_output(available_lines.max(20))
+            .unwrap_or_default();
 
-        let content = vec![
-            Line::from(vec![
-                Span::styled(status_icon, Style::default().fg(status_color)),
-                Span::raw(" "),
-                Span::styled(
-                    manager.health.as_str().to_uppercase(),
-                    Style::default().fg(status_color),
-                ),
-                Span::raw("  |  Idle: "),
-                Span::styled(idle_display, Style::default().fg(Color::White)),
-                Span::raw("  |  "),
-                Span::styled(
-                    "Orchestrates worker agents",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            Line::from(Span::styled(
-                truncate(
-                    &manager.health_info.last_output,
-                    area.width.saturating_sub(4) as usize,
-                ),
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
+        // Parse ANSI codes and convert to ratatui text
+        let content = match ansi_to_tui::IntoText::into_text(&output) {
+            Ok(text) => text,
+            Err(_) => {
+                // Fallback: strip ANSI and show plain text
+                let plain = strip_ansi(&output);
+                ratatui::text::Text::raw(plain)
+            }
+        };
 
         let paragraph = Paragraph::new(content)
             .block(block)
-            .wrap(Wrap { trim: true });
+            .wrap(Wrap { trim: false });
 
         frame.render_widget(paragraph, area);
     } else {
@@ -211,6 +193,14 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
 
         frame.render_widget(paragraph, area);
     }
+}
+
+/// Strip ANSI escape codes from a string (fallback)
+fn strip_ansi(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap());
+    re.replace_all(s, "").to_string()
 }
 
 fn render_agent_card(frame: &mut Frame, agent: &AgentInfo, area: Rect, selected: bool) {
@@ -285,23 +275,58 @@ fn render_agent_card(frame: &mut Frame, agent: &AgentInfo, area: Rect, selected:
     frame.render_widget(paragraph, area);
 }
 
-fn render_help_bar(frame: &mut Frame, area: Rect) {
-    let help_text = vec![
-        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Quit "),
-        Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Nav "),
-        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Attach "),
-        Span::styled("n", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":New "),
-        Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Kill "),
-        Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Refresh "),
-        Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Help"),
-    ];
+fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let help_text = if app.interactive_mode {
+        // Interactive mode help
+        vec![
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            ),
+            Span::raw(":Exit interactive "),
+            Span::styled("Type", Style::default().fg(Color::DarkGray)),
+            Span::raw(" to send input to manager"),
+        ]
+    } else if app.manager_selected {
+        // Manager selected help
+        vec![
+            Span::styled(
+                "i",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            ),
+            Span::raw(":Interactive "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Popup "),
+            Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Nav "),
+            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Quit "),
+            Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Help"),
+        ]
+    } else {
+        // Normal help
+        vec![
+            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Quit "),
+            Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Nav "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Attach "),
+            Span::styled("n", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":New "),
+            Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Kill "),
+            Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Refresh "),
+            Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Help"),
+        ]
+    };
 
     let paragraph =
         Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray));

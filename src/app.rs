@@ -28,6 +28,7 @@ pub struct App {
     pub manager: Option<AgentInfo>,
     pub selected: usize,
     pub manager_selected: bool,
+    pub interactive_mode: bool,
     pub should_quit: bool,
     pub show_help: bool,
     pub show_confirm_kill: bool,
@@ -55,6 +56,7 @@ impl App {
             manager: None,
             selected: 0,
             manager_selected: false,
+            interactive_mode: false,
             should_quit: false,
             show_help: false,
             show_confirm_kill: false,
@@ -365,5 +367,32 @@ impl App {
     /// Get total agent count (including manager)
     pub fn total_agents(&self) -> usize {
         self.agents.len() + if self.manager.is_some() { 1 } else { 0 }
+    }
+
+    /// Enter interactive mode (for manager)
+    pub fn enter_interactive(&mut self) {
+        if self.manager_selected && self.manager.is_some() {
+            self.interactive_mode = true;
+        }
+    }
+
+    /// Exit interactive mode
+    pub fn exit_interactive(&mut self) {
+        self.interactive_mode = false;
+    }
+
+    /// Send a key to the manager (for interactive mode)
+    pub fn send_key_to_manager(&self, key: &str) -> Result<()> {
+        self.client.send_keys(MANAGER_SESSION, key)
+    }
+
+    /// Send literal text to the manager (for interactive mode)
+    pub fn send_text_to_manager(&self, text: &str) -> Result<()> {
+        self.client.send_keys_literal(MANAGER_SESSION, text)
+    }
+
+    /// Get manager pane output (more lines for display)
+    pub fn get_manager_output(&self, lines: i32) -> Result<String> {
+        self.client.capture_pane(MANAGER_SESSION, lines)
     }
 }

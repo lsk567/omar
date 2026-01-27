@@ -190,7 +190,47 @@ async fn run_dashboard(config: Config) -> Result<()> {
         if let Some(event) = events.next().await {
             match event {
                 AppEvent::Key(key) => {
-                    // Handle confirmation dialog first
+                    // Handle interactive mode - forward keys to manager
+                    if app.interactive_mode {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.exit_interactive();
+                            }
+                            KeyCode::Enter => {
+                                let _ = app.send_key_to_manager("Enter");
+                            }
+                            KeyCode::Backspace => {
+                                let _ = app.send_key_to_manager("BSpace");
+                            }
+                            KeyCode::Tab => {
+                                let _ = app.send_key_to_manager("Tab");
+                            }
+                            KeyCode::Up => {
+                                let _ = app.send_key_to_manager("Up");
+                            }
+                            KeyCode::Down => {
+                                let _ = app.send_key_to_manager("Down");
+                            }
+                            KeyCode::Left => {
+                                let _ = app.send_key_to_manager("Left");
+                            }
+                            KeyCode::Right => {
+                                let _ = app.send_key_to_manager("Right");
+                            }
+                            KeyCode::Char(c) => {
+                                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                    // Send Ctrl+key
+                                    let _ = app.send_key_to_manager(&format!("C-{}", c));
+                                } else {
+                                    let _ = app.send_text_to_manager(&c.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Handle confirmation dialog
                     if app.show_confirm_kill {
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -224,6 +264,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             app.previous();
+                        }
+                        KeyCode::Char('i') => {
+                            // Enter interactive mode if manager selected
+                            if app.manager_selected {
+                                app.enter_interactive();
+                            }
                         }
                         KeyCode::Enter => {
                             // Temporarily exit raw mode for popup

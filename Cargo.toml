@@ -20,6 +20,7 @@ dirs = "5"
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 chrono = { version = "0.4", features = ["serde"] }
+ansi-to-tui = "7"
 
 [dev-dependencies]
 pretty_assertions = "1"
