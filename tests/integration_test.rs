@@ -318,14 +318,8 @@ fn test_oma_spawn_and_kill() {
 
     cleanup_test_sessions();
 
-    // Also clean up any oma-agent- sessions from previous test runs
-    if let Ok(output) = tmux(&["list-sessions", "-F", "#{session_name}"]) {
-        for line in output.lines() {
-            if line.starts_with("oma-agent-") {
-                let _ = tmux(&["kill-session", "-t", line]);
-            }
-        }
-    }
+    // Also clean up test-spawn session from previous test runs
+    let _ = tmux(&["kill-session", "-t", "test-spawn"]);
 
     // Spawn a new agent
     let output = Command::new("cargo")
@@ -341,10 +335,10 @@ fn test_oma_spawn_and_kill() {
         stdout
     );
 
-    // Verify session exists
+    // Verify session exists (no prefix since we removed it)
     thread::sleep(Duration::from_millis(200));
     let result = Command::new("tmux")
-        .args(["has-session", "-t", "oma-agent-test-spawn"])
+        .args(["has-session", "-t", "test-spawn"])
         .output()
         .unwrap();
     assert!(result.status.success(), "Session should exist after spawn");
@@ -377,10 +371,10 @@ fn test_oma_spawn_and_kill() {
         stdout
     );
 
-    // Verify session is gone
+    // Verify session is gone (no prefix since we removed it)
     thread::sleep(Duration::from_millis(100));
     let result = Command::new("tmux")
-        .args(["has-session", "-t", "oma-agent-test-spawn"])
+        .args(["has-session", "-t", "test-spawn"])
         .output()
         .unwrap();
     assert!(
