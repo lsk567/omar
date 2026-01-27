@@ -281,6 +281,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
         }
     }
 
+    // Cleanup: kill manager session on exit
+    let _ = app.client().kill_session(crate::manager::MANAGER_SESSION);
+
     // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
