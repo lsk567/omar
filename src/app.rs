@@ -369,9 +369,9 @@ impl App {
         self.agents.len() + if self.manager.is_some() { 1 } else { 0 }
     }
 
-    /// Enter interactive mode (for manager)
+    /// Enter interactive mode (for selected agent or manager)
     pub fn enter_interactive(&mut self) {
-        if self.manager_selected && self.manager.is_some() {
+        if self.selected_agent().is_some() {
             self.interactive_mode = true;
         }
     }
@@ -381,18 +381,36 @@ impl App {
         self.interactive_mode = false;
     }
 
-    /// Send a key to the manager (for interactive mode)
-    pub fn send_key_to_manager(&self, key: &str) -> Result<()> {
-        self.client.send_keys(MANAGER_SESSION, key)
+    /// Get the session name of the currently selected agent
+    fn selected_session(&self) -> Option<&str> {
+        self.selected_agent().map(|a| a.session.name.as_str())
     }
 
-    /// Send literal text to the manager (for interactive mode)
-    pub fn send_text_to_manager(&self, text: &str) -> Result<()> {
-        self.client.send_keys_literal(MANAGER_SESSION, text)
+    /// Send a key to the selected agent (for interactive mode)
+    pub fn send_key_to_selected(&self, key: &str) -> Result<()> {
+        if let Some(session) = self.selected_session() {
+            self.client.send_keys(session, key)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Send literal text to the selected agent (for interactive mode)
+    pub fn send_text_to_selected(&self, text: &str) -> Result<()> {
+        if let Some(session) = self.selected_session() {
+            self.client.send_keys_literal(session, text)
+        } else {
+            Ok(())
+        }
     }
 
     /// Get manager pane output (more lines for display)
     pub fn get_manager_output(&self, lines: i32) -> Result<String> {
         self.client.capture_pane(MANAGER_SESSION, lines)
+    }
+
+    /// Get agent pane output by session name
+    pub fn get_agent_output(&self, session: &str, lines: i32) -> Result<String> {
+        self.client.capture_pane(session, lines)
     }
 }

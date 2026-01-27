@@ -96,11 +96,15 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let cols = 3.min(app.agents.len()).max(1);
+    // Max 2 columns for better readability
+    let cols = 2.min(app.agents.len()).max(1);
     let rows = app.agents.len().div_ceil(cols);
 
-    // Create row constraints
-    let row_constraints: Vec<Constraint> = (0..rows).map(|_| Constraint::Length(7)).collect();
+    // Calculate row height to fill available space
+    let row_height = area.height / rows as u16;
+    let row_constraints: Vec<Constraint> = (0..rows)
+        .map(|_| Constraint::Length(row_height.max(8)))
+        .collect();
 
     let row_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -126,7 +130,15 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
 
         if col < col_chunks.len() {
             let is_selected = !app.manager_selected && i == app.selected;
-            render_agent_card(frame, agent, col_chunks[col], is_selected);
+            let is_interactive = app.interactive_mode && is_selected;
+            render_agent_card(
+                frame,
+                app,
+                agent,
+                col_chunks[col],
+                is_selected,
+                is_interactive,
+            );
         }
     }
 }
@@ -175,9 +187,15 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
             }
         };
 
+        // Calculate scroll to show bottom of content
+        let content_height = content.lines.len() as u16;
+        let visible_height = area.height.saturating_sub(2); // -2 for borders
+        let scroll = content_height.saturating_sub(visible_height);
+
         let paragraph = Paragraph::new(content)
             .block(block)
-            .wrap(Wrap { trim: false });
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
 
         frame.render_widget(paragraph, area);
     } else {
@@ -203,34 +221,45 @@ fn strip_ansi(s: &str) -> String {
     re.replace_all(s, "").to_string()
 }
 
-fn render_agent_card(frame: &mut Frame, agent: &AgentInfo, area: Rect, selected: bool) {
-    let (border_color, status_icon) = match agent.health {
+fn render_agent_card(
+    frame: &mut Frame,
+    app: &App,
+    agent: &AgentInfo,
+    area: Rect,
+    selected: bool,
+    interactive: bool,
+) {
+    let (health_color, status_icon) = match agent.health {
         HealthState::Working => (Color::Green, "●"),
         HealthState::WaitingForInput => (Color::Blue, "◆"),
         HealthState::Idle => (Color::Yellow, "○"),
         HealthState::Stuck => (Color::Red, "✖"),
     };
 
-    let border_style = if selected {
-        Style::default()
-            .fg(border_color)
-            .add_modifier(Modifier::BOLD)
+    // Border color based on state
+    let border_color = if interactive {
+        Color::Cyan
+    } else if selected {
+        Color::Magenta
     } else {
-        Style::default().fg(border_color)
+        health_color
     };
 
-    // Extract short name (remove prefix)
-    let short_name = agent
-        .session
-        .name
-        .split('-')
-        .next_back()
-        .unwrap_or(&agent.session.name);
+    let border_style = Style::default()
+        .fg(border_color)
+        .add_modifier(if selected || interactive {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
 
-    let title = if selected {
-        format!(" [{}] ", short_name)
+    // Title with status indicator
+    let title = if interactive {
+        format!(" {} [INTERACTIVE - Esc] ", &agent.session.name)
+    } else if selected {
+        format!(" [{}] {} - 'i' to type ", status_icon, &agent.session.name)
     } else {
-        format!(" {} ", short_name)
+        format!(" {} {} ", status_icon, &agent.session.name)
     };
 
     let block = Block::default()
@@ -238,39 +267,30 @@ fn render_agent_card(frame: &mut Frame, agent: &AgentInfo, area: Rect, selected:
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let idle_display = agent.health_info.idle_display();
-    let status_color = match agent.health {
-        HealthState::Working => Color::Green,
-        HealthState::WaitingForInput => Color::Blue,
-        HealthState::Idle => Color::Yellow,
-        HealthState::Stuck => Color::Red,
+    // Get live output from the agent's pane
+    let available_lines = area.height.saturating_sub(2) as i32;
+    let output = app
+        .get_agent_output(&agent.session.name, available_lines.max(10))
+        .unwrap_or_default();
+
+    // Parse ANSI codes
+    let content = match ansi_to_tui::IntoText::into_text(&output) {
+        Ok(text) => text,
+        Err(_) => {
+            let plain = strip_ansi(&output);
+            ratatui::text::Text::raw(plain)
+        }
     };
 
-    let content = vec![
-        Line::from(vec![
-            Span::styled(status_icon, Style::default().fg(status_color)),
-            Span::raw(" "),
-            Span::styled(
-                agent.health.as_str().to_uppercase(),
-                Style::default().fg(status_color),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("Idle: "),
-            Span::styled(idle_display, Style::default().fg(Color::White)),
-        ]),
-        Line::from(Span::styled(
-            truncate(
-                &agent.health_info.last_output,
-                area.width.saturating_sub(4) as usize,
-            ),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
+    // Scroll to bottom
+    let content_height = content.lines.len() as u16;
+    let visible_height = area.height.saturating_sub(2);
+    let scroll = content_height.saturating_sub(visible_height);
 
     let paragraph = Paragraph::new(content)
         .block(block)
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
 
     frame.render_widget(paragraph, area);
 }
@@ -278,6 +298,11 @@ fn render_agent_card(frame: &mut Frame, agent: &AgentInfo, area: Rect, selected:
 fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     let help_text = if app.interactive_mode {
         // Interactive mode help
+        let target = if app.manager_selected {
+            "manager"
+        } else {
+            "agent"
+        };
         vec![
             Span::styled(
                 "Esc",
@@ -287,10 +312,10 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw(":Exit interactive "),
             Span::styled("Type", Style::default().fg(Color::DarkGray)),
-            Span::raw(" to send input to manager"),
+            Span::raw(format!(" to send input to {}", target)),
         ]
-    } else if app.manager_selected {
-        // Manager selected help
+    } else if app.manager_selected || app.selected_agent().is_some() {
+        // Any agent selected help (including manager)
         vec![
             Span::styled(
                 "i",
@@ -427,17 +452,4 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
-}
-
-/// Truncate a string to fit within max_len (char-aware for UTF-8)
-fn truncate(s: &str, max_len: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max_len {
-        s.to_string()
-    } else if max_len > 3 {
-        let truncated: String = s.chars().take(max_len - 3).collect();
-        format!("{}...", truncated)
-    } else {
-        s.chars().take(max_len).collect()
-    }
 }
