@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod event;
+mod manager;
 mod tmux;
 mod ui;
 
@@ -57,6 +58,20 @@ enum Commands {
         /// Name of the session to kill
         name: String,
     },
+
+    /// Start or attach to the manager agent
+    Manager {
+        #[command(subcommand)]
+        action: Option<ManagerAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManagerAction {
+    /// Start the manager agent session
+    Start,
+    /// Run manager orchestration mode
+    Orchestrate,
 }
 
 #[tokio::main]
@@ -73,6 +88,10 @@ async fn main() -> Result<()> {
         }) => spawn_agent(&client, &name, &command, workdir.as_deref()),
         Some(Commands::List) => list_agents(&client),
         Some(Commands::Kill { name }) => kill_agent(&client, &name),
+        Some(Commands::Manager { action }) => match action {
+            Some(ManagerAction::Start) | None => manager::start_manager(&client),
+            Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(&client),
+        },
         None => run_dashboard(config).await,
     }
 }

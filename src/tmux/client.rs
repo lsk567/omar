@@ -163,6 +163,15 @@ impl TmuxClient {
         Ok(result.status.success())
     }
 
+    /// Attach to a session (blocks until detached)
+    pub fn attach_session(&self, session: &str) -> Result<()> {
+        Command::new("tmux")
+            .args(["attach-session", "-t", session])
+            .status()
+            .context("Failed to attach to tmux session")?;
+        Ok(())
+    }
+
     /// Open a popup attached to a session
     pub fn attach_popup(&self, session: &str, width: &str, height: &str) -> Result<()> {
         Command::new("tmux")
