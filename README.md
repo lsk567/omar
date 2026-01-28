@@ -1,10 +1,10 @@
-# One-Man Army (OMAR)
+# One-Man Army
 
-Be a one-man army with non-stop agents.
+Be a one-man army with non-stop agents tackling the biggest problems.
 
 A TUI dashboard for managing multiple AI coding agents based on `tmux`.
 
-![thermopylae](docs/img/thermopylae.png)
+<img src="docs/img/thermopylae.png" alt="thermopylae" width="450" />
 
 ## Features
 
