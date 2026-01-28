@@ -128,8 +128,9 @@ pub fn start_manager(client: &TmuxClient) -> Result<()> {
     client.send_keys_literal(MANAGER_SESSION, MANAGER_SYSTEM_PROMPT)?;
 
     // Small delay to ensure prompt is fully received before pressing Enter
-    thread::sleep(Duration::from_millis(100));
-    client.send_keys(MANAGER_SESSION, "Enter")?;
+    thread::sleep(Duration::from_millis(200));
+    // Use C-m (Ctrl+M) which is equivalent to Enter and may work better with Claude
+    client.send_keys(MANAGER_SESSION, "C-m")?;
 
     thread::sleep(Duration::from_millis(500));
 

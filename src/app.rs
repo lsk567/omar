@@ -161,8 +161,9 @@ impl App {
             .send_keys_literal(MANAGER_SESSION, crate::manager::MANAGER_SYSTEM_PROMPT)?;
 
         // Small delay to ensure prompt is fully received before pressing Enter
-        thread::sleep(Duration::from_millis(100));
-        self.client.send_keys(MANAGER_SESSION, "Enter")?;
+        thread::sleep(Duration::from_millis(200));
+        // Use C-m (Ctrl+M) which is equivalent to Enter and may work better with Claude
+        self.client.send_keys(MANAGER_SESSION, "C-m")?;
 
         Ok(())
     }
