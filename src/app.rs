@@ -154,11 +154,14 @@ impl App {
         )?;
 
         // Give it time to start
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_secs(2));
 
         // Send manager system prompt
         self.client
             .send_keys_literal(MANAGER_SESSION, crate::manager::MANAGER_SYSTEM_PROMPT)?;
+
+        // Small delay to ensure prompt is fully received before pressing Enter
+        thread::sleep(Duration::from_millis(100));
         self.client.send_keys(MANAGER_SESSION, "Enter")?;
 
         Ok(())

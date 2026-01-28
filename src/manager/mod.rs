@@ -126,6 +126,9 @@ pub fn start_manager(client: &TmuxClient) -> Result<()> {
     // Send the system prompt
     println!("Configuring manager with system prompt...");
     client.send_keys_literal(MANAGER_SESSION, MANAGER_SYSTEM_PROMPT)?;
+
+    // Small delay to ensure prompt is fully received before pressing Enter
+    thread::sleep(Duration::from_millis(100));
     client.send_keys(MANAGER_SESSION, "Enter")?;
 
     thread::sleep(Duration::from_millis(500));
