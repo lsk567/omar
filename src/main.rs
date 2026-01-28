@@ -190,46 +190,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
         if let Some(event) = events.next().await {
             match event {
                 AppEvent::Key(key) => {
-                    // Handle interactive mode - forward keys to selected agent
-                    if app.interactive_mode {
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.exit_interactive();
-                            }
-                            KeyCode::Enter => {
-                                let _ = app.send_key_to_selected("Enter");
-                            }
-                            KeyCode::Backspace => {
-                                let _ = app.send_key_to_selected("BSpace");
-                            }
-                            KeyCode::Tab => {
-                                let _ = app.send_key_to_selected("Tab");
-                            }
-                            KeyCode::Up => {
-                                let _ = app.send_key_to_selected("Up");
-                            }
-                            KeyCode::Down => {
-                                let _ = app.send_key_to_selected("Down");
-                            }
-                            KeyCode::Left => {
-                                let _ = app.send_key_to_selected("Left");
-                            }
-                            KeyCode::Right => {
-                                let _ = app.send_key_to_selected("Right");
-                            }
-                            KeyCode::Char(c) => {
-                                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                    // Send Ctrl+key
-                                    let _ = app.send_key_to_selected(&format!("C-{}", c));
-                                } else {
-                                    let _ = app.send_text_to_selected(&c.to_string());
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
                     // Handle confirmation dialog
                     if app.show_confirm_kill {
                         match key.code {
@@ -264,10 +224,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             app.previous();
-                        }
-                        KeyCode::Char('i') => {
-                            // Enter interactive mode for any selected agent
-                            app.enter_interactive();
                         }
                         KeyCode::Enter => {
                             // Temporarily exit raw mode for popup
