@@ -80,7 +80,7 @@ fn default_session_prefix() -> String {
 }
 
 fn default_idle_warning() -> i64 {
-    60
+    15
 }
 
 fn default_idle_critical() -> i64 {
@@ -196,7 +196,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.dashboard.refresh_interval, 2);
         assert_eq!(config.dashboard.session_prefix, ""); // No prefix by default
-        assert_eq!(config.health.idle_warning, 60);
+        assert_eq!(config.health.idle_warning, 15);
         assert_eq!(config.health.idle_critical, 300);
     }
 

@@ -44,18 +44,13 @@ pub struct App {
 impl App {
     pub fn new(config: &Config) -> Self {
         let client = TmuxClient::new(&config.dashboard.session_prefix);
-        let health_checker = HealthChecker::new(
-            client.clone(),
-            config.health.idle_warning,
-            config.health.idle_critical,
-            &config.health.error_patterns,
-        );
+        let health_checker = HealthChecker::new(client.clone(), config.health.idle_warning);
 
         Self {
             agents: Vec::new(),
             manager: None,
             selected: 0,
-            manager_selected: false,
+            manager_selected: true,
             interactive_mode: false,
             should_quit: false,
             show_help: false,
@@ -337,35 +332,27 @@ impl App {
         self.status_message = None;
     }
 
-    /// Get counts by health state: (working, waiting, idle, stuck)
+    /// Get counts by health state: (running, idle)
     /// Includes manager in the count
-    pub fn health_counts(&self) -> (usize, usize, usize, usize) {
-        let mut working = 0;
-        let mut waiting = 0;
+    pub fn health_counts(&self) -> (usize, usize) {
+        let mut running = 0;
         let mut idle = 0;
-        let mut stuck = 0;
 
-        // Count regular agents
         for agent in &self.agents {
             match agent.health {
-                HealthState::Working => working += 1,
-                HealthState::WaitingForInput => waiting += 1,
+                HealthState::Running => running += 1,
                 HealthState::Idle => idle += 1,
-                HealthState::Stuck => stuck += 1,
             }
         }
 
-        // Count manager
         if let Some(ref manager) = self.manager {
             match manager.health {
-                HealthState::Working => working += 1,
-                HealthState::WaitingForInput => waiting += 1,
+                HealthState::Running => running += 1,
                 HealthState::Idle => idle += 1,
-                HealthState::Stuck => stuck += 1,
             }
         }
 
-        (working, waiting, idle, stuck)
+        (running, idle)
     }
 
     /// Get total agent count (including manager)
