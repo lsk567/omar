@@ -80,6 +80,47 @@ curl -X DELETE http://localhost:9876/api/agents/worker-name
 - Monitor health status: "working", "waiting", "idle", "stuck"
 - Agents showing "waiting" likely need input from you
 
+## Demo Window (Running Commands for the User)
+
+When you report steps the user should run (e.g., "here are the steps to run the server"),
+and the user asks you to show them, run it, or demonstrate it, you should spawn a plain
+bash window and execute the commands there one by one.
+
+### How it works
+
+1. Spawn a bash window (NOT a Claude agent):
+```bash
+curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json" -d '{"name": "demo", "command": "bash"}'
+```
+
+2. Send a command and press Enter:
+```bash
+curl -X POST http://localhost:9876/api/agents/demo/send -H "Content-Type: application/json" -d '{"text": "npm install", "enter": true}'
+```
+
+3. Monitor output until the command finishes:
+```bash
+curl http://localhost:9876/api/agents/demo
+```
+
+4. When the output shows the command has completed (e.g., you see a shell prompt again),
+   send the next command.
+
+5. When all commands are done, leave the window open — do NOT kill it.
+   The user may want to continue working in it.
+
+### When to use this
+
+The user may say things like:
+- "show me"
+- "run it for me"
+- "demo this in a window"
+- "show me in a separate window"
+- "can you run those steps?"
+
+In all these cases, spawn a "demo" bash window and run the commands sequentially,
+waiting for each to complete before sending the next.
+
 ## Example
 
 User: "Build a REST API with authentication"
