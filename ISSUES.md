@@ -40,6 +40,27 @@ Reorder the checks to prioritize `WaitingForInput` detection regardless of idle 
 
 ---
 
+### 3. Agent status reporting incorrect
+**Status:** Open
+**Severity:** Medium
+**Date:** 2026-01-27
+
+**Description:**
+The agent health status displayed in the dashboard does not accurately reflect the actual state of agents. The status indicators (Working/Waiting/Idle/Stuck) frequently show incorrect states.
+
+**Current behavior:**
+- Agents may show "Working" when they are actually idle or waiting for input
+- Status updates may lag behind actual agent state
+- Pattern matching for detecting agent state is unreliable
+
+**Expected behavior:**
+- Status should accurately reflect whether an agent is actively processing, waiting for input, idle, or stuck
+- Status should update promptly when agent state changes
+
+**Related:** See issue #1 for startup-specific health detection problems.
+
+---
+
 ## Resolved
 
 ### 2. Pressing 'd' kills user's main tmux session
