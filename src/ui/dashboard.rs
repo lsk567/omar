@@ -130,7 +130,15 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
 
         if col < col_chunks.len() {
             let is_selected = !app.manager_selected && i == app.selected;
-            render_agent_card(frame, app, agent, col_chunks[col], is_selected);
+            let is_interactive = app.interactive_mode && is_selected;
+            render_agent_card(
+                frame,
+                app,
+                agent,
+                col_chunks[col],
+                is_selected,
+                is_interactive,
+            );
         }
     }
 }
@@ -138,21 +146,25 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
 fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
     if app.manager.is_some() {
         let is_selected = app.manager_selected;
+        let is_interactive = app.interactive_mode;
 
         // Different styles for different states
-        let (border_color, title) = if is_selected {
-            (Color::Magenta, " [MANAGER] - Press Enter to attach ")
+        let (border_color, title) = if is_interactive {
+            (Color::Cyan, " MANAGER [INTERACTIVE - Esc to exit] ")
+        } else if is_selected {
+            (Color::Magenta, " [MANAGER] - Press 'i' to type ")
         } else {
             (Color::Blue, " MANAGER ")
         };
 
-        let border_style = Style::default()
-            .fg(border_color)
-            .add_modifier(if is_selected {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            });
+        let border_style =
+            Style::default()
+                .fg(border_color)
+                .add_modifier(if is_selected || is_interactive {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                });
 
         let block = Block::default()
             .title(title)
@@ -215,6 +227,7 @@ fn render_agent_card(
     agent: &AgentInfo,
     area: Rect,
     selected: bool,
+    interactive: bool,
 ) {
     let (health_color, status_icon) = match agent.health {
         HealthState::Working => (Color::Green, "●"),
@@ -224,7 +237,9 @@ fn render_agent_card(
     };
 
     // Border color based on state
-    let border_color = if selected {
+    let border_color = if interactive {
+        Color::Cyan
+    } else if selected {
         Color::Magenta
     } else {
         health_color
@@ -232,15 +247,17 @@ fn render_agent_card(
 
     let border_style = Style::default()
         .fg(border_color)
-        .add_modifier(if selected {
+        .add_modifier(if selected || interactive {
             Modifier::BOLD
         } else {
             Modifier::empty()
         });
 
     // Title with status indicator
-    let title = if selected {
-        format!(" [{}] {} - Enter to attach ", status_icon, &agent.session.name)
+    let title = if interactive {
+        format!(" {} [INTERACTIVE - Esc] ", &agent.session.name)
+    } else if selected {
+        format!(" [{}] {} - 'i' to type ", status_icon, &agent.session.name)
     } else {
         format!(" {} {} ", status_icon, &agent.session.name)
     };
@@ -278,23 +295,63 @@ fn render_agent_card(
     frame.render_widget(paragraph, area);
 }
 
-fn render_help_bar(frame: &mut Frame, _app: &App, area: Rect) {
-    let help_text = vec![
-        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Quit "),
-        Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Nav "),
-        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Attach "),
-        Span::styled("n", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":New "),
-        Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Kill "),
-        Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Refresh "),
-        Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Help"),
-    ];
+fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let help_text = if app.interactive_mode {
+        // Interactive mode help
+        let target = if app.manager_selected {
+            "manager"
+        } else {
+            "agent"
+        };
+        vec![
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            ),
+            Span::raw(":Exit interactive "),
+            Span::styled("Type", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(" to send input to {}", target)),
+        ]
+    } else if app.manager_selected || app.selected_agent().is_some() {
+        // Any agent selected help (including manager)
+        vec![
+            Span::styled(
+                "i",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            ),
+            Span::raw(":Interactive "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Popup "),
+            Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Nav "),
+            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Quit "),
+            Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Help"),
+        ]
+    } else {
+        // Normal help
+        vec![
+            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Quit "),
+            Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Nav "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Attach "),
+            Span::styled("n", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":New "),
+            Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Kill "),
+            Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Refresh "),
+            Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Help"),
+        ]
+    };
 
     let paragraph =
         Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray));
