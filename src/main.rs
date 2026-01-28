@@ -270,19 +270,28 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.enter_interactive();
                         }
                         KeyCode::Enter => {
-                            // Temporarily exit raw mode for popup
-                            disable_raw_mode()?;
-                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                            if std::env::var("TMUX").is_ok() {
+                                // Inside tmux: use display-popup overlay (stays on top of dashboard)
+                                if let Err(e) = app.attach_selected() {
+                                    app.set_status(format!("Error: {}", e));
+                                }
+                                // Force redraw after popup closes
+                                terminal.clear()?;
+                            } else {
+                                // Outside tmux: temporarily exit alternate screen
+                                disable_raw_mode()?;
+                                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-                            let result = app.attach_selected();
+                                let result = app.attach_selected();
 
-                            // Restore terminal
-                            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                            enable_raw_mode()?;
-                            terminal.clear()?;
+                                // Restore terminal
+                                execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                                enable_raw_mode()?;
+                                terminal.clear()?;
 
-                            if let Err(e) = result {
-                                app.set_status(format!("Error: {}", e));
+                                if let Err(e) = result {
+                                    app.set_status(format!("Error: {}", e));
+                                }
                             }
                         }
                         KeyCode::Char('n') => {
