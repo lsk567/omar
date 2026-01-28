@@ -9,7 +9,7 @@ A TUI dashboard for managing multiple AI coding agents based on `tmux`.
 ## Features
 
 - Real-time monitoring of agent sessions
-- Health status tracking (OK, Idle)
+- Health status tracking (Running, Idle)
 - Quick attach/detach via tmux popups
 - Session management (spawn, list, kill)
 
@@ -38,6 +38,9 @@ omar list
 
 # Kill an agent
 omar kill my-agent
+
+# Start or attach to the manager agent
+omar manager
 ```
 
 ### Keyboard Shortcuts
@@ -48,6 +51,7 @@ omar kill my-agent
 | `j` / `Down` | Move down |
 | `k` / `Up` | Move up |
 | `Enter` | Attach to agent |
+| `i` | Interactive mode (type directly to agent) |
 | `n` | Spawn new agent |
 | `d` | Kill agent |
 | `r` | Refresh |
@@ -63,9 +67,7 @@ refresh_interval = 2
 session_prefix = "omar-agent-"
 
 [health]
-idle_warning = 60
-idle_critical = 300
-error_patterns = ["error", "failed", "rate limit"]
+idle_warning = 15
 
 [agent]
 default_command = "claude"
