@@ -1,14 +1,15 @@
-# OMAR
+# One-Man Army (OMAR)
 
-Make everyone a one-man army by commanding agents non-stop.
+Be a one-man army with non-stop agents.
 
-A TUI dashboard for monitoring and managing multiple AI coding agents running in tmux sessions.
+A TUI dashboard for managing multiple AI coding agents based on `tmux`.
+
+![thermopylae](docs/img/thermopylae.png)
 
 ## Features
 
 - Real-time monitoring of agent sessions
-- Health status tracking (OK, Idle, Stuck)
-- Error pattern detection in agent output
+- Health status tracking (OK, Idle)
 - Quick attach/detach via tmux popups
 - Session management (spawn, list, kill)
 
