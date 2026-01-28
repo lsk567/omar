@@ -42,7 +42,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let total = app.total_agents();
 
     let status_text = vec![
-        Span::styled("OMA ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("One-Man Army ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("| Agents: "),
         Span::styled(format!("{}", total), Style::default().fg(Color::White)),
         Span::raw(" | "),

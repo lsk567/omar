@@ -51,9 +51,9 @@ A manager agent that orchestrates multiple worker agents, allowing users to issu
 
 ## Architecture Options
 
-### Option A: Manager as Claude Session + OMA Commands
+### Option A: Manager as Claude Session + OMAR Commands
 
-The manager is a regular Claude session with special system prompt. OMA provides CLI commands that the manager can invoke.
+The manager is a regular Claude session with special system prompt. OMAR provides CLI commands that the manager can invoke.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -61,12 +61,12 @@ The manager is a regular Claude session with special system prompt. OMA provides
 │                                             │
 │  System prompt includes:                    │
 │  - You are a manager agent                  │
-│  - Use /oma commands to control workers     │
+│  - Use /omar commands to control workers     │
 │  - Available commands:                      │
-│    /oma spawn <name> <task>                 │
-│    /oma send <name> <message>               │
-│    /oma status                              │
-│    /oma wait <name>                         │
+│    /omar spawn <name> <task>                 │
+│    /omar send <name> <message>               │
+│    /omar status                              │
+│    /omar wait <name>                         │
 │                                             │
 └─────────────────────────────────────────────┘
 ```
@@ -81,13 +81,13 @@ The manager is a regular Claude session with special system prompt. OMA provides
 - No structured communication protocol
 - Hard to enforce approval flow
 
-### Option B: OMA Native Orchestration
+### Option B: OMAR Native Orchestration
 
-OMA itself becomes the orchestrator with a TUI for manager mode.
+OMAR itself becomes the orchestrator with a TUI for manager mode.
 
 ```
 ┌─────────────────────────────────────────────┐
-│              OMA Manager Mode               │
+│              OMAR Manager Mode               │
 │                                             │
 │  ┌───────────────────────────────────────┐  │
 │  │ Your request:                         │  │
@@ -123,7 +123,7 @@ OMA itself becomes the orchestrator with a TUI for manager mode.
 
 ### Option C: Hybrid - Manager Claude + Structured Protocol
 
-Manager is Claude, but communicates via structured JSON protocol that OMA interprets.
+Manager is Claude, but communicates via structured JSON protocol that OMAR interprets.
 
 ```
 Manager Claude outputs:
@@ -137,9 +137,9 @@ Manager Claude outputs:
   ]
 }
 
-User approves via OMA UI.
+User approves via OMAR UI.
 
-OMA then sends to each worker:
+OMAR then sends to each worker:
 {
   "role": "worker",
   "task": "Set up Express server with routes for /users, /posts",
@@ -166,7 +166,7 @@ OMA then sends to each worker:
    - Outputs structured JSON plans
    - Monitors worker status
 
-2. **OMA Protocol Layer**
+2. **OMAR Protocol Layer**
    - Parses manager JSON output
    - Presents plan to user for approval
    - Spawns/controls worker agents
@@ -181,14 +181,14 @@ OMA then sends to each worker:
 
 #### Phase 1: Basic Manager Commands
 ```bash
-oma manager start              # Start manager session
-oma manager propose "task"     # Ask manager to break down task
-oma manager approve            # Approve proposed plan
-oma manager status             # Show all agent status
+omar manager start              # Start manager session
+omar manager propose "task"     # Ask manager to break down task
+omar manager approve            # Approve proposed plan
+omar manager status             # Show all agent status
 ```
 
 #### Phase 2: Structured Communication
-- Define JSON protocol for manager ↔ OMA
+- Define JSON protocol for manager ↔ OMAR
 - Add plan parsing and validation
 - Implement approval UI in dashboard
 
@@ -205,7 +205,7 @@ oma manager status             # Show all agent status
 
 ## Protocol Specification
 
-### Manager → OMA Messages
+### Manager → OMAR Messages
 
 ```json
 // Propose a plan
@@ -238,7 +238,7 @@ oma manager status             # Show all agent status
 }
 ```
 
-### OMA → Manager Messages
+### OMAR → Manager Messages
 
 ```json
 // Plan approval
@@ -266,7 +266,7 @@ oma manager status             # Show all agent status
 
 ### Worker Context Injection
 
-When spawning a worker, OMA injects context:
+When spawning a worker, OMAR injects context:
 
 ```
 You are a worker agent in a multi-agent project.
@@ -313,7 +313,7 @@ INSTRUCTIONS:
 
 1. [ ] Decide on architecture (recommend Option C)
 2. [ ] Design manager system prompt
-3. [ ] Implement basic `oma manager` commands
+3. [ ] Implement basic `omar manager` commands
 4. [ ] Add JSON protocol parsing
 5. [ ] Build approval UI in dashboard
 6. [ ] Test with simple multi-agent task

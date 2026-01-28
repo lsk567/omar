@@ -1,4 +1,4 @@
-# OMA
+# OMAR
 
 Make everyone a one-man army by commanding agents non-stop.
 
@@ -23,20 +23,20 @@ cargo install --path .
 ### Dashboard Mode
 
 ```bash
-oma
+omar
 ```
 
 ### CLI Commands
 
 ```bash
 # Spawn a new agent
-oma spawn -n my-agent -c "claude"
+omar spawn -n my-agent -c "claude"
 
 # List all agents
-oma list
+omar list
 
 # Kill an agent
-oma kill my-agent
+omar kill my-agent
 ```
 
 ### Keyboard Shortcuts
@@ -54,12 +54,12 @@ oma kill my-agent
 
 ## Configuration
 
-Create `~/.config/oma/config.toml`:
+Create `~/.config/omar/config.toml`:
 
 ```toml
 [dashboard]
 refresh_interval = 2
-session_prefix = "oma-agent-"
+session_prefix = "omar-agent-"
 
 [health]
 idle_warning = 60

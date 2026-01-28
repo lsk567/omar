@@ -69,7 +69,7 @@ The agent health status displayed in the dashboard does not accurately reflect t
 **Date:** 2025-01-26
 
 **Description:**
-After removing the session prefix for direct tmux integration, `oma list` showed ALL tmux sessions including the user's attached terminal. If the user selected their main session and pressed 'd' to kill, it would exit their entire tmux environment.
+After removing the session prefix for direct tmux integration, `omar list` showed ALL tmux sessions including the user's attached terminal. If the user selected their main session and pressed 'd' to kill, it would exit their entire tmux environment.
 
 **Fix:**
 - Filter out attached sessions from the agent list

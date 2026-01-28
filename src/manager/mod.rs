@@ -11,7 +11,7 @@ use crate::tmux::TmuxClient;
 use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 
 /// Manager session name (exported for use in app.rs)
-pub const MANAGER_SESSION: &str = "oma-manager";
+pub const MANAGER_SESSION: &str = "omar-manager";
 
 /// Manager system prompt, loaded from prompts/manager.md at compile time
 pub const MANAGER_SYSTEM_PROMPT: &str = include_str!("../../prompts/manager.md");
@@ -56,7 +56,7 @@ pub fn start_manager(client: &TmuxClient) -> Result<()> {
 
 /// Run the manager in orchestration mode (interactive)
 pub fn run_manager_orchestration(client: &TmuxClient) -> Result<()> {
-    println!("=== OMA Manager Orchestration Mode ===\n");
+    println!("=== OMAR Manager Orchestration Mode ===\n");
 
     // Check if manager exists
     if !client.has_session(MANAGER_SESSION)? {
@@ -67,7 +67,7 @@ pub fn run_manager_orchestration(client: &TmuxClient) -> Result<()> {
 
     loop {
         // Get user input
-        print!("\n[OMA] Enter command (or 'help'): ");
+        print!("\n[OMAR] Enter command (or 'help'): ");
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -119,7 +119,7 @@ pub fn run_manager_orchestration(client: &TmuxClient) -> Result<()> {
 fn print_help() {
     println!(
         r#"
-OMA Manager Commands:
+OMAR Manager Commands:
   <text>        Send request to manager agent
   status (s)    Show all agent status
   attach (a)    Attach to manager session
@@ -297,7 +297,7 @@ fn spawn_worker(client: &TmuxClient, agent: &ProposedAgent) -> Result<()> {
 
     // Send worker context
     let context = format!(
-        r#"You are a Worker Agent in the OMA system.
+        r#"You are a Worker Agent in the OMAR system.
 
 YOUR ROLE: {}
 YOUR TASK: {}

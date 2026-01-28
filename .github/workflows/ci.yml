@@ -128,8 +128,8 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: oma-${{ matrix.os }}
-          path: target/release/oma
+          name: omar-${{ matrix.os }}
+          path: target/release/omar
 
   # Ensure all jobs pass before allowing merge
   ci-success:

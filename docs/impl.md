@@ -1,4 +1,4 @@
-# OMA: Implementation Plan
+# OMAR: Implementation Plan
 
 ## Tech Stack
 
@@ -14,7 +14,7 @@
 ## Project Structure
 
 ```
-oma/
+omar/
 ├── Cargo.toml
 ├── src/
 │   ├── main.rs              # Entry point, CLI parsing
@@ -472,12 +472,12 @@ use clap::{Parser, Subcommand};
 use anyhow::Result;
 
 #[derive(Parser)]
-#[command(name = "oma", about = "Agent dashboard for tmux")]
+#[command(name = "omar", about = "Agent dashboard for tmux")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    #[arg(short, long, default_value = "~/.config/oma/config.toml")]
+    #[arg(short, long, default_value = "~/.config/omar/config.toml")]
     config: String,
 }
 
@@ -517,7 +517,7 @@ async fn run_dashboard() -> Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     // Create app
-    let client = TmuxClient::new("oma-agent-");
+    let client = TmuxClient::new("omar-agent-");
     let health_checker = HealthChecker::new(client.clone(), 60, 300, &["error", "failed"]);
     let mut app = App::new(client, health_checker);
 
@@ -558,19 +558,19 @@ async fn run_dashboard() -> Result<()> {
 
 ```bash
 # Start dashboard
-oma
+omar
 
 # Start with custom config
-oma --config ~/.config/oma/config.toml
+omar --config ~/.config/omar/config.toml
 
 # Spawn a new agent
-oma spawn --name my-agent --command "claude"
+omar spawn --name my-agent --command "claude"
 
 # List agents (non-TUI)
-oma list
+omar list
 
 # Kill an agent
-oma kill agent-1
+omar kill agent-1
 ```
 
 ## Dependencies
@@ -578,7 +578,7 @@ oma kill agent-1
 ```toml
 # Cargo.toml
 [package]
-name = "oma"
+name = "omar"
 version = "0.1.0"
 edition = "2021"
 

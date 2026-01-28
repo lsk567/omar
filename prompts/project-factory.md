@@ -31,7 +31,7 @@ Great I want to build a workflow that keeps turning out interesting projects lik
 ## How It Works
 
 1. The manager agent suggests a project broken into 3-5 parallel sub-tasks
-2. Each sub-task is assigned to a worker agent via the OMA HTTP API
+2. Each sub-task is assigned to a worker agent via the OMAR HTTP API
 3. Workers create their files independently in the `junk/<project-name>/` folder
 4. Manager monitors progress and approves pending permissions
 5. When complete, manager immediately spawns the next project

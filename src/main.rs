@@ -26,13 +26,13 @@ use event::{AppEvent, EventHandler};
 use tmux::TmuxClient;
 
 #[derive(Parser)]
-#[command(name = "oma", about = "Agent dashboard for tmux", version)]
+#[command(name = "omar", about = "Agent dashboard for tmux", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
     /// Path to config file
-    #[arg(short, long, default_value = "~/.config/oma/config.toml")]
+    #[arg(short, long, default_value = "~/.config/omar/config.toml")]
     config: String,
 }
 

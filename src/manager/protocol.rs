@@ -1,4 +1,4 @@
-//! JSON protocol for manager ↔ OMA communication
+//! JSON protocol for manager ↔ OMAR communication
 
 #![allow(dead_code)]
 
@@ -23,7 +23,7 @@ pub struct Plan {
     pub agents: Vec<ProposedAgent>,
 }
 
-/// Messages from manager to OMA
+/// Messages from manager to OMAR
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ManagerMessage {
@@ -40,10 +40,10 @@ pub enum ManagerMessage {
     Complete { summary: String },
 }
 
-/// Messages from OMA to manager
+/// Messages from OMAR to manager
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum OmaMessage {
+pub enum OmarMessage {
     #[serde(rename = "plan_approved")]
     PlanApproved { modifications: Vec<String> },
     #[serde(rename = "plan_rejected")]

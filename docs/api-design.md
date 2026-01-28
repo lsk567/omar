@@ -1,8 +1,8 @@
-# OMA HTTP API Design
+# OMAR HTTP API Design
 
 ## Overview
 
-OMA exposes a local HTTP API that allows any agent (Claude, opencode, custom tools) to orchestrate worker agents. This enables:
+OMAR exposes a local HTTP API that allows any agent (Claude, opencode, custom tools) to orchestrate worker agents. This enables:
 - Agent-agnostic orchestration
 - Distributed deployment (agents on different machines)
 - Easy integration with any tool that can make HTTP calls
@@ -11,7 +11,7 @@ OMA exposes a local HTTP API that allows any agent (Claude, opencode, custom too
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         OMA Dashboard                            │
+│                         OMAR Dashboard                            │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
 │  │   Agent 1   │  │   Agent 2   │  │   Agent 3   │              │
 │  └─────────────┘  └─────────────┘  └─────────────┘              │
@@ -46,7 +46,7 @@ Request:
 {
   "name": "worker-1",           // Optional, auto-generated if not provided
   "task": "Implement feature X", // Task description for the agent
-  "workdir": "/path/to/project", // Optional, defaults to OMA's cwd
+  "workdir": "/path/to/project", // Optional, defaults to OMAR's cwd
   "command": "claude",           // Optional, defaults to config
   "depends_on": ["worker-0"]     // Optional, wait for these agents
 }
@@ -83,7 +83,7 @@ Response:
     }
   ],
   "manager": {
-    "id": "oma-manager",
+    "id": "omar-manager",
     "status": "running",
     "health": "working"
   }
@@ -205,7 +205,7 @@ Response:
 
 ## Configuration
 
-Add to `~/.config/oma/config.toml`:
+Add to `~/.config/omar/config.toml`:
 
 ```toml
 [api]
@@ -265,7 +265,7 @@ while True:
 
 ## Implementation Plan
 
-1. Add `axum` or `warp` HTTP server to OMA
+1. Add `axum` or `warp` HTTP server to OMAR
 2. Run server in background tokio task
 3. Share app state via `Arc<Mutex<App>>`
 4. Add API endpoints incrementally
@@ -275,5 +275,5 @@ while True:
 
 - WebSocket for real-time updates
 - Agent output streaming
-- Remote OMA instances (distributed workers)
+- Remote OMAR instances (distributed workers)
 - Authentication for multi-user setups

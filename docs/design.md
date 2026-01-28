@@ -1,15 +1,15 @@
-# OMA: Agent Dashboard Design
+# OMAR: Agent Dashboard Design
 
 ## Overview
 
-OMA is a TUI dashboard for monitoring and managing multiple AI coding agents. It runs inside tmux and leverages tmux's native features for session management.
+OMAR is a TUI dashboard for monitoring and managing multiple AI coding agents. It runs inside tmux and leverages tmux's native features for session management.
 
 ## Architecture
 
 ```
 ┌─ tmux server ───────────────────────────────────────────────┐
 │                                                             │
-│  ┌─ oma-dashboard (session) ─────────────────────────────┐  │
+│  ┌─ omar-dashboard (session) ────────────────────────────┐  │
 │  │                                                       │  │
 │  │  ┌─ TUI Dashboard ─────────────────────────────────┐  │  │
 │  │  │ Agents: 3/5 active    CPU: 12%    Mem: 4.2GB    │  │  │
@@ -40,9 +40,9 @@ OMA is a TUI dashboard for monitoring and managing multiple AI coding agents. It
 ## Core Concepts
 
 ### Sessions
-- Each agent runs in its own tmux session (`oma-agent-{id}`)
-- Dashboard runs in `oma-dashboard` session
-- Sessions are prefixed with `oma-` for easy filtering
+- Each agent runs in its own tmux session (`omar-agent-{id}`)
+- Dashboard runs in `omar-dashboard` session
+- Sessions are prefixed with `omar-` for easy filtering
 
 ### Health States
 | State | Condition | Indicator |
@@ -90,11 +90,11 @@ OMA is a TUI dashboard for monitoring and managing multiple AI coding agents. It
 ## Configuration
 
 ```toml
-# ~/.config/oma/config.toml
+# ~/.config/omar/config.toml
 
 [dashboard]
 refresh_interval = 2  # seconds
-session_prefix = "oma-agent-"
+session_prefix = "omar-agent-"
 
 [health]
 idle_warning = 60     # seconds

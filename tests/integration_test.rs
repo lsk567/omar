@@ -1,4 +1,4 @@
-//! Integration tests for OMA
+//! Integration tests for OMAR
 //!
 //! These tests require tmux to be installed and will create/destroy
 //! test sessions during execution.
@@ -7,7 +7,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-const TEST_PREFIX: &str = "oma-test-";
+const TEST_PREFIX: &str = "omar-test-";
 
 /// Helper to run tmux commands
 fn tmux(args: &[&str]) -> Result<String, String> {
@@ -111,7 +111,7 @@ fn test_capture_pane() {
         "send-keys",
         "-t",
         &session_name,
-        "echo HELLO_OMA_TEST",
+        "echo HELLO_OMAR_TEST",
         "Enter",
     ]);
 
@@ -121,7 +121,7 @@ fn test_capture_pane() {
     // Capture pane content
     let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
     assert!(
-        output.contains("HELLO_OMA_TEST"),
+        output.contains("HELLO_OMAR_TEST"),
         "Expected output not found: {}",
         output
     );
@@ -248,7 +248,7 @@ fn test_send_keys() {
         "send-keys",
         "-t",
         &session_name,
-        "echo SENT_BY_OMA",
+        "echo SENT_BY_OMAR",
         "Enter",
     ]);
     assert!(result.is_ok());
@@ -259,7 +259,7 @@ fn test_send_keys() {
     // Capture and verify
     let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
     assert!(
-        output.contains("SENT_BY_OMA"),
+        output.contains("SENT_BY_OMAR"),
         "Sent command not found: {}",
         output
     );
@@ -268,14 +268,14 @@ fn test_send_keys() {
     let _ = tmux(&["kill-session", "-t", &session_name]);
 }
 
-/// Test that the oma binary can be built and shows help
+/// Test that the omar binary can be built and shows help
 #[test]
-fn test_oma_help() {
+fn test_omar_help() {
     let output = Command::new("cargo")
         .args(["run", "--", "--help"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("Failed to run oma");
+        .expect("Failed to run omar");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -286,7 +286,7 @@ fn test_oma_help() {
 }
 
 #[test]
-fn test_oma_list_empty() {
+fn test_omar_list_empty() {
     if !tmux_available() {
         eprintln!("Skipping test: tmux not available");
         return;
@@ -298,10 +298,10 @@ fn test_oma_list_empty() {
         .args(["run", "--", "list"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("Failed to run oma list");
+        .expect("Failed to run omar list");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Should show "No agent sessions" since we use oma-agent- prefix
+    // Should show "No agent sessions" since we have no prefix by default
     assert!(
         stdout.contains("No agent sessions") || stdout.contains("NAME"),
         "Unexpected output: {}",
@@ -310,7 +310,7 @@ fn test_oma_list_empty() {
 }
 
 #[test]
-fn test_oma_spawn_and_kill() {
+fn test_omar_spawn_and_kill() {
     if !tmux_available() {
         eprintln!("Skipping test: tmux not available");
         return;
@@ -326,7 +326,7 @@ fn test_oma_spawn_and_kill() {
         .args(["run", "--", "spawn", "-n", "test-spawn", "-c", "sleep 60"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("Failed to run oma spawn");
+        .expect("Failed to run omar spawn");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -348,7 +348,7 @@ fn test_oma_spawn_and_kill() {
         .args(["run", "--", "list"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("Failed to run oma list");
+        .expect("Failed to run omar list");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -362,7 +362,7 @@ fn test_oma_spawn_and_kill() {
         .args(["run", "--", "kill", "test-spawn"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("Failed to run oma kill");
+        .expect("Failed to run omar kill");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(

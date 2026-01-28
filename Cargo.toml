@@ -1,5 +1,5 @@
 [package]
-name = "oma"
+name = "omar"
 version = "0.1.0"
 edition = "2021"
 description = "Agent dashboard for tmux"
@@ -27,5 +27,5 @@ pretty_assertions = "1"
 tempfile = "3"
 
 [[bin]]
-name = "oma"
+name = "omar"
 path = "src/main.rs"
