@@ -372,8 +372,11 @@ fn test_omar_spawn_and_kill() {
 
     cleanup_test_sessions();
 
-    // Also clean up test-spawn session from previous test runs
-    let _ = tmux(&["kill-session", "-t", "test-spawn"]);
+    // Default prefix is "omar-agent-", so session name = "omar-agent-test-spawn"
+    let full_session = "omar-agent-test-spawn";
+
+    // Clean up from previous test runs
+    let _ = tmux(&["kill-session", "-t", full_session]);
 
     // Spawn a new agent
     let output = Command::new("cargo")
@@ -389,15 +392,15 @@ fn test_omar_spawn_and_kill() {
         stdout
     );
 
-    // Verify session exists (no prefix since we removed it)
+    // Verify session exists with the prefixed name
     thread::sleep(Duration::from_millis(200));
     let result = Command::new("tmux")
-        .args(["has-session", "-t", "test-spawn"])
+        .args(["has-session", "-t", full_session])
         .output()
         .unwrap();
     assert!(result.status.success(), "Session should exist after spawn");
 
-    // List should show the agent
+    // List should show the agent (displayed without prefix)
     let output = Command::new("cargo")
         .args(["run", "--", "list"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -411,7 +414,7 @@ fn test_omar_spawn_and_kill() {
         stdout
     );
 
-    // Kill the agent
+    // Kill the agent (using short name)
     let output = Command::new("cargo")
         .args(["run", "--", "kill", "test-spawn"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -425,10 +428,10 @@ fn test_omar_spawn_and_kill() {
         stdout
     );
 
-    // Verify session is gone (no prefix since we removed it)
+    // Verify session is gone
     thread::sleep(Duration::from_millis(100));
     let result = Command::new("tmux")
-        .args(["has-session", "-t", "test-spawn"])
+        .args(["has-session", "-t", full_session])
         .output()
         .unwrap();
     assert!(
