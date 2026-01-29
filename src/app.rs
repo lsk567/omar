@@ -142,11 +142,8 @@ impl App {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
 
-        self.client.new_session(
-            MANAGER_SESSION,
-            &self.default_command,
-            Some(&workdir),
-        )?;
+        self.client
+            .new_session(MANAGER_SESSION, &self.default_command, Some(&workdir))?;
 
         // Give it time to start
         thread::sleep(Duration::from_secs(2));
