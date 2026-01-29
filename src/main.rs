@@ -102,7 +102,13 @@ async fn main() -> Result<()> {
                 manager::run_manager_orchestration(&client, &config.agent.default_command)
             }
         },
-        None => run_dashboard(config).await,
+        None => {
+            if std::env::var("TMUX").is_err() {
+                relaunch_in_tmux()
+            } else {
+                run_dashboard(config).await
+            }
+        }
     }
 }
 
@@ -156,6 +162,26 @@ fn kill_agent(client: &TmuxClient, name: &str) -> Result<()> {
     client.kill_session(&full_name)?;
     println!("Killed agent: {}", name);
     Ok(())
+}
+
+/// Re-launch omar inside a tmux session.
+/// Called when the dashboard is started outside of tmux so that popups,
+/// attach, and other tmux-dependent features work correctly.
+fn relaunch_in_tmux() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let mut cmd = std::process::Command::new("tmux");
+    // -A: attach if session already exists, otherwise create it
+    cmd.args(["new-session", "-A", "-s", "omar-dashboard"]);
+    cmd.arg(&exe);
+    cmd.args(&args);
+
+    // exec() replaces the current process; only returns on error
+    let err = cmd.exec();
+    anyhow::bail!("Failed to launch tmux: {}", err)
 }
 
 async fn run_dashboard(config: Config) -> Result<()> {
