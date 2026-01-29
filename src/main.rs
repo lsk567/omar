@@ -370,11 +370,23 @@ async fn run_dashboard(config: Config) -> Result<()> {
         }
     }
 
-    // Manager session is intentionally kept alive so it retains
-    // conversation history across omar restarts.
-
     // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    // Tell the user the manager is still running
+    if app
+        .client()
+        .has_session(crate::manager::MANAGER_SESSION)
+        .unwrap_or(false)
+    {
+        println!(
+            "Manager session kept alive to preserve conversation history.\n\
+             Restart omar to reconnect. To kill the manager:\n\
+             \n  tmux kill-session -t {}\n",
+            crate::manager::MANAGER_SESSION
+        );
+    }
+
     Ok(())
 }
