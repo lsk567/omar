@@ -370,8 +370,8 @@ async fn run_dashboard(config: Config) -> Result<()> {
         }
     }
 
-    // Cleanup: kill manager session on exit
-    let _ = app.client().kill_session(crate::manager::MANAGER_SESSION);
+    // Manager session is intentionally kept alive so it retains
+    // conversation history across omar restarts.
 
     // Restore terminal
     disable_raw_mode()?;
