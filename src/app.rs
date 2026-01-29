@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::manager::MANAGER_SESSION;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
+use crate::DASHBOARD_SESSION;
 
 // Re-export for API handlers
 pub use crate::manager::MANAGER_SESSION as MANAGER_SESSION_NAME;
@@ -77,13 +78,21 @@ impl App {
         // Get all sessions
         let sessions = self.client.list_all_sessions()?;
 
-        // Separate manager from other agents
+        // Separate manager from other agents, filtering out non-omar sessions
         let mut manager_session = None;
         let mut other_sessions = Vec::new();
 
         for session in sessions {
             if session.name == MANAGER_SESSION {
                 manager_session = Some(session);
+            } else if session.name == DASHBOARD_SESSION {
+                // Skip the dashboard's own tmux session
+                continue;
+            } else if !self.session_prefix.is_empty()
+                && !session.name.starts_with(&self.session_prefix)
+            {
+                // Skip sessions that don't match the configured prefix
+                continue;
             } else {
                 other_sessions.push(session);
             }

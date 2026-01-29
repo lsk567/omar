@@ -25,6 +25,9 @@ use config::Config;
 use event::{AppEvent, EventHandler};
 use tmux::TmuxClient;
 
+/// Tmux session name used when omar auto-launches into tmux
+pub const DASHBOARD_SESSION: &str = "omar-dashboard";
+
 #[derive(Parser)]
 #[command(name = "omar", about = "Agent dashboard for tmux", version)]
 struct Cli {
@@ -175,7 +178,7 @@ fn relaunch_in_tmux() -> Result<()> {
 
     let mut cmd = std::process::Command::new("tmux");
     // -A: attach if session already exists, otherwise create it
-    cmd.args(["new-session", "-A", "-s", "omar-dashboard"]);
+    cmd.args(["new-session", "-A", "-s", DASHBOARD_SESSION]);
     cmd.arg(&exe);
     cmd.args(&args);
 

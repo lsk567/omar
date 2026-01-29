@@ -11,6 +11,21 @@ use tokio::sync::Mutex;
 use super::models::*;
 use crate::app::{SharedApp, MANAGER_SESSION_NAME};
 
+/// Resolve a user-facing agent name to a full tmux session name.
+/// Accepts both short names ("auth") and full names ("omar-agent-auth").
+fn resolve_session_name(prefix: &str, id: &str) -> String {
+    if prefix.is_empty() || id.starts_with(prefix) {
+        id.to_string()
+    } else {
+        format!("{}{}", prefix, id)
+    }
+}
+
+/// Strip the session prefix to get the user-facing short name.
+fn display_name<'a>(prefix: &str, session_name: &'a str) -> &'a str {
+    session_name.strip_prefix(prefix).unwrap_or(session_name)
+}
+
 /// GET /api/health
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
@@ -35,11 +50,12 @@ pub async fn list_agents(
         ));
     }
 
+    let prefix = app.client().prefix();
     let agents: Vec<AgentInfo> = app
         .agents()
         .iter()
         .map(|a| AgentInfo {
-            id: a.session.name.clone(),
+            id: display_name(prefix, &a.session.name).to_string(),
             status: "running".to_string(),
             health: a.health.as_str().to_string(),
             idle_seconds: a.health_info.idle_seconds,
@@ -65,23 +81,25 @@ pub async fn get_agent(
 ) -> Result<Json<AgentDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
     let app = app.lock().await;
 
-    // Find agent by id
+    let prefix = app.client().prefix().to_string();
+    let full_id = resolve_session_name(&prefix, &id);
+
+    // Find agent by resolved session name, or manager by raw name
     let agent = app
         .agents()
         .iter()
-        .find(|a| a.session.name == id)
+        .find(|a| a.session.name == full_id)
         .or_else(|| app.manager().filter(|m| m.session.name == id));
 
     match agent {
         Some(a) => {
-            // Get more output for detail view
             let output_tail = app
                 .client()
                 .capture_pane(&a.session.name, 50)
                 .unwrap_or_default();
 
             Ok(Json(AgentDetailResponse {
-                id: a.session.name.clone(),
+                id: display_name(&prefix, &a.session.name).to_string(),
                 status: "running".to_string(),
                 health: a.health.as_str().to_string(),
                 idle_seconds: a.health_info.idle_seconds,
@@ -105,15 +123,21 @@ pub async fn spawn_agent(
 ) -> Result<Json<SpawnAgentResponse>, (StatusCode, Json<ErrorResponse>)> {
     let app = app.lock().await;
 
-    // Generate name if not provided
-    let name = req.name.unwrap_or_else(|| app.generate_agent_name());
+    let prefix = app.client().prefix().to_string();
+
+    // Generate full session name: prepend prefix to user-provided names,
+    // or auto-generate (which already includes the prefix)
+    let name = match req.name {
+        Some(n) => resolve_session_name(&prefix, &n),
+        None => app.generate_agent_name(),
+    };
 
     // Check if already exists
     if app.client().has_session(&name).unwrap_or(false) {
         return Err((
             StatusCode::CONFLICT,
             Json(ErrorResponse {
-                error: format!("Agent '{}' already exists", name),
+                error: format!("Agent '{}' already exists", display_name(&prefix, &name)),
             }),
         ));
     }
@@ -155,8 +179,9 @@ pub async fn spawn_agent(
         });
     }
 
+    let short = display_name(&prefix, &name).to_string();
     Ok(Json(SpawnAgentResponse {
-        id: name.clone(),
+        id: short,
         status: "running".to_string(),
         session: name,
     }))
@@ -169,8 +194,11 @@ pub async fn kill_agent(
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     let app = app.lock().await;
 
+    let prefix = app.client().prefix().to_string();
+    let session_name = resolve_session_name(&prefix, &id);
+
     // Don't allow killing manager via API
-    if id == MANAGER_SESSION_NAME {
+    if session_name == MANAGER_SESSION_NAME || id == MANAGER_SESSION_NAME {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -180,7 +208,7 @@ pub async fn kill_agent(
     }
 
     // Check if exists
-    if !app.client().has_session(&id).unwrap_or(false) {
+    if !app.client().has_session(&session_name).unwrap_or(false) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -190,7 +218,7 @@ pub async fn kill_agent(
     }
 
     // Kill it
-    if let Err(e) = app.client().kill_session(&id) {
+    if let Err(e) = app.client().kill_session(&session_name) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -213,8 +241,11 @@ pub async fn send_input(
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     let app = app.lock().await;
 
+    let prefix = app.client().prefix().to_string();
+    let session_name = resolve_session_name(&prefix, &id);
+
     // Check if exists
-    if !app.client().has_session(&id).unwrap_or(false) {
+    if !app.client().has_session(&session_name).unwrap_or(false) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -224,7 +255,7 @@ pub async fn send_input(
     }
 
     // Send text
-    if let Err(e) = app.client().send_keys_literal(&id, &req.text) {
+    if let Err(e) = app.client().send_keys_literal(&session_name, &req.text) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -235,7 +266,7 @@ pub async fn send_input(
 
     // Send enter if requested
     if req.enter {
-        if let Err(e) = app.client().send_keys(&id, "Enter") {
+        if let Err(e) = app.client().send_keys(&session_name, "Enter") {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
