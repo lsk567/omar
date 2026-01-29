@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 
-use super::{Session, TmuxClient};
+use super::TmuxClient;
 
 /// Health state of an agent
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,40 +29,39 @@ impl HealthState {
     }
 }
 
-/// Checks health of agent sessions based on tmux activity timestamp.
-/// If no new terminal lines have been produced in `idle_threshold` seconds,
-/// the session is considered Idle; otherwise Running.
+/// Checks health of agent sessions by comparing pane content between frames.
+/// If the pane content has changed since the last check, the session is Running;
+/// otherwise it is Idle.
 pub struct HealthChecker {
     client: TmuxClient,
-    idle_threshold: i64,
+    /// Last captured pane content per session name
+    last_frames: HashMap<String, String>,
 }
 
 impl HealthChecker {
-    pub fn new(client: TmuxClient, idle_threshold: i64) -> Self {
+    pub fn new(client: TmuxClient, _idle_threshold: i64) -> Self {
         Self {
             client,
-            idle_threshold,
+            last_frames: HashMap::new(),
         }
     }
 
-    /// Get current Unix timestamp
-    fn now() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    }
+    /// Check the health of a session by comparing against the previous frame.
+    /// Returns Running if pane content changed, Idle if unchanged.
+    pub fn check(&mut self, session_name: &str) -> HealthState {
+        let current = self
+            .client
+            .capture_pane(session_name, 50)
+            .unwrap_or_default();
 
-    /// Calculate idle time in seconds
-    pub fn idle_seconds(&self, session: &Session) -> i64 {
-        Self::now() - session.activity
-    }
+        let changed = match self.last_frames.get(session_name) {
+            Some(prev) => *prev != current,
+            None => true, // First check — assume running
+        };
 
-    /// Check the health of a session
-    pub fn check(&self, session: &Session) -> HealthState {
-        let idle = self.idle_seconds(session);
+        self.last_frames.insert(session_name.to_string(), current);
 
-        if idle < self.idle_threshold {
+        if changed {
             HealthState::Running
         } else {
             HealthState::Idle
@@ -70,27 +69,31 @@ impl HealthChecker {
     }
 
     /// Check health and return additional info
-    pub fn check_detailed(&self, session: &Session) -> HealthInfo {
-        let idle_seconds = self.idle_seconds(session);
-        let state = self.check(session);
+    pub fn check_detailed(&mut self, session_name: &str) -> HealthInfo {
+        let state = self.check(session_name);
 
         let last_output = self
-            .client
-            .capture_pane(&session.name, 5)
-            .unwrap_or_default()
-            .lines()
-            .next_back()
-            .unwrap_or("")
-            .trim()
-            .chars()
-            .take(80)
-            .collect();
+            .last_frames
+            .get(session_name)
+            .map(|frame| {
+                frame
+                    .lines()
+                    .next_back()
+                    .unwrap_or("")
+                    .trim()
+                    .chars()
+                    .take(80)
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        HealthInfo {
-            state,
-            idle_seconds,
-            last_output,
-        }
+        HealthInfo { state, last_output }
+    }
+
+    /// Remove stale entries for sessions that no longer exist
+    pub fn retain_sessions(&mut self, active_sessions: &[String]) {
+        self.last_frames
+            .retain(|name, _| active_sessions.contains(name));
     }
 }
 
@@ -98,22 +101,7 @@ impl HealthChecker {
 #[derive(Debug, Clone)]
 pub struct HealthInfo {
     pub state: HealthState,
-    pub idle_seconds: i64,
     pub last_output: String,
-}
-
-impl HealthInfo {
-    /// Format idle time as human-readable string
-    pub fn idle_display(&self) -> String {
-        let secs = self.idle_seconds;
-        if secs < 60 {
-            format!("{}s", secs)
-        } else if secs < 3600 {
-            format!("{}m", secs / 60)
-        } else {
-            format!("{}h", secs / 3600)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -130,29 +118,5 @@ mod tests {
     fn test_health_state_icons() {
         assert_eq!(HealthState::Running.icon(), "●");
         assert_eq!(HealthState::Idle.icon(), "○");
-    }
-
-    #[test]
-    fn test_idle_display() {
-        let info = HealthInfo {
-            state: HealthState::Running,
-            idle_seconds: 30,
-            last_output: String::new(),
-        };
-        assert_eq!(info.idle_display(), "30s");
-
-        let info = HealthInfo {
-            state: HealthState::Running,
-            idle_seconds: 120,
-            last_output: String::new(),
-        };
-        assert_eq!(info.idle_display(), "2m");
-
-        let info = HealthInfo {
-            state: HealthState::Running,
-            idle_seconds: 7200,
-            last_output: String::new(),
-        };
-        assert_eq!(info.idle_display(), "2h");
     }
 }

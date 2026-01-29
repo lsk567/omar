@@ -29,7 +29,6 @@ pub struct AgentInfo {
     pub id: String,
     pub status: String,
     pub health: String,
-    pub idle_seconds: i64,
     pub last_output: String,
 }
 
@@ -46,7 +45,6 @@ pub struct AgentDetailResponse {
     pub id: String,
     pub status: String,
     pub health: String,
-    pub idle_seconds: i64,
     pub last_output: String,
     pub output_tail: String,
 }

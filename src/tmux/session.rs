@@ -1,6 +1,7 @@
 #[derive(Debug, Clone)]
 pub struct Session {
     pub name: String,
+    #[allow(dead_code)]
     pub activity: i64,
     pub attached: bool,
     pub pane_pid: u32,

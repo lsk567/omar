@@ -58,7 +58,6 @@ pub async fn list_agents(
             id: display_name(prefix, &a.session.name).to_string(),
             status: "running".to_string(),
             health: a.health.as_str().to_string(),
-            idle_seconds: a.health_info.idle_seconds,
             last_output: a.health_info.last_output.clone(),
         })
         .collect();
@@ -67,7 +66,6 @@ pub async fn list_agents(
         id: m.session.name.clone(),
         status: "running".to_string(),
         health: m.health.as_str().to_string(),
-        idle_seconds: m.health_info.idle_seconds,
         last_output: m.health_info.last_output.clone(),
     });
 
@@ -102,7 +100,6 @@ pub async fn get_agent(
                 id: display_name(&prefix, &a.session.name).to_string(),
                 status: "running".to_string(),
                 health: a.health.as_str().to_string(),
-                idle_seconds: a.health_info.idle_seconds,
                 last_output: a.health_info.last_output.clone(),
                 output_tail,
             }))

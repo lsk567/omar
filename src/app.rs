@@ -100,7 +100,7 @@ impl App {
 
         // Update manager info
         self.manager = manager_session.map(|session| {
-            let health_info = self.health_checker.check_detailed(&session);
+            let health_info = self.health_checker.check_detailed(&session.name);
             let health = health_info.state;
             AgentInfo {
                 session,
@@ -109,13 +109,17 @@ impl App {
             }
         });
 
-        // Update agents list (excluding manager and attached sessions)
+        // Update agents list (excluding attached sessions)
         // Attached sessions are likely the user's main terminal, not agents
-        self.agents = other_sessions
+        let filtered: Vec<Session> = other_sessions
             .into_iter()
-            .filter(|session| !session.attached) // Don't show user's attached sessions
+            .filter(|session| !session.attached)
+            .collect();
+
+        self.agents = filtered
+            .into_iter()
             .map(|session| {
-                let health_info = self.health_checker.check_detailed(&session);
+                let health_info = self.health_checker.check_detailed(&session.name);
                 let health = health_info.state;
                 AgentInfo {
                     session,
@@ -124,6 +128,15 @@ impl App {
                 }
             })
             .collect();
+
+        // Clean up stale frame data for sessions that no longer exist
+        let active: Vec<String> = self
+            .agents
+            .iter()
+            .map(|a| a.session.name.clone())
+            .chain(self.manager.iter().map(|m| m.session.name.clone()))
+            .collect();
+        self.health_checker.retain_sessions(&active);
 
         // Apply filter if set
         if !self.filter.is_empty() {
