@@ -12,6 +12,9 @@ A TUI dashboard for managing multiple AI coding agents based on `tmux`.
 - Health status tracking (Running, Idle)
 - Quick attach/detach via tmux popups
 - Session management (spawn, list, kill)
+- Parallel agents!
+
+<img src="docs/img/demo.png" alt="demo" width="700" />
 
 ## Installation
 
