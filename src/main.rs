@@ -44,9 +44,9 @@ enum Commands {
         #[arg(short, long)]
         name: String,
 
-        /// Command to run in the session
-        #[arg(short, long, default_value = "claude")]
-        command: String,
+        /// Command to run in the session (defaults to configured default_command)
+        #[arg(short, long)]
+        command: Option<String>,
 
         /// Working directory
         #[arg(short, long)]
@@ -88,12 +88,19 @@ async fn main() -> Result<()> {
             name,
             command,
             workdir,
-        }) => spawn_agent(&client, &name, &command, workdir.as_deref()),
+        }) => {
+            let cmd = command.unwrap_or_else(|| config.agent.default_command.clone());
+            spawn_agent(&client, &name, &cmd, workdir.as_deref())
+        }
         Some(Commands::List) => list_agents(&client),
         Some(Commands::Kill { name }) => kill_agent(&client, &name),
         Some(Commands::Manager { action }) => match action {
-            Some(ManagerAction::Start) | None => manager::start_manager(&client),
-            Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(&client),
+            Some(ManagerAction::Start) | None => {
+                manager::start_manager(&client, &config.agent.default_command)
+            }
+            Some(ManagerAction::Orchestrate) => {
+                manager::run_manager_orchestration(&client, &config.agent.default_command)
+            }
         },
         None => run_dashboard(config).await,
     }

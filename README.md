@@ -57,6 +57,18 @@ omar manager
 | `r` | Refresh |
 | `?` | Help |
 
+## Supported Agent Backends
+
+Omar auto-detects which agent backend is available on your system:
+
+| Backend | Command | Auto-detected |
+|---------|---------|---------------|
+| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `claude --dangerously-skip-permissions` | Yes (first priority) |
+| [Opencode](https://github.com/nichochar/opencode) | `opencode` | Yes (second priority) |
+| Custom | Any command | Via config |
+
+If both are installed, `claude` takes priority. Override with the `default_command` config option.
+
 ## Configuration
 
 Create `~/.config/omar/config.toml`:
@@ -70,7 +82,7 @@ session_prefix = "omar-agent-"
 idle_warning = 15
 
 [agent]
-default_command = "claude"
+default_command = "claude --dangerously-skip-permissions"  # or "opencode", or any command
 default_workdir = "."
 ```
 
@@ -78,6 +90,7 @@ default_workdir = "."
 
 - tmux 3.0+
 - Rust 1.70+
+- At least one agent backend (claude, opencode, or custom)
 
 ## License
 

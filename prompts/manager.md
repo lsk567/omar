@@ -68,8 +68,8 @@ curl -X DELETE http://localhost:9876/api/agents/worker-name
 - Keep agent names short (e.g., "api", "auth", "db", "test")
 - Be specific about each agent's task
 - Spawn independent agents in parallel (multiple curl commands)
-- Monitor health status: "working", "waiting", "idle", "stuck"
-- Agents showing "waiting" likely need input from you
+- Monitor health status: "running", "idle"
+- Agents showing "idle" may have finished or may need input from you
 
 ## Demo Window (Running Commands for the User)
 

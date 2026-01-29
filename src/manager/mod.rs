@@ -17,7 +17,7 @@ pub const MANAGER_SESSION: &str = "omar-manager";
 pub const MANAGER_SYSTEM_PROMPT: &str = include_str!("../../prompts/manager.md");
 
 /// Start the manager agent session
-pub fn start_manager(client: &TmuxClient) -> Result<()> {
+pub fn start_manager(client: &TmuxClient, command: &str) -> Result<()> {
     // Check if manager already exists
     if client.has_session(MANAGER_SESSION)? {
         println!("Manager session already exists. Attaching...");
@@ -25,11 +25,11 @@ pub fn start_manager(client: &TmuxClient) -> Result<()> {
         return Ok(());
     }
 
-    // Create manager session with Claude
+    // Create manager session with the configured agent command
     println!("Starting manager agent...");
     client.new_session(
         MANAGER_SESSION,
-        "claude --dangerously-skip-permissions",
+        command,
         Some(&std::env::current_dir()?.to_string_lossy()),
     )?;
 
@@ -55,13 +55,13 @@ pub fn start_manager(client: &TmuxClient) -> Result<()> {
 }
 
 /// Run the manager in orchestration mode (interactive)
-pub fn run_manager_orchestration(client: &TmuxClient) -> Result<()> {
+pub fn run_manager_orchestration(client: &TmuxClient, command: &str) -> Result<()> {
     println!("=== OMAR Manager Orchestration Mode ===\n");
 
     // Check if manager exists
     if !client.has_session(MANAGER_SESSION)? {
         println!("No manager session found. Starting one...");
-        start_manager(client)?;
+        start_manager(client, command)?;
         return Ok(());
     }
 
@@ -88,7 +88,7 @@ pub fn run_manager_orchestration(client: &TmuxClient) -> Result<()> {
                 check_manager_output(client)?;
             }
             "approve" | "y" => {
-                approve_plan(client)?;
+                approve_plan(client, command)?;
             }
             "reject" | "n" => {
                 reject_plan(client)?;
@@ -208,7 +208,7 @@ fn check_manager_output(client: &TmuxClient) -> Result<()> {
     Ok(())
 }
 
-fn approve_plan(client: &TmuxClient) -> Result<()> {
+fn approve_plan(client: &TmuxClient, command: &str) -> Result<()> {
     let output = client.capture_pane(MANAGER_SESSION, 50)?;
 
     if let Some(ManagerMessage::Plan {
@@ -220,7 +220,7 @@ fn approve_plan(client: &TmuxClient) -> Result<()> {
         println!("Spawning {} worker agents...\n", agents.len());
 
         for agent in &agents {
-            spawn_worker(client, agent)?;
+            spawn_worker(client, agent, command)?;
         }
 
         // Notify manager that plan was approved
@@ -277,7 +277,7 @@ fn send_to_agent(client: &TmuxClient, agent: &str, message: &str) -> Result<()> 
     Ok(())
 }
 
-fn spawn_worker(client: &TmuxClient, agent: &ProposedAgent) -> Result<()> {
+fn spawn_worker(client: &TmuxClient, agent: &ProposedAgent, command: &str) -> Result<()> {
     let session_name = format!("{}{}", client.prefix(), agent.name);
 
     if client.has_session(&session_name)? {
@@ -285,10 +285,10 @@ fn spawn_worker(client: &TmuxClient, agent: &ProposedAgent) -> Result<()> {
         return Ok(());
     }
 
-    // Create the worker session
+    // Create the worker session with the configured agent command
     client.new_session(
         &session_name,
-        "claude --dangerously-skip-permissions",
+        command,
         Some(&std::env::current_dir()?.to_string_lossy()),
     )?;
 

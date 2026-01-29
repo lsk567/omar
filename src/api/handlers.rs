@@ -125,24 +125,34 @@ pub async fn spawn_agent(
             .unwrap_or_else(|_| ".".to_string())
     });
 
-    // Get command - if task provided, inject it into claude
+    // Always start an interactive session with the base command
     let base_command = req
         .command
         .unwrap_or_else(|| app.default_command().to_string());
-    let command = if let Some(task) = &req.task {
-        format!("{} \"{}\"", base_command, task.replace('"', "\\\""))
-    } else {
-        base_command
-    };
 
-    // Spawn the agent
-    if let Err(e) = app.client().new_session(&name, &command, Some(&workdir)) {
+    // Spawn the agent with the base command (no task appended)
+    if let Err(e) = app
+        .client()
+        .new_session(&name, &base_command, Some(&workdir))
+    {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: format!("Failed to spawn agent: {}", e),
             }),
         ));
+    }
+
+    // If a task was provided, send it via tmux send-keys after a delay
+    // This works universally with any agent backend (claude, opencode, etc.)
+    if let Some(task) = req.task {
+        let client = app.client().clone();
+        let session = name.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let _ = client.send_keys_literal(&session, &task);
+            let _ = client.send_keys(&session, "Enter");
+        });
     }
 
     Ok(Json(SpawnAgentResponse {

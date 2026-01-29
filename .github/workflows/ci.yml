@@ -99,6 +99,47 @@ jobs:
       - name: Run all tests
         run: cargo test -- --test-threads=1
 
+  opencode-compat:
+    name: Opencode Compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run backend config unit tests
+        run: cargo test --bin omar config::tests -- --test-threads=1
+
+      - name: Run custom command integration test
+        run: cargo test --test integration_test test_spawn_custom_command -- --test-threads=1
+
+      - name: Verify no hardcoded claude references in runtime paths
+        run: |
+          # Ensure no hardcoded "claude --dangerously-skip-permissions" remains
+          # outside of config.rs (where it's the fallback default)
+          MATCHES=$(grep -rn '"claude --dangerously-skip-permissions"' src/ --include='*.rs' | grep -v 'src/config.rs' || true)
+          if [ -n "$MATCHES" ]; then
+            echo "Found hardcoded claude command outside config.rs:"
+            echo "$MATCHES"
+            exit 1
+          fi
+          echo "No hardcoded claude references found outside config.rs"
+
   build:
     name: Build
     runs-on: ${{ matrix.os }}
@@ -134,7 +175,7 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, build]
+    needs: [check, fmt, clippy, test, opencode-compat, build]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -144,6 +185,7 @@ jobs:
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.opencode-compat.result }}" != "success" ]] || \
              [[ "${{ needs.build.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1

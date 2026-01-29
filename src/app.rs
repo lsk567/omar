@@ -144,7 +144,7 @@ impl App {
 
         self.client.new_session(
             MANAGER_SESSION,
-            "claude --dangerously-skip-permissions",
+            &self.default_command,
             Some(&workdir),
         )?;
 

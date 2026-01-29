@@ -268,6 +268,60 @@ fn test_send_keys() {
     let _ = tmux(&["kill-session", "-t", &session_name]);
 }
 
+/// Test that spawning with a custom (non-claude) command works.
+/// This validates opencode and other backend compatibility: omar should
+/// start any command in a tmux session and inject tasks via send-keys.
+#[test]
+fn test_spawn_custom_command() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    cleanup_test_sessions();
+
+    let session_name = format!("{}custom-cmd", TEST_PREFIX);
+
+    // Spawn a session with a non-claude command (simulates opencode or other backend)
+    let result = tmux(&["new-session", "-d", "-s", &session_name, "bash"]);
+    assert!(
+        result.is_ok(),
+        "Should spawn session with custom command: {:?}",
+        result
+    );
+
+    thread::sleep(Duration::from_millis(300));
+
+    // Verify session is running
+    let check = Command::new("tmux")
+        .args(["has-session", "-t", &session_name])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "Session with custom command should be running"
+    );
+
+    // Simulate the universal send-keys task injection pattern
+    // (this is how omar sends tasks to any backend, including opencode)
+    let task_text = "echo TASK_INJECTED_VIA_SENDKEYS";
+    let _ = tmux(&["send-keys", "-t", &session_name, "-l", task_text]);
+    let _ = tmux(&["send-keys", "-t", &session_name, "Enter"]);
+
+    thread::sleep(Duration::from_millis(500));
+
+    // Verify the task was injected and executed
+    let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
+    assert!(
+        output.contains("TASK_INJECTED_VIA_SENDKEYS"),
+        "Task should be injected via send-keys: {}",
+        output
+    );
+
+    // Cleanup
+    let _ = tmux(&["kill-session", "-t", &session_name]);
+}
+
 /// Test that the omar binary can be built and shows help
 #[test]
 fn test_omar_help() {
