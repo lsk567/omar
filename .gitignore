@@ -16,3 +16,6 @@ Thumbs.db
 # Test artifacts
 *.log
 junk/
+
+# AI agent config
+CLAUDE.md
