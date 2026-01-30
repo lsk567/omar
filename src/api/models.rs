@@ -79,3 +79,22 @@ pub struct HealthResponse {
 pub struct ErrorResponse {
     pub error: String,
 }
+
+/// Request to add a project
+#[derive(Debug, Deserialize)]
+pub struct AddProjectRequest {
+    pub name: String,
+}
+
+/// Single project in response
+#[derive(Debug, Serialize)]
+pub struct ProjectResponse {
+    pub id: usize,
+    pub name: String,
+}
+
+/// Response for listing projects
+#[derive(Debug, Serialize)]
+pub struct ListProjectsResponse {
+    pub projects: Vec<ProjectResponse>,
+}

@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::manager::MANAGER_SESSION;
+use crate::memory;
+use crate::projects::{self, Project};
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -35,6 +37,9 @@ pub struct App {
     pub show_confirm_kill: bool,
     pub filter: String,
     pub status_message: Option<String>,
+    pub projects: Vec<Project>,
+    pub project_input_mode: bool,
+    pub project_input: String,
     client: TmuxClient,
     health_checker: HealthChecker,
     default_command: String,
@@ -58,6 +63,9 @@ impl App {
             show_confirm_kill: false,
             filter: String::new(),
             status_message: None,
+            projects: projects::load_projects(),
+            project_input_mode: false,
+            project_input: String::new(),
             client,
             health_checker,
             default_command: config.agent.default_command.clone(),
@@ -145,6 +153,9 @@ impl App {
                 .retain(|a| a.session.name.to_lowercase().contains(&filter));
         }
 
+        // Reload projects from file (picks up API-side changes)
+        self.projects = projects::load_projects();
+
         // Keep selection in bounds
         if !self.agents.is_empty() && self.selected >= self.agents.len() {
             self.selected = self.agents.len() - 1;
@@ -178,6 +189,22 @@ impl App {
         thread::sleep(Duration::from_millis(200));
         // Use C-m (Ctrl+M) which is equivalent to Enter and may work better with Claude
         self.client.send_keys(MANAGER_SESSION, "C-m")?;
+
+        // Inject persistent memory if available
+        let mem = memory::load_memory();
+        if !mem.is_empty() {
+            thread::sleep(Duration::from_secs(1));
+            let ctx = format!(
+                "Here is the current OMAR state from your last session:\n\n{}",
+                mem
+            );
+            self.client.send_keys_literal(MANAGER_SESSION, &ctx)?;
+            thread::sleep(Duration::from_millis(200));
+            self.client.send_keys(MANAGER_SESSION, "C-m")?;
+        }
+
+        // Write memory after creating manager
+        memory::write_memory(&self.agents, None, &self.client);
 
         Ok(())
     }
@@ -283,6 +310,7 @@ impl App {
             self.client.kill_session(&name)?;
             self.status_message = Some(format!("Killed agent: {}", name));
             self.refresh()?;
+            memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
         }
         self.show_confirm_kill = false;
         Ok(())
@@ -337,6 +365,8 @@ impl App {
         if let Some(pos) = self.agents.iter().position(|a| a.session.name == name) {
             self.selected = pos;
         }
+
+        memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
 
         Ok(())
     }
@@ -422,5 +452,19 @@ impl App {
     /// Get agent pane output by session name
     pub fn get_agent_output(&self, session: &str, lines: i32) -> Result<String> {
         self.client.capture_pane(session, lines)
+    }
+
+    /// Add a project and update memory
+    pub fn add_project(&mut self, name: &str) {
+        let _ = projects::add_project(name);
+        self.projects = projects::load_projects();
+        memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
+    }
+
+    /// Complete (remove) a project by id and update memory
+    pub fn complete_project(&mut self, id: usize) {
+        let _ = projects::remove_project(id);
+        self.projects = projects::load_projects();
+        memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
     }
 }

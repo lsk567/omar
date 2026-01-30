@@ -3,6 +3,8 @@ mod app;
 mod config;
 mod event;
 mod manager;
+mod memory;
+mod projects;
 mod tmux;
 mod ui;
 
@@ -226,6 +228,33 @@ async fn run_dashboard(config: Config) -> Result<()> {
         if let Some(event) = events.next().await {
             match event {
                 AppEvent::Key(key) => {
+                    // Handle project input mode
+                    if app.project_input_mode {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.project_input_mode = false;
+                                app.project_input.clear();
+                            }
+                            KeyCode::Enter => {
+                                let name = app.project_input.clone();
+                                if !name.trim().is_empty() {
+                                    app.add_project(name.trim());
+                                    app.set_status("Project added");
+                                }
+                                app.project_input_mode = false;
+                                app.project_input.clear();
+                            }
+                            KeyCode::Backspace => {
+                                app.project_input.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                app.project_input.push(c);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Handle interactive mode - forward keys to selected agent
                     if app.interactive_mode {
                         match key.code {
@@ -339,6 +368,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             if app.selected_agent().is_some() {
                                 app.show_confirm_kill = true;
                             }
+                        }
+                        KeyCode::Char('p') => {
+                            app.project_input_mode = true;
                         }
                         KeyCode::Char('r') => {
                             if let Err(e) = app.refresh() {
