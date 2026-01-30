@@ -187,11 +187,17 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
 
         // Different styles for different states
         let (border_color, title) = if is_interactive {
-            (Color::Cyan, " EA [INTERACTIVE - Esc to exit] ")
+            (
+                Color::Cyan,
+                " Executive Assistant [INTERACTIVE - Esc to exit] ",
+            )
         } else if is_selected {
-            (Color::Magenta, " [EA] - Press Enter to open ")
+            (
+                Color::Magenta,
+                " [Executive Assistant] - Press Enter to open ",
+            )
         } else {
-            (Color::Blue, " EA ")
+            (Color::Blue, " Executive Assistant ")
         };
 
         let border_style =
@@ -239,12 +245,12 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         // Manager not available (shouldn't happen normally)
         let block = Block::default()
-            .title(" EA ")
+            .title(" Executive Assistant ")
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
             .border_style(Style::default().fg(Color::DarkGray));
 
-        let paragraph = Paragraph::new("Starting EA...")
+        let paragraph = Paragraph::new("Starting Executive Assistant...")
             .style(Style::default().fg(Color::DarkGray))
             .block(block);
 
@@ -290,13 +296,25 @@ fn render_agent_card(
             Modifier::empty()
         });
 
+    // Display name: strip prefix, label PMs as "Project Manager"
+    let short_name = agent
+        .session
+        .name
+        .strip_prefix(app.client().prefix())
+        .unwrap_or(&agent.session.name);
+    let display = if let Some(rest) = short_name.strip_prefix("pm-") {
+        format!("Project Manager: {}", rest)
+    } else {
+        short_name.to_string()
+    };
+
     // Title with status indicator
     let title = if interactive {
-        format!(" {} [INTERACTIVE - Esc] ", &agent.session.name)
+        format!(" {} [INTERACTIVE - Esc] ", display)
     } else if selected {
-        format!(" [{}] {} - 'i' to type ", status_icon, &agent.session.name)
+        format!(" [{}] {} - Enter to open ", status_icon, display)
     } else {
-        format!(" {} {} ", status_icon, &agent.session.name)
+        format!(" {} {} ", status_icon, display)
     };
 
     let block = Block::default()
@@ -336,7 +354,11 @@ fn render_agent_card(
 fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     let help_text = if app.interactive_mode {
         // Interactive mode help
-        let target = if app.manager_selected { "EA" } else { "agent" };
+        let target = if app.manager_selected {
+            "Executive Assistant"
+        } else {
+            "agent"
+        };
         vec![
             Span::styled(
                 "Esc",
