@@ -36,7 +36,18 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_agent_grid(frame, app, chunks[1]);
     }
 
-    render_manager_panel(frame, app, chunks[2]);
+    // Split EA area: if command tree has content, show it alongside the EA panel
+    if app.command_tree.len() > 1 {
+        let ea_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(chunks[2]);
+        render_manager_panel(frame, app, ea_chunks[0]);
+        render_command_tree(frame, app, ea_chunks[1]);
+    } else {
+        render_manager_panel(frame, app, chunks[2]);
+    }
+
     render_help_bar(frame, app, chunks[3]);
 
     // Render overlays
@@ -256,6 +267,68 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
 
         frame.render_widget(paragraph, area);
     }
+}
+
+fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Chain of Command ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Blue));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for node in &app.command_tree {
+        let (health_color, icon) = match node.health {
+            HealthState::Running => (Color::Green, "●"),
+            HealthState::Idle => (Color::Yellow, "○"),
+        };
+
+        let mut spans: Vec<Span> = Vec::new();
+
+        if node.depth == 0 {
+            // Root (EA): no connector, just name + icon
+            spans.push(Span::styled(
+                format!(" {} ", node.name),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(icon, Style::default().fg(health_color)));
+        } else {
+            // Build prefix from ancestor continuation lines
+            let mut prefix = String::from(" ");
+            for i in 0..node.ancestor_is_last.len() - 1 {
+                if i == 0 {
+                    continue; // skip EA level (always root)
+                }
+                if node.ancestor_is_last[i] {
+                    prefix.push_str("    ");
+                } else {
+                    prefix.push_str(" │  ");
+                }
+            }
+
+            // Add connector for this node
+            if node.is_last_sibling {
+                prefix.push_str(" └── ");
+            } else {
+                prefix.push_str(" ├── ");
+            }
+
+            spans.push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                format!("{} ", node.name),
+                Style::default().fg(Color::White),
+            ));
+            spans.push(Span::styled(icon, Style::default().fg(health_color)));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
 }
 
 /// Strip ANSI escape codes from a string (fallback)

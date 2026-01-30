@@ -167,6 +167,32 @@ pub async fn spawn_agent(
         ));
     }
 
+    // Save parent mapping: explicit parent, or auto-infer from running PMs
+    let is_pm = req.role.as_deref() == Some("project-manager");
+    if let Some(ref parent) = req.parent {
+        let resolved_parent = resolve_session_name(&prefix, parent);
+        memory::save_agent_parent(&name, &resolved_parent);
+    } else if !is_pm {
+        // Auto-infer: non-PM agents are workers. Query tmux directly
+        // (app.agents() is stale — only updated on dashboard refresh).
+        if let Ok(sessions) = app.client().list_sessions() {
+            let pm_sessions: Vec<String> = sessions
+                .iter()
+                .filter(|s| {
+                    s.name
+                        .strip_prefix(&prefix)
+                        .unwrap_or(&s.name)
+                        .starts_with("pm-")
+                })
+                .map(|s| s.name.clone())
+                .collect();
+            if pm_sessions.len() == 1 {
+                memory::save_agent_parent(&name, &pm_sessions[0]);
+            }
+            // Multiple PMs: can't auto-infer, will show as Unassigned
+        }
+    }
+
     // If a task was provided, send it via tmux send-keys after a delay
     // This works universally with any agent backend (claude, opencode, etc.)
     if let Some(task) = req.task {
@@ -175,8 +201,14 @@ pub async fn spawn_agent(
 
         // Build the full prompt to send: if role is "project-manager",
         // prepend the PM system prompt so the agent knows how to behave.
+        // Also inject the PM's own short name so it can pass it as `parent`
+        // when spawning workers.
         let full_prompt = if req.role.as_deref() == Some("project-manager") {
-            format!("{}\n\nYOUR TASK: {}", PM_SYSTEM_PROMPT, task)
+            let short = display_name(&prefix, &name);
+            format!(
+                "{}\n\nYOUR NAME: {}\nYOUR TASK: {}",
+                PM_SYSTEM_PROMPT, short, task
+            )
         } else {
             task
         };

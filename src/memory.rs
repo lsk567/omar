@@ -30,6 +30,11 @@ fn worker_tasks_path() -> PathBuf {
     omar_dir().join("worker_tasks.json")
 }
 
+/// Path to agent parent mappings (child → parent)
+fn agent_parents_path() -> PathBuf {
+    omar_dir().join("agent_parents.json")
+}
+
 /// Save a worker's task description (upsert)
 pub fn save_worker_task(session: &str, task: &str) {
     let mut tasks = load_worker_tasks();
@@ -54,6 +59,30 @@ fn write_worker_tasks(tasks: &HashMap<String, String>) {
     }
 }
 
+/// Save a child→parent mapping (upsert)
+pub fn save_agent_parent(child: &str, parent: &str) {
+    let mut parents = load_agent_parents();
+    parents.insert(child.to_string(), parent.to_string());
+    write_agent_parents(&parents);
+}
+
+/// Load all child→parent mappings
+pub fn load_agent_parents() -> HashMap<String, String> {
+    let path = agent_parents_path();
+    match fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Write agent parents to disk
+fn write_agent_parents(parents: &HashMap<String, String>) {
+    let path = agent_parents_path();
+    if let Ok(json) = serde_json::to_string_pretty(parents) {
+        fs::write(&path, json).ok();
+    }
+}
+
 /// Load the memory file contents (empty string if missing)
 pub fn load_memory() -> String {
     let path = memory_path();
@@ -72,6 +101,11 @@ pub fn write_memory(agents: &[AgentInfo], manager: Option<&AgentInfo>, client: &
     let active_sessions: Vec<String> = agents.iter().map(|a| a.session.name.clone()).collect();
     worker_tasks.retain(|k, _| active_sessions.contains(k));
     write_worker_tasks(&worker_tasks);
+
+    // Clean up stale entries from agent_parents
+    let mut agent_parents = load_agent_parents();
+    agent_parents.retain(|k, _| active_sessions.contains(k));
+    write_agent_parents(&agent_parents);
 
     let mut out = String::from("# OMAR State\n\n");
 

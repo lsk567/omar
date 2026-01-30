@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
@@ -25,10 +26,29 @@ pub struct AgentInfo {
     pub health_info: HealthInfo,
 }
 
+/// A node in the chain-of-command tree
+#[derive(Debug, Clone)]
+pub struct CommandTreeNode {
+    /// Display name (e.g. "Executive Assistant", "Project Manager: rest-api")
+    pub name: String,
+    /// Full tmux session name (empty for EA root)
+    pub session_name: String,
+    /// Health state of this agent
+    pub health: HealthState,
+    /// Depth in the tree (0 = EA, 1 = PM, 2 = worker)
+    pub depth: usize,
+    /// Whether this is the last sibling at its depth
+    pub is_last_sibling: bool,
+    /// For each ancestor depth, whether that ancestor was the last sibling.
+    /// Used to decide whether to draw "│" or " " for vertical continuation lines.
+    pub ancestor_is_last: Vec<bool>,
+}
+
 /// Application state
 pub struct App {
     pub agents: Vec<AgentInfo>,
     pub manager: Option<AgentInfo>,
+    pub command_tree: Vec<CommandTreeNode>,
     pub selected: usize,
     pub manager_selected: bool,
     pub interactive_mode: bool,
@@ -55,6 +75,7 @@ impl App {
         Self {
             agents: Vec::new(),
             manager: None,
+            command_tree: Vec::new(),
             selected: 0,
             manager_selected: true,
             interactive_mode: false,
@@ -160,6 +181,15 @@ impl App {
         if !self.agents.is_empty() && self.selected >= self.agents.len() {
             self.selected = self.agents.len() - 1;
         }
+
+        // Build the chain-of-command tree
+        let agent_parents = memory::load_agent_parents();
+        self.command_tree = build_tree(
+            &self.agents,
+            self.manager.as_ref(),
+            &agent_parents,
+            &self.session_prefix,
+        );
 
         Ok(())
     }
@@ -466,5 +496,292 @@ impl App {
         let _ = projects::remove_project(id);
         self.projects = projects::load_projects();
         memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
+    }
+}
+
+/// Build the chain-of-command tree from current agents and parent mappings.
+///
+/// Tree structure:
+///   EA (root, depth 0)
+///   ├── PM agents (depth 1, identified by "pm-" prefix)
+///   │   └── Workers with that PM as parent (depth 2)
+///   └── Orphan workers with no parent (depth 1, under EA)
+pub fn build_tree(
+    agents: &[AgentInfo],
+    manager: Option<&AgentInfo>,
+    agent_parents: &HashMap<String, String>,
+    session_prefix: &str,
+) -> Vec<CommandTreeNode> {
+    let mut nodes = Vec::new();
+
+    // Root: EA
+    let ea_health = manager.map(|m| m.health).unwrap_or(HealthState::Idle);
+    nodes.push(CommandTreeNode {
+        name: "Executive Assistant".to_string(),
+        session_name: MANAGER_SESSION.to_string(),
+        health: ea_health,
+        depth: 0,
+        is_last_sibling: true,
+        ancestor_is_last: vec![],
+    });
+
+    // Partition agents into PMs and non-PMs
+    let mut pms: Vec<&AgentInfo> = Vec::new();
+    let mut non_pms: Vec<&AgentInfo> = Vec::new();
+    for agent in agents {
+        let short = agent
+            .session
+            .name
+            .strip_prefix(session_prefix)
+            .unwrap_or(&agent.session.name);
+        if short.starts_with("pm-") {
+            pms.push(agent);
+        } else {
+            non_pms.push(agent);
+        }
+    }
+
+    // For each non-PM, figure out if it has a PM parent
+    let mut pm_children: HashMap<String, Vec<&AgentInfo>> = HashMap::new();
+    let mut orphans: Vec<&AgentInfo> = Vec::new();
+
+    for agent in &non_pms {
+        if let Some(parent_session) = agent_parents.get(&agent.session.name) {
+            // Check that the parent PM actually exists
+            if pms.iter().any(|pm| pm.session.name == *parent_session) {
+                pm_children
+                    .entry(parent_session.clone())
+                    .or_default()
+                    .push(agent);
+            } else {
+                orphans.push(agent);
+            }
+        } else {
+            orphans.push(agent);
+        }
+    }
+
+    // Add PM nodes (depth 1) and their worker children (depth 2)
+    for (pm_idx, pm) in pms.iter().enumerate() {
+        // PM is last among EA children only if it's the last PM AND there are no orphans
+        let is_last = pm_idx == pms.len() - 1 && orphans.is_empty();
+
+        let short = pm
+            .session
+            .name
+            .strip_prefix(session_prefix)
+            .unwrap_or(&pm.session.name);
+        let pm_display = if let Some(rest) = short.strip_prefix("pm-") {
+            format!("Project Manager: {}", rest)
+        } else {
+            short.to_string()
+        };
+
+        nodes.push(CommandTreeNode {
+            name: pm_display,
+            session_name: pm.session.name.clone(),
+            health: pm.health,
+            depth: 1,
+            is_last_sibling: is_last,
+            ancestor_is_last: vec![true], // EA is always last at depth 0
+        });
+
+        // Add workers under this PM (depth 2)
+        let children = pm_children.get(&pm.session.name);
+        if let Some(kids) = children {
+            for (kid_idx, kid) in kids.iter().enumerate() {
+                let kid_short = kid
+                    .session
+                    .name
+                    .strip_prefix(session_prefix)
+                    .unwrap_or(&kid.session.name);
+                let kid_is_last = kid_idx == kids.len() - 1;
+                nodes.push(CommandTreeNode {
+                    name: kid_short.to_string(),
+                    session_name: kid.session.name.clone(),
+                    health: kid.health,
+                    depth: 2,
+                    is_last_sibling: kid_is_last,
+                    ancestor_is_last: vec![true, is_last],
+                });
+            }
+        }
+    }
+
+    // Add orphan workers under a synthetic "Unassigned" group (depth 1)
+    if !orphans.is_empty() {
+        nodes.push(CommandTreeNode {
+            name: "Unassigned".to_string(),
+            session_name: String::new(),
+            health: HealthState::Idle,
+            depth: 1,
+            is_last_sibling: true, // always last child of EA
+            ancestor_is_last: vec![true],
+        });
+
+        for (orphan_idx, orphan) in orphans.iter().enumerate() {
+            let short = orphan
+                .session
+                .name
+                .strip_prefix(session_prefix)
+                .unwrap_or(&orphan.session.name);
+            let is_last = orphan_idx == orphans.len() - 1;
+            nodes.push(CommandTreeNode {
+                name: short.to_string(),
+                session_name: orphan.session.name.clone(),
+                health: orphan.health,
+                depth: 2,
+                is_last_sibling: is_last,
+                ancestor_is_last: vec![true, true], // EA is last, Unassigned is last
+            });
+        }
+    }
+
+    nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tmux::{HealthInfo, HealthState, Session};
+
+    fn make_agent(name: &str, health: HealthState) -> AgentInfo {
+        AgentInfo {
+            session: Session {
+                name: name.to_string(),
+                activity: 0,
+                attached: false,
+                pane_pid: 0,
+            },
+            health,
+            health_info: HealthInfo {
+                state: health,
+                last_output: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_build_tree_ea_only() {
+        let agents = vec![];
+        let ea = make_agent("omar-ea", HealthState::Running);
+        let parents = HashMap::new();
+        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].name, "Executive Assistant");
+        assert_eq!(tree[0].depth, 0);
+    }
+
+    #[test]
+    fn test_build_tree_with_pm_and_workers() {
+        let agents = vec![
+            make_agent("omar-agent-pm-rest-api", HealthState::Running),
+            make_agent("omar-agent-api", HealthState::Running),
+            make_agent("omar-agent-auth", HealthState::Idle),
+        ];
+        let ea = make_agent("omar-ea", HealthState::Running);
+        let mut parents = HashMap::new();
+        parents.insert(
+            "omar-agent-api".to_string(),
+            "omar-agent-pm-rest-api".to_string(),
+        );
+        parents.insert(
+            "omar-agent-auth".to_string(),
+            "omar-agent-pm-rest-api".to_string(),
+        );
+
+        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+
+        // EA + PM + 2 workers = 4 nodes
+        assert_eq!(tree.len(), 4);
+        assert_eq!(tree[0].name, "Executive Assistant");
+        assert_eq!(tree[0].depth, 0);
+        assert_eq!(tree[1].name, "Project Manager: rest-api");
+        assert_eq!(tree[1].depth, 1);
+        assert!(tree[1].is_last_sibling);
+        assert_eq!(tree[2].name, "api");
+        assert_eq!(tree[2].depth, 2);
+        assert!(!tree[2].is_last_sibling);
+        assert_eq!(tree[3].name, "auth");
+        assert_eq!(tree[3].depth, 2);
+        assert!(tree[3].is_last_sibling);
+    }
+
+    #[test]
+    fn test_build_tree_orphan_workers() {
+        let agents = vec![
+            make_agent("omar-agent-debug", HealthState::Running),
+            make_agent("omar-agent-test", HealthState::Idle),
+        ];
+        let ea = make_agent("omar-ea", HealthState::Running);
+        let parents = HashMap::new();
+
+        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+
+        // EA + Unassigned group + 2 orphans = 4 nodes
+        assert_eq!(tree.len(), 4);
+        assert_eq!(tree[1].name, "Unassigned");
+        assert_eq!(tree[1].depth, 1);
+        assert!(tree[1].is_last_sibling);
+        assert_eq!(tree[2].name, "debug");
+        assert_eq!(tree[2].depth, 2);
+        assert!(!tree[2].is_last_sibling);
+        assert_eq!(tree[3].name, "test");
+        assert_eq!(tree[3].depth, 2);
+        assert!(tree[3].is_last_sibling);
+    }
+
+    #[test]
+    fn test_build_tree_mixed_pm_and_orphans() {
+        let agents = vec![
+            make_agent("omar-agent-pm-api", HealthState::Running),
+            make_agent("omar-agent-worker1", HealthState::Running),
+            make_agent("omar-agent-orphan1", HealthState::Idle),
+        ];
+        let ea = make_agent("omar-ea", HealthState::Running);
+        let mut parents = HashMap::new();
+        parents.insert(
+            "omar-agent-worker1".to_string(),
+            "omar-agent-pm-api".to_string(),
+        );
+
+        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+
+        // EA + PM + worker1 + Unassigned + orphan1 = 5
+        assert_eq!(tree.len(), 5);
+        assert_eq!(tree[0].depth, 0); // EA
+        assert_eq!(tree[1].name, "Project Manager: api");
+        assert_eq!(tree[1].depth, 1);
+        assert!(!tree[1].is_last_sibling); // not last because Unassigned follows
+        assert_eq!(tree[2].name, "worker1");
+        assert_eq!(tree[2].depth, 2);
+        assert_eq!(tree[3].name, "Unassigned");
+        assert_eq!(tree[3].depth, 1);
+        assert!(tree[3].is_last_sibling);
+        assert_eq!(tree[4].name, "orphan1");
+        assert_eq!(tree[4].depth, 2);
+        assert!(tree[4].is_last_sibling);
+    }
+
+    #[test]
+    fn test_build_tree_stale_parent_treated_as_orphan() {
+        let agents = vec![make_agent("omar-agent-worker1", HealthState::Running)];
+        let ea = make_agent("omar-ea", HealthState::Running);
+        // Parent PM doesn't exist in agents
+        let mut parents = HashMap::new();
+        parents.insert(
+            "omar-agent-worker1".to_string(),
+            "omar-agent-pm-gone".to_string(),
+        );
+
+        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+
+        // worker1 should be under Unassigned since its PM doesn't exist
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree[1].name, "Unassigned");
+        assert_eq!(tree[1].depth, 1);
+        assert_eq!(tree[2].name, "worker1");
+        assert_eq!(tree[2].depth, 2);
     }
 }
