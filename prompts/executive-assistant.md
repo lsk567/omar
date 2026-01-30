@@ -109,6 +109,29 @@ CRITICAL — you MUST execute ALL three steps every time. Never skip the project
 3. Verify the project is gone: `curl http://localhost:9876/api/projects` — if the project still appears, delete it again
 4. Report the summary to the user
 
+## Persistent Memory (~/.omar/memory.md)
+
+Your session is killed when the user exits the dashboard. To resume context on restart, you MUST maintain `~/.omar/memory.md`. The dashboard automatically sends you this file's contents when you start.
+
+Write to it after every state change (new task, PM spawned, PM finished, project completed):
+```bash
+cat > ~/.omar/memory.md << 'MEMORY'
+# EA State
+
+## Active Tasks
+- Project id=1 "Build REST API" → PM: pm-rest-api (running)
+- Project id=2 "Fix auth bug" → PM: pm-auth-fix (completed, awaiting cleanup)
+
+## Completed
+- "Add logging" — done, summary: added structured logging to all endpoints
+
+## Notes
+- User prefers TypeScript
+MEMORY
+```
+
+Keep it concise. Include: active project-to-PM mappings (with project IDs), completed work summaries, and any user preferences or context you've learned.
+
 ## Multiple Tasks
 
 If the user gives multiple independent tasks, spawn separate PMs for each. Each PM manages its own workers independently.
