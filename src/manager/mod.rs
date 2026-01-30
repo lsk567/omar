@@ -316,6 +316,8 @@ Begin working on your task now.
     );
 
     client.send_keys_literal(&session_name, &context)?;
+    // Small delay so tmux finishes buffering the text before Enter
+    thread::sleep(Duration::from_millis(200));
     client.send_keys(&session_name, "Enter")?;
 
     // Persist worker task description

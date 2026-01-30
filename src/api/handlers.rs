@@ -174,8 +174,11 @@ pub async fn spawn_agent(
         let client = app.client().clone();
         let session = name.clone();
         tokio::spawn(async move {
+            // Wait for the agent process to start
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let _ = client.send_keys_literal(&session, &task);
+            // Small delay so tmux finishes buffering the text before Enter
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let _ = client.send_keys(&session, "Enter");
         });
     }
@@ -265,8 +268,9 @@ pub async fn send_input(
         ));
     }
 
-    // Send enter if requested
+    // Send enter if requested (small delay so tmux finishes buffering the text)
     if req.enter {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if let Err(e) = app.client().send_keys(&session_name, "Enter") {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
