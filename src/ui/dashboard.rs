@@ -187,11 +187,11 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
 
         // Different styles for different states
         let (border_color, title) = if is_interactive {
-            (Color::Cyan, " MANAGER [INTERACTIVE - Esc to exit] ")
+            (Color::Cyan, " EA [INTERACTIVE - Esc to exit] ")
         } else if is_selected {
-            (Color::Magenta, " [MANAGER] - Press 'i' to type ")
+            (Color::Magenta, " [EA] - Press Enter to open ")
         } else {
-            (Color::Blue, " MANAGER ")
+            (Color::Blue, " EA ")
         };
 
         let border_style =
@@ -239,12 +239,12 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         // Manager not available (shouldn't happen normally)
         let block = Block::default()
-            .title(" MANAGER ")
+            .title(" EA ")
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
             .border_style(Style::default().fg(Color::DarkGray));
 
-        let paragraph = Paragraph::new("Starting manager...")
+        let paragraph = Paragraph::new("Starting EA...")
             .style(Style::default().fg(Color::DarkGray))
             .block(block);
 
@@ -336,11 +336,7 @@ fn render_agent_card(
 fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     let help_text = if app.interactive_mode {
         // Interactive mode help
-        let target = if app.manager_selected {
-            "manager"
-        } else {
-            "agent"
-        };
+        let target = if app.manager_selected { "EA" } else { "agent" };
         vec![
             Span::styled(
                 "Esc",
