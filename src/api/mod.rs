@@ -29,6 +29,9 @@ pub fn create_router(app: Arc<Mutex<SharedApp>>) -> Router {
         .route("/api/agents/:id", get(handlers::get_agent))
         .route("/api/agents/:id", delete(handlers::kill_agent))
         .route("/api/agents/:id/send", post(handlers::send_input))
+        .route("/api/projects", get(handlers::list_projects))
+        .route("/api/projects", post(handlers::add_project))
+        .route("/api/projects/:id", delete(handlers::complete_project))
         .layer(cors)
         .with_state(app)
 }

@@ -10,6 +10,8 @@ use tokio::sync::Mutex;
 
 use super::models::*;
 use crate::app::{SharedApp, MANAGER_SESSION_NAME};
+use crate::memory;
+use crate::projects;
 
 /// Resolve a user-facing agent name to a full tmux session name.
 /// Accepts both short names ("auth") and full names ("omar-agent-auth").
@@ -167,6 +169,8 @@ pub async fn spawn_agent(
     // If a task was provided, send it via tmux send-keys after a delay
     // This works universally with any agent backend (claude, opencode, etc.)
     if let Some(task) = req.task {
+        // Persist worker task description
+        memory::save_worker_task(&name, &task);
         let client = app.client().clone();
         let session = name.clone();
         tokio::spawn(async move {
@@ -277,4 +281,56 @@ pub async fn send_input(
         status: "sent".to_string(),
         message: None,
     }))
+}
+
+/// GET /api/projects
+pub async fn list_projects() -> Json<ListProjectsResponse> {
+    let projects = projects::load_projects();
+    let list: Vec<ProjectResponse> = projects
+        .iter()
+        .map(|p| ProjectResponse {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect();
+    Json(ListProjectsResponse { projects: list })
+}
+
+/// POST /api/projects
+pub async fn add_project(
+    Json(req): Json<AddProjectRequest>,
+) -> Result<Json<ProjectResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match projects::add_project(&req.name) {
+        Ok(id) => Ok(Json(ProjectResponse { id, name: req.name })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to add project: {}", e),
+            }),
+        )),
+    }
+}
+
+/// DELETE /api/projects/:id
+pub async fn complete_project(
+    Path(id): Path<usize>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match projects::remove_project(id) {
+        Ok(true) => Ok(Json(StatusResponse {
+            status: "completed".to_string(),
+            message: Some(format!("Project {} removed", id)),
+        })),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Project {} not found", id),
+            }),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to remove project: {}", e),
+            }),
+        )),
+    }
 }

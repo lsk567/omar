@@ -49,6 +49,26 @@ curl -X POST http://localhost:9876/api/agents/worker-name/send \
 curl -X DELETE http://localhost:9876/api/agents/worker-name
 ```
 
+## Projects API
+
+Track ongoing projects to coordinate work. When the user gives you a task, add it as a project first, then break it down into workers.
+
+### Add a project
+```bash
+curl -X POST http://localhost:9876/api/projects \
+  -H "Content-Type: application/json" -d '{"name": "Project description"}'
+```
+
+### List projects
+```bash
+curl http://localhost:9876/api/projects
+```
+
+### Complete a project (remove by id)
+```bash
+curl -X DELETE http://localhost:9876/api/projects/1
+```
+
 ## Workflow
 
 1. User gives you a high-level task

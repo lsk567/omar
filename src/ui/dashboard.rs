@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 use regex::Regex;
@@ -16,14 +16,26 @@ pub fn render(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),      // Status bar
-            Constraint::Percentage(40), // Agent grid
-            Constraint::Min(10),        // Manager panel (takes remaining ~50%)
+            Constraint::Percentage(55), // Agent grid + projects sidebar
+            Constraint::Min(8),         // Manager panel (~33%)
             Constraint::Length(1),      // Help bar
         ])
         .split(frame.area());
 
     render_status_bar(frame, app, chunks[0]);
-    render_agent_grid(frame, app, chunks[1]);
+
+    // Split agent grid area into projects sidebar + agent grid
+    if !app.projects.is_empty() {
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(25), Constraint::Min(0)])
+            .split(chunks[1]);
+        render_projects_panel(frame, app, h_chunks[0]);
+        render_agent_grid(frame, app, h_chunks[1]);
+    } else {
+        render_agent_grid(frame, app, chunks[1]);
+    }
+
     render_manager_panel(frame, app, chunks[2]);
     render_help_bar(frame, app, chunks[3]);
 
@@ -34,6 +46,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if app.show_confirm_kill {
         render_confirm_kill(frame, app);
+    }
+
+    if app.project_input_mode {
+        render_project_input(frame, app);
     }
 }
 
@@ -71,9 +87,33 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(Color::DarkGray));
 
     let paragraph = Paragraph::new(content).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_projects_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Projects ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let lines: Vec<Line> = app
+        .projects
+        .iter()
+        .map(|p| {
+            Line::from(Span::styled(
+                format!("{}. {}", p.id, p.name),
+                Style::default().fg(Color::White),
+            ))
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+
     frame.render_widget(paragraph, area);
 }
 
@@ -85,6 +125,7 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(BorderType::Thick)
                         .title(" Agents ")
                         .border_style(Style::default().fg(Color::DarkGray)),
                 );
@@ -165,6 +206,7 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
             .border_style(border_style);
 
         // Get manager output - more lines to fill the panel
@@ -199,6 +241,7 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
         let block = Block::default()
             .title(" MANAGER ")
             .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
             .border_style(Style::default().fg(Color::DarkGray));
 
         let paragraph = Paragraph::new("Starting manager...")
@@ -259,6 +302,7 @@ fn render_agent_card(
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
         .border_style(border_style);
 
     // Get live output from the agent's pane
@@ -322,6 +366,8 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(":Popup "),
             Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":Nav "),
+            Span::styled("p", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Project "),
             Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":Quit "),
             Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
@@ -340,6 +386,8 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(":New "),
             Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":Kill "),
+            Span::styled("p", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Project "),
             Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":Refresh "),
             Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
@@ -368,6 +416,7 @@ fn render_help_popup(frame: &mut Frame) {
         Line::from("  Enter       Attach to selected agent"),
         Line::from("  n           Spawn new agent"),
         Line::from("  d           Kill selected agent"),
+        Line::from("  p           Add a project"),
         Line::from("  r           Refresh agent list"),
         Line::from("  ?           Toggle this help"),
         Line::from(""),
@@ -418,6 +467,40 @@ fn render_confirm_kill(frame: &mut Frame, app: &App) {
         .title(" Confirm ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red));
+
+    let paragraph = Paragraph::new(content)
+        .block(block)
+        .alignment(ratatui::layout::Alignment::Center);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_project_input(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 20, frame.area());
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Add Project",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("> {}_", app.project_input),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter to confirm, Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Block::default()
+        .title(" New Project ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(content)
         .block(block)

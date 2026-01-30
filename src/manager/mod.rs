@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
 
+use crate::memory;
 use crate::tmux::TmuxClient;
 use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 
@@ -316,6 +317,9 @@ Begin working on your task now.
 
     client.send_keys_literal(&session_name, &context)?;
     client.send_keys(&session_name, "Enter")?;
+
+    // Persist worker task description
+    memory::save_worker_task(&session_name, &agent.task);
 
     println!("  {} - spawned ({})", agent.name, agent.role);
 
