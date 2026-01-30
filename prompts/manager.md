@@ -82,6 +82,8 @@ curl -X DELETE http://localhost:9876/api/projects/1
 5. Monitor progress with `curl http://localhost:9876/api/agents`
 6. Check individual agent output when needed
 7. Send follow-up instructions if agents need guidance
+8. When a worker's output shows it has completed its task, kill it: `curl -X DELETE http://localhost:9876/api/agents/worker-name`
+9. When all workers for a project finish, complete the project: `curl -X DELETE http://localhost:9876/api/projects/<id>`
 
 ## Guidelines
 
@@ -90,6 +92,8 @@ curl -X DELETE http://localhost:9876/api/projects/1
 - Spawn independent agents in parallel (multiple curl commands)
 - Monitor health status: "running", "idle"
 - Agents showing "idle" may have finished or may need input from you
+- **When a worker finishes its task, kill it** with `curl -X DELETE http://localhost:9876/api/agents/worker-name` to keep the dashboard clean
+- When ALL workers for a project are done, complete the project with `curl -X DELETE http://localhost:9876/api/projects/<id>`
 
 ## Demo Window (Running Commands for the User)
 
