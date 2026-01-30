@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 use super::models::*;
 use crate::app::{SharedApp, MANAGER_SESSION_NAME};
+use crate::manager::PM_SYSTEM_PROMPT;
 use crate::memory;
 use crate::projects;
 
@@ -169,14 +170,23 @@ pub async fn spawn_agent(
     // If a task was provided, send it via tmux send-keys after a delay
     // This works universally with any agent backend (claude, opencode, etc.)
     if let Some(task) = req.task {
-        // Persist worker task description
+        // Always persist the original (short) task for dashboard display
         memory::save_worker_task(&name, &task);
+
+        // Build the full prompt to send: if role is "project-manager",
+        // prepend the PM system prompt so the agent knows how to behave.
+        let full_prompt = if req.role.as_deref() == Some("project-manager") {
+            format!("{}\n\nYOUR TASK: {}", PM_SYSTEM_PROMPT, task)
+        } else {
+            task
+        };
+
         let client = app.client().clone();
         let session = name.clone();
         tokio::spawn(async move {
             // Wait for the agent process to start
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let _ = client.send_keys_literal(&session, &task);
+            let _ = client.send_keys_literal(&session, &full_prompt);
             // Small delay so tmux finishes buffering the text before Enter
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let _ = client.send_keys(&session, "Enter");

@@ -13,6 +13,8 @@ pub struct SpawnAgentRequest {
     pub workdir: Option<String>,
     /// Command to run (defaults to config)
     pub command: Option<String>,
+    /// Optional role (e.g. "project-manager") — injects a system prompt
+    pub role: Option<String>,
 }
 
 /// Response after spawning an agent
