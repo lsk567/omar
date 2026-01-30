@@ -72,7 +72,7 @@ pub struct ApiConfig {
 }
 
 fn default_refresh_interval() -> u64 {
-    2
+    1
 }
 
 fn default_session_prefix() -> String {
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.dashboard.refresh_interval, 2);
+        assert_eq!(config.dashboard.refresh_interval, 1);
         assert_eq!(config.dashboard.session_prefix, "omar-agent-");
         assert_eq!(config.health.idle_warning, 15);
         assert_eq!(config.health.idle_critical, 300);
