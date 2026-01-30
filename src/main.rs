@@ -406,18 +406,13 @@ async fn run_dashboard(config: Config) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // Tell the user the manager is still running
+    // Kill the EA session on exit
     if app
         .client()
         .has_session(crate::manager::MANAGER_SESSION)
         .unwrap_or(false)
     {
-        println!(
-            "Manager session kept alive to preserve conversation history.\n\
-             Restart omar to reconnect. To kill the manager:\n\
-             \n  tmux kill-session -t {}\n",
-            crate::manager::MANAGER_SESSION
-        );
+        let _ = app.client().kill_session(crate::manager::MANAGER_SESSION);
     }
 
     Ok(())

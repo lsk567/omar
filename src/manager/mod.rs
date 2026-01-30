@@ -12,10 +12,13 @@ use crate::tmux::TmuxClient;
 use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 
 /// Manager session name (exported for use in app.rs)
-pub const MANAGER_SESSION: &str = "omar-manager";
+pub const MANAGER_SESSION: &str = "omar-ea";
 
-/// Manager system prompt, loaded from prompts/manager.md at compile time
-pub const MANAGER_SYSTEM_PROMPT: &str = include_str!("../../prompts/manager.md");
+/// EA system prompt, loaded from prompts/executive-assistant.md at compile time
+pub const MANAGER_SYSTEM_PROMPT: &str = include_str!("../../prompts/executive-assistant.md");
+
+/// Project Manager system prompt, loaded from prompts/project-manager.md at compile time
+pub const PM_SYSTEM_PROMPT: &str = include_str!("../../prompts/project-manager.md");
 
 /// Start the manager agent session
 pub fn start_manager(client: &TmuxClient, command: &str) -> Result<()> {
