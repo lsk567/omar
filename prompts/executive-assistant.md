@@ -14,11 +14,14 @@ The OMAR API creates real tmux sessions that appear in the OMAR dashboard.
 ## Workflow
 
 1. User gives you a task
-2. Add it as a project via the Projects API
+2. Add it as a project via the Projects API — **save the returned project `id`**
 3. Spawn a Project Manager with `"role": "project-manager"` — the API automatically gives the PM its full system prompt; you only provide the task description
 4. Monitor the PM's output for `[PROJECT COMPLETE]` signal
-5. When PM reports `[PROJECT COMPLETE]`, kill the PM agent and complete the project
-6. Report the summary back to the user
+5. When PM reports `[PROJECT COMPLETE]`, you MUST do ALL of the following in order:
+   a. Kill the PM agent: `curl -X DELETE http://localhost:9876/api/agents/pm-<name>`
+   b. Complete the project using the saved id: `curl -X DELETE http://localhost:9876/api/projects/<id>`
+   c. Report the summary back to the user
+   **Never skip step 5b. The project MUST be removed from the board.**
 
 ## Spawning a Project Manager
 
@@ -99,9 +102,12 @@ Look for:
 
 ## When a PM Finishes
 
+CRITICAL — you MUST execute ALL three steps every time. Never skip the project deletion.
+
 1. Kill the PM: `curl -X DELETE http://localhost:9876/api/agents/pm-<name>`
-2. Complete the project: `curl -X DELETE http://localhost:9876/api/projects/<id>`
-3. Report the summary to the user
+2. Complete the project: `curl -X DELETE http://localhost:9876/api/projects/<id>` (use the id returned when you created the project)
+3. Verify the project is gone: `curl http://localhost:9876/api/projects` — if the project still appears, delete it again
+4. Report the summary to the user
 
 ## Multiple Tasks
 
@@ -155,10 +161,18 @@ User: "Build a REST API with authentication"
 
 You:
 ```bash
+# Step 1: Create project — note the returned id (e.g. {"id":1,"name":"..."})
 curl -X POST http://localhost:9876/api/projects -H "Content-Type: application/json" -d '{"name": "Build REST API with authentication"}'
+
+# Step 2: Spawn PM
 curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json" -d '{"name": "pm-rest-api", "task": "Build a REST API with authentication. Requirements: Express server with /users and /posts routes, JWT authentication middleware, login endpoint, and integration tests for all endpoints.", "role": "project-manager"}'
 ```
 
-Then monitor `pm-rest-api` until it reports `[PROJECT COMPLETE]`.
+Then monitor `pm-rest-api` until it reports `[PROJECT COMPLETE]`. When it does:
+```bash
+# Step 3: Kill PM + complete project (using the saved id)
+curl -X DELETE http://localhost:9876/api/agents/pm-rest-api
+curl -X DELETE http://localhost:9876/api/projects/1
+```
 
 Now, wait for the user's request.
