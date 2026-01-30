@@ -72,23 +72,6 @@ Omar auto-detects which agent backend is available on your system:
 
 If both are installed, `claude` takes priority. Override with the `default_command` config option.
 
-## Configuration
-
-Create `~/.config/omar/config.toml`:
-
-```toml
-[dashboard]
-refresh_interval = 2
-session_prefix = "omar-agent-"
-
-[health]
-idle_warning = 15
-
-[agent]
-default_command = "claude --dangerously-skip-permissions"  # or "opencode", or any command
-default_workdir = "."
-```
-
 ## Requirements
 
 - tmux 3.0+
@@ -98,3 +81,7 @@ default_workdir = "."
 ## License
 
 MIT
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=lsk567/omar&type=date&legend=top-left)](https://www.star-history.com/#lsk567/omar&type=date&legend=top-left)
