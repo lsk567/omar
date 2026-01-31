@@ -15,6 +15,8 @@ pub struct SpawnAgentRequest {
     pub command: Option<String>,
     /// Optional role (e.g. "project-manager") — injects a system prompt
     pub role: Option<String>,
+    /// Optional parent agent name (e.g. "pm-rest-api") for chain-of-command tracking
+    pub parent: Option<String>,
 }
 
 /// Response after spawning an agent

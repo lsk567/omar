@@ -36,7 +36,18 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_agent_grid(frame, app, chunks[1]);
     }
 
-    render_manager_panel(frame, app, chunks[2]);
+    // Split EA area: if command tree has content, show it alongside the EA panel
+    if app.command_tree.len() > 1 {
+        let ea_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(chunks[2]);
+        render_manager_panel(frame, app, ea_chunks[0]);
+        render_command_tree(frame, app, ea_chunks[1]);
+    } else {
+        render_manager_panel(frame, app, chunks[2]);
+    }
+
     render_help_bar(frame, app, chunks[3]);
 
     // Render overlays
@@ -133,14 +144,27 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Max 2 columns for better readability
-    let cols = 2.min(app.agents.len()).max(1);
-    let rows = app.agents.len().div_ceil(cols);
+    let groups = app.agent_groups();
 
-    // Calculate row height to fill available space
-    let row_height = area.height / rows as u16;
-    let row_constraints: Vec<Constraint> = (0..rows)
-        .map(|_| Constraint::Length(row_height.max(8)))
+    // Calculate total visual rows needed
+    let mut total_rows: usize = 0;
+    for group in &groups {
+        if group.pm.is_some() {
+            total_rows += 1; // PM card (full width)
+        }
+        if !group.workers.is_empty() {
+            let cols = 2.min(group.workers.len()).max(1);
+            total_rows += group.workers.len().div_ceil(cols);
+        }
+    }
+
+    if total_rows == 0 {
+        return;
+    }
+
+    let row_height = (area.height / total_rows as u16).max(6);
+    let row_constraints: Vec<Constraint> = (0..total_rows)
+        .map(|_| Constraint::Length(row_height))
         .collect();
 
     let row_chunks = Layout::default()
@@ -148,34 +172,69 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
         .constraints(row_constraints)
         .split(area);
 
-    for (i, agent) in app.agents.iter().enumerate() {
-        let row = i / cols;
-        let col = i % cols;
+    let mut row_idx = 0;
 
-        if row >= row_chunks.len() {
-            break;
+    for group in &groups {
+        // Render PM card (full width)
+        if let Some(pm) = group.pm {
+            if row_idx < row_chunks.len() {
+                let is_selected = app
+                    .agents
+                    .iter()
+                    .position(|a| a.session.name == pm.session.name)
+                    .is_some_and(|idx| !app.manager_selected && idx == app.selected);
+                let is_interactive = app.interactive_mode && is_selected;
+                render_agent_card(
+                    frame,
+                    app,
+                    pm,
+                    row_chunks[row_idx],
+                    is_selected,
+                    is_interactive,
+                );
+                row_idx += 1;
+            }
         }
 
-        let col_constraints: Vec<Constraint> = (0..cols)
-            .map(|_| Constraint::Ratio(1, cols as u32))
-            .collect();
+        // Render workers in 2-column sub-grid below their PM
+        if !group.workers.is_empty() {
+            let cols = 2.min(group.workers.len()).max(1);
+            for (i, worker) in group.workers.iter().enumerate() {
+                let sub_row = i / cols;
+                let sub_col = i % cols;
+                let current_row = row_idx + sub_row;
 
-        let col_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(col_constraints)
-            .split(row_chunks[row]);
+                if current_row >= row_chunks.len() {
+                    break;
+                }
 
-        if col < col_chunks.len() {
-            let is_selected = !app.manager_selected && i == app.selected;
-            let is_interactive = app.interactive_mode && is_selected;
-            render_agent_card(
-                frame,
-                app,
-                agent,
-                col_chunks[col],
-                is_selected,
-                is_interactive,
-            );
+                let col_constraints: Vec<Constraint> = (0..cols)
+                    .map(|_| Constraint::Ratio(1, cols as u32))
+                    .collect();
+
+                let col_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(col_constraints)
+                    .split(row_chunks[current_row]);
+
+                if sub_col < col_chunks.len() {
+                    let is_selected = app
+                        .agents
+                        .iter()
+                        .position(|a| a.session.name == worker.session.name)
+                        .is_some_and(|idx| !app.manager_selected && idx == app.selected);
+                    let is_interactive = app.interactive_mode && is_selected;
+                    render_agent_card(
+                        frame,
+                        app,
+                        worker,
+                        col_chunks[sub_col],
+                        is_selected,
+                        is_interactive,
+                    );
+                }
+            }
+            row_idx += group.workers.len().div_ceil(cols);
         }
     }
 }
@@ -256,6 +315,68 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
 
         frame.render_widget(paragraph, area);
     }
+}
+
+fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Chain of Command ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Blue));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for node in &app.command_tree {
+        let (health_color, icon) = match node.health {
+            HealthState::Running => (Color::Green, "●"),
+            HealthState::Idle => (Color::Yellow, "○"),
+        };
+
+        let mut spans: Vec<Span> = Vec::new();
+
+        if node.depth == 0 {
+            // Root (EA): no connector, just name + icon
+            spans.push(Span::styled(
+                format!(" {} ", node.name),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(icon, Style::default().fg(health_color)));
+        } else {
+            // Build prefix from ancestor continuation lines
+            let mut prefix = String::from(" ");
+            for i in 0..node.ancestor_is_last.len() {
+                if i == 0 {
+                    continue; // skip EA level (always root)
+                }
+                if node.ancestor_is_last[i] {
+                    prefix.push_str("    ");
+                } else {
+                    prefix.push_str(" │  ");
+                }
+            }
+
+            // Add connector for this node
+            if node.is_last_sibling {
+                prefix.push_str(" └── ");
+            } else {
+                prefix.push_str(" ├── ");
+            }
+
+            spans.push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                format!("{} ", node.name),
+                Style::default().fg(Color::White),
+            ));
+            spans.push(Span::styled(icon, Style::default().fg(health_color)));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
 }
 
 /// Strip ANSI escape codes from a string (fallback)

@@ -26,8 +26,11 @@ The OMAR API creates real tmux sessions that appear in the OMAR dashboard.
 ```bash
 curl -X POST http://localhost:9876/api/agents \
   -H "Content-Type: application/json" \
-  -d '{"name": "worker-name", "task": "Task description for the agent"}'
+  -d '{"name": "worker-name", "task": "Task description for the agent", "parent": "<YOUR NAME>"}'
 ```
+
+**IMPORTANT:** Always include `"parent": "<YOUR NAME>"` (the name from YOUR NAME above) when spawning workers so the dashboard can show the chain of command.
+
 
 ### List all agents
 ```bash
@@ -84,11 +87,11 @@ You would:
    - **auth**: Implement JWT authentication middleware and login endpoint
    - **test**: Write integration tests for all API endpoints
 
-2. Spawn them:
+2. Spawn them (assuming YOUR NAME is pm-rest-api):
 ```bash
-curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json" -d '{"name": "api", "task": "Set up Express server with /users and /posts routes. Use express and create proper route handlers."}'
-curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json" -d '{"name": "auth", "task": "Implement JWT authentication middleware and login endpoint. Use jsonwebtoken package."}'
-curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json" -d '{"name": "test", "task": "Write integration tests for all API endpoints using jest and supertest."}'
+curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json" -d '{"name": "api", "task": "Set up Express server with /users and /posts routes. Use express and create proper route handlers.", "parent": "pm-rest-api"}'
+curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json" -d '{"name": "auth", "task": "Implement JWT authentication middleware and login endpoint. Use jsonwebtoken package.", "parent": "pm-rest-api"}'
+curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json" -d '{"name": "test", "task": "Write integration tests for all API endpoints using jest and supertest.", "parent": "pm-rest-api"}'
 ```
 
 3. Monitor, guide, kill when done

@@ -8,13 +8,15 @@ A TUI dashboard for managing multiple AI coding agents based on `tmux`.
 
 ## Features
 
-- Real-time monitoring of agent sessions
-- Health status tracking (Running, Idle)
-- Quick attach/detach via tmux popups
-- Session management (spawn, list, kill)
-- Parallel agents!
+- A TUI dashboard for all your agents in one place
+- Spawn workers in parallel
+- An executive assistant that manages agents for you
+- Visualize a chain of command
+- Health status tracking
+- Easily talk to each agent via tmux popups
+- Support all the familiar `tmux` commands you love
 
-<img src="docs/img/demo.png" alt="demo" width="700" />
+<img src="docs/img/demo2.png" alt="demo"/>
 
 ## Installation
 
@@ -28,22 +30,6 @@ cargo install --path .
 
 ```bash
 omar
-```
-
-### CLI Commands
-
-```bash
-# Spawn a new agent
-omar spawn -n my-agent -c "claude"
-
-# List all agents
-omar list
-
-# Kill an agent
-omar kill my-agent
-
-# Start or attach to the manager agent
-omar manager
 ```
 
 ### Keyboard Shortcuts
@@ -72,23 +58,6 @@ Omar auto-detects which agent backend is available on your system:
 
 If both are installed, `claude` takes priority. Override with the `default_command` config option.
 
-## Configuration
-
-Create `~/.config/omar/config.toml`:
-
-```toml
-[dashboard]
-refresh_interval = 2
-session_prefix = "omar-agent-"
-
-[health]
-idle_warning = 15
-
-[agent]
-default_command = "claude --dangerously-skip-permissions"  # or "opencode", or any command
-default_workdir = "."
-```
-
 ## Requirements
 
 - tmux 3.0+
@@ -98,3 +67,7 @@ default_workdir = "."
 ## License
 
 MIT
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=lsk567/omar&type=date&legend=top-left)](https://www.star-history.com/#lsk567/omar&type=date&legend=top-left)
