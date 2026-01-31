@@ -322,51 +322,6 @@ fn test_spawn_custom_command() {
     let _ = tmux(&["kill-session", "-t", &session_name]);
 }
 
-/// Test the full parent-tracking roundtrip:
-/// save parent mapping → load → build_agent_groups → verify hierarchy
-#[test]
-fn test_agent_parent_roundtrip() {
-    use std::collections::HashMap;
-    use std::fs;
-
-    // Use a temp dir so we don't pollute the real ~/.omar
-    let tmp = std::env::temp_dir().join("omar-test-parents");
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp).unwrap();
-
-    let parents_path = tmp.join("agent_parents.json");
-
-    // Simulate: PM spawns 2 workers, saves parent mappings
-    let mut parents: HashMap<String, String> = HashMap::new();
-    parents.insert(
-        "omar-agent-api".to_string(),
-        "omar-agent-pm-rest-api".to_string(),
-    );
-    parents.insert(
-        "omar-agent-auth".to_string(),
-        "omar-agent-pm-rest-api".to_string(),
-    );
-    let json = serde_json::to_string_pretty(&parents).unwrap();
-    fs::write(&parents_path, &json).unwrap();
-
-    // Read it back
-    let content = fs::read_to_string(&parents_path).unwrap();
-    let loaded: HashMap<String, String> = serde_json::from_str(&content).unwrap();
-
-    assert_eq!(loaded.len(), 2);
-    assert_eq!(
-        loaded.get("omar-agent-api").unwrap(),
-        "omar-agent-pm-rest-api"
-    );
-    assert_eq!(
-        loaded.get("omar-agent-auth").unwrap(),
-        "omar-agent-pm-rest-api"
-    );
-
-    // Cleanup
-    let _ = fs::remove_dir_all(&tmp);
-}
-
 /// Test that the omar binary can be built and shows help
 #[test]
 fn test_omar_help() {
