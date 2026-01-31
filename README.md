@@ -8,13 +8,15 @@ A TUI dashboard for managing multiple AI coding agents based on `tmux`.
 
 ## Features
 
-- Real-time monitoring of agent sessions
-- Health status tracking (Running, Idle)
-- Quick attach/detach via tmux popups
-- Session management (spawn, list, kill)
-- Parallel agents!
+- A TUI dashboard for all your agents in one place
+- Spawn workers in parallel
+- An executive assistant that manages agents for you
+- Visualize a chain of command
+- Health status tracking
+- Easily talk to each agent via tmux popups
+- Support all the familiar `tmux` commands you love
 
-<img src="docs/img/demo.png" alt="demo" width="700" />
+<img src="docs/img/demo2.png" alt="demo"/>
 
 ## Installation
 
@@ -28,22 +30,6 @@ cargo install --path .
 
 ```bash
 omar
-```
-
-### CLI Commands
-
-```bash
-# Spawn a new agent
-omar spawn -n my-agent -c "claude"
-
-# List all agents
-omar list
-
-# Kill an agent
-omar kill my-agent
-
-# Start or attach to the manager agent
-omar manager
 ```
 
 ### Keyboard Shortcuts
