@@ -67,7 +67,7 @@ mod tests {
     fn test_disabled_provider_passthrough() {
         let config = SandboxConfig::default();
         let provider = create_provider(&config);
-        let cmd = "claude --dangerously-skip-permissions";
+        let cmd = "some-agent --flag";
         assert_eq!(provider.wrap_command("test", cmd, None), cmd);
     }
 

@@ -36,7 +36,7 @@ mod tests {
     #[test]
     fn test_noop_returns_command_unchanged() {
         let provider = NoopProvider;
-        let cmd = "claude --dangerously-skip-permissions";
+        let cmd = "some-agent --flag";
         assert_eq!(provider.wrap_command("test", cmd, None), cmd);
     }
 

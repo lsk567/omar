@@ -187,8 +187,7 @@ mod tests {
     #[test]
     fn test_wrap_command_basic() {
         let provider = DockerProvider::new(test_config());
-        let cmd =
-            provider.wrap_command("test-agent", "claude --dangerously-skip-permissions", None);
+        let cmd = provider.wrap_command("test-agent", "some-agent --flag", None);
 
         assert!(cmd.starts_with("docker run"));
         assert!(cmd.contains("--rm"));
@@ -202,17 +201,14 @@ mod tests {
         assert!(cmd.contains("--cpus 2"));
         assert!(cmd.contains("--pids-limit 256"));
         assert!(cmd.contains("ubuntu:22.04"));
-        assert!(cmd.contains("sh -c 'claude --dangerously-skip-permissions'"));
+        assert!(cmd.contains("sh -c 'some-agent --flag'"));
     }
 
     #[test]
     fn test_wrap_command_with_workdir() {
         let provider = DockerProvider::new(test_config());
-        let cmd = provider.wrap_command(
-            "worker-1",
-            "claude --dangerously-skip-permissions",
-            Some("/home/user/project"),
-        );
+        let cmd =
+            provider.wrap_command("worker-1", "some-agent --flag", Some("/home/user/project"));
 
         assert!(cmd.contains("-v /home/user/project:/workspace:rw"));
         assert!(cmd.contains("-w /workspace"));
