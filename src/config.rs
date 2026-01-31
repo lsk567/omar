@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::sandbox::SandboxConfig;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -17,6 +19,9 @@ pub struct Config {
 
     #[serde(default)]
     pub api: ApiConfig,
+
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,5 +283,43 @@ default_command = "aider --yes"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.agent.default_command, "aider --yes");
+    }
+
+    #[test]
+    fn test_sandbox_defaults_when_absent() {
+        let toml = r#"
+[dashboard]
+refresh_interval = 1
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.sandbox.enabled);
+        assert_eq!(config.sandbox.image, "ubuntu:22.04");
+        assert_eq!(config.sandbox.network, "bridge");
+    }
+
+    #[test]
+    fn test_sandbox_config_parsing() {
+        let toml = r#"
+[sandbox]
+enabled = true
+image = "node:20"
+network = "none"
+
+[sandbox.limits]
+memory = "8g"
+cpus = 4.0
+pids_limit = 512
+
+[sandbox.filesystem]
+workspace_access = "ro"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.sandbox.enabled);
+        assert_eq!(config.sandbox.image, "node:20");
+        assert_eq!(config.sandbox.network, "none");
+        assert_eq!(config.sandbox.limits.memory, "8g");
+        assert_eq!(config.sandbox.limits.cpus, 4.0);
+        assert_eq!(config.sandbox.limits.pids_limit, 512);
+        assert_eq!(config.sandbox.filesystem.workspace_access, "ro");
     }
 }

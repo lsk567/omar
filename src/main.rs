@@ -5,6 +5,7 @@ mod event;
 mod manager;
 mod memory;
 mod projects;
+mod sandbox;
 mod tmux;
 mod ui;
 

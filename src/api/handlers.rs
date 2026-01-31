@@ -154,10 +154,19 @@ pub async fn spawn_agent(
         .command
         .unwrap_or_else(|| app.default_command().to_string());
 
-    // Spawn the agent with the base command (no task appended)
+    // Sandbox workers (non-PMs) when sandbox is enabled
+    let is_pm = req.role.as_deref() == Some("project-manager");
+    let final_command = if !is_pm && app.sandbox().is_enabled() {
+        app.sandbox()
+            .wrap_command(&name, &base_command, Some(&workdir))
+    } else {
+        base_command.clone()
+    };
+
+    // Spawn the agent with the (possibly sandboxed) command
     if let Err(e) = app
         .client()
-        .new_session(&name, &base_command, Some(&workdir))
+        .new_session(&name, &final_command, Some(&workdir))
     {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -168,7 +177,6 @@ pub async fn spawn_agent(
     }
 
     // Save parent mapping: explicit parent, or auto-infer from running PMs
-    let is_pm = req.role.as_deref() == Some("project-manager");
     if let Some(ref parent) = req.parent {
         let resolved_parent = resolve_session_name(&prefix, parent);
         memory::save_agent_parent(&name, &resolved_parent);
@@ -272,6 +280,9 @@ pub async fn kill_agent(
             }),
         ));
     }
+
+    // Clean up sandbox container (if any)
+    let _ = app.sandbox().cleanup(&session_name);
 
     // Clean up parent mapping for the killed agent
     memory::remove_agent_parent(&session_name);
