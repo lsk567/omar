@@ -273,6 +273,9 @@ pub async fn kill_agent(
         ));
     }
 
+    // Clean up parent mapping for the killed agent
+    memory::remove_agent_parent(&session_name);
+
     Ok(Json(StatusResponse {
         status: "killed".to_string(),
         message: Some(format!("Agent '{}' killed", id)),

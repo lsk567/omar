@@ -109,10 +109,11 @@ pub fn write_memory(agents: &[AgentInfo], manager: Option<&AgentInfo>, client: &
     worker_tasks.retain(|k, _| active_sessions.contains(k));
     write_worker_tasks(&worker_tasks);
 
-    // Clean up stale entries from agent_parents
-    let mut agent_parents = load_agent_parents();
-    agent_parents.retain(|k, _| active_sessions.contains(k));
-    write_agent_parents(&agent_parents);
+    // Note: agent_parents cleanup is intentionally NOT done here.
+    // write_memory() can be called with a stale agents list (e.g., from
+    // add_project/complete_project) which would incorrectly delete parent
+    // entries for recently API-spawned workers. Parent entries are cleaned
+    // up explicitly via remove_agent_parent() when agents are killed.
 
     let mut out = String::from("# OMAR State\n\n");
 
