@@ -44,6 +44,14 @@ pub struct CommandTreeNode {
     pub ancestor_is_last: Vec<bool>,
 }
 
+/// A group of agents: a PM and its workers, or unassigned workers
+pub struct AgentGroup<'a> {
+    /// The PM agent, if any (None for unassigned group)
+    pub pm: Option<&'a AgentInfo>,
+    /// Workers under this PM (or unassigned)
+    pub workers: Vec<&'a AgentInfo>,
+}
+
 /// Application state
 pub struct App {
     pub agents: Vec<AgentInfo>,
@@ -60,6 +68,7 @@ pub struct App {
     pub projects: Vec<Project>,
     pub project_input_mode: bool,
     pub project_input: String,
+    agent_parents: HashMap<String, String>,
     client: TmuxClient,
     health_checker: HealthChecker,
     default_command: String,
@@ -87,6 +96,7 @@ impl App {
             projects: projects::load_projects(),
             project_input_mode: false,
             project_input: String::new(),
+            agent_parents: HashMap::new(),
             client,
             health_checker,
             default_command: config.agent.default_command.clone(),
@@ -182,12 +192,12 @@ impl App {
             self.selected = self.agents.len() - 1;
         }
 
-        // Build the chain-of-command tree
-        let agent_parents = memory::load_agent_parents();
+        // Load parent mappings and build the chain-of-command tree
+        self.agent_parents = memory::load_agent_parents();
         self.command_tree = build_tree(
             &self.agents,
             self.manager.as_ref(),
-            &agent_parents,
+            &self.agent_parents,
             &self.session_prefix,
         );
 
@@ -252,6 +262,63 @@ impl App {
     /// Get manager info (for API)
     pub fn manager(&self) -> Option<&AgentInfo> {
         self.manager.as_ref()
+    }
+
+    /// Group agents into PM → worker hierarchies for grid display
+    pub fn agent_groups(&self) -> Vec<AgentGroup<'_>> {
+        let prefix = &self.session_prefix;
+
+        let mut pms: Vec<&AgentInfo> = Vec::new();
+        let mut non_pms: Vec<&AgentInfo> = Vec::new();
+        for agent in &self.agents {
+            let short = agent
+                .session
+                .name
+                .strip_prefix(prefix)
+                .unwrap_or(&agent.session.name);
+            if short.starts_with("pm-") {
+                pms.push(agent);
+            } else {
+                non_pms.push(agent);
+            }
+        }
+
+        let mut pm_children: HashMap<String, Vec<&AgentInfo>> = HashMap::new();
+        let mut orphans: Vec<&AgentInfo> = Vec::new();
+
+        for agent in non_pms {
+            if let Some(parent_session) = self.agent_parents.get(&agent.session.name) {
+                if pms.iter().any(|pm| pm.session.name == *parent_session) {
+                    pm_children
+                        .entry(parent_session.clone())
+                        .or_default()
+                        .push(agent);
+                } else {
+                    orphans.push(agent);
+                }
+            } else {
+                orphans.push(agent);
+            }
+        }
+
+        let mut groups = Vec::new();
+
+        for pm in &pms {
+            let workers = pm_children.remove(&pm.session.name).unwrap_or_default();
+            groups.push(AgentGroup {
+                pm: Some(pm),
+                workers,
+            });
+        }
+
+        if !orphans.is_empty() {
+            groups.push(AgentGroup {
+                pm: None,
+                workers: orphans,
+            });
+        }
+
+        groups
     }
 
     /// Get default command
@@ -338,6 +405,7 @@ impl App {
 
             let name = agent.session.name.clone();
             self.client.kill_session(&name)?;
+            memory::remove_agent_parent(&name);
             self.status_message = Some(format!("Killed agent: {}", name));
             self.refresh()?;
             memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);

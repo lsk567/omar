@@ -83,6 +83,13 @@ fn write_agent_parents(parents: &HashMap<String, String>) {
     }
 }
 
+/// Remove a child→parent mapping
+pub fn remove_agent_parent(child: &str) {
+    let mut parents = load_agent_parents();
+    parents.remove(child);
+    write_agent_parents(&parents);
+}
+
 /// Load the memory file contents (empty string if missing)
 pub fn load_memory() -> String {
     let path = memory_path();
