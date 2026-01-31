@@ -31,6 +31,7 @@ curl -X POST http://localhost:9876/api/agents \
 
 **IMPORTANT:** Always include `"parent": "<YOUR NAME>"` (the name from YOUR NAME above) when spawning workers so the dashboard can show the chain of command.
 
+
 ### List all agents
 ```bash
 curl http://localhost:9876/api/agents
