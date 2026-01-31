@@ -198,6 +198,9 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
 
         // Render workers in 2-column sub-grid below their PM
         if !group.workers.is_empty() {
+            // Indent workers under a PM to show hierarchy
+            let indent = if group.pm.is_some() { 3 } else { 0 };
+
             let cols = 2.min(group.workers.len()).max(1);
             for (i, worker) in group.workers.iter().enumerate() {
                 let sub_row = i / cols;
@@ -208,6 +211,17 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
                     break;
                 }
 
+                // Apply left indent for workers under a PM
+                let worker_area = if indent > 0 {
+                    let indented = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Length(indent), Constraint::Min(0)])
+                        .split(row_chunks[current_row]);
+                    indented[1]
+                } else {
+                    row_chunks[current_row]
+                };
+
                 let col_constraints: Vec<Constraint> = (0..cols)
                     .map(|_| Constraint::Ratio(1, cols as u32))
                     .collect();
@@ -215,7 +229,7 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
                 let col_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints(col_constraints)
-                    .split(row_chunks[current_row]);
+                    .split(worker_area);
 
                 if sub_col < col_chunks.len() {
                     let is_selected = app
