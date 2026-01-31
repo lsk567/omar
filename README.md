@@ -68,6 +68,7 @@ Enable it in `~/.config/omar/config.toml`:
 [sandbox]
 enabled = true
 image = "ubuntu:22.04"
+network = "bridge"        # "bridge" (default), "none", or "host"
 
 [sandbox.limits]
 memory = "4g"
@@ -76,14 +77,16 @@ pids_limit = 256
 
 [sandbox.filesystem]
 workspace_access = "rw"
+bind_mounts = []          # extra host paths, e.g. ["/opt/tools:/opt/tools:ro"]
 ```
 
 When enabled, worker agents run with:
-- No network access (`--network none`)
 - Dropped capabilities (`--cap-drop ALL`, `--security-opt no-new-privileges`)
 - Read-only root filesystem with writable `/tmp`
 - Configurable memory, CPU, and PID limits
 - Workspace mounted at `/workspace`
+- Agent binary and config auto-detected and mounted read-only
+- Configurable network mode (default `bridge`; set `none` to block all network)
 
 EA and PM agents are **not** sandboxed (they orchestrate via the API and don't touch untrusted code).
 

@@ -14,6 +14,13 @@ pub struct SandboxConfig {
     #[serde(default = "default_image")]
     pub image: String,
 
+    /// Docker network mode for sandboxed containers.
+    /// "none" = no network (strictest, but agent can't call LLM API);
+    /// "bridge" = default Docker network (allows outbound connections);
+    /// "host" = share host network namespace.
+    #[serde(default = "default_network")]
+    pub network: String,
+
     /// Resource limits for sandboxed containers
     #[serde(default)]
     pub limits: ResourceLimits,
@@ -45,10 +52,20 @@ pub struct FilesystemPolicy {
     /// Workspace mount mode: "rw" (read-write) or "ro" (read-only)
     #[serde(default = "default_workspace_access")]
     pub workspace_access: String,
+
+    /// Additional host paths to bind-mount into the container.
+    /// Format: "host_path:container_path:mode" (e.g. "/opt/tools:/opt/tools:ro")
+    /// or just "path" to mount at the same path read-only.
+    #[serde(default)]
+    pub bind_mounts: Vec<String>,
 }
 
 fn default_image() -> String {
     "ubuntu:22.04".to_string()
+}
+
+fn default_network() -> String {
+    "bridge".to_string()
 }
 
 fn default_memory() -> String {
@@ -72,6 +89,7 @@ impl Default for SandboxConfig {
         Self {
             enabled: false,
             image: default_image(),
+            network: default_network(),
             limits: ResourceLimits::default(),
             filesystem: FilesystemPolicy::default(),
         }
@@ -92,6 +110,7 @@ impl Default for FilesystemPolicy {
     fn default() -> Self {
         Self {
             workspace_access: default_workspace_access(),
+            bind_mounts: Vec::new(),
         }
     }
 }
@@ -105,10 +124,12 @@ mod tests {
         let config = SandboxConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.image, "ubuntu:22.04");
+        assert_eq!(config.network, "bridge");
         assert_eq!(config.limits.memory, "4g");
         assert_eq!(config.limits.cpus, 2.0);
         assert_eq!(config.limits.pids_limit, 256);
         assert_eq!(config.filesystem.workspace_access, "rw");
+        assert!(config.filesystem.bind_mounts.is_empty());
     }
 
     #[test]
@@ -125,6 +146,7 @@ mod tests {
         let toml = r#"
 enabled = true
 image = "node:20"
+network = "none"
 
 [limits]
 memory = "8g"
@@ -133,14 +155,20 @@ pids_limit = 512
 
 [filesystem]
 workspace_access = "ro"
+bind_mounts = ["/opt/tools:/opt/tools:ro"]
 "#;
         let config: SandboxConfig = toml::from_str(toml).unwrap();
         assert!(config.enabled);
         assert_eq!(config.image, "node:20");
+        assert_eq!(config.network, "none");
         assert_eq!(config.limits.memory, "8g");
         assert_eq!(config.limits.cpus, 4.0);
         assert_eq!(config.limits.pids_limit, 512);
         assert_eq!(config.filesystem.workspace_access, "ro");
+        assert_eq!(
+            config.filesystem.bind_mounts,
+            vec!["/opt/tools:/opt/tools:ro"]
+        );
     }
 
     #[test]

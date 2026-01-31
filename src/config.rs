@@ -294,6 +294,7 @@ refresh_interval = 1
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.sandbox.enabled);
         assert_eq!(config.sandbox.image, "ubuntu:22.04");
+        assert_eq!(config.sandbox.network, "bridge");
     }
 
     #[test]
@@ -302,6 +303,7 @@ refresh_interval = 1
 [sandbox]
 enabled = true
 image = "node:20"
+network = "none"
 
 [sandbox.limits]
 memory = "8g"
@@ -314,6 +316,7 @@ workspace_access = "ro"
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.sandbox.enabled);
         assert_eq!(config.sandbox.image, "node:20");
+        assert_eq!(config.sandbox.network, "none");
         assert_eq!(config.sandbox.limits.memory, "8g");
         assert_eq!(config.sandbox.limits.cpus, 4.0);
         assert_eq!(config.sandbox.limits.pids_limit, 512);
