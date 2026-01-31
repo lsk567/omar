@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::manager::MANAGER_SESSION;
 use crate::memory;
 use crate::projects::{self, Project};
+use crate::sandbox::{self, SandboxProvider};
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -71,6 +72,7 @@ pub struct App {
     agent_parents: HashMap<String, String>,
     client: TmuxClient,
     health_checker: HealthChecker,
+    sandbox: Box<dyn SandboxProvider>,
     default_command: String,
     default_workdir: String,
     session_prefix: String,
@@ -80,6 +82,7 @@ impl App {
     pub fn new(config: &Config) -> Self {
         let client = TmuxClient::new(&config.dashboard.session_prefix);
         let health_checker = HealthChecker::new(client.clone(), config.health.idle_warning);
+        let sandbox_provider = sandbox::create_provider(&config.sandbox);
 
         Self {
             agents: Vec::new(),
@@ -99,6 +102,7 @@ impl App {
             agent_parents: HashMap::new(),
             client,
             health_checker,
+            sandbox: sandbox_provider,
             default_command: config.agent.default_command.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             session_prefix: config.dashboard.session_prefix.clone(),
@@ -107,6 +111,10 @@ impl App {
 
     pub fn client(&self) -> &TmuxClient {
         &self.client
+    }
+
+    pub fn sandbox(&self) -> &dyn SandboxProvider {
+        &*self.sandbox
     }
 
     /// Refresh the list of agents
@@ -353,6 +361,7 @@ impl App {
 
             let name = agent.session.name.clone();
             self.client.kill_session(&name)?;
+            let _ = self.sandbox.cleanup(&name);
             memory::remove_agent_parent(&name);
             self.status_message = Some(format!("Killed agent: {}", name));
             self.refresh()?;
@@ -400,8 +409,16 @@ impl App {
             self.default_workdir.clone()
         };
 
-        self.client
-            .new_session(&name, &self.default_command, Some(&workdir))?;
+        // Workers spawned from the dashboard are sandboxed when enabled.
+        // The sandbox wraps the command in `docker run ...`.
+        let command = if self.sandbox.is_enabled() {
+            self.sandbox
+                .wrap_command(&name, &self.default_command, Some(&workdir))
+        } else {
+            self.default_command.clone()
+        };
+
+        self.client.new_session(&name, &command, Some(&workdir))?;
 
         let short_name = name.strip_prefix(&self.session_prefix).unwrap_or(&name);
         self.status_message = Some(format!("Spawned agent: {}", short_name));

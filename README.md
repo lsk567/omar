@@ -58,11 +58,41 @@ Omar auto-detects which agent backend is available on your system:
 
 If both are installed, `claude` takes priority. Override with the `default_command` config option.
 
+## Sandbox Mode (Docker)
+
+Omar can optionally run worker agents inside Docker containers to isolate them from the host system. This protects against prompt-injection attacks where a malicious repository tricks the LLM into executing harmful commands.
+
+Enable it in `~/.config/omar/config.toml`:
+
+```toml
+[sandbox]
+enabled = true
+image = "ubuntu:22.04"
+
+[sandbox.limits]
+memory = "4g"
+cpus = 2.0
+pids_limit = 256
+
+[sandbox.filesystem]
+workspace_access = "rw"
+```
+
+When enabled, worker agents run with:
+- No network access (`--network none`)
+- Dropped capabilities (`--cap-drop ALL`, `--security-opt no-new-privileges`)
+- Read-only root filesystem with writable `/tmp`
+- Configurable memory, CPU, and PID limits
+- Workspace mounted at `/workspace`
+
+EA and PM agents are **not** sandboxed (they orchestrate via the API and don't touch untrusted code).
+
 ## Requirements
 
 - tmux 3.0+
 - Rust 1.70+
 - At least one agent backend (claude, opencode, or custom)
+- Docker (optional, for sandbox mode)
 
 ## License
 
