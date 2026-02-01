@@ -36,6 +36,12 @@ Be a one-man army with non-stop agents tackling the biggest problems.
 
 <img src="docs/img/demo2.png" alt="demo"/>
 
+## Requirements
+
+- tmux 3.0+
+- Rust 1.70+
+- At least one agent backend (claude, opencode, or custom)
+
 ## Installation
 
 ```bash
@@ -107,13 +113,6 @@ When enabled, worker agents run with:
 - Configurable network mode (default `bridge`; set `none` to block all network)
 
 EA and PM agents are **not** sandboxed (they orchestrate via the API and don't touch untrusted code).
-
-## Requirements
-
-- tmux 3.0+
-- Rust 1.70+
-- At least one agent backend (claude, opencode, or custom)
-- Docker (optional, for sandbox mode)
 
 ## License
 
