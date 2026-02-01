@@ -336,15 +336,15 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.enter_interactive();
                         }
                         KeyCode::Enter => {
-                            if std::env::var("TMUX").is_ok() {
-                                // Inside tmux: use display-popup overlay (stays on top of dashboard)
-                                if let Err(e) = app.attach_selected() {
+                            if app.has_popup() {
+                                // Popup already active, ignore Enter
+                            } else if std::env::var("TMUX").is_ok() {
+                                // Inside tmux: spawn non-blocking popup overlay
+                                if let Err(e) = app.start_popup_selected() {
                                     app.set_status(format!("Error: {}", e));
                                 }
-                                // Force redraw after popup closes
-                                terminal.clear()?;
                             } else {
-                                // Outside tmux: temporarily exit alternate screen
+                                // Outside tmux: temporarily exit alternate screen (blocking)
                                 disable_raw_mode()?;
                                 execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
@@ -396,6 +396,11 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     // Terminal will handle resize automatically
                 }
             }
+        }
+
+        // Check if a non-blocking popup has exited
+        if app.check_popup() {
+            terminal.clear()?;
         }
 
         if app.should_quit {
