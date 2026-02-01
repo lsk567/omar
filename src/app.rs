@@ -366,6 +366,8 @@ impl App {
                 }
                 Ok(None) => false,   // still running
                 Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
                     self.popup_child = None;
                     true
                 }
@@ -378,6 +380,14 @@ impl App {
     /// Whether a popup is currently active
     pub fn has_popup(&self) -> bool {
         self.popup_child.is_some()
+    }
+
+    /// Kill and reap any active popup child process
+    pub fn cleanup_popup_child(&mut self) {
+        if let Some(mut child) = self.popup_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     /// Kill the selected agent

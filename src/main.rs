@@ -408,6 +408,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
         }
     }
 
+    // Kill any active popup child process
+    app.cleanup_popup_child();
+
     // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
