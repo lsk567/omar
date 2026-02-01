@@ -22,8 +22,6 @@ Be a one-man army with non-stop agents tackling the biggest problems.
 
 </div>
 
-
-
 ## Features
 
 - A TUI dashboard for all your agents in one place
@@ -35,6 +33,12 @@ Be a one-man army with non-stop agents tackling the biggest problems.
 - Support all the familiar `tmux` commands you love
 
 <img src="docs/img/demo2.png" alt="demo"/>
+
+## Requirements
+
+- tmux 3.0+
+- Rust 1.70+
+- At least one agent backend (claude, opencode, or custom)
 
 ## Installation
 
@@ -75,12 +79,6 @@ Omar auto-detects which agent backend is available on your system:
 | Custom | Any command | Via config |
 
 If both are installed, `claude` takes priority. Override with the `default_command` config option.
-
-## Requirements
-
-- tmux 3.0+
-- Rust 1.70+
-- At least one agent backend (claude, opencode, or custom)
 
 ## License
 
