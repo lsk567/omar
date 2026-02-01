@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::process::Child;
 use std::thread;
 use std::time::Duration;
 
@@ -69,6 +70,7 @@ pub struct App {
     pub projects: Vec<Project>,
     pub project_input_mode: bool,
     pub project_input: String,
+    popup_child: Option<Child>,
     agent_parents: HashMap<String, String>,
     client: TmuxClient,
     health_checker: HealthChecker,
@@ -99,6 +101,7 @@ impl App {
             projects: projects::load_projects(),
             project_input_mode: false,
             project_input: String::new(),
+            popup_child: None,
             agent_parents: HashMap::new(),
             client,
             health_checker,
@@ -342,13 +345,49 @@ impl App {
         Ok(())
     }
 
-    /// Open the selected agent in a new tmux window
+    /// Spawn a non-blocking popup for the selected agent
     pub fn start_popup_selected(&mut self) -> Result<()> {
         if let Some(agent) = self.selected_agent() {
-            self.client
-                .open_in_new_window(&agent.session.name, &agent.session.name)?;
+            let child = self
+                .client
+                .spawn_popup(&agent.session.name, "80%", "80%")?;
+            self.popup_child = Some(child);
         }
         Ok(())
+    }
+
+    /// Check if a popup child has exited. Returns true if a popup just closed.
+    pub fn check_popup(&mut self) -> bool {
+        if let Some(ref mut child) = self.popup_child {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.popup_child = None;
+                    true
+                }
+                Ok(None) => false,   // still running
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    self.popup_child = None;
+                    true
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Whether a popup is currently active
+    pub fn has_popup(&self) -> bool {
+        self.popup_child.is_some()
+    }
+
+    /// Kill and reap any active popup child process
+    pub fn cleanup_popup_child(&mut self) {
+        if let Some(mut child) = self.popup_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     /// Kill the selected agent

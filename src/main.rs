@@ -336,8 +336,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.enter_interactive();
                         }
                         KeyCode::Enter => {
-                            if std::env::var("TMUX").is_ok() {
-                                // Inside tmux: open agent in a new tmux window
+                            if app.has_popup() {
+                                // Popup already active, ignore Enter
+                            } else if std::env::var("TMUX").is_ok() {
+                                // Inside tmux: spawn non-blocking popup overlay
                                 if let Err(e) = app.start_popup_selected() {
                                     app.set_status(format!("Error: {}", e));
                                 }
@@ -396,10 +398,18 @@ async fn run_dashboard(config: Config) -> Result<()> {
             }
         }
 
+        // Check if a non-blocking popup has exited
+        if app.check_popup() {
+            terminal.clear()?;
+        }
+
         if app.should_quit {
             break;
         }
     }
+
+    // Kill any active popup child process
+    app.cleanup_popup_child();
 
     // Restore terminal
     disable_raw_mode()?;
