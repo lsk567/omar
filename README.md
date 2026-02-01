@@ -1,10 +1,28 @@
-# One-Man Army
+<div align="center">
+
+# one-man army
+
+<img src="docs/img/thermopylae.png" alt="thermopylae" width="450" />
 
 Be a one-man army with non-stop agents tackling the biggest problems.
 
-A TUI dashboard for managing multiple AI coding agents based on `tmux`.
+**`omar` is a TUI dashboard for managing AI agents based on `tmux`.**
 
-<img src="docs/img/thermopylae.png" alt="thermopylae" width="450" />
+<p>
+  <a href="https://opensource.org/licenses/BSD-2-Clause">
+    <img src="https://img.shields.io/badge/License-BSD_2--Clause-blue.svg" alt="License"/>
+  </a>
+  <a href="https://github.com/lsk567/omar/actions/workflows/ci.yml">
+    <img src="https://github.com/lsk567/omar/actions/workflows/ci.yml/badge.svg" alt="CI Status"/>
+  </a>
+  <a href="https://discord.gg/X76PSzmfWr">
+    <img src="https://img.shields.io/discord/1467663881588572182?label=Discord&logo=discord&logoColor=white&color=5865F2&cacheSeconds=60" alt="Discord"/>
+  </a>
+</p>
+
+</div>
+
+
 
 ## Features
 
