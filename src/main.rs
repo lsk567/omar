@@ -337,14 +337,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         KeyCode::Enter => {
                             if std::env::var("TMUX").is_ok() {
-                                // Inside tmux: use display-popup overlay (stays on top of dashboard)
-                                if let Err(e) = app.attach_selected() {
+                                // Inside tmux: open agent in a new tmux window
+                                if let Err(e) = app.start_popup_selected() {
                                     app.set_status(format!("Error: {}", e));
                                 }
-                                // Force redraw after popup closes
-                                terminal.clear()?;
                             } else {
-                                // Outside tmux: temporarily exit alternate screen
+                                // Outside tmux: temporarily exit alternate screen (blocking)
                                 disable_raw_mode()?;
                                 execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 

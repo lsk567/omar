@@ -172,7 +172,7 @@ impl TmuxClient {
         Ok(())
     }
 
-    /// Open a popup attached to a session
+    /// Open a popup attached to a session (blocks until dismissed)
     pub fn attach_popup(&self, session: &str, width: &str, height: &str) -> Result<()> {
         Command::new("tmux")
             .args([
@@ -186,6 +186,34 @@ impl TmuxClient {
             ])
             .status()
             .context("Failed to open tmux popup")?;
+        Ok(())
+    }
+
+    /// Open a popup attached to a session (non-blocking, returns child process)
+    pub fn spawn_popup(
+        &self,
+        session: &str,
+        width: &str,
+        height: &str,
+    ) -> Result<std::process::Child> {
+        Command::new("tmux")
+            .args([
+                "display-popup",
+                "-E",
+                "-w",
+                width,
+                "-h",
+                height,
+                &format!("tmux attach -t {}", session),
+            ])
+            .spawn()
+            .context("Failed to open tmux popup")
+    }
+
+    /// Open a session in a new tmux window (non-blocking, no child process)
+    pub fn open_in_new_window(&self, name: &str, session: &str) -> Result<()> {
+        let shell_cmd = format!("TMUX='' tmux attach-session -t {}", session);
+        self.run(&["new-window", "-n", name, &shell_cmd])?;
         Ok(())
     }
 

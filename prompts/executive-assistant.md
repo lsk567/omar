@@ -100,6 +100,15 @@ Look for:
 - `[PROJECT COMPLETE]` — PM finished all work. Kill it and complete the project.
 - If the PM appears stuck or idle for too long, send it a nudge via the send endpoint.
 
+### Detecting Agent Activity State
+
+When you check an agent's output via `curl http://localhost:9876/api/agents/<name>`, look at the status line **after the last `❯` prompt symbol** to determine whether the agent is working or idle:
+
+- **Agent is actively working:** You will see an activity indicator phrase after the `❯` prompt, such as "Deliberating…", "Sautéing…", "Fiddle-faddling…", "Evaporating…", "Sublimating…", "Unravelling…", "Brewed for…", etc. These are processing indicators — the agent is busy. **Wait for it to finish** before sending input.
+- **Agent is idle:** You will see only a bare `❯` prompt with no activity indicator below it. This means the agent has finished its current work and is **waiting for input** — you should send it a message or take action.
+
+This distinction is important: sending input to an agent that is mid-operation can interrupt its work. Always confirm the agent is idle (bare `❯` with no status phrase) before sending follow-up messages or nudges.
+
 ## When a PM Finishes
 
 CRITICAL — you MUST execute ALL three steps every time. Never skip the project deletion.

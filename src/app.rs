@@ -333,11 +333,20 @@ impl App {
         }
     }
 
-    /// Attach to the selected agent via popup
+    /// Attach to the selected agent via popup (blocking)
     pub fn attach_selected(&self) -> Result<()> {
         if let Some(agent) = self.selected_agent() {
             self.client
                 .attach_popup(&agent.session.name, "80%", "80%")?;
+        }
+        Ok(())
+    }
+
+    /// Open the selected agent in a new tmux window
+    pub fn start_popup_selected(&mut self) -> Result<()> {
+        if let Some(agent) = self.selected_agent() {
+            self.client
+                .open_in_new_window(&agent.session.name, &agent.session.name)?;
         }
         Ok(())
     }
