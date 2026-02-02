@@ -82,7 +82,7 @@ If both are installed, `claude` takes priority. Override with the `default_comma
 
 ## License
 
-MIT
+BSD 2-Clause
 
 ## Star History
 
