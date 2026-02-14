@@ -62,4 +62,11 @@ impl EventHandler {
     pub async fn next(&mut self) -> Option<AppEvent> {
         self.rx.recv().await
     }
+
+    /// Drain all buffered events, discarding them.
+    /// Call after a blocking operation (e.g. tmux popup) to skip
+    /// stale ticks and only process fresh events going forward.
+    pub fn drain(&mut self) {
+        while self.rx.try_recv().is_ok() {}
+    }
 }
