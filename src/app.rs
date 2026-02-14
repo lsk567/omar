@@ -329,7 +329,7 @@ impl App {
     pub fn attach_selected(&self) -> Result<()> {
         if let Some(agent) = self.selected_agent() {
             self.client
-                .attach_popup(&agent.session.name, "80%", "80%")?;
+                .attach_popup(&agent.session.name, "90%", "90%")?;
         }
         Ok(())
     }

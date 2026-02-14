@@ -340,6 +340,8 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 if let Err(e) = app.attach_selected() {
                                     app.set_status(format!("Error: {}", e));
                                 }
+                                // Discard ticks that accumulated while popup was open
+                                events.drain();
                                 // Force redraw after popup closes
                                 terminal.clear()?;
                             } else {
@@ -352,6 +354,8 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 // Restore terminal
                                 execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                                 enable_raw_mode()?;
+                                // Discard ticks that accumulated while popup was open
+                                events.drain();
                                 terminal.clear()?;
 
                                 if let Err(e) = result {
