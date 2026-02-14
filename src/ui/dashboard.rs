@@ -406,7 +406,7 @@ fn render_agent_card(
     } else if selected {
         Color::Magenta
     } else {
-        health_color
+        Color::Gray
     };
 
     let border_style = Style::default()
@@ -429,17 +429,34 @@ fn render_agent_card(
         short_name.to_string()
     };
 
-    // Title with status indicator
-    let title = if interactive {
-        format!(" {} [INTERACTIVE - Esc] ", display)
+    // Title with status indicator — dot icon and name use health_color,
+    // surrounding decoration uses border_color.
+    let title_line = if interactive {
+        Line::from(vec![
+            Span::styled(" ", Style::default().fg(border_color)),
+            Span::styled(&display, Style::default().fg(health_color)),
+            Span::styled(" [INTERACTIVE - Esc] ", Style::default().fg(border_color)),
+        ])
     } else if selected {
-        format!(" [{}] {} - Enter to open ", status_icon, display)
+        Line::from(vec![
+            Span::styled(" [", Style::default().fg(border_color)),
+            Span::styled(status_icon, Style::default().fg(health_color)),
+            Span::styled("] ", Style::default().fg(border_color)),
+            Span::styled(&display, Style::default().fg(health_color)),
+            Span::styled(" - Enter to open ", Style::default().fg(border_color)),
+        ])
     } else {
-        format!(" {} {} ", status_icon, display)
+        Line::from(vec![
+            Span::styled(" ", Style::default().fg(border_color)),
+            Span::styled(status_icon, Style::default().fg(health_color)),
+            Span::styled(" ", Style::default().fg(border_color)),
+            Span::styled(&display, Style::default().fg(health_color)),
+            Span::styled(" ", Style::default().fg(border_color)),
+        ])
     };
 
     let block = Block::default()
-        .title(title)
+        .title(title_line)
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
         .border_style(border_style);
