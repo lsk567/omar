@@ -62,6 +62,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.project_input_mode {
         render_project_input(frame, app);
     }
+
+    if app.show_events {
+        render_events_popup(frame, app);
+    }
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -524,6 +528,8 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(":Nav "),
             Span::styled("p", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":Project "),
+            Span::styled("e", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Events "),
             Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":Quit "),
             Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
@@ -544,6 +550,8 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(":Kill "),
             Span::styled("p", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":Project "),
+            Span::styled("e", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Events "),
             Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":Refresh "),
             Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
@@ -573,6 +581,7 @@ fn render_help_popup(frame: &mut Frame) {
         Line::from("  n           Spawn new agent"),
         Line::from("  d           Kill selected agent"),
         Line::from("  p           Add a project"),
+        Line::from("  e           Show scheduled events"),
         Line::from("  r           Refresh agent list"),
         Line::from("  ?           Toggle this help"),
         Line::from(""),
@@ -664,6 +673,114 @@ fn render_project_input(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
+}
+
+fn render_events_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(70, 60, frame.area());
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Scheduled Events",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    if app.scheduled_events.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No events in queue",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        // Header
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<14} {:<14} {:<24} ", "Sender", "Receiver", "Timestamp"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Payload",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(70),
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        for event in &app.scheduled_events {
+            // Format timestamp as human-readable relative time
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            let time_str = if event.timestamp <= now_ns {
+                "overdue".to_string()
+            } else {
+                let diff_ms = (event.timestamp - now_ns) / 1_000_000;
+                if diff_ms < 1000 {
+                    format!("in {}ms", diff_ms)
+                } else if diff_ms < 60_000 {
+                    format!("in {:.1}s", diff_ms as f64 / 1000.0)
+                } else if diff_ms < 3_600_000 {
+                    format!("in {:.1}m", diff_ms as f64 / 60_000.0)
+                } else {
+                    format!("in {:.1}h", diff_ms as f64 / 3_600_000.0)
+                }
+            };
+
+            // Truncate payload to fit
+            let payload = if event.payload.len() > 30 {
+                format!("{}...", &event.payload[..27])
+            } else {
+                event.payload.clone()
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<14}", truncate_str(&event.sender, 13)),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!("{:<14}", truncate_str(&event.receiver, 13)),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{:<24}", time_str),
+                    Style::default().fg(Color::White),
+                ),
+                Span::raw(payload),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press Esc or 'e' to close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .title(" Events Queue ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let paragraph = Paragraph::new(lines).block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() > max_len {
+        format!("{}…", &s[..max_len - 1])
+    } else {
+        s.to_string()
+    }
 }
 
 /// Create a centered rectangle

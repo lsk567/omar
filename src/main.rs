@@ -324,6 +324,17 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
+                    // Handle events popup
+                    if app.show_events {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('e') | KeyCode::Char('q') => {
+                                app.show_events = false;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Normal key handling
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
@@ -390,6 +401,11 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             } else {
                                 app.set_status("Refreshed");
                             }
+                        }
+                        KeyCode::Char('e') => {
+                            app.scheduled_events = scheduler.list();
+                            app.scheduled_events.sort_by_key(|e| e.timestamp);
+                            app.show_events = true;
                         }
                         KeyCode::Char('?') => {
                             app.show_help = !app.show_help;

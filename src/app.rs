@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::manager::MANAGER_SESSION;
 use crate::memory;
 use crate::projects::{self, Project};
+use crate::scheduler::ScheduledEvent;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -68,6 +69,8 @@ pub struct App {
     pub projects: Vec<Project>,
     pub project_input_mode: bool,
     pub project_input: String,
+    pub show_events: bool,
+    pub scheduled_events: Vec<ScheduledEvent>,
     agent_parents: HashMap<String, String>,
     client: TmuxClient,
     health_checker: HealthChecker,
@@ -96,6 +99,8 @@ impl App {
             projects: projects::load_projects(),
             project_input_mode: false,
             project_input: String::new(),
+            show_events: false,
+            scheduled_events: Vec::new(),
             agent_parents: HashMap::new(),
             client,
             health_checker,
