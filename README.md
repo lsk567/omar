@@ -26,13 +26,15 @@ Be a one-man army with non-stop agents tackling the biggest problems.
 
 - A TUI dashboard for all your agents in one place
 - Spawn workers in parallel
-- An executive assistant that manages agents for you
-- Visualize a chain of command
+- Visualize agents' chain of command
 - Health status tracking
-- Easily talk to each agent via tmux popups
-- Support all the familiar `tmux` commands you love
+- Support all the familiar `tmux` commands you love!
 
-<img src="docs/img/demo2.png" alt="demo"/>
+<img src="docs/img/demo3.png" alt="demo"/>
+☝️ See all your agents at once. Nagivate using arrow keys.
+
+<img src="docs/img/demo4.png" alt="demo"/>
+☝️ Talk to any agent in a pop-up window.
 
 ## Requirements
 
@@ -53,20 +55,6 @@ cargo install --path .
 ```bash
 omar
 ```
-
-### Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `q` / `Esc` | Quit |
-| `j` / `Down` | Move down |
-| `k` / `Up` | Move up |
-| `Enter` | Attach to agent |
-| `i` | Interactive mode (type directly to agent) |
-| `n` | Spawn new agent |
-| `d` | Kill agent |
-| `r` | Refresh |
-| `?` | Help |
 
 ## Supported Agent Backends
 
