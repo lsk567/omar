@@ -109,6 +109,22 @@ When you check an agent's output via `curl http://localhost:9876/api/agents/<nam
 
 This distinction is important: sending input to an agent that is mid-operation can interrupt its work. Always confirm the agent is idle (bare `❯` with no status phrase) before sending follow-up messages or nudges.
 
+### Handling Stuck PMs
+
+**Kill and replace — don't nudge repeatedly.** If a PM is stuck (idle too long, stuck in plan mode, not making progress after multiple nudges), do NOT keep nudging it. Kill it and spawn a fresh replacement PM with the same task and full context. Nudging a stuck PM wastes time — a fresh agent with the same instructions will be more effective.
+
+```bash
+# Kill the stuck PM
+curl -X DELETE http://localhost:9876/api/agents/pm-<name>
+
+# Spawn a replacement with the same task
+curl -X POST http://localhost:9876/api/agents \
+  -H "Content-Type: application/json" \
+  -d '{"name": "pm-<name>", "task": "Same task description with full context", "role": "project-manager"}'
+```
+
+**Do not over-nudge active PMs.** When monitoring PMs, do NOT send excessive nudges while a PM is actively working (has an activity indicator like a spinner or progress phrase). Only nudge when the PM is idle (bare `❯` prompt with no activity indicator) AND not making progress. Over-nudging active workers disrupts their flow.
+
 ## When a PM Finishes
 
 CRITICAL — you MUST execute ALL three steps every time. Never skip the project deletion.

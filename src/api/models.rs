@@ -102,3 +102,46 @@ pub struct ProjectResponse {
 pub struct ListProjectsResponse {
     pub projects: Vec<ProjectResponse>,
 }
+
+// ── Event Scheduler models ──
+
+/// Request to schedule a new event
+#[derive(Debug, Deserialize)]
+pub struct ScheduleEventRequest {
+    pub sender: String,
+    pub receiver: String,
+    /// Unix epoch nanoseconds, absolute
+    pub timestamp: u64,
+    pub payload: String,
+}
+
+/// Response after scheduling an event
+#[derive(Debug, Serialize)]
+pub struct ScheduleEventResponse {
+    pub id: String,
+    pub timestamp: u64,
+}
+
+/// Event info in list response
+#[derive(Debug, Serialize)]
+pub struct EventInfo {
+    pub id: String,
+    pub sender: String,
+    pub receiver: String,
+    pub timestamp: u64,
+    pub payload: String,
+    pub created_at: u64,
+}
+
+/// Response for listing events
+#[derive(Debug, Serialize)]
+pub struct EventListResponse {
+    pub events: Vec<EventInfo>,
+}
+
+/// Response after cancelling an event
+#[derive(Debug, Serialize)]
+pub struct EventCancelResponse {
+    pub status: String,
+    pub id: String,
+}

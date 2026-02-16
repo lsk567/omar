@@ -5,6 +5,7 @@ mod event;
 mod manager;
 mod memory;
 mod projects;
+mod scheduler;
 mod tmux;
 mod ui;
 
@@ -190,12 +191,19 @@ fn relaunch_in_tmux() -> Result<()> {
 }
 
 async fn run_dashboard(config: Config) -> Result<()> {
+    // Create the scheduler and spawn its event loop
+    let scheduler = Arc::new(scheduler::Scheduler::new());
+    tokio::spawn(scheduler::run_event_loop(scheduler.clone()));
+
     // Start API server if enabled
     if config.api.enabled {
         let api_config = config.api.clone();
-        let api_app = Arc::new(Mutex::new(App::new(&config)));
+        let api_state = Arc::new(api::handlers::ApiState {
+            app: Arc::new(Mutex::new(App::new(&config))),
+            scheduler: scheduler.clone(),
+        });
         tokio::spawn(async move {
-            if let Err(e) = api::start_server(api_app, &api_config).await {
+            if let Err(e) = api::start_server(api_state, &api_config).await {
                 eprintln!("API server error: {}", e);
             }
         });

@@ -1,11 +1,14 @@
 //! API endpoint handlers
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use super::models::*;
@@ -13,6 +16,13 @@ use crate::app::{SharedApp, MANAGER_SESSION_NAME};
 use crate::manager::PM_SYSTEM_PROMPT;
 use crate::memory;
 use crate::projects;
+use crate::scheduler::{event::ScheduledEvent, Scheduler};
+
+/// Shared state for all API handlers
+pub struct ApiState {
+    pub app: Arc<Mutex<SharedApp>>,
+    pub scheduler: Arc<Scheduler>,
+}
 
 /// Resolve a user-facing agent name to a full tmux session name.
 /// Accepts both short names ("auth") and full names ("omar-agent-auth").
@@ -39,9 +49,9 @@ pub async fn health() -> Json<HealthResponse> {
 
 /// GET /api/agents
 pub async fn list_agents(
-    State(app): State<Arc<Mutex<SharedApp>>>,
+    State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ListAgentsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut app = app.lock().await;
+    let mut app = state.app.lock().await;
 
     // Refresh to get latest state
     if let Err(e) = app.refresh() {
@@ -77,10 +87,10 @@ pub async fn list_agents(
 
 /// GET /api/agents/:id
 pub async fn get_agent(
-    State(app): State<Arc<Mutex<SharedApp>>>,
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<AgentDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = app.lock().await;
+    let app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
     let full_id = resolve_session_name(&prefix, &id);
@@ -118,10 +128,10 @@ pub async fn get_agent(
 
 /// POST /api/agents
 pub async fn spawn_agent(
-    State(app): State<Arc<Mutex<SharedApp>>>,
+    State(state): State<Arc<ApiState>>,
     Json(req): Json<SpawnAgentRequest>,
 ) -> Result<Json<SpawnAgentResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = app.lock().await;
+    let app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
 
@@ -235,10 +245,10 @@ pub async fn spawn_agent(
 
 /// DELETE /api/agents/:id
 pub async fn kill_agent(
-    State(app): State<Arc<Mutex<SharedApp>>>,
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = app.lock().await;
+    let app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
     let session_name = resolve_session_name(&prefix, &id);
@@ -284,11 +294,11 @@ pub async fn kill_agent(
 
 /// POST /api/agents/:id/send
 pub async fn send_input(
-    State(app): State<Arc<Mutex<SharedApp>>>,
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Json(req): Json<SendInputRequest>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = app.lock().await;
+    let app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
     let session_name = resolve_session_name(&prefix, &id);
@@ -381,5 +391,83 @@ pub async fn complete_project(
                 error: format!("Failed to remove project: {}", e),
             }),
         )),
+    }
+}
+
+// ── Event Scheduler handlers ──
+
+/// POST /api/events
+pub async fn schedule_event(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<ScheduleEventRequest>,
+) -> impl IntoResponse {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    let event = ScheduledEvent {
+        id: id.clone(),
+        sender: req.sender,
+        receiver: req.receiver,
+        timestamp: req.timestamp,
+        payload: req.payload,
+        created_at: now,
+    };
+
+    state.scheduler.insert(event);
+
+    Json(ScheduleEventResponse {
+        id,
+        timestamp: req.timestamp,
+    })
+}
+
+/// GET /api/events
+pub async fn list_events(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let events = if let Some(receiver) = params.get("receiver") {
+        state.scheduler.list_by_receiver(receiver)
+    } else {
+        state.scheduler.list()
+    };
+
+    let events: Vec<EventInfo> = events
+        .into_iter()
+        .map(|e| EventInfo {
+            id: e.id,
+            sender: e.sender,
+            receiver: e.receiver,
+            timestamp: e.timestamp,
+            payload: e.payload,
+            created_at: e.created_at,
+        })
+        .collect();
+
+    Json(EventListResponse { events })
+}
+
+/// DELETE /api/events/:id
+pub async fn cancel_event(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.scheduler.cancel(&id) {
+        Some(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!(EventCancelResponse {
+                status: "cancelled".to_string(),
+                id,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse {
+                error: format!("Event '{}' not found", id),
+            })),
+        ),
     }
 }
