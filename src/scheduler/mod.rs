@@ -63,6 +63,7 @@ impl Scheduler {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn peek_next_timestamp(&self) -> Option<u64> {
         let queue = self.queue.lock().unwrap();
         queue.peek().map(|e| e.timestamp)
@@ -101,7 +102,10 @@ fn deliver_to_tmux(receiver: &str, message: &str) {
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("[scheduler] tmux send-keys failed for {}: {}", target, stderr);
+            eprintln!(
+                "[scheduler] tmux send-keys failed for {}: {}",
+                target, stderr
+            );
         }
         Err(e) => {
             eprintln!("[scheduler] failed to run tmux for {}: {}", target, e);
@@ -202,12 +206,7 @@ pub async fn run_event_loop(scheduler: Arc<Scheduler>) {
 mod tests {
     use super::*;
 
-    fn make_event(
-        receiver: &str,
-        sender: &str,
-        timestamp: u64,
-        payload: &str,
-    ) -> ScheduledEvent {
+    fn make_event(receiver: &str, sender: &str, timestamp: u64, payload: &str) -> ScheduledEvent {
         ScheduledEvent {
             id: uuid::Uuid::new_v4().to_string(),
             sender: sender.to_string(),
@@ -274,7 +273,9 @@ mod tests {
 
         let batch = sched.pop_batch("bob", 100);
         assert_eq!(batch.len(), 2);
-        assert!(batch.iter().all(|e| e.receiver == "bob" && e.timestamp == 100));
+        assert!(batch
+            .iter()
+            .all(|e| e.receiver == "bob" && e.timestamp == 100));
 
         // Remaining: bob@200 and carol@100
         assert_eq!(sched.list().len(), 2);
