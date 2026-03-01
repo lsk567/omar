@@ -9,6 +9,8 @@ pub enum AppEvent {
     Key(KeyEvent),
     /// Time to refresh the display
     Tick,
+    /// Advance the scrolling ticker by one character
+    TickerScroll,
     /// Terminal was resized
     #[allow(dead_code)]
     Resize(u16, u16),
@@ -29,11 +31,15 @@ impl EventHandler {
         // Spawn event polling task
         tokio::spawn(async move {
             let mut tick_interval = tokio::time::interval(tick_rate);
+            let mut ticker_interval = tokio::time::interval(Duration::from_millis(150));
 
             loop {
                 let event = tokio::select! {
                     _ = tick_interval.tick() => {
                         AppEvent::Tick
+                    }
+                    _ = ticker_interval.tick() => {
+                        AppEvent::TickerScroll
                     }
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {
                         // Poll for crossterm events

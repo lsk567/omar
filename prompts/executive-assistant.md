@@ -109,6 +109,22 @@ When you check an agent's output via `curl http://localhost:9876/api/agents/<nam
 
 This distinction is important: sending input to an agent that is mid-operation can interrupt its work. Always confirm the agent is idle (bare `❯` with no status phrase) before sending follow-up messages or nudges.
 
+### Handling Stuck PMs
+
+**Kill and replace — don't nudge repeatedly.** If a PM is stuck (idle too long, stuck in plan mode, not making progress after multiple nudges), do NOT keep nudging it. Kill it and spawn a fresh replacement PM with the same task and full context. Nudging a stuck PM wastes time — a fresh agent with the same instructions will be more effective.
+
+```bash
+# Kill the stuck PM
+curl -X DELETE http://localhost:9876/api/agents/pm-<name>
+
+# Spawn a replacement with the same task
+curl -X POST http://localhost:9876/api/agents \
+  -H "Content-Type: application/json" \
+  -d '{"name": "pm-<name>", "task": "Same task description with full context", "role": "project-manager"}'
+```
+
+**Do not over-nudge active PMs.** When monitoring PMs, do NOT send excessive nudges while a PM is actively working (has an activity indicator like a spinner or progress phrase). Only nudge when the PM is idle (bare `❯` prompt with no activity indicator) AND not making progress. Over-nudging active workers disrupts their flow.
+
 ## When a PM Finishes
 
 CRITICAL — you MUST execute ALL three steps every time. Never skip the project deletion.
@@ -205,6 +221,25 @@ Then monitor `pm-rest-api` until it reports `[PROJECT COMPLETE]`. When it does:
 # Step 3: Kill PM + complete project (using the saved id)
 curl -X DELETE http://localhost:9876/api/agents/pm-rest-api
 curl -X DELETE http://localhost:9876/api/projects/1
+```
+
+## Scheduling and Wake-ups
+
+IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler that will wake you up when needed. Always wait for OMAR to send you events or instructions.
+
+If you need to schedule a future wake-up or send a delayed message to another agent, use the Events API:
+
+```bash
+# Schedule an event (timestamp is in nanoseconds since Unix epoch)
+curl -X POST http://localhost:9876/api/events \
+  -H "Content-Type: application/json" \
+  -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <nanosecond-timestamp>, "payload": "reason for wakeup"}'
+
+# List pending events
+curl http://localhost:9876/api/events
+
+# Cancel a scheduled event
+curl -X DELETE http://localhost:9876/api/events/<event-id>
 ```
 
 Now, wait for the user's request.

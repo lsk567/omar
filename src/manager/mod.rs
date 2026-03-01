@@ -12,13 +12,16 @@ use crate::tmux::TmuxClient;
 use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 
 /// Manager session name (exported for use in app.rs)
-pub const MANAGER_SESSION: &str = "omar-ea";
+pub const MANAGER_SESSION: &str = "omar-agent-ea";
 
 /// EA system prompt, loaded from prompts/executive-assistant.md at compile time
 pub const MANAGER_SYSTEM_PROMPT: &str = include_str!("../../prompts/executive-assistant.md");
 
 /// Project Manager system prompt, loaded from prompts/project-manager.md at compile time
 pub const PM_SYSTEM_PROMPT: &str = include_str!("../../prompts/project-manager.md");
+
+/// Worker system prompt, loaded from prompts/worker.md at compile time
+pub const WORKER_SYSTEM_PROMPT: &str = include_str!("../../prompts/worker.md");
 
 /// Start the manager agent session
 pub fn start_manager(client: &TmuxClient, command: &str) -> Result<()> {
@@ -299,24 +302,11 @@ fn spawn_worker(client: &TmuxClient, agent: &ProposedAgent, command: &str) -> Re
     // Give it time to start
     thread::sleep(Duration::from_secs(1));
 
-    // Send worker context
-    let context = format!(
-        r#"You are a Worker Agent in the OMAR system.
-
-YOUR ROLE: {}
-YOUR TASK: {}
-
-INSTRUCTIONS:
-- Focus ONLY on your assigned task
-- Work independently but be aware others are working in parallel
-- When you complete your task, say: [TASK COMPLETE]
-- If you're blocked, say: [BLOCKED: reason]
-- If you need clarification, say: [NEED INPUT: question]
-
-Begin working on your task now.
-"#,
-        agent.role, agent.task
-    );
+    // Send worker context using the full worker system prompt
+    let parent_name = client.prefix().to_string() + "manager";
+    let context = WORKER_SYSTEM_PROMPT
+        .replace("{{PARENT_NAME}}", &parent_name)
+        .replace("{{TASK}}", &agent.task);
 
     client.send_keys_literal(&session_name, &context)?;
     // Small delay so tmux finishes buffering the text before Enter
