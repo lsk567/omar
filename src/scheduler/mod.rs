@@ -2,11 +2,67 @@ pub mod event;
 
 pub use event::ScheduledEvent;
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
+
+/// A ticker message with its creation time.
+struct TickerEntry {
+    text: String,
+    created_at: Instant,
+}
+
+/// Thread-safe scrolling ticker buffer shared between scheduler and UI.
+#[derive(Clone)]
+pub struct TickerBuffer {
+    entries: Arc<Mutex<VecDeque<TickerEntry>>>,
+}
+
+impl TickerBuffer {
+    pub fn new() -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    /// Push a new message into the ticker. Caps at 50 entries.
+    pub fn push(&self, msg: impl Into<String>) {
+        let mut buf = self.entries.lock().unwrap();
+        if buf.len() >= 50 {
+            buf.pop_front();
+        }
+        buf.push_back(TickerEntry {
+            text: msg.into(),
+            created_at: Instant::now(),
+        });
+    }
+
+    /// Return the joined ticker content, pruning entries older than `ttl`.
+    pub fn render(&self, ttl: std::time::Duration) -> String {
+        let mut buf = self.entries.lock().unwrap();
+        let now = Instant::now();
+        buf.retain(|e| now.duration_since(e.created_at) < ttl);
+        buf.iter()
+            .map(|e| e.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" +++ ")
+    }
+
+    /// Return the last `n` messages regardless of age (for debug console).
+    pub fn latest(&self, n: usize) -> Vec<String> {
+        let buf = self.entries.lock().unwrap();
+        buf.iter()
+            .rev()
+            .take(n)
+            .map(|e| e.text.clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+}
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -87,7 +143,7 @@ impl Scheduler {
     }
 }
 
-fn deliver_to_tmux(receiver: &str, message: &str) {
+pub(crate) fn deliver_to_tmux(receiver: &str, message: &str, ticker: &TickerBuffer) {
     let target = format!("omar-agent-{}", receiver);
     let result = Command::new("tmux")
         .args(["send-keys", "-t", &target, "-l", message])
@@ -102,13 +158,10 @@ fn deliver_to_tmux(receiver: &str, message: &str) {
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!(
-                "[scheduler] tmux send-keys failed for {}: {}",
-                target, stderr
-            );
+            ticker.push(format!("tmux send-keys failed for {}: {}", target, stderr));
         }
         Err(e) => {
-            eprintln!("[scheduler] failed to run tmux for {}: {}", target, e);
+            ticker.push(format!("failed to run tmux for {}: {}", target, e));
         }
     }
 }
@@ -129,7 +182,7 @@ fn format_delivery(events: &[ScheduledEvent], timestamp: u64) -> String {
     }
 }
 
-pub async fn run_event_loop(scheduler: Arc<Scheduler>) {
+pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer) {
     loop {
         let next_ts = {
             let queue = scheduler.queue.lock().unwrap();
@@ -185,17 +238,16 @@ pub async fn run_event_loop(scheduler: Arc<Scheduler>) {
                         continue;
                     }
                     let message = format_delivery(&batch, earliest_ts);
-                    deliver_to_tmux(receiver, &message);
+                    deliver_to_tmux(receiver, &message, &ticker);
 
                     let lag_ns = now_ns().saturating_sub(earliest_ts);
                     let lag_ms = lag_ns as f64 / 1_000_000.0;
-                    eprintln!(
-                        "[scheduler] delivered {} event(s) to {} at t={}, lag={:.2}ms",
+                    ticker.push(format!(
+                        "delivered {} event(s) to {}, lag={:.2}ms",
                         batch.len(),
                         receiver,
-                        earliest_ts,
                         lag_ms
-                    );
+                    ));
                 }
             }
         }
@@ -298,5 +350,164 @@ mod tests {
         assert!(msg.contains("[EVENT BATCH at t=1000]"));
         assert!(msg.contains("From alice: msg1"));
         assert!(msg.contains("From carol: msg2"));
+    }
+
+    /// Helper: check if tmux is available on this machine.
+    fn tmux_available() -> bool {
+        Command::new("tmux").arg("-V").output().is_ok()
+    }
+
+    /// Helper: create a tmux session, returning true if successful.
+    fn create_test_session(name: &str) -> bool {
+        Command::new("tmux")
+            .args(["new-session", "-d", "-s", name, "-x", "200", "-y", "50"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Helper: kill a tmux session (best-effort cleanup).
+    fn kill_test_session(name: &str) {
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+    }
+
+    /// Helper: capture pane content from a tmux session.
+    fn capture_pane(name: &str) -> String {
+        Command::new("tmux")
+            .args(["capture-pane", "-t", name, "-p"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_deliver_to_tmux() {
+        if !tmux_available() {
+            eprintln!("skipping test_deliver_to_tmux: tmux not available");
+            return;
+        }
+
+        let session = "omar-agent-test-deliver";
+        // Clean up any leftover session from a previous run
+        kill_test_session(session);
+
+        if !create_test_session(session) {
+            eprintln!("skipping test_deliver_to_tmux: could not create tmux session");
+            return;
+        }
+
+        // deliver_to_tmux prepends "omar-agent-" to the receiver name
+        let ticker = TickerBuffer::new();
+        deliver_to_tmux("test-deliver", "hello-from-scheduler", &ticker);
+
+        // Give tmux a moment to process the send-keys
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let content = capture_pane(session);
+        kill_test_session(session);
+
+        assert!(
+            content.contains("hello-from-scheduler"),
+            "expected pane to contain 'hello-from-scheduler', got: {}",
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_event_delivery_cycle() {
+        if !tmux_available() {
+            eprintln!("skipping test_scheduler_event_delivery_cycle: tmux not available");
+            return;
+        }
+
+        let session = "omar-agent-test-sched";
+        kill_test_session(session);
+
+        if !create_test_session(session) {
+            eprintln!(
+                "skipping test_scheduler_event_delivery_cycle: could not create tmux session"
+            );
+            return;
+        }
+
+        let scheduler = Arc::new(Scheduler::new());
+
+        // Insert an event with timestamp=1 (immediately due — way in the past)
+        let event = ScheduledEvent {
+            id: "test-cycle-1".to_string(),
+            sender: "alice".to_string(),
+            receiver: "test-sched".to_string(),
+            timestamp: 1,
+            payload: "cycle-delivery-payload".to_string(),
+            created_at: now_ns(),
+        };
+        scheduler.insert(event);
+
+        // Spawn the event loop with a timeout
+        let sched = Arc::clone(&scheduler);
+        let ticker = TickerBuffer::new();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = run_event_loop(sched, ticker) => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+            }
+        });
+
+        // Wait for delivery
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let content = capture_pane(session);
+        kill_test_session(session);
+
+        // Abort the event loop task
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            content.contains("cycle-delivery-payload"),
+            "expected pane to contain 'cycle-delivery-payload', got: {}",
+            content
+        );
+    }
+
+    // ── TickerBuffer tests ──
+
+    #[test]
+    fn test_ticker_push_and_render() {
+        let ticker = TickerBuffer::new();
+        ticker.push("hello");
+        ticker.push("world");
+        let out = ticker.render(std::time::Duration::from_secs(30));
+        assert_eq!(out, "hello +++ world");
+    }
+
+    #[test]
+    fn test_ticker_empty_render() {
+        let ticker = TickerBuffer::new();
+        let out = ticker.render(std::time::Duration::from_secs(30));
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn test_ticker_expiry() {
+        let ticker = TickerBuffer::new();
+        ticker.push("old");
+        // Render with zero TTL — everything expires immediately
+        let out = ticker.render(std::time::Duration::ZERO);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn test_ticker_capacity_cap() {
+        let ticker = TickerBuffer::new();
+        for i in 0..60 {
+            ticker.push(format!("msg{}", i));
+        }
+        let buf = ticker.entries.lock().unwrap();
+        assert_eq!(buf.len(), 50);
+        // Oldest entries should have been dropped
+        assert_eq!(buf.front().unwrap().text, "msg10");
     }
 }

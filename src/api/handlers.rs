@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use super::models::*;
 use crate::app::{SharedApp, MANAGER_SESSION_NAME};
-use crate::manager::PM_SYSTEM_PROMPT;
+use crate::manager::{PM_SYSTEM_PROMPT, WORKER_SYSTEM_PROMPT};
 use crate::memory;
 use crate::projects;
 use crate::scheduler::{event::ScheduledEvent, Scheduler};
@@ -95,12 +95,12 @@ pub async fn get_agent(
     let prefix = app.client().prefix().to_string();
     let full_id = resolve_session_name(&prefix, &id);
 
-    // Find agent by resolved session name, or manager by raw name
+    // Find agent by resolved session name, or manager by resolved/raw name
     let agent = app
         .agents()
         .iter()
         .find(|a| a.session.name == full_id)
-        .or_else(|| app.manager().filter(|m| m.session.name == id));
+        .or_else(|| app.manager().filter(|m| m.session.name == full_id || m.session.name == id));
 
     match agent {
         Some(a) => {
@@ -220,7 +220,11 @@ pub async fn spawn_agent(
                 PM_SYSTEM_PROMPT, short, task
             )
         } else {
-            task
+            // Inject the worker system prompt with parent name and task
+            let parent = req.parent.as_deref().unwrap_or("ea");
+            WORKER_SYSTEM_PROMPT
+                .replace("{{PARENT_NAME}}", parent)
+                .replace("{{TASK}}", &task)
         };
 
         let client = app.client().clone();

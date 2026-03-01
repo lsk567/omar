@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::manager::MANAGER_SESSION;
 use crate::memory;
 use crate::projects::{self, Project};
-use crate::scheduler::ScheduledEvent;
+use crate::scheduler::{ScheduledEvent, TickerBuffer};
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -71,6 +71,9 @@ pub struct App {
     pub project_input: String,
     pub show_events: bool,
     pub scheduled_events: Vec<ScheduledEvent>,
+    pub ticker: TickerBuffer,
+    pub ticker_offset: usize,
+    pub show_debug_console: bool,
     agent_parents: HashMap<String, String>,
     client: TmuxClient,
     health_checker: HealthChecker,
@@ -80,7 +83,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, ticker: TickerBuffer) -> Self {
         let client = TmuxClient::new(&config.dashboard.session_prefix);
         let health_checker = HealthChecker::new(client.clone(), config.health.idle_warning);
 
@@ -101,6 +104,9 @@ impl App {
             project_input: String::new(),
             show_events: false,
             scheduled_events: Vec::new(),
+            ticker,
+            ticker_offset: 0,
+            show_debug_console: false,
             agent_parents: HashMap::new(),
             client,
             health_checker,
@@ -226,27 +232,23 @@ impl App {
         // Give it time to start
         thread::sleep(Duration::from_secs(2));
 
-        // Send manager system prompt
+        // Build full prompt: EA system prompt + persistent memory
+        let mut full_prompt = crate::manager::MANAGER_SYSTEM_PROMPT.to_string();
+        let mem = memory::load_memory();
+        if !mem.is_empty() {
+            full_prompt.push_str(&format!(
+                "\n\n---\n\nHere is the current OMAR state from your last session:\n\n{}",
+                mem
+            ));
+        }
+
+        // Send concatenated prompt
         self.client
-            .send_keys_literal(MANAGER_SESSION, crate::manager::MANAGER_SYSTEM_PROMPT)?;
+            .send_keys_literal(MANAGER_SESSION, &full_prompt)?;
 
         // Small delay to ensure prompt is fully received before pressing Enter
         thread::sleep(Duration::from_millis(200));
-        // Use C-m (Ctrl+M) which is equivalent to Enter and may work better with Claude
         self.client.send_keys(MANAGER_SESSION, "C-m")?;
-
-        // Inject persistent memory if available
-        let mem = memory::load_memory();
-        if !mem.is_empty() {
-            thread::sleep(Duration::from_secs(1));
-            let ctx = format!(
-                "Here is the current OMAR state from your last session:\n\n{}",
-                mem
-            );
-            self.client.send_keys_literal(MANAGER_SESSION, &ctx)?;
-            thread::sleep(Duration::from_millis(200));
-            self.client.send_keys(MANAGER_SESSION, "C-m")?;
-        }
 
         // Write memory after creating manager
         memory::write_memory(&self.agents, None, &self.client);
@@ -921,7 +923,7 @@ mod tests {
     #[test]
     fn test_build_tree_ea_only() {
         let agents = vec![];
-        let ea = make_agent("omar-ea", HealthState::Running);
+        let ea = make_agent("omar-agent-ea", HealthState::Running);
         let parents = HashMap::new();
         let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
 
@@ -937,7 +939,7 @@ mod tests {
             make_agent("omar-agent-api", HealthState::Running),
             make_agent("omar-agent-auth", HealthState::Idle),
         ];
-        let ea = make_agent("omar-ea", HealthState::Running);
+        let ea = make_agent("omar-agent-ea", HealthState::Running);
         let mut parents = HashMap::new();
         parents.insert(
             "omar-agent-api".to_string(),
@@ -971,7 +973,7 @@ mod tests {
             make_agent("omar-agent-debug", HealthState::Running),
             make_agent("omar-agent-test", HealthState::Idle),
         ];
-        let ea = make_agent("omar-ea", HealthState::Running);
+        let ea = make_agent("omar-agent-ea", HealthState::Running);
         let parents = HashMap::new();
 
         let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
@@ -996,7 +998,7 @@ mod tests {
             make_agent("omar-agent-worker1", HealthState::Running),
             make_agent("omar-agent-orphan1", HealthState::Idle),
         ];
-        let ea = make_agent("omar-ea", HealthState::Running);
+        let ea = make_agent("omar-agent-ea", HealthState::Running);
         let mut parents = HashMap::new();
         parents.insert(
             "omar-agent-worker1".to_string(),
@@ -1024,7 +1026,7 @@ mod tests {
     #[test]
     fn test_build_tree_stale_parent_treated_as_orphan() {
         let agents = vec![make_agent("omar-agent-worker1", HealthState::Running)];
-        let ea = make_agent("omar-ea", HealthState::Running);
+        let ea = make_agent("omar-agent-ea", HealthState::Running);
         // Parent PM doesn't exist in agents
         let mut parents = HashMap::new();
         parents.insert(

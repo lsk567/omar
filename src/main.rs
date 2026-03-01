@@ -191,15 +191,16 @@ fn relaunch_in_tmux() -> Result<()> {
 }
 
 async fn run_dashboard(config: Config) -> Result<()> {
-    // Create the scheduler and spawn its event loop
+    // Create the ticker buffer and scheduler, then spawn the event loop
+    let ticker = scheduler::TickerBuffer::new();
     let scheduler = Arc::new(scheduler::Scheduler::new());
-    tokio::spawn(scheduler::run_event_loop(scheduler.clone()));
+    tokio::spawn(scheduler::run_event_loop(scheduler.clone(), ticker.clone()));
 
     // Start API server if enabled
     if config.api.enabled {
         let api_config = config.api.clone();
         let api_state = Arc::new(api::handlers::ApiState {
-            app: Arc::new(Mutex::new(App::new(&config))),
+            app: Arc::new(Mutex::new(App::new(&config, ticker.clone()))),
             scheduler: scheduler.clone(),
         });
         tokio::spawn(async move {
@@ -217,7 +218,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app for dashboard (separate instance)
-    let mut app = App::new(&config);
+    let mut app = App::new(&config, ticker);
 
     // Initial refresh
     if let Err(e) = app.refresh() {
@@ -335,6 +336,17 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
+                    // Handle debug console popup
+                    if app.show_debug_console {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('D') | KeyCode::Char('q') => {
+                                app.show_debug_console = false;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Normal key handling
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
@@ -407,6 +419,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.scheduled_events.sort_by_key(|e| e.timestamp);
                             app.show_events = true;
                         }
+                        KeyCode::Char('D') => {
+                            app.show_debug_console = true;
+                        }
                         KeyCode::Char('?') => {
                             app.show_help = !app.show_help;
                         }
@@ -418,6 +433,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     if let Err(e) = app.refresh() {
                         app.set_status(format!("Error: {}", e));
                     }
+                }
+                AppEvent::TickerScroll => {
+                    app.ticker_offset = app.ticker_offset.wrapping_add(1);
                 }
                 AppEvent::Resize(_, _) => {
                     // Terminal will handle resize automatically

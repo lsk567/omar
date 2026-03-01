@@ -66,6 +66,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.show_events {
         render_events_popup(frame, app);
     }
+
+    if app.show_debug_console {
+        render_debug_console(frame, app);
+    }
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -559,10 +563,62 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
         ]
     };
 
-    let paragraph =
-        Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray));
+    let ticker_content = app
+        .ticker
+        .render(std::time::Duration::from_secs(5));
 
-    frame.render_widget(paragraph, area);
+    if ticker_content.is_empty() {
+        // No ticker content — full-width help text
+        let paragraph =
+            Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(paragraph, area);
+    } else {
+        // Compute help text width (sum of span widths)
+        let help_width: u16 = help_text.iter().map(|s| s.width() as u16).sum();
+        let help_col_width = help_width.saturating_add(1).min(area.width);
+
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(help_col_width),
+                Constraint::Min(1),
+            ])
+            .split(area);
+
+        // Left: help text
+        let help_paragraph =
+            Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(help_paragraph, h_chunks[0]);
+
+        // Right: ticker (static if fits, scrolling if too long)
+        let ticker_area_width = h_chunks[1].width as usize;
+        if ticker_area_width > 0 {
+            let content_len = ticker_content.chars().count();
+            let visible = if content_len <= ticker_area_width {
+                // Fits — display statically, right-aligned
+                format!("{:>width$}", ticker_content, width = ticker_area_width)
+            } else {
+                // Too long — scroll
+                let padded: String = std::iter::repeat_n(' ', ticker_area_width)
+                    .chain(ticker_content.chars())
+                    .collect();
+                let total_len = padded.chars().count();
+                let offset = app.ticker_offset % total_len;
+                padded
+                    .chars()
+                    .cycle()
+                    .skip(offset)
+                    .take(ticker_area_width)
+                    .collect()
+            };
+
+            let ticker_paragraph = Paragraph::new(Line::from(Span::styled(
+                visible,
+                Style::default().fg(Color::Yellow),
+            )));
+            frame.render_widget(ticker_paragraph, h_chunks[1]);
+        }
+    }
 }
 
 fn render_help_popup(frame: &mut Frame) {
@@ -582,6 +638,7 @@ fn render_help_popup(frame: &mut Frame) {
         Line::from("  d           Kill selected agent"),
         Line::from("  p           Add a project"),
         Line::from("  e           Show scheduled events"),
+        Line::from("  D           Debug console"),
         Line::from("  r           Refresh agent list"),
         Line::from("  ?           Toggle this help"),
         Line::from(""),
@@ -768,6 +825,53 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
         .title(" Events Queue ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
+
+    let paragraph = Paragraph::new(lines).block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_debug_console(frame: &mut Frame, app: &App) {
+    let area = centered_rect(60, 40, frame.area());
+
+    let messages = app.ticker.latest(10);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Debug Console",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    if messages.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No messages yet",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (i, msg) in messages.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:>2}. ", i + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(msg.clone(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press Esc or 'D' to close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .title(" Debug Console ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
 
     let paragraph = Paragraph::new(lines).block(block);
 
