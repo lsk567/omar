@@ -100,7 +100,10 @@ pub async fn get_agent(
         .agents()
         .iter()
         .find(|a| a.session.name == full_id)
-        .or_else(|| app.manager().filter(|m| m.session.name == full_id || m.session.name == id));
+        .or_else(|| {
+            app.manager()
+                .filter(|m| m.session.name == full_id || m.session.name == id)
+        });
 
     match agent {
         Some(a) => {

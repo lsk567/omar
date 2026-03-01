@@ -563,9 +563,7 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
         ]
     };
 
-    let ticker_content = app
-        .ticker
-        .render(std::time::Duration::from_secs(5));
+    let ticker_content = app.ticker.render(std::time::Duration::from_secs(5));
 
     if ticker_content.is_empty() {
         // No ticker content — full-width help text
@@ -579,10 +577,7 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
 
         let h_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(help_col_width),
-                Constraint::Min(1),
-            ])
+            .constraints([Constraint::Length(help_col_width), Constraint::Min(1)])
             .split(area);
 
         // Left: help text
