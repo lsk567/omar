@@ -366,11 +366,7 @@ mod tests {
 
     #[test]
     fn test_build_agent_command_claude() {
-        let cmd = build_agent_command(
-            "claude --some-flag",
-            Path::new("/tmp/prompts/ea.md"),
-            &[],
-        );
+        let cmd = build_agent_command("claude --some-flag", Path::new("/tmp/prompts/ea.md"), &[]);
         assert_eq!(
             cmd,
             "claude --some-flag --system-prompt \"$(cat '/tmp/prompts/ea.md')\""
