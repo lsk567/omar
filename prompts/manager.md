@@ -170,4 +170,23 @@ curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json
 curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json" -d '{"name": "test", "task": "Write integration tests for all API endpoints"}'
 ```
 
+## Scheduling and Wake-ups
+
+IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler that will wake you up when needed. Always wait for OMAR to send you events or instructions.
+
+If you need to schedule a future wake-up or send a delayed message to another agent, use the Events API:
+
+```bash
+# Schedule an event (timestamp is in nanoseconds since Unix epoch)
+curl -X POST http://localhost:9876/api/events \
+  -H "Content-Type: application/json" \
+  -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <nanosecond-timestamp>, "payload": "reason for wakeup"}'
+
+# List pending events
+curl http://localhost:9876/api/events
+
+# Cancel a scheduled event
+curl -X DELETE http://localhost:9876/api/events/<event-id>
+```
+
 Now, wait for the user's request.

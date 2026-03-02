@@ -1,18 +1,28 @@
 //! API endpoint handlers
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use super::models::*;
 use crate::app::{SharedApp, MANAGER_SESSION_NAME};
-use crate::manager::PM_SYSTEM_PROMPT;
+use crate::manager::{build_agent_command, prompts_dir};
 use crate::memory;
 use crate::projects;
+use crate::scheduler::{event::ScheduledEvent, Scheduler};
+
+/// Shared state for all API handlers
+pub struct ApiState {
+    pub app: Arc<Mutex<SharedApp>>,
+    pub scheduler: Arc<Scheduler>,
+}
 
 /// Resolve a user-facing agent name to a full tmux session name.
 /// Accepts both short names ("auth") and full names ("omar-agent-auth").
@@ -39,9 +49,9 @@ pub async fn health() -> Json<HealthResponse> {
 
 /// GET /api/agents
 pub async fn list_agents(
-    State(app): State<Arc<Mutex<SharedApp>>>,
+    State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ListAgentsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut app = app.lock().await;
+    let mut app = state.app.lock().await;
 
     // Refresh to get latest state
     if let Err(e) = app.refresh() {
@@ -77,20 +87,23 @@ pub async fn list_agents(
 
 /// GET /api/agents/:id
 pub async fn get_agent(
-    State(app): State<Arc<Mutex<SharedApp>>>,
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<AgentDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = app.lock().await;
+    let app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
     let full_id = resolve_session_name(&prefix, &id);
 
-    // Find agent by resolved session name, or manager by raw name
+    // Find agent by resolved session name, or manager by resolved/raw name
     let agent = app
         .agents()
         .iter()
         .find(|a| a.session.name == full_id)
-        .or_else(|| app.manager().filter(|m| m.session.name == id));
+        .or_else(|| {
+            app.manager()
+                .filter(|m| m.session.name == full_id || m.session.name == id)
+        });
 
     match agent {
         Some(a) => {
@@ -118,10 +131,10 @@ pub async fn get_agent(
 
 /// POST /api/agents
 pub async fn spawn_agent(
-    State(app): State<Arc<Mutex<SharedApp>>>,
+    State(state): State<Arc<ApiState>>,
     Json(req): Json<SpawnAgentRequest>,
 ) -> Result<Json<SpawnAgentResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = app.lock().await;
+    let app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
 
@@ -149,16 +162,31 @@ pub async fn spawn_agent(
             .unwrap_or_else(|_| ".".to_string())
     });
 
-    // Always start an interactive session with the base command
+    // Build the agent command — with system prompt via native CLI flag if a role is set
     let base_command = req
         .command
         .unwrap_or_else(|| app.default_command().to_string());
 
-    // Spawn the agent with the base command (no task appended)
-    if let Err(e) = app
-        .client()
-        .new_session(&name, &base_command, Some(&workdir))
-    {
+    let is_pm = req.role.as_deref() == Some("project-manager");
+    let cmd = if is_pm {
+        let prompt_file = prompts_dir().join("project-manager.md");
+        build_agent_command(&base_command, &prompt_file, &[])
+    } else if req.task.is_some() && req.role.as_deref() != Some("project-manager") {
+        // Worker with a task — use worker prompt with template substitutions
+        let parent = req.parent.as_deref().unwrap_or("ea");
+        let task = req.task.as_deref().unwrap_or("");
+        let prompt_file = prompts_dir().join("worker.md");
+        build_agent_command(
+            &base_command,
+            &prompt_file,
+            &[("{{PARENT_NAME}}", parent), ("{{TASK}}", task)],
+        )
+    } else {
+        base_command.clone()
+    };
+
+    // Spawn the agent — system prompt set at process start
+    if let Err(e) = app.client().new_session(&name, &cmd, Some(&workdir)) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -168,7 +196,6 @@ pub async fn spawn_agent(
     }
 
     // Save parent mapping: explicit parent, or auto-infer from running PMs
-    let is_pm = req.role.as_deref() == Some("project-manager");
     if let Some(ref parent) = req.parent {
         let resolved_parent = resolve_session_name(&prefix, parent);
         memory::save_agent_parent(&name, &resolved_parent);
@@ -193,24 +220,16 @@ pub async fn spawn_agent(
         }
     }
 
-    // If a task was provided, send it via tmux send-keys after a delay
-    // This works universally with any agent backend (claude, opencode, etc.)
+    // Send first user message after a delay (role-dependent content)
     if let Some(task) = req.task {
         // Always persist the original (short) task for dashboard display
         memory::save_worker_task(&name, &task);
 
-        // Build the full prompt to send: if role is "project-manager",
-        // prepend the PM system prompt so the agent knows how to behave.
-        // Also inject the PM's own short name so it can pass it as `parent`
-        // when spawning workers.
-        let full_prompt = if req.role.as_deref() == Some("project-manager") {
+        let user_msg = if is_pm {
             let short = display_name(&prefix, &name);
-            format!(
-                "{}\n\nYOUR NAME: {}\nYOUR TASK: {}",
-                PM_SYSTEM_PROMPT, short, task
-            )
+            format!("YOUR NAME: {}\nYOUR TASK: {}", short, task)
         } else {
-            task
+            "Start working on your assigned task now.".to_string()
         };
 
         let client = app.client().clone();
@@ -218,7 +237,7 @@ pub async fn spawn_agent(
         tokio::spawn(async move {
             // Wait for the agent process to start
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let _ = client.send_keys_literal(&session, &full_prompt);
+            let _ = client.send_keys_literal(&session, &user_msg);
             // Small delay so tmux finishes buffering the text before Enter
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let _ = client.send_keys(&session, "Enter");
@@ -235,10 +254,10 @@ pub async fn spawn_agent(
 
 /// DELETE /api/agents/:id
 pub async fn kill_agent(
-    State(app): State<Arc<Mutex<SharedApp>>>,
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = app.lock().await;
+    let app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
     let session_name = resolve_session_name(&prefix, &id);
@@ -284,11 +303,11 @@ pub async fn kill_agent(
 
 /// POST /api/agents/:id/send
 pub async fn send_input(
-    State(app): State<Arc<Mutex<SharedApp>>>,
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Json(req): Json<SendInputRequest>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = app.lock().await;
+    let app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
     let session_name = resolve_session_name(&prefix, &id);
@@ -381,5 +400,83 @@ pub async fn complete_project(
                 error: format!("Failed to remove project: {}", e),
             }),
         )),
+    }
+}
+
+// ── Event Scheduler handlers ──
+
+/// POST /api/events
+pub async fn schedule_event(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<ScheduleEventRequest>,
+) -> impl IntoResponse {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    let event = ScheduledEvent {
+        id: id.clone(),
+        sender: req.sender,
+        receiver: req.receiver,
+        timestamp: req.timestamp,
+        payload: req.payload,
+        created_at: now,
+    };
+
+    state.scheduler.insert(event);
+
+    Json(ScheduleEventResponse {
+        id,
+        timestamp: req.timestamp,
+    })
+}
+
+/// GET /api/events
+pub async fn list_events(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let events = if let Some(receiver) = params.get("receiver") {
+        state.scheduler.list_by_receiver(receiver)
+    } else {
+        state.scheduler.list()
+    };
+
+    let events: Vec<EventInfo> = events
+        .into_iter()
+        .map(|e| EventInfo {
+            id: e.id,
+            sender: e.sender,
+            receiver: e.receiver,
+            timestamp: e.timestamp,
+            payload: e.payload,
+            created_at: e.created_at,
+        })
+        .collect();
+
+    Json(EventListResponse { events })
+}
+
+/// DELETE /api/events/:id
+pub async fn cancel_event(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.scheduler.cancel(&id) {
+        Some(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!(EventCancelResponse {
+                status: "cancelled".to_string(),
+                id,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse {
+                error: format!("Event '{}' not found", id),
+            })),
+        ),
     }
 }

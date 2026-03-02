@@ -105,3 +105,39 @@ curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json
 
 3. Monitor, guide, kill when done
 4. Output `[PROJECT COMPLETE]` with summary
+
+## Scheduling and Wake-ups
+
+IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler — use its Events API instead.
+
+### How it works
+
+After spawning workers, schedule a self-wake-up so OMAR will nudge you to check on them later. Workers also schedule an event to wake you when they finish. When an event fires, OMAR delivers the payload as a message to your tmux session.
+
+### Monitoring workflow
+
+1. Spawn workers
+2. Schedule a self-wake-up (e.g., 2 minutes out) to check progress:
+```bash
+NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 120_000_000_000)")
+curl -X POST http://localhost:9876/api/events \
+  -H "Content-Type: application/json" \
+  -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<YOUR NAME>\", \"timestamp\": $NOW, \"payload\": \"Check worker progress\"}"
+```
+3. When woken, check each worker's output. If some are still running, schedule another check.
+4. Workers will also wake you on completion — check their output when you receive that event.
+
+### Events API
+
+```bash
+# Schedule an event (timestamp in nanoseconds since Unix epoch)
+curl -X POST http://localhost:9876/api/events \
+  -H "Content-Type: application/json" \
+  -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <ns-timestamp>, "payload": "reason"}'
+
+# List pending events
+curl http://localhost:9876/api/events
+
+# Cancel a scheduled event
+curl -X DELETE http://localhost:9876/api/events/<event-id>
+```
