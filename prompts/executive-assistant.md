@@ -225,15 +225,32 @@ curl -X DELETE http://localhost:9876/api/projects/1
 
 ## Scheduling and Wake-ups
 
-IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler that will wake you up when needed. Always wait for OMAR to send you events or instructions.
+IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler — use its Events API instead.
 
-If you need to schedule a future wake-up or send a delayed message to another agent, use the Events API:
+### How it works
 
+After spawning a PM, schedule a self-wake-up so OMAR will nudge you to check on it later. When an event fires, OMAR delivers the payload as a message to your tmux session.
+
+### Monitoring workflow
+
+1. Spawn a PM
+2. Schedule a self-wake-up (e.g., 3 minutes out) to check progress:
 ```bash
-# Schedule an event (timestamp is in nanoseconds since Unix epoch)
+NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 180_000_000_000)")
 curl -X POST http://localhost:9876/api/events \
   -H "Content-Type: application/json" \
-  -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <nanosecond-timestamp>, "payload": "reason for wakeup"}'
+  -d "{\"sender\": \"ea\", \"receiver\": \"ea\", \"timestamp\": $NOW, \"payload\": \"Check PM progress\"}"
+```
+3. When woken, check the PM's output. If still running, schedule another check.
+4. When PM reports `[PROJECT COMPLETE]`, clean up (kill PM, complete project, report).
+
+### Events API
+
+```bash
+# Schedule an event (timestamp in nanoseconds since Unix epoch)
+curl -X POST http://localhost:9876/api/events \
+  -H "Content-Type: application/json" \
+  -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <ns-timestamp>, "payload": "reason"}'
 
 # List pending events
 curl http://localhost:9876/api/events

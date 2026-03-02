@@ -4,6 +4,7 @@ pub mod protocol;
 
 use anyhow::Result;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -14,14 +15,56 @@ use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 /// Manager session name (exported for use in app.rs)
 pub const MANAGER_SESSION: &str = "omar-agent-ea";
 
-/// EA system prompt, loaded from prompts/executive-assistant.md at compile time
-pub const MANAGER_SYSTEM_PROMPT: &str = include_str!("../../prompts/executive-assistant.md");
+/// Return the absolute `prompts/` directory path (cwd-based).
+pub fn prompts_dir() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("prompts")
+}
 
-/// Project Manager system prompt, loaded from prompts/project-manager.md at compile time
-pub const PM_SYSTEM_PROMPT: &str = include_str!("../../prompts/project-manager.md");
+/// Escape a string for use in a sed replacement (with `|` as delimiter).
+fn sed_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('&', "\\&")
+        .replace('\n', "\\n")
+}
 
-/// Worker system prompt, loaded from prompts/worker.md at compile time
-pub const WORKER_SYSTEM_PROMPT: &str = include_str!("../../prompts/worker.md");
+/// Build a CLI command with system prompt loaded from a file via native flag.
+///
+/// - `prompt_file`: absolute path to the prompt .md file
+/// - `substitutions`: `(pattern, replacement)` pairs for sed; empty = use `cat`
+///
+/// Detects backend from `base_command`:
+///   - contains "claude" → `--system-prompt`
+///   - contains "opencode" → `--prompt`
+pub fn build_agent_command(
+    base_command: &str,
+    prompt_file: &Path,
+    substitutions: &[(&str, &str)],
+) -> String {
+    let flag = if base_command.contains("claude") {
+        "--system-prompt"
+    } else if base_command.contains("opencode") {
+        "--prompt"
+    } else {
+        return base_command.to_string();
+    };
+
+    let path_str = prompt_file.display();
+    let shell_expr = if substitutions.is_empty() {
+        format!("$(cat '{}')", path_str)
+    } else {
+        let sed_script: String = substitutions
+            .iter()
+            .map(|(pat, repl)| format!("s|{}|{}|g", pat, sed_escape(repl)))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("$(sed '{}' '{}')", sed_script, path_str)
+    };
+
+    format!("{} {} \"{}\"", base_command, flag, shell_expr)
+}
 
 /// Start the manager agent session
 pub fn start_manager(client: &TmuxClient, command: &str) -> Result<()> {
@@ -32,27 +75,20 @@ pub fn start_manager(client: &TmuxClient, command: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Create manager session with the configured agent command
+    // Build command with system prompt loaded via native CLI flag
+    let prompt_file = prompts_dir().join("executive-assistant.md");
+    let cmd = build_agent_command(command, &prompt_file, &[]);
+
+    // Create manager session — system prompt set at process start
     println!("Starting manager agent...");
     client.new_session(
         MANAGER_SESSION,
-        command,
+        &cmd,
         Some(&std::env::current_dir()?.to_string_lossy()),
     )?;
 
     // Give it time to start
     thread::sleep(Duration::from_secs(2));
-
-    // Send the system prompt
-    println!("Configuring manager with system prompt...");
-    client.send_keys_literal(MANAGER_SESSION, MANAGER_SYSTEM_PROMPT)?;
-
-    // Small delay to ensure prompt is fully received before pressing Enter
-    thread::sleep(Duration::from_millis(200));
-    // Use C-m (Ctrl+M) which is equivalent to Enter and may work better with Claude
-    client.send_keys(MANAGER_SESSION, "C-m")?;
-
-    thread::sleep(Duration::from_millis(500));
 
     // Attach to the session
     println!("Attaching to manager session...");
@@ -292,24 +328,27 @@ fn spawn_worker(client: &TmuxClient, agent: &ProposedAgent, command: &str) -> Re
         return Ok(());
     }
 
-    // Create the worker session with the configured agent command
+    // Build command with worker system prompt (template vars substituted via sed)
+    let parent_name = client.prefix().to_string() + "manager";
+    let prompt_file = prompts_dir().join("worker.md");
+    let cmd = build_agent_command(
+        command,
+        &prompt_file,
+        &[("{{PARENT_NAME}}", &parent_name), ("{{TASK}}", &agent.task)],
+    );
+
+    // Create worker session — system prompt set at process start
     client.new_session(
         &session_name,
-        command,
+        &cmd,
         Some(&std::env::current_dir()?.to_string_lossy()),
     )?;
 
     // Give it time to start
     thread::sleep(Duration::from_secs(1));
 
-    // Send worker context using the full worker system prompt
-    let parent_name = client.prefix().to_string() + "manager";
-    let context = WORKER_SYSTEM_PROMPT
-        .replace("{{PARENT_NAME}}", &parent_name)
-        .replace("{{TASK}}", &agent.task);
-
-    client.send_keys_literal(&session_name, &context)?;
-    // Small delay so tmux finishes buffering the text before Enter
+    // Send first user message to kick off work
+    client.send_keys_literal(&session_name, "Start working on your assigned task now.")?;
     thread::sleep(Duration::from_millis(200));
     client.send_keys(&session_name, "Enter")?;
 
@@ -319,4 +358,58 @@ fn spawn_worker(client: &TmuxClient, agent: &ProposedAgent, command: &str) -> Re
     println!("  {} - spawned ({})", agent.name, agent.role);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_agent_command_claude() {
+        let cmd = build_agent_command(
+            "claude --dangerously-skip-permissions",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "claude --dangerously-skip-permissions --system-prompt \"$(cat '/tmp/prompts/ea.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode() {
+        let cmd = build_agent_command("opencode", Path::new("/tmp/prompts/pm.md"), &[]);
+        assert_eq!(cmd, "opencode --prompt \"$(cat '/tmp/prompts/pm.md')\"");
+    }
+
+    #[test]
+    fn test_build_agent_command_unknown_backend() {
+        let cmd = build_agent_command("vim", Path::new("/tmp/prompts/ea.md"), &[]);
+        assert_eq!(cmd, "vim");
+    }
+
+    #[test]
+    fn test_build_agent_command_with_substitutions() {
+        let cmd = build_agent_command(
+            "claude",
+            Path::new("/prompts/worker.md"),
+            &[("{{PARENT_NAME}}", "pm-api"), ("{{TASK}}", "build it")],
+        );
+        assert_eq!(
+            cmd,
+            "claude --system-prompt \"$(sed 's|{{PARENT_NAME}}|pm-api|g; s|{{TASK}}|build it|g' '/prompts/worker.md')\""
+        );
+    }
+
+    #[test]
+    fn test_sed_escape() {
+        assert_eq!(sed_escape("hello"), "hello");
+        assert_eq!(sed_escape("a\\b"), "a\\\\b");
+        assert_eq!(sed_escape("a|b"), "a\\|b");
+        assert_eq!(sed_escape("a&b"), "a\\&b");
+        assert_eq!(sed_escape("a\nb"), "a\\nb");
+        // Combined
+        assert_eq!(sed_escape("a\\|&\nb"), "a\\\\\\|\\&\\nb");
+    }
 }
