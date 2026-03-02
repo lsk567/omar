@@ -40,6 +40,10 @@ struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "~/.config/omar/config.toml")]
     config: String,
+
+    /// Agent backend to use (e.g., "claude", "opencode")
+    #[arg(short, long)]
+    agent: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -86,7 +90,10 @@ enum ManagerAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::load(&cli.config)?;
+    let mut config = Config::load(&cli.config)?;
+    if let Some(ref agent) = cli.agent {
+        config.agent.default_command = config::resolve_backend(agent);
+    }
     let client = TmuxClient::new(&config.dashboard.session_prefix);
 
     match cli.command {

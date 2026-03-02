@@ -125,6 +125,19 @@ fn default_command() -> String {
     detect_agent_command()
 }
 
+/// Map shorthand agent names to full commands.
+///
+/// - `"claude"` → `"claude --dangerously-skip-permissions"`
+/// - `"opencode"` → `"opencode"`
+/// - anything else → passed through as-is
+pub fn resolve_backend(name: &str) -> String {
+    match name {
+        "claude" => "claude --dangerously-skip-permissions".to_string(),
+        "opencode" => "opencode".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn default_workdir() -> String {
     ".".to_string()
 }
@@ -258,6 +271,21 @@ default_command = "bash"
         assert_eq!(config.dashboard.session_prefix, "test-");
         assert_eq!(config.health.idle_warning, 30);
         assert_eq!(config.health.error_patterns, vec!["error", "panic"]);
+    }
+
+    #[test]
+    fn test_resolve_backend_known_names() {
+        assert_eq!(
+            resolve_backend("claude"),
+            "claude --dangerously-skip-permissions"
+        );
+        assert_eq!(resolve_backend("opencode"), "opencode");
+    }
+
+    #[test]
+    fn test_resolve_backend_passthrough() {
+        assert_eq!(resolve_backend("aider --yes"), "aider --yes");
+        assert_eq!(resolve_backend("custom-agent"), "custom-agent");
     }
 
     #[test]
