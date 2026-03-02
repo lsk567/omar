@@ -66,6 +66,35 @@ pub fn build_agent_command(
     format!("{} {} \"{}\"", base_command, flag, shell_expr)
 }
 
+/// Build an EA command with memory state baked into the system prompt.
+///
+/// Reads the EA prompt, appends the latest memory snapshot, writes a
+/// combined file to `~/.omar/ea_prompt_combined.md`, and returns the
+/// CLI command with the combined file as the system prompt.
+pub fn build_ea_command(base_command: &str) -> String {
+    let prompt_file = prompts_dir().join("executive-assistant.md");
+    let mem = memory::load_memory();
+
+    if mem.is_empty() {
+        return build_agent_command(base_command, &prompt_file, &[]);
+    }
+
+    let prompt_content = std::fs::read_to_string(&prompt_file).unwrap_or_default();
+    let combined = format!(
+        "{}\n\n---\n\n## Current OMAR State (from previous session)\n\n{}",
+        prompt_content, mem
+    );
+
+    let combined_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".omar")
+        .join("ea_prompt_combined.md");
+    std::fs::create_dir_all(combined_path.parent().unwrap()).ok();
+    std::fs::write(&combined_path, &combined).ok();
+
+    build_agent_command(base_command, &combined_path, &[])
+}
+
 /// Start the manager agent session
 pub fn start_manager(client: &TmuxClient, command: &str) -> Result<()> {
     // Check if manager already exists
@@ -75,9 +104,8 @@ pub fn start_manager(client: &TmuxClient, command: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Build command with system prompt loaded via native CLI flag
-    let prompt_file = prompts_dir().join("executive-assistant.md");
-    let cmd = build_agent_command(command, &prompt_file, &[]);
+    // Build command with EA system prompt + memory baked in
+    let cmd = build_ea_command(command);
 
     // Create manager session — system prompt set at process start
     println!("Starting manager agent...");

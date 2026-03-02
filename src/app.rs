@@ -2,8 +2,6 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::thread;
-use std::time::Duration;
 
 use crate::config::Config;
 use crate::manager::MANAGER_SESSION;
@@ -221,9 +219,8 @@ impl App {
             return Ok(());
         }
 
-        // Build command with EA system prompt loaded via native CLI flag
-        let prompt_file = crate::manager::prompts_dir().join("executive-assistant.md");
-        let cmd = crate::manager::build_agent_command(&self.default_command, &prompt_file, &[]);
+        // Build command with EA system prompt + memory baked in
+        let cmd = crate::manager::build_ea_command(&self.default_command);
 
         // Start manager session — system prompt set at process start
         let workdir = std::env::current_dir()
@@ -232,21 +229,6 @@ impl App {
 
         self.client
             .new_session(MANAGER_SESSION, &cmd, Some(&workdir))?;
-
-        // Give it time to start
-        thread::sleep(Duration::from_secs(2));
-
-        // Send persistent memory as first user message (if non-empty)
-        let mem = memory::load_memory();
-        if !mem.is_empty() {
-            let user_msg = format!(
-                "Here is the current OMAR state from your last session:\n\n{}",
-                mem
-            );
-            self.client.send_keys_literal(MANAGER_SESSION, &user_msg)?;
-            thread::sleep(Duration::from_millis(200));
-            self.client.send_keys(MANAGER_SESSION, "C-m")?;
-        }
 
         // Write memory after creating manager
         memory::write_memory(&self.agents, None, &self.client);
