@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 use super::models::*;
 use crate::app::{SharedApp, MANAGER_SESSION_NAME};
-use crate::manager::{PM_SYSTEM_PROMPT, WORKER_SYSTEM_PROMPT};
+use crate::manager::{build_agent_command, prompts_dir};
 use crate::memory;
 use crate::projects;
 use crate::scheduler::{event::ScheduledEvent, Scheduler};
@@ -162,16 +162,31 @@ pub async fn spawn_agent(
             .unwrap_or_else(|_| ".".to_string())
     });
 
-    // Always start an interactive session with the base command
+    // Build the agent command — with system prompt via native CLI flag if a role is set
     let base_command = req
         .command
         .unwrap_or_else(|| app.default_command().to_string());
 
-    // Spawn the agent with the base command (no task appended)
-    if let Err(e) = app
-        .client()
-        .new_session(&name, &base_command, Some(&workdir))
-    {
+    let is_pm = req.role.as_deref() == Some("project-manager");
+    let cmd = if is_pm {
+        let prompt_file = prompts_dir().join("project-manager.md");
+        build_agent_command(&base_command, &prompt_file, &[])
+    } else if req.task.is_some() && req.role.as_deref() != Some("project-manager") {
+        // Worker with a task — use worker prompt with template substitutions
+        let parent = req.parent.as_deref().unwrap_or("ea");
+        let task = req.task.as_deref().unwrap_or("");
+        let prompt_file = prompts_dir().join("worker.md");
+        build_agent_command(
+            &base_command,
+            &prompt_file,
+            &[("{{PARENT_NAME}}", parent), ("{{TASK}}", task)],
+        )
+    } else {
+        base_command.clone()
+    };
+
+    // Spawn the agent — system prompt set at process start
+    if let Err(e) = app.client().new_session(&name, &cmd, Some(&workdir)) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -181,7 +196,6 @@ pub async fn spawn_agent(
     }
 
     // Save parent mapping: explicit parent, or auto-infer from running PMs
-    let is_pm = req.role.as_deref() == Some("project-manager");
     if let Some(ref parent) = req.parent {
         let resolved_parent = resolve_session_name(&prefix, parent);
         memory::save_agent_parent(&name, &resolved_parent);
@@ -206,28 +220,16 @@ pub async fn spawn_agent(
         }
     }
 
-    // If a task was provided, send it via tmux send-keys after a delay
-    // This works universally with any agent backend (claude, opencode, etc.)
+    // Send first user message after a delay (role-dependent content)
     if let Some(task) = req.task {
         // Always persist the original (short) task for dashboard display
         memory::save_worker_task(&name, &task);
 
-        // Build the full prompt to send: if role is "project-manager",
-        // prepend the PM system prompt so the agent knows how to behave.
-        // Also inject the PM's own short name so it can pass it as `parent`
-        // when spawning workers.
-        let full_prompt = if req.role.as_deref() == Some("project-manager") {
+        let user_msg = if is_pm {
             let short = display_name(&prefix, &name);
-            format!(
-                "{}\n\nYOUR NAME: {}\nYOUR TASK: {}",
-                PM_SYSTEM_PROMPT, short, task
-            )
+            format!("YOUR NAME: {}\nYOUR TASK: {}", short, task)
         } else {
-            // Inject the worker system prompt with parent name and task
-            let parent = req.parent.as_deref().unwrap_or("ea");
-            WORKER_SYSTEM_PROMPT
-                .replace("{{PARENT_NAME}}", parent)
-                .replace("{{TASK}}", &task)
+            "Start working on your assigned task now.".to_string()
         };
 
         let client = app.client().clone();
@@ -235,7 +237,7 @@ pub async fn spawn_agent(
         tokio::spawn(async move {
             // Wait for the agent process to start
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let _ = client.send_keys_literal(&session, &full_prompt);
+            let _ = client.send_keys_literal(&session, &user_msg);
             // Small delay so tmux finishes buffering the text before Enter
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let _ = client.send_keys(&session, "Enter");

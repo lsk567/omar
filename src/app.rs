@@ -221,34 +221,32 @@ impl App {
             return Ok(());
         }
 
-        // Start manager session
+        // Build command with EA system prompt loaded via native CLI flag
+        let prompt_file = crate::manager::prompts_dir().join("executive-assistant.md");
+        let cmd = crate::manager::build_agent_command(&self.default_command, &prompt_file, &[]);
+
+        // Start manager session — system prompt set at process start
         let workdir = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
 
         self.client
-            .new_session(MANAGER_SESSION, &self.default_command, Some(&workdir))?;
+            .new_session(MANAGER_SESSION, &cmd, Some(&workdir))?;
 
         // Give it time to start
         thread::sleep(Duration::from_secs(2));
 
-        // Build full prompt: EA system prompt + persistent memory
-        let mut full_prompt = crate::manager::MANAGER_SYSTEM_PROMPT.to_string();
+        // Send persistent memory as first user message (if non-empty)
         let mem = memory::load_memory();
         if !mem.is_empty() {
-            full_prompt.push_str(&format!(
-                "\n\n---\n\nHere is the current OMAR state from your last session:\n\n{}",
+            let user_msg = format!(
+                "Here is the current OMAR state from your last session:\n\n{}",
                 mem
-            ));
+            );
+            self.client.send_keys_literal(MANAGER_SESSION, &user_msg)?;
+            thread::sleep(Duration::from_millis(200));
+            self.client.send_keys(MANAGER_SESSION, "C-m")?;
         }
-
-        // Send concatenated prompt
-        self.client
-            .send_keys_literal(MANAGER_SESSION, &full_prompt)?;
-
-        // Small delay to ensure prompt is fully received before pressing Enter
-        thread::sleep(Duration::from_millis(200));
-        self.client.send_keys(MANAGER_SESSION, "C-m")?;
 
         // Write memory after creating manager
         memory::write_memory(&self.agents, None, &self.client);

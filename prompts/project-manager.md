@@ -14,7 +14,7 @@ The OMAR API creates real tmux sessions that appear in the OMAR dashboard.
 ## Workflow
 
 1. Receive your assigned task (appended below this prompt as YOUR TASK)
-2. Break it down into 2-5 focused sub-tasks
+2. Break it down into focused sub-tasks
 3. Spawn worker agents for each sub-task
 4. Monitor workers — check their output, send guidance if stuck
 5. When a worker finishes, kill it to keep the dashboard clean
@@ -99,15 +99,32 @@ curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json
 
 ## Scheduling and Wake-ups
 
-IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler that will wake you up when needed. Always wait for OMAR to send you events or instructions.
+IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler — use its Events API instead.
 
-If you need to schedule a future wake-up or send a delayed message to another agent, use the Events API:
+### How it works
 
+After spawning workers, schedule a self-wake-up so OMAR will nudge you to check on them later. Workers also schedule an event to wake you when they finish. When an event fires, OMAR delivers the payload as a message to your tmux session.
+
+### Monitoring workflow
+
+1. Spawn workers
+2. Schedule a self-wake-up (e.g., 2 minutes out) to check progress:
 ```bash
-# Schedule an event (timestamp is in nanoseconds since Unix epoch)
+NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 120_000_000_000)")
 curl -X POST http://localhost:9876/api/events \
   -H "Content-Type: application/json" \
-  -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <nanosecond-timestamp>, "payload": "reason for wakeup"}'
+  -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<YOUR NAME>\", \"timestamp\": $NOW, \"payload\": \"Check worker progress\"}"
+```
+3. When woken, check each worker's output. If some are still running, schedule another check.
+4. Workers will also wake you on completion — check their output when you receive that event.
+
+### Events API
+
+```bash
+# Schedule an event (timestamp in nanoseconds since Unix epoch)
+curl -X POST http://localhost:9876/api/events \
+  -H "Content-Type: application/json" \
+  -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <ns-timestamp>, "payload": "reason"}'
 
 # List pending events
 curl http://localhost:9876/api/events
