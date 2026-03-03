@@ -307,6 +307,26 @@ pub async fn spawn_agent(
         });
     }
 
+    // Schedule a recurring status-prompt event for PMs
+    if is_pm {
+        let short_name = display_name(&prefix, &name).to_string();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let interval: u64 = 60_000_000_000; // 60 seconds
+        let event = ScheduledEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            sender: "omar".to_string(),
+            receiver: short_name,
+            timestamp: now + interval,
+            payload: "[STATUS CHECK] Update your status: echo \"<1-line status>\" > ~/.omar/status/$(tmux display-message -p '#S').md".to_string(),
+            created_at: now,
+            recurring_ns: Some(interval),
+        };
+        state.scheduler.insert(event);
+    }
+
     let short = display_name(&prefix, &name).to_string();
     Ok(Json(SpawnAgentResponse {
         id: short,
@@ -355,8 +375,10 @@ pub async fn kill_agent(
         ));
     }
 
-    // Clean up parent mapping for the killed agent
+    // Clean up parent mapping and cancel pending events for the killed agent
     memory::remove_agent_parent(&session_name);
+    let short_name = display_name(&prefix, &session_name).to_string();
+    state.scheduler.cancel_by_receiver(&short_name);
 
     Ok(Json(StatusResponse {
         status: "killed".to_string(),
@@ -486,6 +508,7 @@ pub async fn schedule_event(
         timestamp: req.timestamp,
         payload: req.payload,
         created_at: now,
+        recurring_ns: req.recurring_ns,
     };
 
     state.scheduler.insert(event);

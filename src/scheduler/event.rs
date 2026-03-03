@@ -9,6 +9,9 @@ pub struct ScheduledEvent {
     pub timestamp: u64,
     pub payload: String,
     pub created_at: u64,
+    /// If set, the event re-schedules itself with `timestamp = now + recurring_ns`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurring_ns: Option<u64>,
 }
 
 // Reverse ordering so BinaryHeap (max-heap) behaves as a min-heap.
@@ -41,6 +44,7 @@ mod tests {
             timestamp,
             payload: payload.to_string(),
             created_at: 0,
+            recurring_ns: None,
         }
     }
 

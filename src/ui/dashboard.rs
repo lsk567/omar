@@ -478,23 +478,100 @@ fn render_summary_card(
         Span::styled(status_text, Style::default().fg(Color::White)),
     ]));
 
-    // Task line (last, with ellipsis if too long)
+    // Task (multi-line word wrap to fill available card space)
     let task = app
         .worker_tasks()
         .get(&agent.session.name)
         .cloned()
         .unwrap_or_else(|| "(no task assigned)".to_string());
     let label = "Task: ";
-    let max_task_len = content_width.saturating_sub(label.len());
-    let task_display = if task.len() > max_task_len && max_task_len > 3 {
-        format!("{}...", &task[..max_task_len - 3])
-    } else {
-        task
-    };
-    lines.push(Line::from(vec![
-        Span::styled(label, Style::default().fg(Color::Cyan)),
-        Span::styled(task_display, Style::default().fg(Color::White)),
-    ]));
+    let inner_height = area.height.saturating_sub(2) as usize; // minus top/bottom border
+    let task_lines_budget = inner_height.saturating_sub(lines.len());
+
+    if task_lines_budget > 0 {
+        // Word-wrap the task text into lines
+        let first_width = content_width.saturating_sub(label.len());
+        let cont_width = content_width;
+
+        let mut wrapped: Vec<String> = Vec::new();
+        let mut remaining = task.as_str();
+
+        // First line has reduced width due to "Task: " label
+        let widths = std::iter::once(first_width).chain(std::iter::repeat(cont_width));
+        for w in widths {
+            if remaining.is_empty() || w == 0 {
+                break;
+            }
+            if remaining.len() <= w {
+                wrapped.push(remaining.to_string());
+                remaining = "";
+            } else {
+                // Try to break at a word boundary
+                let break_at = remaining[..w]
+                    .rfind(' ')
+                    .map(|i| i + 1) // include the space on the current line
+                    .unwrap_or(w);
+                wrapped.push(remaining[..break_at].trim_end().to_string());
+                remaining = &remaining[break_at..];
+            }
+        }
+
+        // Fit into budget, truncating last visible line if needed
+        if wrapped.len() <= task_lines_budget {
+            // Everything fits
+            for (i, line_text) in wrapped.iter().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(label, Style::default().fg(Color::Cyan)),
+                        Span::styled(line_text.clone(), Style::default().fg(Color::White)),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        line_text.clone(),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+            }
+        } else {
+            // Truncate: show budget-1 full lines + last line with "..."
+            let last = task_lines_budget - 1;
+            for (i, text) in wrapped.iter().enumerate().take(task_lines_budget) {
+                let is_first = i == 0;
+                if i < last {
+                    if is_first {
+                        lines.push(Line::from(vec![
+                            Span::styled(label, Style::default().fg(Color::Cyan)),
+                            Span::styled(text.clone(), Style::default().fg(Color::White)),
+                        ]));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            text.clone(),
+                            Style::default().fg(Color::White),
+                        )));
+                    }
+                } else {
+                    // Last line: truncate with ellipsis
+                    let w = if is_first { first_width } else { cont_width };
+                    let truncated = if text.len() > w.saturating_sub(3) && w > 3 {
+                        format!("{}...", &text[..w - 3])
+                    } else {
+                        format!("{}...", text)
+                    };
+                    if is_first {
+                        lines.push(Line::from(vec![
+                            Span::styled(label, Style::default().fg(Color::Cyan)),
+                            Span::styled(truncated, Style::default().fg(Color::White)),
+                        ]));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            truncated,
+                            Style::default().fg(Color::White),
+                        )));
+                    }
+                }
+            }
+        }
+    }
 
     let paragraph = Paragraph::new(lines).block(block);
 

@@ -88,11 +88,11 @@ The Executive Assistant watches for `[PROJECT COMPLETE]` to know you are done.
 
 ## Status Reporting
 
-After spawning workers or reaching a milestone, update your status:
+OMAR sends you a periodic `[STATUS CHECK]` event every 60 seconds. When you receive one, update your status file immediately:
 ```bash
 echo "Managing N workers: <brief project status>" > ~/.omar/status/$(tmux display-message -p '#S').md
 ```
-Update this whenever your project status changes.
+Also update proactively after spawning workers or reaching a milestone.
 
 ## Example
 

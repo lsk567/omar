@@ -125,6 +125,8 @@ pub struct ScheduleEventRequest {
     /// Unix epoch nanoseconds, absolute
     pub timestamp: u64,
     pub payload: String,
+    /// If set, the event re-schedules itself at `now + recurring_ns` after each delivery.
+    pub recurring_ns: Option<u64>,
 }
 
 /// Response after scheduling an event
