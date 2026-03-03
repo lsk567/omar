@@ -105,6 +105,12 @@ pub fn load_agent_status(session_name: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// Save an agent's status to ~/.omar/status/<session>.md
+pub fn save_agent_status(session_name: &str, status: &str) {
+    let path = status_dir().join(format!("{}.md", session_name));
+    fs::write(&path, status).ok();
+}
+
 /// Load the memory file contents (empty string if missing)
 pub fn load_memory() -> String {
     let path = memory_path();

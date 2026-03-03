@@ -192,6 +192,33 @@ pub async fn get_agent_summary(
     }
 }
 
+/// PUT /api/agents/:id/status
+pub async fn update_agent_status(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateStatusRequest>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let app = state.app.lock().await;
+    let prefix = app.client().prefix().to_string();
+    let session_name = resolve_session_name(&prefix, &id);
+
+    if !app.client().has_session(&session_name).unwrap_or(false) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Agent '{}' not found", id),
+            }),
+        ));
+    }
+
+    memory::save_agent_status(&session_name, &req.status);
+
+    Ok(Json(StatusResponse {
+        status: "updated".to_string(),
+        message: Some(format!("Status updated for '{}'", id)),
+    }))
+}
+
 /// POST /api/agents
 pub async fn spawn_agent(
     State(state): State<Arc<ApiState>>,
@@ -320,7 +347,7 @@ pub async fn spawn_agent(
             sender: "omar".to_string(),
             receiver: short_name,
             timestamp: now + interval,
-            payload: "[STATUS CHECK] Update your status: echo \"<1-line status>\" > ~/.omar/status/$(tmux display-message -p '#S').md".to_string(),
+            payload: "[STATUS CHECK] Update your status via the API: curl -X PUT http://localhost:9876/api/agents/<YOUR NAME>/status -H 'Content-Type: application/json' -d '{\"status\": \"<1-line status>\"}'".to_string(),
             created_at: now,
             recurring_ns: Some(interval),
         };

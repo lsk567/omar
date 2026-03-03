@@ -4,7 +4,7 @@ pub mod handlers;
 pub mod models;
 
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::net::SocketAddr;
@@ -28,6 +28,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/agents/:id", get(handlers::get_agent))
         .route("/api/agents/:id", delete(handlers::kill_agent))
         .route("/api/agents/:id/summary", get(handlers::get_agent_summary))
+        .route("/api/agents/:id/status", put(handlers::update_agent_status))
         .route("/api/agents/:id/send", post(handlers::send_input))
         .route("/api/projects", get(handlers::list_projects))
         .route("/api/projects", post(handlers::add_project))

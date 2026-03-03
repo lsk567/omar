@@ -39,9 +39,11 @@ IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g
 
 ## Status Reporting
 
-After each major step, update your status so the dashboard can show a summary:
+After each major step, update your status via the API so the dashboard can show a summary:
 ```bash
-echo "Currently: <brief description of what you're doing>" > ~/.omar/status/$(tmux display-message -p '#S').md
+curl -X PUT http://localhost:9876/api/agents/<YOUR NAME>/status \
+  -H "Content-Type: application/json" \
+  -d '{"status": "Currently: <brief description of what you are doing>"}'
 ```
 Update this whenever you start a new sub-task or reach a milestone.
 

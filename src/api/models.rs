@@ -103,6 +103,12 @@ pub struct ListProjectsResponse {
     pub projects: Vec<ProjectResponse>,
 }
 
+/// Request to update an agent's status
+#[derive(Debug, Deserialize)]
+pub struct UpdateStatusRequest {
+    pub status: String,
+}
+
 /// Agent summary response (lightweight card info)
 #[derive(Debug, Serialize)]
 pub struct AgentSummaryResponse {
