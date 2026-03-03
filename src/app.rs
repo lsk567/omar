@@ -58,7 +58,6 @@ pub struct App {
     pub command_tree: Vec<CommandTreeNode>,
     pub selected: usize,
     pub manager_selected: bool,
-    pub interactive_mode: bool,
     pub should_quit: bool,
     pub show_help: bool,
     pub show_confirm_kill: bool,
@@ -98,7 +97,6 @@ impl App {
             command_tree: Vec::new(),
             selected: 0,
             manager_selected: true,
-            interactive_mode: false,
             should_quit: false,
             show_help: false,
             show_confirm_kill: false,
@@ -634,41 +632,6 @@ impl App {
     /// Get total agent count (including manager)
     pub fn total_agents(&self) -> usize {
         self.agents.len() + if self.manager.is_some() { 1 } else { 0 }
-    }
-
-    /// Enter interactive mode (for selected agent or manager)
-    pub fn enter_interactive(&mut self) {
-        if self.selected_agent().is_some() {
-            self.interactive_mode = true;
-        }
-    }
-
-    /// Exit interactive mode
-    pub fn exit_interactive(&mut self) {
-        self.interactive_mode = false;
-    }
-
-    /// Get the session name of the currently selected agent
-    fn selected_session(&self) -> Option<&str> {
-        self.selected_agent().map(|a| a.session.name.as_str())
-    }
-
-    /// Send a key to the selected agent (for interactive mode)
-    pub fn send_key_to_selected(&self, key: &str) -> Result<()> {
-        if let Some(session) = self.selected_session() {
-            self.client.send_keys(session, key)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Send literal text to the selected agent (for interactive mode)
-    pub fn send_text_to_selected(&self, text: &str) -> Result<()> {
-        if let Some(session) = self.selected_session() {
-            self.client.send_keys_literal(session, text)
-        } else {
-            Ok(())
-        }
     }
 
     /// Get focus parent pane output (more lines for display)

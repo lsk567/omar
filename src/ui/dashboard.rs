@@ -187,15 +187,7 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
 
         if col < col_chunks.len() {
             let is_selected = !app.manager_selected && i == app.selected;
-            let is_interactive = app.interactive_mode && is_selected;
-            render_summary_card(
-                frame,
-                app,
-                child,
-                col_chunks[col],
-                is_selected,
-                is_interactive,
-            );
+            render_summary_card(frame, app, child, col_chunks[col], is_selected);
         }
     }
 }
@@ -203,9 +195,8 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
 fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
     let parent_info = app.focus_parent_info();
 
-    if parent_info.is_some() {
+    if let Some(info) = parent_info {
         let is_selected = app.manager_selected;
-        let is_interactive = app.interactive_mode && is_selected;
 
         // Build display title based on focus parent type
         let parent_name = &app.focus_parent;
@@ -222,34 +213,46 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             }
         };
 
-        // Build breadcrumb
-        let breadcrumb = app.breadcrumb().join(" > ");
-
-        let (border_color, title) = if is_interactive {
-            (
-                Color::Cyan,
-                format!(" {} [INTERACTIVE - Esc to exit] ", display_title),
-            )
-        } else if is_selected {
-            (
-                Color::Magenta,
-                format!(" [{}] - Enter to open | {} ", display_title, breadcrumb),
-            )
-        } else {
-            (Color::Blue, format!(" {} | {} ", display_title, breadcrumb))
+        // Health status dot
+        let (health_color, status_icon) = match info.health {
+            HealthState::Running => (Color::Green, "●"),
+            HealthState::Idle => (Color::Yellow, "○"),
         };
 
-        let border_style =
-            Style::default()
-                .fg(border_color)
-                .add_modifier(if is_selected || is_interactive {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                });
+        let (border_color, title_line) = if is_selected {
+            (
+                Color::Magenta,
+                Line::from(vec![
+                    Span::styled(" [", Style::default().fg(Color::Magenta)),
+                    Span::styled(status_icon, Style::default().fg(health_color)),
+                    Span::styled("] ", Style::default().fg(Color::Magenta)),
+                    Span::styled(&display_title, Style::default().fg(health_color)),
+                    Span::styled(" - Enter to open ", Style::default().fg(Color::Magenta)),
+                ]),
+            )
+        } else {
+            (
+                Color::Blue,
+                Line::from(vec![
+                    Span::styled(" ", Style::default().fg(Color::Blue)),
+                    Span::styled(status_icon, Style::default().fg(health_color)),
+                    Span::styled(" ", Style::default().fg(Color::Blue)),
+                    Span::styled(&display_title, Style::default().fg(health_color)),
+                    Span::styled(" ", Style::default().fg(Color::Blue)),
+                ]),
+            )
+        };
+
+        let border_style = Style::default()
+            .fg(border_color)
+            .add_modifier(if is_selected {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
 
         let block = Block::default()
-            .title(title)
+            .title(title_line)
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
             .border_style(border_style);
@@ -390,29 +393,23 @@ fn render_summary_card(
     agent: &AgentInfo,
     area: Rect,
     selected: bool,
-    interactive: bool,
 ) {
     let (health_color, status_icon) = match agent.health {
         HealthState::Running => (Color::Green, "●"),
         HealthState::Idle => (Color::Yellow, "○"),
     };
 
-    // Border color based on state
-    let border_color = if interactive {
-        Color::Cyan
-    } else if selected {
+    let border_color = if selected {
         Color::Magenta
     } else {
         Color::Gray
     };
 
-    let border_style = Style::default()
-        .fg(border_color)
-        .add_modifier(if selected || interactive {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        });
+    let border_style = Style::default().fg(border_color).add_modifier(if selected {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
+    });
 
     // Display name: strip prefix, label PMs as "Project Manager"
     let short_name = agent
@@ -427,13 +424,7 @@ fn render_summary_card(
     };
 
     // Title with status indicator
-    let title_line = if interactive {
-        Line::from(vec![
-            Span::styled(" ", Style::default().fg(border_color)),
-            Span::styled(&display, Style::default().fg(health_color)),
-            Span::styled(" [INTERACTIVE - Esc] ", Style::default().fg(border_color)),
-        ])
-    } else if selected {
+    let title_line = if selected {
         Line::from(vec![
             Span::styled(" [", Style::default().fg(border_color)),
             Span::styled(status_icon, Style::default().fg(health_color)),
@@ -457,19 +448,22 @@ fn render_summary_card(
         .border_type(BorderType::Thick)
         .border_style(border_style);
 
-    // Build summary content instead of raw pane capture
+    // Available width for text content (minus borders and label prefix)
+    let content_width = area.width.saturating_sub(2) as usize; // -2 for borders
+
     let mut lines: Vec<Line> = Vec::new();
 
-    // Task line
-    let task = app
-        .worker_tasks()
-        .get(&agent.session.name)
-        .cloned()
-        .unwrap_or_else(|| "(no task assigned)".to_string());
-    lines.push(Line::from(vec![
-        Span::styled("Task: ", Style::default().fg(Color::Cyan)),
-        Span::styled(task, Style::default().fg(Color::White)),
-    ]));
+    // Sub-agent count (first)
+    let child_count = app.child_count(&agent.session.name);
+    if child_count > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("Sub-agents: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", child_count),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
 
     // Status line (from status file, fallback to last_output)
     let status_text = memory::load_agent_status(&agent.session.name).unwrap_or_else(|| {
@@ -484,79 +478,60 @@ fn render_summary_card(
         Span::styled(status_text, Style::default().fg(Color::White)),
     ]));
 
-    // Sub-agent count
-    let child_count = app.child_count(&agent.session.name);
-    if child_count > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("Sub-agents: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", child_count),
-                Style::default().fg(Color::White),
-            ),
-        ]));
-    }
+    // Task line (last, with ellipsis if too long)
+    let task = app
+        .worker_tasks()
+        .get(&agent.session.name)
+        .cloned()
+        .unwrap_or_else(|| "(no task assigned)".to_string());
+    let label = "Task: ";
+    let max_task_len = content_width.saturating_sub(label.len());
+    let task_display = if task.len() > max_task_len && max_task_len > 3 {
+        format!("{}...", &task[..max_task_len - 3])
+    } else {
+        task
+    };
+    lines.push(Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::Cyan)),
+        Span::styled(task_display, Style::default().fg(Color::White)),
+    ]));
 
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(block);
 
     frame.render_widget(paragraph, area);
 }
 
 fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let help_text = if app.interactive_mode {
-        // Interactive mode help
-        let target = if app.manager_selected {
-            "Executive Assistant"
-        } else {
-            "agent"
-        };
-        vec![
-            Span::styled(
-                "Esc",
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(Color::Cyan),
-            ),
-            Span::raw(":Exit interactive "),
-            Span::styled("Type", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!(" to send input to {}", target)),
-        ]
-    } else {
-        let at_root = app.focus_parent == crate::manager::MANAGER_SESSION;
-        let esc_label = if at_root { "Esc:Quit " } else { "Esc:Back " };
+    let at_root = app.focus_parent == crate::manager::MANAGER_SESSION;
 
-        // Common help for both selected and normal states
-        let mut spans = vec![
-            Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Nav "),
-            Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Drill-in "),
-            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Popup "),
-            Span::styled(
-                "i",
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(Color::Cyan),
-            ),
-            Span::raw(":Interactive "),
-            Span::styled("n", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":New "),
-            Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Kill "),
-            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Quit "),
-        ];
-        spans.push(Span::styled(
-            esc_label,
+    let mut help_text = vec![
+        Span::styled("↑↓", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Nav "),
+        Span::styled("→", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Drill-in "),
+        Span::styled("←", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Back "),
+        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Popup "),
+        Span::styled("n", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":New "),
+        Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Kill "),
+        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Quit "),
+    ];
+    if !at_root {
+        help_text.push(Span::styled(
+            "Esc",
             Style::default().add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(
-            "?",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(":Help"));
-        spans
-    };
+        help_text.push(Span::raw(":Back "));
+    }
+    help_text.push(Span::styled(
+        "?",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    help_text.push(Span::raw(":Help"));
 
     let ticker_content = app.ticker.render(std::time::Duration::from_secs(5));
 
@@ -621,12 +596,10 @@ fn render_help_popup(frame: &mut Frame) {
         )),
         Line::from(""),
         Line::from("  q           Quit"),
-        Line::from("  Esc         Back (drill up) / Quit at root"),
-        Line::from("  Tab         Drill into selected agent"),
-        Line::from("  j, Down     Move selection down"),
-        Line::from("  k, Up       Move selection up"),
+        Line::from("  Esc, ←      Back (drill up)"),
+        Line::from("  Tab, →      Drill into selected agent"),
+        Line::from("  ↑/↓, j/k   Move selection up/down"),
         Line::from("  Enter       Attach to selected agent"),
-        Line::from("  i           Interactive mode"),
         Line::from("  n           Spawn new agent"),
         Line::from("  d           Kill selected agent"),
         Line::from("  p           Add a project"),

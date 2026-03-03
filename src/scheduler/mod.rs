@@ -39,12 +39,13 @@ impl TickerBuffer {
         });
     }
 
-    /// Return the joined ticker content, pruning entries older than `ttl`.
+    /// Return the joined ticker content, filtering entries older than `ttl`.
+    /// Does NOT prune the buffer — old entries remain for `latest()` / debug console.
     pub fn render(&self, ttl: std::time::Duration) -> String {
-        let mut buf = self.entries.lock().unwrap();
+        let buf = self.entries.lock().unwrap();
         let now = Instant::now();
-        buf.retain(|e| now.duration_since(e.created_at) < ttl);
         buf.iter()
+            .filter(|e| now.duration_since(e.created_at) < ttl)
             .map(|e| e.text.as_str())
             .collect::<Vec<_>>()
             .join(" +++ ")
