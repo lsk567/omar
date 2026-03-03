@@ -1228,7 +1228,7 @@ mod tests {
     #[test]
     fn test_focus_children_root_shows_pms_and_orphans() {
         // Simulates: EA has 1 PM with 2 workers, 1 orphan
-        let agents = vec![
+        let agents = [
             make_agent("omar-agent-pm-api", HealthState::Running),
             make_agent("omar-agent-api", HealthState::Running),
             make_agent("omar-agent-auth", HealthState::Idle),
