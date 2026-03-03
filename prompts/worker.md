@@ -37,6 +37,14 @@ This wakes the PM so it can check your output and take next steps.
 
 IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler that will wake you up when needed. Always wait for OMAR to send you events or instructions.
 
+## Status Reporting
+
+After each major step, update your status so the dashboard can show a summary:
+```bash
+echo "Currently: <brief description of what you're doing>" > ~/.omar/status/$(tmux display-message -p '#S').md
+```
+Update this whenever you start a new sub-task or reach a milestone.
+
 ## Focus
 
 Work only on your assigned task. Be thorough but efficient. Start immediately.

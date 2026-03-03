@@ -86,6 +86,14 @@ Summary:
 
 The Executive Assistant watches for `[PROJECT COMPLETE]` to know you are done.
 
+## Status Reporting
+
+After spawning workers or reaching a milestone, update your status:
+```bash
+echo "Managing N workers: <brief project status>" > ~/.omar/status/$(tmux display-message -p '#S').md
+```
+Update this whenever your project status changes.
+
 ## Example
 
 YOUR TASK: Build a REST API with authentication

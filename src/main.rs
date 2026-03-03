@@ -356,8 +356,16 @@ async fn run_dashboard(config: Config) -> Result<()> {
 
                     // Normal key handling
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
+                        KeyCode::Char('q') => {
                             app.should_quit = true;
+                        }
+                        KeyCode::Esc => {
+                            if !app.drill_up() {
+                                app.should_quit = true;
+                            }
+                        }
+                        KeyCode::Tab => {
+                            app.drill_down();
                         }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.should_quit = true;

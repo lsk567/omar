@@ -72,7 +72,14 @@ pub struct App {
     pub ticker: TickerBuffer,
     pub ticker_offset: usize,
     pub show_debug_console: bool,
+    /// Session name of the agent shown in the bottom panel (default: MANAGER_SESSION)
+    pub focus_parent: String,
+    /// Stack for Esc navigation (drill-up restores previous parent)
+    focus_stack: Vec<String>,
+    /// Indices into self.agents for the current focus_parent's direct children
+    pub focus_child_indices: Vec<usize>,
     agent_parents: HashMap<String, String>,
+    worker_tasks: HashMap<String, String>,
     client: TmuxClient,
     health_checker: HealthChecker,
     default_command: String,
@@ -105,7 +112,11 @@ impl App {
             ticker,
             ticker_offset: 0,
             show_debug_console: false,
+            focus_parent: MANAGER_SESSION.to_string(),
+            focus_stack: Vec::new(),
+            focus_child_indices: Vec::new(),
             agent_parents: HashMap::new(),
+            worker_tasks: HashMap::new(),
             client,
             health_checker,
             default_command: config.agent.default_command.clone(),
@@ -196,19 +207,26 @@ impl App {
         // Reload projects from file (picks up API-side changes)
         self.projects = projects::load_projects();
 
-        // Keep selection in bounds
-        if !self.agents.is_empty() && self.selected >= self.agents.len() {
-            self.selected = self.agents.len() - 1;
-        }
-
-        // Load parent mappings and build the chain-of-command tree
+        // Load parent mappings, worker tasks, and build the chain-of-command tree
         self.agent_parents = memory::load_agent_parents();
+        self.worker_tasks = memory::load_worker_tasks();
         self.command_tree = build_tree(
             &self.agents,
             self.manager.as_ref(),
             &self.agent_parents,
             &self.session_prefix,
         );
+
+        // Recompute focus children indices
+        self.focus_child_indices = self.compute_focus_child_indices();
+
+        // Keep selection in bounds relative to focus children
+        if !self.manager_selected
+            && !self.focus_child_indices.is_empty()
+            && self.selected >= self.focus_child_indices.len()
+        {
+            self.selected = self.focus_child_indices.len() - 1;
+        }
 
         Ok(())
     }
@@ -261,54 +279,230 @@ impl App {
         &self.default_command
     }
 
-    /// Move selection down
+    /// Get the agent_parents map (for API/display)
+    pub fn agent_parents(&self) -> &HashMap<String, String> {
+        &self.agent_parents
+    }
+
+    /// Get the worker_tasks map (for display)
+    pub fn worker_tasks(&self) -> &HashMap<String, String> {
+        &self.worker_tasks
+    }
+
+    /// Compute indices into self.agents for focus_parent's direct children
+    fn compute_focus_child_indices(&self) -> Vec<usize> {
+        let mut indices = Vec::new();
+        if self.focus_parent == MANAGER_SESSION {
+            // Root view: show PMs + orphan workers (direct children of EA)
+            for (i, agent) in self.agents.iter().enumerate() {
+                let short = agent
+                    .session
+                    .name
+                    .strip_prefix(&self.session_prefix)
+                    .unwrap_or(&agent.session.name);
+                let is_pm = short.starts_with("pm-");
+                if is_pm {
+                    // PMs are always direct children of EA
+                    indices.push(i);
+                } else {
+                    // Non-PM: include if it has no parent, or its parent is not a live PM
+                    let parent = self.agent_parents.get(&agent.session.name);
+                    let has_live_pm_parent = parent
+                        .map(|p| {
+                            self.agents.iter().any(|a| {
+                                a.session.name == *p
+                                    && a.session
+                                        .name
+                                        .strip_prefix(&self.session_prefix)
+                                        .unwrap_or(&a.session.name)
+                                        .starts_with("pm-")
+                            })
+                        })
+                        .unwrap_or(false);
+                    if !has_live_pm_parent {
+                        indices.push(i);
+                    }
+                }
+            }
+        } else {
+            // Non-root: show agents whose parent matches focus_parent
+            for (i, agent) in self.agents.iter().enumerate() {
+                if let Some(parent) = self.agent_parents.get(&agent.session.name) {
+                    if *parent == self.focus_parent {
+                        indices.push(i);
+                    }
+                }
+            }
+        }
+        indices
+    }
+
+    /// Get the direct children of the current focus parent
+    pub fn focus_children(&self) -> Vec<&AgentInfo> {
+        self.focus_child_indices
+            .iter()
+            .filter_map(|&i| self.agents.get(i))
+            .collect()
+    }
+
+    /// Get AgentInfo for the focus parent
+    pub fn focus_parent_info(&self) -> Option<&AgentInfo> {
+        if self.focus_parent == MANAGER_SESSION {
+            self.manager.as_ref()
+        } else {
+            self.agents
+                .iter()
+                .find(|a| a.session.name == self.focus_parent)
+        }
+    }
+
+    /// Check if an agent has children (is a PM or EA)
+    fn agent_has_children(&self, session_name: &str) -> bool {
+        if session_name == MANAGER_SESSION {
+            return true;
+        }
+        self.agent_parents.values().any(|p| p == session_name)
+    }
+
+    /// Count children for a given agent
+    pub fn child_count(&self, session_name: &str) -> usize {
+        if session_name == MANAGER_SESSION {
+            // Count PMs + orphans
+            return self.compute_focus_child_indices().len();
+        }
+        self.agent_parents
+            .values()
+            .filter(|p| *p == session_name)
+            .count()
+    }
+
+    /// Build breadcrumb path from root to current focus parent
+    pub fn breadcrumb(&self) -> Vec<String> {
+        let mut crumbs: Vec<String> = vec!["EA".to_string()];
+        for session in &self.focus_stack {
+            if *session == MANAGER_SESSION {
+                continue; // Already added EA
+            }
+            let short = session
+                .strip_prefix(&self.session_prefix)
+                .unwrap_or(session);
+            if let Some(rest) = short.strip_prefix("pm-") {
+                crumbs.push(format!("PM: {}", rest));
+            } else {
+                crumbs.push(short.to_string());
+            }
+        }
+        // Add current focus parent if not EA
+        if self.focus_parent != MANAGER_SESSION {
+            let short = self
+                .focus_parent
+                .strip_prefix(&self.session_prefix)
+                .unwrap_or(&self.focus_parent);
+            if let Some(rest) = short.strip_prefix("pm-") {
+                crumbs.push(format!("PM: {}", rest));
+            } else {
+                crumbs.push(short.to_string());
+            }
+        }
+        crumbs
+    }
+
+    /// Drill down into the selected agent (Tab). Only works if the agent has children.
+    pub fn drill_down(&mut self) {
+        let session_name = if self.manager_selected {
+            // Already viewing EA's children; drill down into EA is a no-op
+            return;
+        } else {
+            // Get the session name of the selected focus child
+            if let Some(&idx) = self.focus_child_indices.get(self.selected) {
+                if let Some(agent) = self.agents.get(idx) {
+                    agent.session.name.clone()
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+        };
+
+        // Only drill down if the selected agent has children
+        if !self.agent_has_children(&session_name) {
+            return;
+        }
+
+        self.focus_stack.push(self.focus_parent.clone());
+        self.focus_parent = session_name.clone();
+        self.selected = 0;
+        self.manager_selected = false;
+        self.focus_child_indices = self.compute_focus_child_indices();
+
+        let short = session_name
+            .strip_prefix(&self.session_prefix)
+            .unwrap_or(&session_name);
+        self.status_message = Some(format!("Viewing: {}", short));
+    }
+
+    /// Drill up to the parent view (Esc). Returns true if drilled up, false if at root.
+    pub fn drill_up(&mut self) -> bool {
+        if self.focus_stack.is_empty() {
+            return false;
+        }
+        self.focus_parent = self.focus_stack.pop().unwrap();
+        self.selected = 0;
+        self.manager_selected = true;
+        self.focus_child_indices = self.compute_focus_child_indices();
+        true
+    }
+
+    /// Move selection down (within focus children + focus parent)
     pub fn next(&mut self) {
+        let child_count = self.focus_child_indices.len();
         if self.manager_selected {
-            // From manager, wrap to first agent (if any) or stay on manager
-            if !self.agents.is_empty() {
+            // From focus parent, go to first child (if any)
+            if child_count > 0 {
                 self.manager_selected = false;
                 self.selected = 0;
             }
-        } else if !self.agents.is_empty() {
-            if self.selected + 1 >= self.agents.len() {
-                // From last agent, go to manager
+        } else if child_count > 0 {
+            if self.selected + 1 >= child_count {
+                // From last child, go to focus parent
                 self.manager_selected = true;
             } else {
                 self.selected += 1;
             }
         } else {
-            // No agents, select manager
             self.manager_selected = true;
         }
     }
 
-    /// Move selection up
+    /// Move selection up (within focus children + focus parent)
     pub fn previous(&mut self) {
+        let child_count = self.focus_child_indices.len();
         if self.manager_selected {
-            // From manager, go to last agent (if any) or stay on manager
-            if !self.agents.is_empty() {
+            // From focus parent, go to last child (if any)
+            if child_count > 0 {
                 self.manager_selected = false;
-                self.selected = self.agents.len() - 1;
+                self.selected = child_count - 1;
             }
-        } else if !self.agents.is_empty() {
+        } else if child_count > 0 {
             if self.selected == 0 {
-                // From first agent, go to manager
                 self.manager_selected = true;
             } else {
                 self.selected -= 1;
             }
         } else {
-            // No agents, select manager
             self.manager_selected = true;
         }
     }
 
-    /// Get currently selected agent (could be manager)
+    /// Get currently selected agent (could be focus parent or a focus child)
     pub fn selected_agent(&self) -> Option<&AgentInfo> {
         if self.manager_selected {
-            self.manager.as_ref()
+            self.focus_parent_info()
         } else {
-            self.agents.get(self.selected)
+            self.focus_child_indices
+                .get(self.selected)
+                .and_then(|&idx| self.agents.get(idx))
         }
     }
 
@@ -477,9 +671,9 @@ impl App {
         }
     }
 
-    /// Get manager pane output (more lines for display)
-    pub fn get_manager_output(&self, lines: i32) -> Result<String> {
-        self.client.capture_pane(MANAGER_SESSION, lines)
+    /// Get focus parent pane output (more lines for display)
+    pub fn get_focus_parent_output(&self, lines: i32) -> Result<String> {
+        self.client.capture_pane(&self.focus_parent, lines)
     }
 
     /// Get agent pane output by session name
@@ -1022,5 +1216,175 @@ mod tests {
         assert_eq!(tree[1].depth, 1);
         assert_eq!(tree[2].name, "worker1");
         assert_eq!(tree[2].depth, 2);
+    }
+
+    // ── focus navigation tests ──
+
+    /// Helper to build a minimal App-like struct for focus testing.
+    /// We can't construct a full App (needs TmuxClient), so we test
+    /// compute_focus_child_indices, child_count, and breadcrumb via
+    /// the underlying logic directly.
+
+    #[test]
+    fn test_focus_children_root_shows_pms_and_orphans() {
+        // Simulates: EA has 1 PM with 2 workers, 1 orphan
+        let agents = vec![
+            make_agent("omar-agent-pm-api", HealthState::Running),
+            make_agent("omar-agent-api", HealthState::Running),
+            make_agent("omar-agent-auth", HealthState::Idle),
+            make_agent("omar-agent-orphan", HealthState::Idle),
+        ];
+        let mut parents = HashMap::new();
+        parents.insert(
+            "omar-agent-api".to_string(),
+            "omar-agent-pm-api".to_string(),
+        );
+        parents.insert(
+            "omar-agent-auth".to_string(),
+            "omar-agent-pm-api".to_string(),
+        );
+
+        // Manually compute focus children at root (MANAGER_SESSION)
+        let session_prefix = "omar-agent-";
+        let _focus_parent = MANAGER_SESSION;
+        let mut indices = Vec::new();
+        for (i, agent) in agents.iter().enumerate() {
+            let short = agent
+                .session
+                .name
+                .strip_prefix(session_prefix)
+                .unwrap_or(&agent.session.name);
+            let is_pm = short.starts_with("pm-");
+            if is_pm {
+                indices.push(i);
+            } else {
+                let parent = parents.get(&agent.session.name);
+                let has_live_pm_parent = parent
+                    .map(|p| {
+                        agents.iter().any(|a| {
+                            a.session.name == *p
+                                && a.session
+                                    .name
+                                    .strip_prefix(session_prefix)
+                                    .unwrap_or(&a.session.name)
+                                    .starts_with("pm-")
+                        })
+                    })
+                    .unwrap_or(false);
+                if !has_live_pm_parent {
+                    indices.push(i);
+                }
+            }
+        }
+
+        // Root should show PM + orphan (not the PM's workers)
+        assert_eq!(indices.len(), 2);
+        assert_eq!(agents[indices[0]].session.name, "omar-agent-pm-api");
+        assert_eq!(agents[indices[1]].session.name, "omar-agent-orphan");
+
+        // Drill into PM: should show its workers
+        let focus_parent = "omar-agent-pm-api";
+        let mut pm_indices = Vec::new();
+        for (i, agent) in agents.iter().enumerate() {
+            if let Some(parent) = parents.get(&agent.session.name) {
+                if *parent == focus_parent {
+                    pm_indices.push(i);
+                }
+            }
+        }
+        assert_eq!(pm_indices.len(), 2);
+        assert_eq!(agents[pm_indices[0]].session.name, "omar-agent-api");
+        assert_eq!(agents[pm_indices[1]].session.name, "omar-agent-auth");
+
+        let _ = focus_parent; // suppress unused warning
+    }
+
+    #[test]
+    fn test_child_count() {
+        let parents: HashMap<String, String> = [
+            ("omar-agent-api", "omar-agent-pm-api"),
+            ("omar-agent-auth", "omar-agent-pm-api"),
+            ("omar-agent-ui", "omar-agent-pm-frontend"),
+        ]
+        .iter()
+        .map(|(c, p)| (c.to_string(), p.to_string()))
+        .collect();
+
+        // PM-api has 2 children
+        let count = parents
+            .values()
+            .filter(|p| *p == "omar-agent-pm-api")
+            .count();
+        assert_eq!(count, 2);
+
+        // PM-frontend has 1 child
+        let count = parents
+            .values()
+            .filter(|p| *p == "omar-agent-pm-frontend")
+            .count();
+        assert_eq!(count, 1);
+
+        // Worker has 0 children
+        let count = parents.values().filter(|p| *p == "omar-agent-api").count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_breadcrumb_building() {
+        let session_prefix = "omar-agent-";
+
+        // At root: just ["EA"]
+        let focus_stack: Vec<String> = vec![];
+        let focus_parent = MANAGER_SESSION.to_string();
+        let mut crumbs = vec!["EA".to_string()];
+        for session in &focus_stack {
+            if *session == MANAGER_SESSION {
+                continue;
+            }
+            let short = session.strip_prefix(session_prefix).unwrap_or(session);
+            if let Some(rest) = short.strip_prefix("pm-") {
+                crumbs.push(format!("PM: {}", rest));
+            } else {
+                crumbs.push(short.to_string());
+            }
+        }
+        if focus_parent != MANAGER_SESSION {
+            let short = focus_parent
+                .strip_prefix(session_prefix)
+                .unwrap_or(&focus_parent);
+            if let Some(rest) = short.strip_prefix("pm-") {
+                crumbs.push(format!("PM: {}", rest));
+            } else {
+                crumbs.push(short.to_string());
+            }
+        }
+        assert_eq!(crumbs, vec!["EA"]);
+
+        // Drilled into PM: ["EA", "PM: rest-api"]
+        let focus_stack = vec![MANAGER_SESSION.to_string()];
+        let focus_parent = "omar-agent-pm-rest-api".to_string();
+        let mut crumbs = vec!["EA".to_string()];
+        for session in &focus_stack {
+            if *session == MANAGER_SESSION {
+                continue;
+            }
+            let short = session.strip_prefix(session_prefix).unwrap_or(session);
+            if let Some(rest) = short.strip_prefix("pm-") {
+                crumbs.push(format!("PM: {}", rest));
+            } else {
+                crumbs.push(short.to_string());
+            }
+        }
+        if focus_parent != MANAGER_SESSION {
+            let short = focus_parent
+                .strip_prefix(session_prefix)
+                .unwrap_or(&focus_parent);
+            if let Some(rest) = short.strip_prefix("pm-") {
+                crumbs.push(format!("PM: {}", rest));
+            } else {
+                crumbs.push(short.to_string());
+            }
+        }
+        assert_eq!(crumbs, vec!["EA", "PM: rest-api"]);
     }
 }

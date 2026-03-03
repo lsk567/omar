@@ -8,6 +8,7 @@ use ratatui::{
 use regex::Regex;
 
 use crate::app::{AgentInfo, App};
+use crate::memory;
 use crate::tmux::HealthState;
 
 /// Render the entire dashboard
@@ -36,16 +37,16 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_agent_grid(frame, app, chunks[1]);
     }
 
-    // Split EA area: if command tree has content, show it alongside the EA panel
+    // Split focus parent area: if command tree has content, show it alongside
     if app.command_tree.len() > 1 {
         let ea_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
             .split(chunks[2]);
-        render_manager_panel(frame, app, ea_chunks[0]);
+        render_focus_parent(frame, app, ea_chunks[0]);
         render_command_tree(frame, app, ea_chunks[1]);
     } else {
-        render_manager_panel(frame, app, chunks[2]);
+        render_focus_parent(frame, app, chunks[2]);
     }
 
     render_help_bar(frame, app, chunks[3]);
@@ -137,38 +138,25 @@ fn render_projects_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
-    if app.agents.is_empty() {
-        let empty_msg =
-            Paragraph::new("No agent sessions found.\n\nPress 'n' to spawn a new agent.")
-                .style(Style::default().fg(Color::DarkGray))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Thick)
-                        .title(" Agents ")
-                        .border_style(Style::default().fg(Color::DarkGray)),
-                );
+    let children = app.focus_children();
+
+    if children.is_empty() {
+        let empty_msg = Paragraph::new("No child agents.\n\nPress 'n' to spawn a new agent.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Thick)
+                    .title(" Agents ")
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
         frame.render_widget(empty_msg, area);
         return;
     }
 
-    let groups = app.agent_groups();
-
-    // Calculate total visual rows needed
-    let mut total_rows: usize = 0;
-    for group in &groups {
-        if group.pm.is_some() {
-            total_rows += 1; // PM card (full width)
-        }
-        if !group.workers.is_empty() {
-            let cols = 2.min(group.workers.len()).max(1);
-            total_rows += group.workers.len().div_ceil(cols);
-        }
-    }
-
-    if total_rows == 0 {
-        return;
-    }
+    // Simple 2-column grid layout
+    let cols = 2.min(children.len()).max(1);
+    let total_rows = children.len().div_ceil(cols);
 
     let row_height = (area.height / total_rows as u16).max(6);
     let row_constraints: Vec<Constraint> = (0..total_rows)
@@ -180,91 +168,75 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
         .constraints(row_constraints)
         .split(area);
 
-    let mut row_idx = 0;
+    for (i, child) in children.iter().enumerate() {
+        let row = i / cols;
+        let col = i % cols;
 
-    for group in &groups {
-        // Render PM card (full width)
-        if let Some(pm) = group.pm {
-            if row_idx < row_chunks.len() {
-                let is_selected = app
-                    .agents
-                    .iter()
-                    .position(|a| a.session.name == pm.session.name)
-                    .is_some_and(|idx| !app.manager_selected && idx == app.selected);
-                let is_interactive = app.interactive_mode && is_selected;
-                render_agent_card(
-                    frame,
-                    app,
-                    pm,
-                    row_chunks[row_idx],
-                    is_selected,
-                    is_interactive,
-                );
-                row_idx += 1;
-            }
+        if row >= row_chunks.len() {
+            break;
         }
 
-        // Render workers in 2-column sub-grid below their PM
-        if !group.workers.is_empty() {
-            let cols = 2.min(group.workers.len()).max(1);
-            for (i, worker) in group.workers.iter().enumerate() {
-                let sub_row = i / cols;
-                let sub_col = i % cols;
-                let current_row = row_idx + sub_row;
+        let col_constraints: Vec<Constraint> = (0..cols)
+            .map(|_| Constraint::Ratio(1, cols as u32))
+            .collect();
 
-                if current_row >= row_chunks.len() {
-                    break;
-                }
+        let col_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(col_constraints)
+            .split(row_chunks[row]);
 
-                let col_constraints: Vec<Constraint> = (0..cols)
-                    .map(|_| Constraint::Ratio(1, cols as u32))
-                    .collect();
-
-                let col_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints(col_constraints)
-                    .split(row_chunks[current_row]);
-
-                if sub_col < col_chunks.len() {
-                    let is_selected = app
-                        .agents
-                        .iter()
-                        .position(|a| a.session.name == worker.session.name)
-                        .is_some_and(|idx| !app.manager_selected && idx == app.selected);
-                    let is_interactive = app.interactive_mode && is_selected;
-                    render_agent_card(
-                        frame,
-                        app,
-                        worker,
-                        col_chunks[sub_col],
-                        is_selected,
-                        is_interactive,
-                    );
-                }
-            }
-            row_idx += group.workers.len().div_ceil(cols);
+        if col < col_chunks.len() {
+            let is_selected = !app.manager_selected && i == app.selected;
+            let is_interactive = app.interactive_mode && is_selected;
+            render_summary_card(
+                frame,
+                app,
+                child,
+                col_chunks[col],
+                is_selected,
+                is_interactive,
+            );
         }
     }
 }
 
-fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
-    if app.manager.is_some() {
-        let is_selected = app.manager_selected;
-        let is_interactive = app.interactive_mode;
+fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
+    let parent_info = app.focus_parent_info();
 
-        // Different styles for different states
+    if parent_info.is_some() {
+        let is_selected = app.manager_selected;
+        let is_interactive = app.interactive_mode && is_selected;
+
+        // Build display title based on focus parent type
+        let parent_name = &app.focus_parent;
+        let display_title = if *parent_name == crate::manager::MANAGER_SESSION {
+            "Executive Assistant".to_string()
+        } else {
+            let short = parent_name
+                .strip_prefix(app.client().prefix())
+                .unwrap_or(parent_name);
+            if let Some(rest) = short.strip_prefix("pm-") {
+                format!("Project Manager: {}", rest)
+            } else {
+                short.to_string()
+            }
+        };
+
+        // Build breadcrumb
+        let breadcrumb = app.breadcrumb().join(" > ");
+
         let (border_color, title) = if is_interactive {
             (
                 Color::Cyan,
-                " Executive Assistant [INTERACTIVE - Esc to exit] ",
+                format!(" {} [INTERACTIVE - Esc to exit] ", display_title),
             )
         } else if is_selected {
             (
                 Color::Magenta,
-                " [Executive Assistant] - Press Enter to open ",
+                format!(" [{}] - Enter to open | {} ", display_title, breadcrumb),
             )
         } else {
-            (Color::Blue, " Executive Assistant ")
+            (Color::Blue, format!(" {} | {} ", display_title, breadcrumb))
         };
 
         let border_style =
@@ -282,17 +254,16 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
             .border_type(BorderType::Thick)
             .border_style(border_style);
 
-        // Get manager output - more lines to fill the panel
-        let available_lines = area.height.saturating_sub(2) as i32; // -2 for borders
+        // Get focus parent output - more lines to fill the panel
+        let available_lines = area.height.saturating_sub(2) as i32;
         let output = app
-            .get_manager_output(available_lines.max(20))
+            .get_focus_parent_output(available_lines.max(20))
             .unwrap_or_default();
 
         // Parse ANSI codes and convert to ratatui text
         let content = match ansi_to_tui::IntoText::into_text(&output) {
             Ok(text) => text,
             Err(_) => {
-                // Fallback: strip ANSI and show plain text
                 let plain = strip_ansi(&output);
                 ratatui::text::Text::raw(plain)
             }
@@ -300,7 +271,7 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
 
         // Calculate scroll to show bottom of content
         let content_height = content.lines.len() as u16;
-        let visible_height = area.height.saturating_sub(2); // -2 for borders
+        let visible_height = area.height.saturating_sub(2);
         let scroll = content_height.saturating_sub(visible_height);
 
         let paragraph = Paragraph::new(content)
@@ -310,7 +281,6 @@ fn render_manager_panel(frame: &mut Frame, app: &App, area: Rect) {
 
         frame.render_widget(paragraph, area);
     } else {
-        // Manager not available (shouldn't happen normally)
         let block = Block::default()
             .title(" Executive Assistant ")
             .borders(Borders::ALL)
@@ -340,16 +310,26 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
             HealthState::Idle => (Color::Yellow, "○"),
         };
 
+        // Check if this node is the current focus parent
+        let is_focus = node.session_name == app.focus_parent;
+
         let mut spans: Vec<Span> = Vec::new();
 
         if node.depth == 0 {
             // Root (EA): no connector, just name + icon
-            spans.push(Span::styled(
-                format!(" {} ", node.name),
+            let name_style = if is_focus {
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else {
                 Style::default()
                     .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ));
+                    .add_modifier(Modifier::BOLD)
+            };
+            if is_focus {
+                spans.push(Span::styled("►", Style::default().fg(Color::Magenta)));
+            }
+            spans.push(Span::styled(format!(" {} ", node.name), name_style));
             spans.push(Span::styled(icon, Style::default().fg(health_color)));
         } else {
             // Build prefix from ancestor continuation lines
@@ -373,10 +353,19 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
             }
 
             spans.push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled(
-                format!("{} ", node.name),
-                Style::default().fg(Color::White),
-            ));
+
+            let name_style = if is_focus {
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            if is_focus {
+                spans.push(Span::styled("►", Style::default().fg(Color::Magenta)));
+            }
+            spans.push(Span::styled(format!("{} ", node.name), name_style));
             spans.push(Span::styled(icon, Style::default().fg(health_color)));
         }
 
@@ -395,7 +384,7 @@ fn strip_ansi(s: &str) -> String {
     re.replace_all(s, "").to_string()
 }
 
-fn render_agent_card(
+fn render_summary_card(
     frame: &mut Frame,
     app: &App,
     agent: &AgentInfo,
@@ -437,8 +426,7 @@ fn render_agent_card(
         short_name.to_string()
     };
 
-    // Title with status indicator — dot icon and name use health_color,
-    // surrounding decoration uses border_color.
+    // Title with status indicator
     let title_line = if interactive {
         Line::from(vec![
             Span::styled(" ", Style::default().fg(border_color)),
@@ -451,7 +439,7 @@ fn render_agent_card(
             Span::styled(status_icon, Style::default().fg(health_color)),
             Span::styled("] ", Style::default().fg(border_color)),
             Span::styled(&display, Style::default().fg(health_color)),
-            Span::styled(" - Enter to open ", Style::default().fg(border_color)),
+            Span::styled(" ", Style::default().fg(border_color)),
         ])
     } else {
         Line::from(vec![
@@ -469,30 +457,46 @@ fn render_agent_card(
         .border_type(BorderType::Thick)
         .border_style(border_style);
 
-    // Get live output from the agent's pane
-    let available_lines = area.height.saturating_sub(2) as i32;
-    let output = app
-        .get_agent_output(&agent.session.name, available_lines.max(10))
-        .unwrap_or_default();
+    // Build summary content instead of raw pane capture
+    let mut lines: Vec<Line> = Vec::new();
 
-    // Parse ANSI codes
-    let content = match ansi_to_tui::IntoText::into_text(&output) {
-        Ok(text) => text,
-        Err(_) => {
-            let plain = strip_ansi(&output);
-            ratatui::text::Text::raw(plain)
+    // Task line
+    let task = app
+        .worker_tasks()
+        .get(&agent.session.name)
+        .cloned()
+        .unwrap_or_else(|| "(no task assigned)".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("Task: ", Style::default().fg(Color::Cyan)),
+        Span::styled(task, Style::default().fg(Color::White)),
+    ]));
+
+    // Status line (from status file, fallback to last_output)
+    let status_text = memory::load_agent_status(&agent.session.name).unwrap_or_else(|| {
+        if agent.health_info.last_output.is_empty() {
+            "—".to_string()
+        } else {
+            agent.health_info.last_output.clone()
         }
-    };
+    });
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", Style::default().fg(Color::Yellow)),
+        Span::styled(status_text, Style::default().fg(Color::White)),
+    ]));
 
-    // Scroll to bottom
-    let content_height = content.lines.len() as u16;
-    let visible_height = area.height.saturating_sub(2);
-    let scroll = content_height.saturating_sub(visible_height);
+    // Sub-agent count
+    let child_count = app.child_count(&agent.session.name);
+    if child_count > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("Sub-agents: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", child_count),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
 
-    let paragraph = Paragraph::new(content)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
 
     frame.render_widget(paragraph, area);
 }
@@ -516,9 +520,18 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("Type", Style::default().fg(Color::DarkGray)),
             Span::raw(format!(" to send input to {}", target)),
         ]
-    } else if app.manager_selected || app.selected_agent().is_some() {
-        // Any agent selected help (including manager)
-        vec![
+    } else {
+        let at_root = app.focus_parent == crate::manager::MANAGER_SESSION;
+        let esc_label = if at_root { "Esc:Quit " } else { "Esc:Back " };
+
+        // Common help for both selected and normal states
+        let mut spans = vec![
+            Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Nav "),
+            Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Drill-in "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Popup "),
             Span::styled(
                 "i",
                 Style::default()
@@ -526,41 +539,23 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Cyan),
             ),
             Span::raw(":Interactive "),
-            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Popup "),
-            Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Nav "),
-            Span::styled("p", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Project "),
-            Span::styled("e", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Events "),
-            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Quit "),
-            Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Help"),
-        ]
-    } else {
-        // Normal help
-        vec![
-            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Quit "),
-            Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Nav "),
-            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Attach "),
             Span::styled("n", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":New "),
             Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(":Kill "),
-            Span::styled("p", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Project "),
-            Span::styled("e", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Events "),
-            Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Refresh "),
-            Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(":Help"),
-        ]
+            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(":Quit "),
+        ];
+        spans.push(Span::styled(
+            esc_label,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            "?",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(":Help"));
+        spans
     };
 
     let ticker_content = app.ticker.render(std::time::Duration::from_secs(5));
@@ -625,10 +620,13 @@ fn render_help_popup(frame: &mut Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  q, Esc      Quit"),
+        Line::from("  q           Quit"),
+        Line::from("  Esc         Back (drill up) / Quit at root"),
+        Line::from("  Tab         Drill into selected agent"),
         Line::from("  j, Down     Move selection down"),
         Line::from("  k, Up       Move selection up"),
         Line::from("  Enter       Attach to selected agent"),
+        Line::from("  i           Interactive mode"),
         Line::from("  n           Spawn new agent"),
         Line::from("  d           Kill selected agent"),
         Line::from("  p           Add a project"),

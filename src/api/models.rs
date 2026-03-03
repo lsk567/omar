@@ -103,6 +103,18 @@ pub struct ListProjectsResponse {
     pub projects: Vec<ProjectResponse>,
 }
 
+/// Agent summary response (lightweight card info)
+#[derive(Debug, Serialize)]
+pub struct AgentSummaryResponse {
+    pub id: String,
+    pub health: String,
+    pub task: Option<String>,
+    /// Self-reported status from ~/.omar/status/<session>.md
+    pub status: Option<String>,
+    /// Direct child agent names
+    pub children: Vec<String>,
+}
+
 // ── Event Scheduler models ──
 
 /// Request to schedule a new event

@@ -90,6 +90,21 @@ pub fn remove_agent_parent(child: &str) {
     write_agent_parents(&parents);
 }
 
+/// Directory for agent status files
+fn status_dir() -> PathBuf {
+    let dir = omar_dir().join("status");
+    fs::create_dir_all(&dir).ok();
+    dir
+}
+
+/// Load an agent's self-reported status from ~/.omar/status/<session>.md
+pub fn load_agent_status(session_name: &str) -> Option<String> {
+    let path = status_dir().join(format!("{}.md", session_name));
+    fs::read_to_string(&path)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// Load the memory file contents (empty string if missing)
 pub fn load_memory() -> String {
     let path = memory_path();

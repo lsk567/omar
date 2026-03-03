@@ -27,6 +27,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/agents", post(handlers::spawn_agent))
         .route("/api/agents/:id", get(handlers::get_agent))
         .route("/api/agents/:id", delete(handlers::kill_agent))
+        .route("/api/agents/:id/summary", get(handlers::get_agent_summary))
         .route("/api/agents/:id/send", post(handlers::send_input))
         .route("/api/projects", get(handlers::list_projects))
         .route("/api/projects", post(handlers::add_project))
