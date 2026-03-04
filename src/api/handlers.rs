@@ -17,13 +17,15 @@ use crate::computer::{self, ComputerLock};
 use crate::manager::{build_agent_command, prompts_dir};
 use crate::memory;
 use crate::projects;
-use crate::scheduler::{event::ScheduledEvent, Scheduler};
+use crate::scheduler::{event::ScheduledEvent, PopupReceiver, Scheduler};
 
 /// Shared state for all API handlers
 pub struct ApiState {
     pub app: Arc<Mutex<SharedApp>>,
     pub scheduler: Arc<Scheduler>,
     pub computer_lock: ComputerLock,
+    /// Tracks which agent currently has a dashboard popup open (if any).
+    pub popup_receiver: PopupReceiver,
 }
 
 /// Resolve a user-facing agent name to a full tmux session name.
@@ -109,17 +111,30 @@ pub async fn get_agent(
 
     match agent {
         Some(a) => {
+            let short = display_name(&prefix, &a.session.name).to_string();
             let output_tail = app
                 .client()
                 .capture_pane(&a.session.name, 50)
                 .unwrap_or_default();
 
+            let protected = state
+                .popup_receiver
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|r| r == short);
+
+            let completed = output_tail.contains("[PROJECT COMPLETE]")
+                || output_tail.contains("[TASK COMPLETE]");
+
             Ok(Json(AgentDetailResponse {
-                id: display_name(&prefix, &a.session.name).to_string(),
+                id: short,
                 status: "running".to_string(),
                 health: a.health.as_str().to_string(),
                 last_output: a.health_info.last_output.clone(),
                 output_tail,
+                protected,
+                completed,
             }))
         }
         None => Err((
@@ -342,14 +357,19 @@ pub async fn spawn_agent(
 }
 
 /// DELETE /api/agents/:id
+///
+/// Query params:
+///   - `force=true`: bypass the activity check (popup protection is never bypassable)
 pub async fn kill_agent(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     let app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
     let session_name = resolve_session_name(&prefix, &id);
+    let short_name = display_name(&prefix, &session_name).to_string();
 
     // Don't allow killing manager via API
     if session_name == MANAGER_SESSION_NAME || id == MANAGER_SESSION_NAME {
@@ -371,6 +391,57 @@ pub async fn kill_agent(
         ));
     }
 
+    // ── Protection 1: popup is open on this agent ──
+    // When a user has the agent's popup open in the dashboard, the agent
+    // is untouchable. This cannot be bypassed even with force=true.
+    let popup_active = state
+        .popup_receiver
+        .lock()
+        .unwrap()
+        .as_deref()
+        .is_some_and(|r| r == short_name);
+    if popup_active {
+        return Err((
+            StatusCode::LOCKED,
+            Json(ErrorResponse {
+                error: format!(
+                    "Agent '{}' is protected: a dashboard popup is open on it. \
+                     Close the popup first.",
+                    id
+                ),
+            }),
+        ));
+    }
+
+    // ── Protection 2: agent has not signalled completion ──
+    // Unless ?force=true, refuse to kill an agent whose pane output does
+    // not contain [PROJECT COMPLETE] (for PMs) or [TASK COMPLETE] (for workers).
+    let force = params
+        .get("force")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+    if !force {
+        let output = app
+            .client()
+            .capture_pane(&session_name, 100)
+            .unwrap_or_default();
+        let has_completion_signal =
+            output.contains("[PROJECT COMPLETE]") || output.contains("[TASK COMPLETE]");
+        if !has_completion_signal {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Agent '{}' has not signalled completion ([PROJECT COMPLETE] or \
+                         [TASK COMPLETE]). It may still be working. To force-kill, use \
+                         DELETE /api/agents/{}?force=true",
+                        id, id
+                    ),
+                }),
+            ));
+        }
+    }
+
     // Kill it
     if let Err(e) = app.client().kill_session(&session_name) {
         return Err((
@@ -383,7 +454,6 @@ pub async fn kill_agent(
 
     // Clean up parent mapping and cancel pending events for the killed agent
     memory::remove_agent_parent(&session_name);
-    let short_name = display_name(&prefix, &session_name).to_string();
     state.scheduler.cancel_by_receiver(&short_name);
 
     Ok(Json(StatusResponse {

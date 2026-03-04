@@ -454,6 +454,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
             app: Arc::new(Mutex::new(App::new(&config, ticker.clone()))),
             scheduler: scheduler.clone(),
             computer_lock: computer::new_lock(),
+            popup_receiver: popup_receiver.clone(),
         });
         tokio::spawn(async move {
             if let Err(e) = api::start_server(api_state, &api_config).await {

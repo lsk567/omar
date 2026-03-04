@@ -70,6 +70,12 @@ curl -X POST http://localhost:9876/api/agents/<name>/send \
 curl -X DELETE http://localhost:9876/api/agents/<name>
 ```
 
+**Kill protection:** The API enforces two safety rules:
+1. **Popup protection (423 Locked):** If a user has a popup open on the agent in the dashboard, the kill is rejected. Wait for the popup to close.
+2. **Completion check (409 Conflict):** If the agent has not outputted `[PROJECT COMPLETE]` or `[TASK COMPLETE]`, the kill is rejected. Only kill agents that have signalled completion. If you absolutely must force-kill a stuck agent, append `?force=true` to the URL.
+
+You can check an agent's protection and completion state via `GET /api/agents/<name>` — look at the `protected` and `completed` fields.
+
 ### Projects API
 
 #### Add a project
@@ -97,6 +103,7 @@ curl http://localhost:9876/api/agents/<name>
 
 Look for:
 - `[TASK COMPLETE]` — Agent finished all work. Kill it and complete the project.
+- Also check the `completed` and `protected` fields — only kill when `completed: true` and `protected: false`.
 - If the agent appears stuck or idle for too long, send it a nudge via the send endpoint.
 
 ### Detecting Agent Activity State
@@ -112,9 +119,11 @@ This distinction is important: sending input to an agent that is mid-operation c
 
 **Kill and replace — don't nudge repeatedly.** If an agent is stuck (idle too long, stuck in plan mode, not making progress after multiple nudges), do NOT keep nudging it. Kill it and spawn a fresh replacement with the same task and full context. Nudging a stuck agent wastes time — a fresh agent with the same instructions will be more effective.
 
+Because the API requires agents to have signalled completion before they can be killed, you must use `?force=true` when killing a stuck agent that has NOT completed:
+
 ```bash
-# Kill the stuck agent
-curl -X DELETE http://localhost:9876/api/agents/<name>
+# Force-kill the stuck agent (has not signalled [TASK COMPLETE])
+curl -X DELETE http://localhost:9876/api/agents/<name>?force=true
 
 # Spawn a replacement with the same task
 curl -X POST http://localhost:9876/api/agents \
@@ -126,8 +135,9 @@ curl -X POST http://localhost:9876/api/agents \
 
 ## When an Agent Finishes
 
-CRITICAL — you MUST execute ALL three steps every time. Never skip the project deletion.
+CRITICAL — you MUST execute ALL of these steps every time. Never skip the project deletion.
 
+0. Verify the agent is done: `curl http://localhost:9876/api/agents/<name>` — confirm `completed: true` and `protected: false` before proceeding. If `protected: true`, the user has a popup open — wait and retry later.
 1. Kill the agent: `curl -X DELETE http://localhost:9876/api/agents/<name>`
 2. Complete the project: `curl -X DELETE http://localhost:9876/api/projects/<id>` (use the id returned when you created the project)
 3. Verify the project is gone: `curl http://localhost:9876/api/projects` — if the project still appears, delete it again
