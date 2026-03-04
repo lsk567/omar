@@ -411,7 +411,7 @@ async fn handle_socket_message<S>(
             payload: None,
         };
         if let Ok(ack_json) = serde_json::to_string(&ack) {
-            if let Err(e) = ws_write.send(WsMessage::Text(ack_json.into())).await {
+            if let Err(e) = ws_write.send(WsMessage::Text(ack_json)).await {
                 error!("Failed to send ack: {}", e);
             }
         }
