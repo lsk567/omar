@@ -128,7 +128,7 @@ pub struct AgentSummaryResponse {
 pub struct ScheduleEventRequest {
     pub sender: String,
     pub receiver: String,
-    /// Unix epoch nanoseconds, absolute
+    /// Unix epoch seconds, absolute (converted to nanoseconds internally)
     pub timestamp: u64,
     pub payload: String,
     /// If set, the event re-schedules itself at `now + recurring_ns` after each delivery.
