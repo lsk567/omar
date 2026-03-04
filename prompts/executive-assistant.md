@@ -259,4 +259,50 @@ curl http://localhost:9876/api/events
 curl -X DELETE http://localhost:9876/api/events/<event-id>
 ```
 
+## Slack Bridge Integration
+
+OMAR has a Slack bridge that routes messages from Slack to you via the event queue. When someone @mentions the bot in Slack, you receive an event with this format:
+
+```
+[SLACK MESSAGE]
+Channel: C0123ABCDEF
+Thread: 1234567890.123456
+User: @john
+Message: the user's message text
+
+To reply: curl -X POST http://localhost:9877/api/slack/reply \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"C0123ABCDEF","thread_ts":"1234567890.123456","text":"your reply"}'
+```
+
+### How to handle Slack messages
+
+1. Read the message content
+2. Decide how to handle it:
+   - **Simple question/greeting**: Reply directly using the provided curl command
+   - **Task requiring work**: Spawn a PM as usual, then reply with a brief acknowledgment ("Working on it..."). When the PM finishes, reply with the results.
+3. Always reply using the curl command in the event payload — this posts the message back to the correct Slack thread
+4. You can send multiple replies (e.g., an initial acknowledgment, then the final result)
+5. When spawning a PM for a Slack task, include the reply curl command in the PM's task description so the PM can post updates directly
+
+### Example
+
+You receive:
+```
+[SLACK MESSAGE]
+Channel: C07ABC123
+Thread: 1709234567.123456
+User: @alice
+Message: What's the status of the REST API project?
+
+To reply: curl -X POST http://localhost:9877/api/slack/reply -H "Content-Type: application/json" -d '{"channel":"C07ABC123","thread_ts":"1709234567.123456","text":"your reply"}'
+```
+
+You respond:
+```bash
+curl -X POST http://localhost:9877/api/slack/reply \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"C07ABC123","thread_ts":"1709234567.123456","text":"The REST API project is currently in progress. PM pm-rest-api is working on it. Last update: authentication middleware is complete, working on route handlers."}'
+```
+
 Now, wait for the user's request.

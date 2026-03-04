@@ -7,15 +7,25 @@ Messages in Slack channels/threads create and interact with OMAR agents. Agent o
 ## Architecture
 
 ```
-Slack (Socket Mode WS) <---> omar-slack bridge <---> OMAR API (localhost:9876)
-       ^                                                    ^
-       |                                                    |
-  messages/threads                                   agents/send/output
+Slack (Socket Mode WS)                           OMAR (localhost:9876)
+       │                                                │
+       │ @mention event                                 │
+       ▼                                                │
+  omar-slack bridge ──POST /api/events──────────►  Event Queue
+       ▲            (receiver: "ea")                    │
+       │                                                ▼
+       │                                           EA (tmux)
+       │                                                │
+       │◄──curl POST /api/slack/reply──────────────────┘
+       │   (localhost:9877)
+       ▼
+  Slack (chat.postMessage)
 ```
 
 - **Socket Mode**: WebSocket connection via app-level token — no public endpoint required
-- **Thread mapping**: each Slack thread maps to one OMAR agent session
-- **Output polling**: background task polls agent output and posts new content back to Slack
+- **Event-driven**: Slack messages are routed to the EA via OMAR's event queue
+- **Bidirectional**: Bridge runs an HTTP server so the EA can push replies back to Slack
+- **Popup-aware**: Events are deferred when the user is interacting with the EA popup
 - **Auto-reconnect**: WebSocket reconnects automatically on disconnection
 
 ## Setup
@@ -95,12 +105,13 @@ cargo build --release
 ## How It Works
 
 1. Bridge authenticates with Slack (`auth.test`) and connects via Socket Mode WebSocket
-2. When a message arrives in a channel where the bot is a member:
-   - If it's a new thread/top-level message: spawns a new OMAR agent via `POST /api/agents`
-   - If it's a reply in an existing thread: sends input to the mapped agent via `POST /api/agents/:name/send`
-3. Background poller checks agent output every `POLL_INTERVAL_MS` milliseconds
-4. New output is posted back to the Slack thread (auto-chunked if >3900 chars)
-5. Completed agents (output contains `[PROJECT COMPLETE]`) are auto-cleaned
+2. Bridge starts an HTTP callback server on `SLACK_BRIDGE_PORT` (default 9877)
+3. When someone @mentions the bot in a channel:
+   - Bridge formats the message as a `[SLACK MESSAGE]` event payload (includes channel, thread, user, reply curl command)
+   - Posts it to the OMAR event queue via `POST /api/events` with `receiver: "ea"`
+4. OMAR's event scheduler delivers the event to the EA (deferred if popup is open)
+5. EA processes the request and replies by curling `POST /api/slack/reply` on the bridge
+6. Bridge posts the reply back to the correct Slack thread (auto-chunked if >3900 chars)
 
 ## Agent Naming
 
@@ -113,6 +124,6 @@ Agents are named `slack-<channel_suffix>-<thread_ts>` for traceability in OMAR's
 | `SLACK_BOT_TOKEN` | Yes | — | Bot OAuth token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | Yes | — | App-level token (`xapp-...`) |
 | `OMAR_URL` | No | `http://127.0.0.1:9876` | OMAR API endpoint |
-| `POLL_INTERVAL_MS` | No | `2000` | Agent output poll interval (ms) |
+| `SLACK_BRIDGE_PORT` | No | `9877` | Bridge HTTP callback server port |
 | `MAX_MESSAGE_LENGTH` | No | `3900` | Max Slack message chunk size |
 | `RUST_LOG` | No | `info` | Log level (trace/debug/info/warn/error) |

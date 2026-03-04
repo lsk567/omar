@@ -455,7 +455,7 @@ fn handle_events_api_payload(
     };
 
     let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    if event_type != "message" {
+    if event_type != "message" && event_type != "app_mention" {
         debug!("Ignoring event type: {}", event_type);
         return;
     }

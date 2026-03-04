@@ -179,6 +179,43 @@ impl OmarClient {
         Ok(agents)
     }
 
+    /// Post an event to the OMAR event queue.
+    pub async fn post_event(&self, sender: &str, receiver: &str, payload: &str) -> Result<()> {
+        // Use current time in nanoseconds for immediate delivery
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        let body = serde_json::json!({
+            "sender": sender,
+            "receiver": receiver,
+            "timestamp": timestamp_ns,
+            "payload": payload,
+        });
+
+        let resp = self
+            .client
+            .post(format!("{}/api/events", self.base_url))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to post event to OMAR")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to post event ({}): {}", status, body_text);
+        }
+
+        debug!(
+            "Posted event to '{}': {}...",
+            receiver,
+            &payload[..80.min(payload.len())]
+        );
+        Ok(())
+    }
+
     /// Kill an agent.
     pub async fn kill_agent(&self, name: &str) -> Result<()> {
         let resp = self

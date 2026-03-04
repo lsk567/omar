@@ -9,10 +9,10 @@ pub struct Config {
     pub app_token: String,
     /// OMAR API base URL (default: http://127.0.0.1:9876)
     pub omar_url: String,
-    /// How often to poll agent output, in milliseconds (default: 2000)
-    pub poll_interval_ms: u64,
     /// Maximum Slack message length before chunking (Slack limit is 4000)
     pub max_message_length: usize,
+    /// Port for the bridge's HTTP callback server (default: 9877)
+    pub bridge_port: u16,
 }
 
 impl Config {
@@ -37,22 +37,22 @@ impl Config {
         let omar_url =
             std::env::var("OMAR_URL").unwrap_or_else(|_| "http://127.0.0.1:9876".to_string());
 
-        let poll_interval_ms: u64 = std::env::var("POLL_INTERVAL_MS")
-            .unwrap_or_else(|_| "2000".to_string())
-            .parse()
-            .unwrap_or(2000);
-
         let max_message_length: usize = std::env::var("MAX_MESSAGE_LENGTH")
             .unwrap_or_else(|_| "3900".to_string())
             .parse()
             .unwrap_or(3900);
 
+        let bridge_port: u16 = std::env::var("SLACK_BRIDGE_PORT")
+            .unwrap_or_else(|_| "9877".to_string())
+            .parse()
+            .unwrap_or(9877);
+
         Ok(Self {
             bot_token,
             app_token,
             omar_url,
-            poll_interval_ms,
             max_message_length,
+            bridge_port,
         })
     }
 }
