@@ -200,7 +200,18 @@ fn format_delivery(events: &[ScheduledEvent], timestamp: u64) -> String {
     }
 }
 
-pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer) {
+/// Shared state: the short name of the agent whose popup is currently open, if any.
+pub type PopupReceiver = Arc<Mutex<Option<String>>>;
+
+pub fn new_popup_receiver() -> PopupReceiver {
+    Arc::new(Mutex::new(None))
+}
+
+pub async fn run_event_loop(
+    scheduler: Arc<Scheduler>,
+    ticker: TickerBuffer,
+    popup_receiver: PopupReceiver,
+) {
     loop {
         let next_ts = {
             let queue = scheduler.queue.lock().unwrap();
@@ -251,6 +262,25 @@ pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer) {
                 };
 
                 for receiver in &receivers {
+                    // If the user has a popup open for this receiver, defer by 30s.
+                    // The event will keep getting rescheduled on each attempt until
+                    // the popup is closed.
+                    let popup_active = popup_receiver
+                        .lock()
+                        .unwrap()
+                        .as_deref()
+                        .is_some_and(|r| r == receiver);
+                    if popup_active {
+                        let batch = scheduler.pop_batch(receiver, earliest_ts);
+                        let defer_ns: u64 = 30_000_000_000;
+                        for mut ev in batch {
+                            ev.timestamp = now_ns() + defer_ns;
+                            scheduler.insert(ev);
+                        }
+                        ticker.push(format!("deferred event(s) for {} (popup open)", receiver));
+                        continue;
+                    }
+
                     let batch = scheduler.pop_batch(receiver, earliest_ts);
                     if batch.is_empty() {
                         continue;
@@ -510,7 +540,7 @@ mod tests {
         let ticker = TickerBuffer::new();
         let handle = tokio::spawn(async move {
             tokio::select! {
-                _ = run_event_loop(sched, ticker) => {}
+                _ = run_event_loop(sched, ticker, new_popup_receiver()) => {}
                 _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
             }
         });
