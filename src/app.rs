@@ -513,6 +513,17 @@ impl App {
         }
     }
 
+    /// Get the short name (receiver name) of the selected agent.
+    pub fn selected_agent_short_name(&self) -> Option<String> {
+        self.selected_agent().map(|a| {
+            a.session
+                .name
+                .strip_prefix(self.client.prefix())
+                .unwrap_or(&a.session.name)
+                .to_string()
+        })
+    }
+
     /// Attach to the selected agent via popup
     pub fn attach_selected(&self) -> Result<()> {
         if let Some(agent) = self.selected_agent() {

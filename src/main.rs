@@ -201,7 +201,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
     // Create the ticker buffer and scheduler, then spawn the event loop
     let ticker = scheduler::TickerBuffer::new();
     let scheduler = Arc::new(scheduler::Scheduler::new());
-    tokio::spawn(scheduler::run_event_loop(scheduler.clone(), ticker.clone()));
+    let popup_receiver = scheduler::new_popup_receiver();
+    tokio::spawn(scheduler::run_event_loop(
+        scheduler.clone(),
+        ticker.clone(),
+        popup_receiver.clone(),
+    ));
 
     // Start API server if enabled
     if config.api.enabled {
@@ -340,6 +345,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.previous();
                         }
                         KeyCode::Enter => {
+                            // Tell the scheduler which agent popup is open so it
+                            // defers events for that receiver until the popup closes.
+                            *popup_receiver.lock().unwrap() = app.selected_agent_short_name();
+
                             if std::env::var("TMUX").is_ok() {
                                 // Inside tmux: use display-popup overlay (stays on top of dashboard)
                                 if let Err(e) = app.attach_selected() {
@@ -367,6 +376,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     app.set_status(format!("Error: {}", e));
                                 }
                             }
+
+                            // Popup closed — clear so events resume delivery
+                            *popup_receiver.lock().unwrap() = None;
                         }
                         KeyCode::Char('n') => {
                             if let Err(e) = app.spawn_agent() {
