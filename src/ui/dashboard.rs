@@ -298,13 +298,71 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             .unwrap_or_default();
 
         // Parse ANSI codes and convert to ratatui text
-        let content = match ansi_to_tui::IntoText::into_text(&output) {
+        let mut content = match ansi_to_tui::IntoText::into_text(&output) {
             Ok(text) => text,
             Err(_) => {
                 let plain = strip_ansi(&output);
                 ratatui::text::Text::raw(plain)
             }
         };
+
+        let focus_short = app
+            .focus_parent
+            .strip_prefix(app.client().prefix())
+            .unwrap_or(&app.focus_parent);
+        if focus_short.starts_with("pm-") {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            let workers = app.focus_children();
+            let running_workers = workers
+                .iter()
+                .filter(|a| matches!(a.health, HealthState::Running))
+                .count();
+            let next_pm_wake = app
+                .scheduled_events
+                .iter()
+                .filter(|e| e.receiver == app.focus_parent)
+                .min_by_key(|e| e.timestamp);
+
+            let indicator = if let Some(event) = next_pm_wake {
+                Line::from(vec![
+                    Span::styled("PM Wake: ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format_countdown_ns(event.timestamp, now_ns),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                    Span::raw(" | "),
+                    Span::styled(
+                        format!("Workers running: {}", running_workers),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::raw(" | "),
+                    Span::styled("ETA unknown", Style::default().fg(Color::DarkGray)),
+                ])
+            } else if !workers.is_empty() {
+                Line::from(vec![
+                    Span::styled("PM Wake: ", Style::default().fg(Color::Cyan)),
+                    Span::styled("not scheduled", Style::default().fg(Color::Yellow)),
+                    Span::raw(" | "),
+                    Span::styled(
+                        format!("Workers running: {}", running_workers),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::raw(" | "),
+                    Span::styled("ETA unknown", Style::default().fg(Color::DarkGray)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("PM status: ", Style::default().fg(Color::Cyan)),
+                    Span::styled("no workers", Style::default().fg(Color::DarkGray)),
+                ])
+            };
+
+            content.lines.insert(0, indicator);
+            content.lines.insert(1, Line::from(""));
+        }
 
         // Calculate scroll to show bottom of content
         let content_height = content.lines.len() as u16;
