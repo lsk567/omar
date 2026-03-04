@@ -490,6 +490,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     }
                 }
                 AppEvent::Tick => {
+                    // Keep event snapshots fresh for status-bar countdowns and events popup.
+                    app.scheduled_events = scheduler.list();
+                    app.scheduled_events.sort_by_key(|e| e.timestamp);
+
                     // Skip refresh while a popup/input overlay is active
                     // to avoid interrupting user input.
                     if !app.has_popup() {

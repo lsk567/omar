@@ -76,8 +76,19 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let (running, idle) = app.health_counts();
     let total = app.total_agents();
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
 
-    let status_text = vec![
+    let next_ea_event = app
+        .scheduled_events
+        .iter()
+        .filter(|e| e.receiver == "ea")
+        .min_by_key(|e| e.timestamp);
+    let next_event = app.scheduled_events.iter().min_by_key(|e| e.timestamp);
+
+    let mut status_text = vec![
         Span::styled(
             "One-Man Army ",
             Style::default().add_modifier(Modifier::BOLD),
@@ -91,7 +102,30 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw(" "),
         Span::styled(format!("{} Idle", idle), Style::default().fg(Color::Yellow)),
+        Span::raw(" | Events: "),
+        Span::styled(
+            format!("{}", app.scheduled_events.len()),
+            Style::default().fg(Color::Cyan),
+        ),
     ];
+
+    if let Some(event) = next_ea_event {
+        status_text.push(Span::raw(" | EA Wake: "));
+        status_text.push(Span::styled(
+            format_countdown_ns(event.timestamp, now_ns),
+            Style::default().fg(Color::Magenta),
+        ));
+    } else if let Some(event) = next_event {
+        status_text.push(Span::raw(" | Next Event: "));
+        status_text.push(Span::styled(
+            format!(
+                "{} ({})",
+                truncate_str(&event.receiver, 10),
+                format_countdown_ns(event.timestamp, now_ns)
+            ),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
 
     let status_line = Line::from(status_text);
 
@@ -927,6 +961,23 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         format!("{}…", &s[..max_len - 1])
     } else {
         s.to_string()
+    }
+}
+
+fn format_countdown_ns(target_ns: u64, now_ns: u64) -> String {
+    if target_ns <= now_ns {
+        return "due now".to_string();
+    }
+
+    let total_secs = (target_ns - now_ns) / 1_000_000_000;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if hours > 0 {
+        format!("in {}:{:02}:{:02}", hours, mins, secs)
+    } else {
+        format!("in {:02}:{:02}", mins, secs)
     }
 }
 
