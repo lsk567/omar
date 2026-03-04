@@ -15,11 +15,33 @@ use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 /// Manager session name (exported for use in app.rs)
 pub const MANAGER_SESSION: &str = "omar-agent-ea";
 
-/// Return the absolute `prompts/` directory path (cwd-based).
+// Embed prompt files at compile time so they work regardless of CWD.
+const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
+const PROMPT_PM: &str = include_str!("../../prompts/project-manager.md");
+const PROMPT_WORKER: &str = include_str!("../../prompts/worker.md");
+
+/// Embedded prompt files, keyed by filename.
+const EMBEDDED_PROMPTS: &[(&str, &str)] = &[
+    ("executive-assistant.md", PROMPT_EA),
+    ("project-manager.md", PROMPT_PM),
+    ("worker.md", PROMPT_WORKER),
+];
+
+/// Return the `~/.omar/prompts/` directory, writing embedded prompts on first call.
 pub fn prompts_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("prompts")
+    let dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".omar")
+        .join("prompts");
+    std::fs::create_dir_all(&dir).ok();
+
+    for (name, content) in EMBEDDED_PROMPTS {
+        let path = dir.join(name);
+        // Always overwrite so prompts stay in sync with the binary
+        std::fs::write(&path, content).ok();
+    }
+
+    dir
 }
 
 /// Escape a string for use in a sed replacement (with `|` as delimiter).
