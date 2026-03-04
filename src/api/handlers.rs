@@ -528,27 +528,11 @@ pub async fn schedule_event(
         .unwrap()
         .as_nanos() as u64;
 
-    // Convert caller's Unix-seconds timestamp to nanoseconds (scheduler uses ns internally)
-    let timestamp_ns = req.timestamp * 1_000_000_000;
-
-    if timestamp_ns <= now {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!(ErrorResponse {
-                error: format!(
-                    "Timestamp must be in the future (got {} s = {} ns, now = {} ns)",
-                    req.timestamp, timestamp_ns, now
-                ),
-            })),
-        )
-            .into_response();
-    }
-
     let event = ScheduledEvent {
         id: id.clone(),
         sender: req.sender,
         receiver: req.receiver,
-        timestamp: timestamp_ns,
+        timestamp: req.timestamp,
         payload: req.payload,
         created_at: now,
         recurring_ns: req.recurring_ns,
@@ -558,9 +542,8 @@ pub async fn schedule_event(
 
     Json(ScheduleEventResponse {
         id,
-        timestamp: timestamp_ns,
+        timestamp: req.timestamp,
     })
-    .into_response()
 }
 
 /// GET /api/events
