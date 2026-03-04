@@ -1,9 +1,14 @@
+[workspace]
+members = [".", "bridges/slack"]
+default-members = [".", "bridges/slack"]
+
 [package]
 name = "omar"
 version = "0.1.0"
 edition = "2021"
 description = "Agent dashboard for tmux"
 license = "MIT"
+default-run = "omar"
 
 [dependencies]
 ratatui = "0.29"
