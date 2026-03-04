@@ -69,30 +69,28 @@ In Slack, invite the bot to any channel where you want it active:
 ## Usage
 
 ```bash
-# Required
 export SLACK_BOT_TOKEN="xoxb-..."
 export SLACK_APP_TOKEN="xapp-..."
 
-# Optional (defaults shown)
-export OMAR_URL="http://127.0.0.1:9876"
-export POLL_INTERVAL_MS="2000"
-export MAX_MESSAGE_LENGTH="3900"
-export RUST_LOG="info"  # or debug, trace
+# OMAR auto-launches the bridge when these env vars are set:
+cargo run --release
+```
 
-# Run (OMAR must be running first)
-cargo run
-# or
-./target/release/omar-slack
+The bridge can also be run standalone for debugging:
+```bash
+cd bridges/slack
+RUST_LOG=debug cargo run
 ```
 
 ## Build
 
-```bash
-cd bridges/slack
-cargo build --release
-```
+Both `omar` and `omar-slack` are workspace members — a single build produces both:
 
-Binary: `target/release/omar-slack`
+```bash
+cargo build --release
+# -> target/release/omar
+# -> target/release/omar-slack
+```
 
 ## How It Works
 
