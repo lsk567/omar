@@ -1,0 +1,43 @@
+mod bridge;
+mod config;
+mod omar;
+mod slack;
+
+use anyhow::Result;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+use crate::bridge::Bridge;
+use crate::config::Config;
+use crate::omar::OmarClient;
+use crate::slack::SlackClient;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logging (respects RUST_LOG env var, defaults to info)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .with_thread_ids(false)
+        .init();
+
+    info!("OMAR Slack Bridge starting up...");
+
+    // Load configuration from environment
+    let config = Config::from_env()?;
+    info!("OMAR API: {}", config.omar_url);
+    info!("Poll interval: {}ms", config.poll_interval_ms);
+
+    // Create clients
+    let slack_client = SlackClient::new(&config.bot_token, &config.app_token);
+    let omar_client = OmarClient::new(&config.omar_url);
+
+    // Build and run the bridge
+    let bridge = Bridge::new(config, slack_client, omar_client);
+    bridge.run().await?;
+
+    Ok(())
+}

@@ -10,6 +10,7 @@ mod tmux;
 mod ui;
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -197,6 +198,72 @@ fn relaunch_in_tmux() -> Result<()> {
     anyhow::bail!("Failed to launch tmux: {}", err)
 }
 
+/// Locate the `omar-slack` binary. Checks next to the current executable
+/// first, then falls back to a PATH lookup.
+fn find_slack_binary() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("omar-slack");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    // Fall back to PATH lookup
+    Some(PathBuf::from("omar-slack"))
+}
+
+/// Spawn the Slack bridge binary if SLACK_BOT_TOKEN and SLACK_APP_TOKEN are set.
+fn spawn_slack_bridge() -> Option<std::process::Child> {
+    if std::env::var("SLACK_BOT_TOKEN").is_err() || std::env::var("SLACK_APP_TOKEN").is_err() {
+        return None;
+    }
+
+    let binary = find_slack_binary()?;
+    match std::process::Command::new(&binary)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            eprintln!("[omar] Slack bridge started (pid {})", child.id());
+            Some(child)
+        }
+        Err(e) => {
+            eprintln!("[omar] Failed to start Slack bridge: {}", e);
+            None
+        }
+    }
+}
+
+/// Kill a child process gracefully: SIGTERM first, then SIGKILL after timeout.
+fn kill_child_gracefully(child: &mut std::process::Child, timeout: Duration) {
+    // Send SIGTERM
+    let _ = std::process::Command::new("kill")
+        .arg(child.id().to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    // Wait for the process to exit
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            _ => {
+                if start.elapsed() >= timeout {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    // Force kill if still running
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 async fn run_dashboard(config: Config) -> Result<()> {
     // Create the ticker buffer and scheduler, then spawn the event loop
     let ticker = scheduler::TickerBuffer::new();
@@ -222,6 +289,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
         });
     }
 
+    // Spawn Slack bridge if configured
+    let mut slack_bridge = spawn_slack_bridge();
+
     // Initialize terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -231,6 +301,11 @@ async fn run_dashboard(config: Config) -> Result<()> {
 
     // Create app for dashboard (separate instance)
     let mut app = App::new(&config, ticker);
+
+    // Show Slack bridge status
+    if slack_bridge.is_some() {
+        app.set_status("Slack bridge started");
+    }
 
     // Initial refresh
     if let Err(e) = app.refresh() {
@@ -449,6 +524,11 @@ async fn run_dashboard(config: Config) -> Result<()> {
         .unwrap_or(false)
     {
         let _ = app.client().kill_session(crate::manager::MANAGER_SESSION);
+    }
+
+    // Kill Slack bridge on exit
+    if let Some(ref mut child) = slack_bridge {
+        kill_child_gracefully(child, Duration::from_secs(3));
     }
 
     Ok(())
