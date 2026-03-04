@@ -73,7 +73,7 @@ curl -X DELETE http://localhost:9876/api/agents/worker-name
 
 ## Completion Protocol
 
-When ALL workers have finished and been killed, output exactly:
+When done (either you finished directly or all workers are done and killed), output exactly:
 
 ```
 [PROJECT COMPLETE]
@@ -82,6 +82,15 @@ Summary:
 - <what was accomplished>
 - <key files changed>
 - <any notes or follow-ups>
+```
+
+Then immediately schedule a wake-up event for the EA so it can kill you and complete the project:
+
+```bash
+NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 1_000_000)")
+curl -X POST http://localhost:9876/api/events \
+  -H "Content-Type: application/json" \
+  -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"ea\", \"timestamp\": $NOW, \"payload\": \"[PROJECT COMPLETE] from <YOUR NAME>. Ready for cleanup.\"}"
 ```
 
 The Executive Assistant watches for `[PROJECT COMPLETE]` to know you are done.
