@@ -123,6 +123,15 @@ impl App {
         }
     }
 
+    /// True when any popup or input overlay is active.
+    pub fn has_popup(&self) -> bool {
+        self.show_help
+            || self.show_confirm_kill
+            || self.project_input_mode
+            || self.show_events
+            || self.show_debug_console
+    }
+
     pub fn client(&self) -> &TmuxClient {
         &self.client
     }

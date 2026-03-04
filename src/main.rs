@@ -403,9 +403,13 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     }
                 }
                 AppEvent::Tick => {
-                    app.clear_status();
-                    if let Err(e) = app.refresh() {
-                        app.set_status(format!("Error: {}", e));
+                    // Skip refresh while a popup/input overlay is active
+                    // to avoid interrupting user input.
+                    if !app.has_popup() {
+                        app.clear_status();
+                        if let Err(e) = app.refresh() {
+                            app.set_status(format!("Error: {}", e));
+                        }
                     }
                 }
                 AppEvent::TickerScroll => {
