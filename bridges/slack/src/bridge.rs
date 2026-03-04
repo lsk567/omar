@@ -57,7 +57,10 @@ impl Bridge {
             Ok(true) => info!("OMAR API is reachable at {}", self.config.omar_url),
             Ok(false) => warn!("OMAR API returned non-success status"),
             Err(e) => {
-                warn!("OMAR API not reachable: {} — will retry on message arrival", e);
+                warn!(
+                    "OMAR API not reachable: {} — will retry on message arrival",
+                    e
+                );
             }
         }
 
@@ -110,7 +113,9 @@ impl Bridge {
             // New session — spawn an OMAR agent
             info!(
                 "Spawning new agent '{}' for channel={} thread={}",
-                agent_name, msg.channel, msg.thread_key()
+                agent_name,
+                msg.channel,
+                msg.thread_key()
             );
 
             // Resolve user name for the task description
@@ -136,7 +141,10 @@ impl Bridge {
 
             match self.omar.spawn_agent(&spawn_req).await {
                 Ok(resp) => {
-                    info!("Spawned agent '{}' (session: {:?})", agent_name, resp.session);
+                    info!(
+                        "Spawned agent '{}' (session: {:?})",
+                        agent_name, resp.session
+                    );
 
                     let thread_ts = if msg.is_threaded_reply() {
                         msg.thread_ts.clone().unwrap_or_else(|| msg.ts.clone())
@@ -145,24 +153,30 @@ impl Bridge {
                         msg.ts.clone()
                     };
 
-                    sessions.insert(session_key, AgentSession {
-                        agent_name: agent_name.clone(),
-                        channel: msg.channel.clone(),
-                        thread_ts,
-                        last_output_len: 0,
-                        spawned: true,
-                    });
+                    sessions.insert(
+                        session_key,
+                        AgentSession {
+                            agent_name: agent_name.clone(),
+                            channel: msg.channel.clone(),
+                            thread_ts,
+                            last_output_len: 0,
+                            spawned: true,
+                        },
+                    );
                 }
                 Err(e) => {
                     error!("Failed to spawn agent: {}", e);
                     // Try to post error back to Slack
                     let slack = self.slack.lock().await;
                     let thread_ts = msg.thread_ts.as_deref().unwrap_or(&msg.ts);
-                    slack.post_message(
-                        &msg.channel,
-                        &format!(":warning: Failed to start agent: {}", e),
-                        Some(thread_ts),
-                    ).await.ok();
+                    slack
+                        .post_message(
+                            &msg.channel,
+                            &format!(":warning: Failed to start agent: {}", e),
+                            Some(thread_ts),
+                        )
+                        .await
+                        .ok();
                 }
             }
         }
@@ -210,7 +224,10 @@ impl Bridge {
                 // Snapshot current sessions
                 let session_snapshot: Vec<(String, AgentSession)> = {
                     let sessions = sessions.lock().await;
-                    sessions.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    sessions
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
                 };
 
                 for (key, session) in &session_snapshot {
@@ -235,12 +252,15 @@ impl Bridge {
                                     );
 
                                     let slack = slack.lock().await;
-                                    if let Err(e) = slack.post_message_chunked(
-                                        &session.channel,
-                                        trimmed,
-                                        Some(&session.thread_ts),
-                                        max_msg_len,
-                                    ).await {
+                                    if let Err(e) = slack
+                                        .post_message_chunked(
+                                            &session.channel,
+                                            trimmed,
+                                            Some(&session.thread_ts),
+                                            max_msg_len,
+                                        )
+                                        .await
+                                    {
                                         error!(
                                             "Failed to post output to Slack for {}: {}",
                                             session.agent_name, e
@@ -262,19 +282,28 @@ impl Bridge {
                                 if output_lower.contains("[project complete]")
                                     || output_lower.contains("task completed")
                                 {
-                                    info!("Agent '{}' appears complete, cleaning up", session.agent_name);
+                                    info!(
+                                        "Agent '{}' appears complete, cleaning up",
+                                        session.agent_name
+                                    );
                                     let mut sessions_mut = sessions.lock().await;
                                     sessions_mut.remove(key);
                                     // Optionally kill the agent
                                     if let Err(e) = omar.kill_agent(&session.agent_name).await {
-                                        warn!("Failed to kill completed agent {}: {}", session.agent_name, e);
+                                        warn!(
+                                            "Failed to kill completed agent {}: {}",
+                                            session.agent_name, e
+                                        );
                                     }
                                 }
                             }
                         }
                         Ok(None) => {
                             // Agent no longer exists — clean up session
-                            debug!("Agent '{}' no longer exists, removing session", session.agent_name);
+                            debug!(
+                                "Agent '{}' no longer exists, removing session",
+                                session.agent_name
+                            );
                             let mut sessions_mut = sessions.lock().await;
                             sessions_mut.remove(key);
                         }

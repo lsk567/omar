@@ -18,10 +18,8 @@ pub struct Config {
 impl Config {
     /// Load configuration from environment variables.
     pub fn from_env() -> Result<Self> {
-        let bot_token = std::env::var("SLACK_BOT_TOKEN")
-            .unwrap_or_default();
-        let app_token = std::env::var("SLACK_APP_TOKEN")
-            .unwrap_or_default();
+        let bot_token = std::env::var("SLACK_BOT_TOKEN").unwrap_or_default();
+        let app_token = std::env::var("SLACK_APP_TOKEN").unwrap_or_default();
 
         if bot_token.is_empty() {
             bail!("SLACK_BOT_TOKEN environment variable is required (xoxb-...)");
@@ -36,8 +34,8 @@ impl Config {
             bail!("SLACK_APP_TOKEN must start with 'xapp-'");
         }
 
-        let omar_url = std::env::var("OMAR_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:9876".to_string());
+        let omar_url =
+            std::env::var("OMAR_URL").unwrap_or_else(|_| "http://127.0.0.1:9876".to_string());
 
         let poll_interval_ms: u64 = std::env::var("POLL_INTERVAL_MS")
             .unwrap_or_else(|_| "2000".to_string())

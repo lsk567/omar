@@ -74,7 +74,8 @@ impl OmarClient {
 
     /// Check if OMAR API is reachable.
     pub async fn health_check(&self) -> Result<bool> {
-        let resp = self.client
+        let resp = self
+            .client
             .get(format!("{}/api/health", self.base_url))
             .send()
             .await?;
@@ -83,7 +84,8 @@ impl OmarClient {
 
     /// Spawn a new OMAR agent.
     pub async fn spawn_agent(&self, req: &SpawnAgentRequest) -> Result<SpawnAgentResponse> {
-        let resp = self.client
+        let resp = self
+            .client
             .post(format!("{}/api/agents", self.base_url))
             .json(req)
             .send()
@@ -101,7 +103,8 @@ impl OmarClient {
 
     /// Get agent details including recent output.
     pub async fn get_agent(&self, name: &str) -> Result<Option<AgentDetail>> {
-        let resp = self.client
+        let resp = self
+            .client
             .get(format!("{}/api/agents/{}", self.base_url, name))
             .send()
             .await
@@ -128,7 +131,8 @@ impl OmarClient {
             enter: true,
         };
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(format!("{}/api/agents/{}/send", self.base_url, name))
             .json(&req)
             .send()
@@ -138,7 +142,10 @@ impl OmarClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            warn!("Failed to send input to agent {} ({}): {}", name, status, body);
+            warn!(
+                "Failed to send input to agent {} ({}): {}",
+                name, status, body
+            );
         } else {
             debug!("Sent input to agent {}", name);
         }
@@ -148,7 +155,8 @@ impl OmarClient {
 
     /// List all agents.
     pub async fn list_agents(&self) -> Result<Vec<AgentListItem>> {
-        let resp = self.client
+        let resp = self
+            .client
             .get(format!("{}/api/agents", self.base_url))
             .send()
             .await
@@ -173,7 +181,8 @@ impl OmarClient {
 
     /// Kill an agent.
     pub async fn kill_agent(&self, name: &str) -> Result<()> {
-        let resp = self.client
+        let resp = self
+            .client
             .delete(format!("{}/api/agents/{}", self.base_url, name))
             .send()
             .await

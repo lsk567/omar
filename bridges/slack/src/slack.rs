@@ -138,7 +138,8 @@ impl SlackClient {
 
     /// Fetch the bot's own user ID via auth.test.
     pub async fn auth_test(&mut self) -> Result<String> {
-        let resp: AuthTestResponse = self.http
+        let resp: AuthTestResponse = self
+            .http
             .post("https://slack.com/api/auth.test")
             .bearer_auth(&self.bot_token)
             .send()
@@ -150,8 +151,7 @@ impl SlackClient {
             anyhow::bail!("auth.test failed: {:?}", resp.error);
         }
 
-        let user_id = resp.user_id
-            .context("auth.test did not return user_id")?;
+        let user_id = resp.user_id.context("auth.test did not return user_id")?;
         self.bot_user_id = Some(user_id.clone());
         info!("Authenticated as bot user: {}", user_id);
         Ok(user_id)
@@ -172,7 +172,8 @@ impl SlackClient {
             body["thread_ts"] = serde_json::Value::String(ts.to_string());
         }
 
-        let resp: PostMessageResponse = self.http
+        let resp: PostMessageResponse = self
+            .http
             .post("https://slack.com/api/chat.postMessage")
             .bearer_auth(&self.bot_token)
             .json(&body)
@@ -233,12 +234,14 @@ impl SlackClient {
             }
         };
 
-        self.user_name_cache.insert(user_id.to_string(), name.clone());
+        self.user_name_cache
+            .insert(user_id.to_string(), name.clone());
         name
     }
 
     async fn fetch_user_name(&self, user_id: &str) -> Result<Option<String>> {
-        let resp: UserInfoResponse = self.http
+        let resp: UserInfoResponse = self
+            .http
             .get("https://slack.com/api/users.info")
             .bearer_auth(&self.bot_token)
             .query(&[("user", user_id)])
@@ -256,7 +259,8 @@ impl SlackClient {
 
     /// Request a Socket Mode WebSocket URL from Slack.
     async fn get_websocket_url(&self) -> Result<String> {
-        let resp: ConnectionsOpenResponse = self.http
+        let resp: ConnectionsOpenResponse = self
+            .http
             .post("https://slack.com/api/apps.connections.open")
             .bearer_auth(&self.app_token)
             .send()
@@ -336,7 +340,10 @@ async fn run_socket_mode_loop(
         resp.url.context("No WebSocket URL")?
     };
 
-    info!("Connecting to Slack Socket Mode: {}...", &ws_url_str[..60.min(ws_url_str.len())]);
+    info!(
+        "Connecting to Slack Socket Mode: {}...",
+        &ws_url_str[..60.min(ws_url_str.len())]
+    );
 
     // 2. Connect WebSocket (pass as string — tokio-tungstenite accepts &str)
     let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url_str).await?;
@@ -388,7 +395,11 @@ async fn handle_socket_message<S>(
     let envelope: SocketEnvelope = match serde_json::from_str(text) {
         Ok(e) => e,
         Err(e) => {
-            debug!("Failed to parse envelope: {} — raw: {}", e, &text[..200.min(text.len())]);
+            debug!(
+                "Failed to parse envelope: {} — raw: {}",
+                e,
+                &text[..200.min(text.len())]
+            );
             return;
         }
     };
@@ -460,13 +471,38 @@ fn handle_events_api_payload(
     }
 
     // Extract message fields
-    let channel = event.get("channel").and_then(|c| c.as_str()).unwrap_or("").to_string();
-    let user = event.get("user").and_then(|u| u.as_str()).unwrap_or("").to_string();
-    let text = event.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
-    let ts = event.get("ts").and_then(|t| t.as_str()).unwrap_or("").to_string();
-    let thread_ts = event.get("thread_ts").and_then(|t| t.as_str()).map(String::from);
-    let channel_type = event.get("channel_type").and_then(|c| c.as_str()).map(String::from);
-    let bot_id = event.get("bot_id").and_then(|b| b.as_str()).map(String::from);
+    let channel = event
+        .get("channel")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    let user = event
+        .get("user")
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string();
+    let text = event
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ts = event
+        .get("ts")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let thread_ts = event
+        .get("thread_ts")
+        .and_then(|t| t.as_str())
+        .map(String::from);
+    let channel_type = event
+        .get("channel_type")
+        .and_then(|c| c.as_str())
+        .map(String::from);
+    let bot_id = event
+        .get("bot_id")
+        .and_then(|b| b.as_str())
+        .map(String::from);
 
     if text.is_empty() || channel.is_empty() {
         return;
@@ -490,7 +526,11 @@ fn handle_events_api_payload(
         subtype: subtype.map(String::from),
     };
 
-    debug!("Received message in #{}: {}", msg.channel, &msg.text[..80.min(msg.text.len())]);
+    debug!(
+        "Received message in #{}: {}",
+        msg.channel,
+        &msg.text[..80.min(msg.text.len())]
+    );
 
     if tx.send(msg).is_err() {
         error!("Message channel closed");
