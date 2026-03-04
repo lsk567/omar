@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "bridges/slack"]
+default-members = [".", "bridges/slack"]
+
 [package]
 name = "omar"
 version = "0.1.0"
