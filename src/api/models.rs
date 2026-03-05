@@ -165,3 +165,117 @@ pub struct EventCancelResponse {
     pub status: String,
     pub id: String,
 }
+
+// ── Computer Use models ──
+
+/// Request to acquire the computer use lock
+#[derive(Debug, Deserialize)]
+pub struct ComputerLockRequest {
+    /// Agent requesting the lock
+    pub agent: String,
+}
+
+/// Response for lock operations
+#[derive(Debug, Serialize)]
+pub struct ComputerLockResponse {
+    pub status: String,
+    /// Agent currently holding the lock (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<String>,
+}
+
+/// Request for a screenshot
+#[derive(Debug, Deserialize)]
+pub struct ScreenshotRequest {
+    /// Agent requesting the screenshot (must hold the lock)
+    pub agent: String,
+    /// Max width for resizing (optional)
+    pub max_width: Option<u32>,
+    /// Max height for resizing (optional)
+    pub max_height: Option<u32>,
+}
+
+/// Response containing a screenshot
+#[derive(Debug, Serialize)]
+pub struct ScreenshotResponse {
+    pub image_base64: String,
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+}
+
+/// Request for mouse actions
+#[derive(Debug, Deserialize)]
+pub struct MouseRequest {
+    /// Agent performing the action (must hold the lock)
+    pub agent: String,
+    /// Action: "move", "click", "double_click", "drag", "scroll"
+    pub action: String,
+    /// X coordinate
+    pub x: i32,
+    /// Y coordinate
+    pub y: i32,
+    /// Mouse button (1=left, 2=middle, 3=right). Default: 1
+    #[serde(default = "default_mouse_button")]
+    pub button: u8,
+    /// For drag: destination X
+    pub to_x: Option<i32>,
+    /// For drag: destination Y
+    pub to_y: Option<i32>,
+    /// For scroll: direction ("up", "down", "left", "right")
+    pub scroll_direction: Option<String>,
+    /// For scroll: amount (number of clicks)
+    #[serde(default = "default_scroll_amount")]
+    pub scroll_amount: u32,
+}
+
+fn default_mouse_button() -> u8 {
+    1
+}
+
+fn default_scroll_amount() -> u32 {
+    3
+}
+
+/// Request for keyboard actions
+#[derive(Debug, Deserialize)]
+pub struct KeyboardRequest {
+    /// Agent performing the action (must hold the lock)
+    pub agent: String,
+    /// Action: "type" or "key"
+    pub action: String,
+    /// For "type": text to type. For "key": key combo (e.g. "ctrl+s", "Return")
+    pub text: String,
+}
+
+/// Generic computer use response (for mouse/keyboard)
+#[derive(Debug, Serialize)]
+pub struct ComputerActionResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Response for screen size
+#[derive(Debug, Serialize)]
+pub struct ScreenSizeResponse {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Response for mouse position
+#[derive(Debug, Serialize)]
+pub struct MousePositionResponse {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Response for computer use availability check
+#[derive(Debug, Serialize)]
+pub struct ComputerAvailabilityResponse {
+    pub available: bool,
+    pub xdotool: bool,
+    pub screenshot: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen_size: Option<ScreenSizeResponse>,
+}

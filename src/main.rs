@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod computer;
 mod config;
 mod event;
 mod manager;
@@ -281,6 +282,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
         let api_state = Arc::new(api::handlers::ApiState {
             app: Arc::new(Mutex::new(App::new(&config, ticker.clone()))),
             scheduler: scheduler.clone(),
+            computer_lock: computer::new_lock(),
         });
         tokio::spawn(async move {
             if let Err(e) = api::start_server(api_state, &api_config).await {

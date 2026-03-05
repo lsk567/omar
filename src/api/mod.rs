@@ -36,6 +36,27 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/events", post(handlers::schedule_event))
         .route("/api/events", get(handlers::list_events))
         .route("/api/events/:id", delete(handlers::cancel_event))
+        // Computer use endpoints
+        .route("/api/computer/status", get(handlers::computer_status))
+        .route("/api/computer/lock", post(handlers::computer_lock_acquire))
+        .route(
+            "/api/computer/lock",
+            delete(handlers::computer_lock_release),
+        )
+        .route(
+            "/api/computer/screenshot",
+            post(handlers::computer_screenshot),
+        )
+        .route("/api/computer/mouse", post(handlers::computer_mouse))
+        .route("/api/computer/keyboard", post(handlers::computer_keyboard))
+        .route(
+            "/api/computer/screen-size",
+            get(handlers::computer_screen_size),
+        )
+        .route(
+            "/api/computer/mouse-position",
+            get(handlers::computer_mouse_position),
+        )
         .layer(cors)
         .with_state(state)
 }
