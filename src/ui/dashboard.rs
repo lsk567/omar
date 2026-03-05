@@ -127,17 +127,13 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    let status_line = Line::from(status_text);
+    // Append status message inline if present
+    if let Some(ref msg) = app.status_message {
+        status_text.push(Span::raw(" | "));
+        status_text.push(Span::styled(msg.clone(), Style::default().fg(Color::Cyan)));
+    }
 
-    // Add status message if present
-    let content = if let Some(ref msg) = app.status_message {
-        vec![
-            status_line,
-            Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Cyan))),
-        ]
-    } else {
-        vec![status_line]
-    };
+    let content = vec![Line::from(status_text)];
 
     let block = Block::default()
         .borders(Borders::ALL)
