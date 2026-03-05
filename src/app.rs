@@ -420,6 +420,7 @@ impl App {
     pub fn drill_down(&mut self) {
         let session_name = if self.manager_selected {
             // Already viewing EA's children; drill down into EA is a no-op
+            self.set_status("Already at top level");
             return;
         } else {
             // Get the session name of the selected focus child
@@ -430,13 +431,14 @@ impl App {
                     return;
                 }
             } else {
+                self.set_status("No agent selected");
                 return;
             }
         };
 
         // Only drill down if the selected agent has children
         if !self.agent_has_children(&session_name) {
-            self.status_message = Some("No sub-agents to drill into".to_string());
+            self.set_status("No sub-agents to drill into");
             return;
         }
 
@@ -449,7 +451,7 @@ impl App {
         let short = session_name
             .strip_prefix(&self.session_prefix)
             .unwrap_or(&session_name);
-        self.status_message = Some(format!("Viewing: {}", short));
+        self.set_status(format!("Viewing: {}", short));
     }
 
     /// Drill up to the parent view (Esc). Returns true if drilled up, false if at root.
@@ -541,14 +543,14 @@ impl App {
         if let Some(agent) = self.selected_agent() {
             // Safety: don't kill attached sessions (user's terminal)
             if agent.session.attached {
-                self.status_message = Some("Cannot kill attached session".to_string());
+                self.set_status("Cannot kill attached session");
                 self.show_confirm_kill = false;
                 return Ok(());
             }
 
             // Safety: don't kill manager from 'd' key (use separate mechanism)
             if agent.session.name == MANAGER_SESSION {
-                self.status_message = Some("Cannot kill manager with 'd'".to_string());
+                self.set_status("Cannot kill manager with 'd'");
                 self.show_confirm_kill = false;
                 return Ok(());
             }
@@ -556,7 +558,7 @@ impl App {
             let name = agent.session.name.clone();
             self.client.kill_session(&name)?;
             memory::remove_agent_parent(&name);
-            self.status_message = Some(format!("Killed agent: {}", name));
+            self.set_status(format!("Killed agent: {}", name));
             self.refresh()?;
             memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
         }
@@ -606,7 +608,7 @@ impl App {
             .new_session(&name, &self.default_command, Some(&workdir))?;
 
         let short_name = name.strip_prefix(&self.session_prefix).unwrap_or(&name);
-        self.status_message = Some(format!("Spawned agent: {}", short_name));
+        self.set_status(format!("Spawned agent: {}", short_name));
         self.refresh()?;
 
         // Select the new agent
