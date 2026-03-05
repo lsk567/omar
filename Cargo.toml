@@ -1,6 +1,6 @@
 [workspace]
-members = [".", "bridges/slack"]
-default-members = [".", "bridges/slack"]
+members = [".", "bridges/slack", "bridges/computer"]
+default-members = [".", "bridges/slack", "bridges/computer"]
 
 [package]
 name = "omar"
