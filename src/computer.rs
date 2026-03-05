@@ -8,6 +8,85 @@ use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Detect X11 display environment. Returns (DISPLAY, XAUTHORITY) if found.
+/// Auto-detects by scanning /tmp/.X11-unix/ for X sockets and common Xauthority paths.
+fn detect_x11_env() -> Option<(String, String)> {
+    // If DISPLAY is already set, use it
+    if let Ok(display) = std::env::var("DISPLAY") {
+        if !display.is_empty() {
+            let xauth = std::env::var("XAUTHORITY").unwrap_or_default();
+            return Some((display, xauth));
+        }
+    }
+
+    // Auto-detect: find X socket in /tmp/.X11-unix/
+    let x11_dir = std::path::Path::new("/tmp/.X11-unix");
+    if !x11_dir.exists() {
+        return None;
+    }
+
+    let mut display_num: Option<String> = None;
+    if let Ok(entries) = std::fs::read_dir(x11_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Socket files are named X0, X1, X1001, etc.
+            if let Some(num) = name.strip_prefix('X') {
+                // Prefer lower-numbered displays (skip very high numbers like X1001)
+                if let Ok(n) = num.parse::<u32>() {
+                    if n < 100 {
+                        display_num = Some(num.to_string());
+                        break;
+                    } else if display_num.is_none() {
+                        display_num = Some(num.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let display_num = display_num?;
+    let display = format!(":{}", display_num);
+
+    // Try common Xauthority locations
+    // Get UID from /proc/self/status to avoid libc dependency
+    let uid = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u32>().ok())
+        })
+        .unwrap_or(1000);
+    let xauth_candidates = [
+        format!("/run/user/{}/gdm/Xauthority", uid),
+        format!("/run/user/{}/.mutter-Xwaylandauth", uid),
+        std::env::var("HOME")
+            .map(|h| format!("{}/.Xauthority", h))
+            .unwrap_or_default(),
+    ];
+
+    let xauth = xauth_candidates
+        .iter()
+        .find(|p| !p.is_empty() && std::path::Path::new(p).exists())
+        .cloned()
+        .unwrap_or_default();
+
+    Some((display, xauth))
+}
+
+/// Create a Command with X11 environment variables set.
+fn x11_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    if let Some((display, xauth)) = detect_x11_env() {
+        cmd.env("DISPLAY", &display);
+        if !xauth.is_empty() {
+            cmd.env("XAUTHORITY", &xauth);
+        }
+    }
+    cmd
+}
+
 /// Shared lock for exclusive computer access.
 /// Contains the agent name that currently holds the lock, or None.
 pub type ComputerLock = Arc<Mutex<Option<String>>>;
@@ -26,7 +105,7 @@ pub struct ScreenSize {
 
 /// Get the current screen size using xdotool.
 pub fn get_screen_size() -> Result<ScreenSize> {
-    let output = Command::new("xdotool")
+    let output = x11_command("xdotool")
         .arg("getdisplaygeometry")
         .output()
         .context("Failed to run xdotool — is xdotool installed?")?;
@@ -54,7 +133,7 @@ pub fn get_screen_size() -> Result<ScreenSize> {
 /// Take a screenshot and return it as a base64-encoded PNG.
 pub fn take_screenshot() -> Result<String> {
     // Use ImageMagick's `import` to capture the root window to stdout as PNG
-    let output = Command::new("import")
+    let output = x11_command("import")
         .args(["-window", "root", "png:-"])
         .output()
         .context("Failed to run import — is ImageMagick installed?")?;
@@ -72,7 +151,7 @@ pub fn take_screenshot() -> Result<String> {
 
 /// Take a screenshot, resizing to fit within `max_width x max_height`.
 pub fn take_screenshot_resized(max_width: u32, max_height: u32) -> Result<String> {
-    let output = Command::new("import")
+    let output = x11_command("import")
         .args([
             "-window",
             "root",
@@ -94,7 +173,7 @@ pub fn take_screenshot_resized(max_width: u32, max_height: u32) -> Result<String
 
 /// Move the mouse to the given coordinates.
 pub fn mouse_move(x: i32, y: i32) -> Result<()> {
-    let output = Command::new("xdotool")
+    let output = x11_command("xdotool")
         .args(["mousemove", &x.to_string(), &y.to_string()])
         .output()
         .context("Failed to run xdotool mousemove")?;
@@ -111,7 +190,7 @@ pub fn mouse_click(x: i32, y: i32, button: u8) -> Result<()> {
     // Move first, then click
     mouse_move(x, y)?;
 
-    let output = Command::new("xdotool")
+    let output = x11_command("xdotool")
         .args(["click", &button.to_string()])
         .output()
         .context("Failed to run xdotool click")?;
@@ -127,7 +206,7 @@ pub fn mouse_click(x: i32, y: i32, button: u8) -> Result<()> {
 pub fn mouse_double_click(x: i32, y: i32, button: u8) -> Result<()> {
     mouse_move(x, y)?;
 
-    let output = Command::new("xdotool")
+    let output = x11_command("xdotool")
         .args(["click", "--repeat", "2", &button.to_string()])
         .output()
         .context("Failed to run xdotool double-click")?;
@@ -143,7 +222,7 @@ pub fn mouse_double_click(x: i32, y: i32, button: u8) -> Result<()> {
 pub fn mouse_drag(x1: i32, y1: i32, x2: i32, y2: i32, button: u8) -> Result<()> {
     mouse_move(x1, y1)?;
 
-    let output = Command::new("xdotool")
+    let output = x11_command("xdotool")
         .args([
             "mousedown",
             &button.to_string(),
@@ -178,7 +257,7 @@ pub fn mouse_scroll(x: i32, y: i32, direction: &str, amount: u32) -> Result<()> 
     };
 
     for _ in 0..amount {
-        let output = Command::new("xdotool")
+        let output = x11_command("xdotool")
             .args(["click", button])
             .output()
             .context("Failed to run xdotool scroll")?;
@@ -193,7 +272,7 @@ pub fn mouse_scroll(x: i32, y: i32, direction: &str, amount: u32) -> Result<()> 
 
 /// Type text using xdotool. Handles special characters properly.
 pub fn type_text(text: &str) -> Result<()> {
-    let output = Command::new("xdotool")
+    let output = x11_command("xdotool")
         .args(["type", "--clearmodifiers", "--delay", "12", text])
         .output()
         .context("Failed to run xdotool type")?;
@@ -208,7 +287,7 @@ pub fn type_text(text: &str) -> Result<()> {
 /// Press a key or key combination (e.g. "Return", "ctrl+s", "alt+F4").
 pub fn key_press(key: &str) -> Result<()> {
     // xdotool uses "+" for combos, same as our input format
-    let output = Command::new("xdotool")
+    let output = x11_command("xdotool")
         .args(["key", "--clearmodifiers", key])
         .output()
         .context("Failed to run xdotool key")?;
@@ -222,7 +301,7 @@ pub fn key_press(key: &str) -> Result<()> {
 
 /// Get the current mouse position.
 pub fn get_mouse_position() -> Result<(i32, i32)> {
-    let output = Command::new("xdotool")
+    let output = x11_command("xdotool")
         .arg("getmouselocation")
         .output()
         .context("Failed to run xdotool getmouselocation")?;
@@ -248,7 +327,7 @@ pub fn get_mouse_position() -> Result<(i32, i32)> {
 
 /// Check if xdotool is available on the system.
 pub fn is_available() -> bool {
-    Command::new("xdotool")
+    x11_command("xdotool")
         .arg("version")
         .output()
         .map(|o| o.status.success())
@@ -257,7 +336,7 @@ pub fn is_available() -> bool {
 
 /// Check if ImageMagick's import command is available.
 pub fn is_screenshot_available() -> bool {
-    Command::new("import")
+    x11_command("import")
         .arg("-version")
         .output()
         .map(|o| o.status.success() || !o.stderr.is_empty())

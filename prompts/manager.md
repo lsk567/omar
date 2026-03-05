@@ -150,6 +150,10 @@ The user may say things like:
 In all these cases, spawn a "demo" bash window and run the commands sequentially,
 waiting for each to complete before sending the next.
 
+## Skills
+
+If a task requires special capabilities (e.g., controlling the desktop via mouse/keyboard/screenshots), check the skills folder at `prompts/skills/` for detailed instructions. Read the relevant skill file and include the skill contents in worker task descriptions when needed.
+
 ## Example
 
 User: "Build a REST API with authentication"

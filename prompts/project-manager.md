@@ -125,6 +125,10 @@ curl -X POST http://localhost:9876/api/agents -H "Content-Type: application/json
 3. Monitor, guide, kill when done
 4. Output `[PROJECT COMPLETE]` with summary
 
+## Skills
+
+If your task requires special capabilities (e.g., controlling the desktop via mouse/keyboard/screenshots), check the skills folder at `prompts/skills/` for detailed instructions. Read the relevant skill file before proceeding. When spawning workers that need a skill, include the skill contents in the worker's task description.
+
 ## Scheduling and Wake-ups
 
 IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler — use its Events API instead.

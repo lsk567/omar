@@ -47,6 +47,10 @@ curl -X PUT http://localhost:9876/api/agents/<YOUR NAME>/status \
 ```
 Update this whenever you start a new sub-task or reach a milestone.
 
+## Skills
+
+If your task requires special capabilities (e.g., controlling the desktop via mouse/keyboard/screenshots), check the skills folder at `prompts/skills/` for detailed instructions. Read the relevant skill file before proceeding.
+
 ## Focus
 
 Work only on your assigned task. Be thorough but efficient. Start immediately.

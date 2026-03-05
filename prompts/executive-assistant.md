@@ -203,6 +203,10 @@ curl -X POST http://localhost:9876/api/agents/demo/send -H "Content-Type: applic
 
 7. Do NOT kill the demo window. Leave it open for the user.
 
+## Skills
+
+If a task requires special capabilities (e.g., controlling the desktop via mouse/keyboard/screenshots), check the skills folder at `prompts/skills/` for detailed instructions. Mention relevant skills when describing the task to a PM.
+
 ## Example
 
 User: "Build a REST API with authentication"
