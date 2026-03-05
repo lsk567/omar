@@ -434,6 +434,7 @@ impl App {
 
         // Only drill down if the selected agent has children
         if !self.agent_has_children(&session_name) {
+            self.status_message = Some("No sub-agents to drill into".to_string());
             return;
         }
 
