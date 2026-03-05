@@ -63,6 +63,7 @@ pub struct App {
     pub show_confirm_kill: bool,
     pub filter: String,
     pub status_message: Option<String>,
+    status_set_at: Option<std::time::Instant>,
     pub projects: Vec<Project>,
     pub project_input_mode: bool,
     pub project_input: String,
@@ -102,6 +103,7 @@ impl App {
             show_confirm_kill: false,
             filter: String::new(),
             status_message: None,
+            status_set_at: None,
             projects: projects::load_projects(),
             project_input_mode: false,
             project_input: String::new(),
@@ -620,11 +622,19 @@ impl App {
     /// Set status message
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
+        self.status_set_at = Some(std::time::Instant::now());
     }
 
-    /// Clear status message
+    /// Clear status message if it has been visible long enough (≥3 seconds)
     pub fn clear_status(&mut self) {
-        self.status_message = None;
+        if let Some(set_at) = self.status_set_at {
+            if set_at.elapsed() >= std::time::Duration::from_secs(3) {
+                self.status_message = None;
+                self.status_set_at = None;
+            }
+        } else {
+            self.status_message = None;
+        }
     }
 
     /// Get counts by health state: (running, idle)
