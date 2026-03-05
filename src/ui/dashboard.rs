@@ -594,15 +594,21 @@ fn render_summary_card(
             if remaining.is_empty() || w == 0 {
                 break;
             }
-            if remaining.len() <= w {
+            if remaining.chars().count() <= w {
                 wrapped.push(remaining.to_string());
                 remaining = "";
             } else {
-                // Try to break at a word boundary
-                let break_at = remaining[..w]
+                // Find the byte index corresponding to `w` characters
+                let byte_w = remaining
+                    .char_indices()
+                    .nth(w)
+                    .map(|(i, _)| i)
+                    .unwrap_or(remaining.len());
+                // Try to break at a word boundary within the first `w` chars
+                let break_at = remaining[..byte_w]
                     .rfind(' ')
                     .map(|i| i + 1) // include the space on the current line
-                    .unwrap_or(w);
+                    .unwrap_or(byte_w);
                 wrapped.push(remaining[..break_at].trim_end().to_string());
                 remaining = &remaining[break_at..];
             }
@@ -926,8 +932,8 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
             };
 
             // Truncate payload to fit
-            let payload = if event.payload.len() > 30 {
-                format!("{}...", &event.payload[..27])
+            let payload = if event.payload.chars().count() > 30 {
+                format!("{}...", char_truncate(&event.payload, 27))
             } else {
                 event.payload.clone()
             };
@@ -1014,9 +1020,20 @@ fn render_debug_console(frame: &mut Frame, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+/// Return a valid UTF-8 prefix of `s` containing at most `max_chars` characters.
+fn char_truncate(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}…", &s[..max_len - 1])
+    if max_len == 0 {
+        return String::new();
+    }
+    if s.chars().count() > max_len {
+        format!("{}…", char_truncate(s, max_len - 1))
     } else {
         s.to_string()
     }
