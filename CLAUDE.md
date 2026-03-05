@@ -9,3 +9,4 @@
 7. Always format code before pushing to remote.
 8. Always create a new branch off `main` for each PR — never pile unrelated changes onto an existing feature branch.
 9. When pushing new code to an existing open PR, always update the PR description to reflect the latest changes.
+10. When CI tests pass, request reviews from GitHub Copilot and address them judiciously.
