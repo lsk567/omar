@@ -274,9 +274,8 @@ fn setup_tmux() -> Result<()> {
         }
     }
 
+    let normalized = existing.replace(' ', "");
     for &(needle, line, desc) in TMUX_EXTRA_LINES {
-        // Normalize whitespace for matching
-        let normalized = existing.replace(' ', "");
         if !normalized.contains(needle) {
             to_add.push((line, desc));
         }
@@ -494,29 +493,21 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
-                    // Handle kill confirmation dialog
-                    if app.show_confirm_kill {
+                    // Handle confirmation dialog (kill or quit)
+                    if let Some(action) = app.pending_confirm {
                         match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                if let Err(e) = app.kill_selected() {
-                                    app.set_status(format!("Error: {}", e));
+                            KeyCode::Char('y') | KeyCode::Char('Y') => match action {
+                                app::ConfirmAction::Kill => {
+                                    if let Err(e) = app.kill_selected() {
+                                        app.set_status(format!("Error: {}", e));
+                                    }
                                 }
-                            }
+                                app::ConfirmAction::Quit => {
+                                    app.should_quit = true;
+                                }
+                            },
                             _ => {
-                                app.show_confirm_kill = false;
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Handle quit confirmation dialog
-                    if app.show_confirm_quit {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                app.should_quit = true;
-                            }
-                            _ => {
-                                app.show_confirm_quit = false;
+                                app.pending_confirm = None;
                             }
                         }
                         continue;
@@ -553,7 +544,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     // Normal key handling
                     match key.code {
                         KeyCode::Char('Q') => {
-                            app.show_confirm_quit = true;
+                            app.pending_confirm = Some(app::ConfirmAction::Quit);
                         }
                         KeyCode::Esc => {
                             app.drill_up();
@@ -565,7 +556,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.drill_up();
                         }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.show_confirm_quit = true;
+                            app.pending_confirm = Some(app::ConfirmAction::Quit);
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
                             app.next();
@@ -616,7 +607,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('d') => {
                             if app.selected_agent().is_some() {
-                                app.show_confirm_kill = true;
+                                app.pending_confirm = Some(app::ConfirmAction::Kill);
                             }
                         }
                         KeyCode::Char('p') => {

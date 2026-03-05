@@ -7,7 +7,7 @@ use ratatui::{
 };
 use regex::Regex;
 
-use crate::app::{AgentInfo, App};
+use crate::app::{AgentInfo, App, ConfirmAction};
 use crate::memory;
 use crate::tmux::HealthState;
 
@@ -56,12 +56,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_help_popup(frame);
     }
 
-    if app.show_confirm_kill {
-        render_confirm_kill(frame, app);
-    }
-
-    if app.show_confirm_quit {
-        render_confirm_quit(frame);
+    if let Some(action) = app.pending_confirm {
+        render_confirm_dialog(frame, app, action);
     }
 
     if app.project_input_mode {
@@ -800,74 +796,51 @@ fn render_help_popup(frame: &mut Frame) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_confirm_kill(frame: &mut Frame, app: &App) {
-    let area = centered_rect(40, 20, frame.area());
-
-    let agent_name = app
-        .selected_agent()
-        .map(|a| a.session.name.clone())
-        .unwrap_or_else(|| "?".to_string());
-
-    let content = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Kill this agent?",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(agent_name, Style::default().fg(Color::Yellow))),
-        Line::from(""),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("y", Style::default().fg(Color::Green)),
-            Span::raw(": Yes  "),
-            Span::styled("n", Style::default().fg(Color::Red)),
-            Span::raw(": No"),
-        ]),
-    ];
-
-    let block = Block::default()
-        .title(" Confirm ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red));
-
-    let paragraph = Paragraph::new(content)
-        .block(block)
-        .alignment(ratatui::layout::Alignment::Center);
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(paragraph, area);
-}
-
-fn render_confirm_quit(frame: &mut Frame) {
-    let area = centered_rect(50, 20, frame.area());
-
-    let content = vec![
-        Line::from(""),
-        Line::from(Span::styled(
+fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
+    let (title, heading, detail, hint, width) = match action {
+        ConfirmAction::Kill => {
+            let name = app
+                .selected_agent()
+                .map(|a| a.session.name.clone())
+                .unwrap_or_else(|| "?".to_string());
+            (" Confirm ", "Kill this agent?", name, String::new(), 40)
+        }
+        ConfirmAction::Quit => (
+            " Confirm Quit ",
             "Quit omar?",
+            "This will kill the EA session.".to_string(),
+            "Press z to walk away instead.".to_string(),
+            50,
+        ),
+    };
+
+    let area = centered_rect(width, 20, frame.area());
+
+    let mut content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            heading,
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "This will kill the EA session.",
-            Style::default().fg(Color::Yellow),
-        )),
-        Line::from(Span::styled(
-            "Press z to walk away instead.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("y", Style::default().fg(Color::Green)),
-            Span::raw(": Yes, quit  "),
-            Span::styled("n", Style::default().fg(Color::Red)),
-            Span::raw(": Cancel"),
-        ]),
+        Line::from(Span::styled(detail, Style::default().fg(Color::Yellow))),
     ];
+    if !hint.is_empty() {
+        content.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    content.push(Line::from(""));
+    content.push(Line::from(vec![
+        Span::styled("y", Style::default().fg(Color::Green)),
+        Span::raw(": Yes  "),
+        Span::styled("n", Style::default().fg(Color::Red)),
+        Span::raw(": No"),
+    ]));
 
     let block = Block::default()
-        .title(" Confirm Quit ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red));
 

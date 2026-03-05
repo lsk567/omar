@@ -17,6 +17,15 @@ pub use crate::manager::MANAGER_SESSION as MANAGER_SESSION_NAME;
 /// Shared app state for API access
 pub type SharedApp = App;
 
+/// What kind of confirmation the user is being prompted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmAction {
+    /// Kill the selected agent
+    Kill,
+    /// Quit omar (kills EA)
+    Quit,
+}
+
 /// Information about an agent for display
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
@@ -60,8 +69,7 @@ pub struct App {
     pub manager_selected: bool,
     pub should_quit: bool,
     pub show_help: bool,
-    pub show_confirm_kill: bool,
-    pub show_confirm_quit: bool,
+    pub pending_confirm: Option<ConfirmAction>,
     pub filter: String,
     pub status_message: Option<String>,
     pub projects: Vec<Project>,
@@ -100,8 +108,7 @@ impl App {
             manager_selected: true,
             should_quit: false,
             show_help: false,
-            show_confirm_kill: false,
-            show_confirm_quit: false,
+            pending_confirm: None,
             filter: String::new(),
             status_message: None,
             projects: projects::load_projects(),
@@ -128,8 +135,7 @@ impl App {
     /// True when any popup or input overlay is active.
     pub fn has_popup(&self) -> bool {
         self.show_help
-            || self.show_confirm_kill
-            || self.show_confirm_quit
+            || self.pending_confirm.is_some()
             || self.project_input_mode
             || self.show_events
             || self.show_debug_console
@@ -542,14 +548,14 @@ impl App {
             // Safety: don't kill attached sessions (user's terminal)
             if agent.session.attached {
                 self.status_message = Some("Cannot kill attached session".to_string());
-                self.show_confirm_kill = false;
+                self.pending_confirm = None;
                 return Ok(());
             }
 
             // Safety: don't kill manager from 'd' key (use separate mechanism)
             if agent.session.name == MANAGER_SESSION {
                 self.status_message = Some("Cannot kill manager with 'd'".to_string());
-                self.show_confirm_kill = false;
+                self.pending_confirm = None;
                 return Ok(());
             }
 
@@ -560,7 +566,7 @@ impl App {
             self.refresh()?;
             memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
         }
-        self.show_confirm_kill = false;
+        self.pending_confirm = None;
         Ok(())
     }
 
