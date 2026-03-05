@@ -549,9 +549,9 @@ fn render_summary_card(
     let child_count = app.child_count(&agent.session.name);
     if child_count > 0 {
         lines.push(Line::from(vec![
-            Span::styled("Sub-agents: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("▶ ", Style::default().fg(Color::Cyan)),
             Span::styled(
-                format!("{}", child_count),
+                format!("{} workers", child_count),
                 Style::default().fg(Color::White),
             ),
         ]));
