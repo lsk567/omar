@@ -19,12 +19,14 @@ pub const MANAGER_SESSION: &str = "omar-agent-ea";
 const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
 const PROMPT_PM: &str = include_str!("../../prompts/project-manager.md");
 const PROMPT_WORKER: &str = include_str!("../../prompts/worker.md");
+const PROMPT_AGENT: &str = include_str!("../../prompts/agent.md");
 
 /// Embedded prompt files, keyed by filename.
 const EMBEDDED_PROMPTS: &[(&str, &str)] = &[
     ("executive-assistant.md", PROMPT_EA),
     ("project-manager.md", PROMPT_PM),
     ("worker.md", PROMPT_WORKER),
+    ("agent.md", PROMPT_AGENT),
 ];
 
 /// Return the `~/.omar/prompts/` directory, writing embedded prompts on first call.

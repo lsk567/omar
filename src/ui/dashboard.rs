@@ -240,11 +240,7 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             let short = parent_name
                 .strip_prefix(app.client().prefix())
                 .unwrap_or(parent_name);
-            if let Some(rest) = short.strip_prefix("pm-") {
-                format!("Project Manager: {}", rest)
-            } else {
-                short.to_string()
-            }
+            short.to_string()
         };
 
         // Health status dot
@@ -306,11 +302,7 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             }
         };
 
-        let focus_short = app
-            .focus_parent
-            .strip_prefix(app.client().prefix())
-            .unwrap_or(&app.focus_parent);
-        if focus_short.starts_with("pm-") {
+        if app.child_count(&app.focus_parent) > 0 {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -503,17 +495,13 @@ fn render_summary_card(
         Modifier::empty()
     });
 
-    // Display name: strip prefix, label PMs as "Project Manager"
+    // Display name: strip session prefix
     let short_name = agent
         .session
         .name
         .strip_prefix(app.client().prefix())
         .unwrap_or(&agent.session.name);
-    let display = if let Some(rest) = short_name.strip_prefix("pm-") {
-        format!("Project Manager: {}", rest)
-    } else {
-        short_name.to_string()
-    };
+    let display = short_name.to_string();
 
     // Title with status indicator
     let title_line = if selected {
