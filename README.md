@@ -4,69 +4,84 @@
 
 <img src="docs/img/thermopylae.png" alt="thermopylae" width="450" />
 
-Be a one-man army with non-stop agents tackling the biggest problems.
+Lead an army of 300 agents to solve humanity's biggest problems.
 
-**`omar` is a TUI dashboard for managing AI agents based on `tmux`.**
+**`omar` is a TUI for creating powerful agentic organizations.**
 
-<p>
-  <a href="https://opensource.org/licenses/BSD-2-Clause">
-    <img src="https://img.shields.io/badge/License-BSD_2--Clause-blue.svg" alt="License"/>
-  </a>
-  <a href="https://github.com/lsk567/omar/actions/workflows/ci.yml">
-    <img src="https://github.com/lsk567/omar/actions/workflows/ci.yml/badge.svg" alt="CI Status"/>
-  </a>
-  <a href="https://discord.gg/X76PSzmfWr">
-    <img src="https://img.shields.io/discord/1467663881588572182?label=Discord&logo=discord&logoColor=white&color=5865F2&cacheSeconds=60" alt="Discord"/>
-  </a>
-</p>
+<a href="https://opensource.org/licenses/BSD-2-Clause">
+  <img src="https://img.shields.io/badge/License-BSD_2--Clause-blue.svg" alt="License"/>
+</a>
+<a href="https://github.com/lsk567/omar/actions/workflows/ci.yml">
+  <img src="https://github.com/lsk567/omar/actions/workflows/ci.yml/badge.svg" alt="CI Status"/>
+</a>
+<a href="https://discord.gg/X76PSzmfWr">
+  <img src="https://img.shields.io/discord/1467663881588572182?label=Discord&logo=discord&logoColor=white&color=5865F2&cacheSeconds=60" alt="Discord"/>
+</a>
 
 </div>
 
 ## Features
 
-- A TUI dashboard for all your agents in one place
-- Spawn workers in parallel
-- Visualize agents' chain of command
-- Health status tracking
-- Support all the familiar `tmux` commands you love!
-
-<img src="docs/img/demo3.png" alt="demo"/>
-☝️ See all your agents at once. Nagivate using arrow keys.
-
-<img src="docs/img/demo4.png" alt="demo"/>
-☝️ Talk to any agent in a pop-up window.
-
-## Requirements
-
-- tmux 3.0+
-- Rust 1.70+
-- At least one agent backend (claude, opencode, or custom)
+- Professional TUI dashboard for all your agents in one place
+- Deep hierarchy of parallel agents, just like a company
+- Talk to any agent - you are in control
+- Messaging systems integration (e.g., Slack, etc.)
+- Computer use (Linux)
+- Highly customizable, supporting all `tmux` commands
 
 ## Installation
 
+#### Install Dependencies
+
+- tmux 3.0+
+- Rust 1.70+
+- GNU Make
+- [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) or [Opencode](https://github.com/anomalyco/opencode)
+
+#### Build from source
+
 ```bash
-cargo install --path .
+make install
 ```
 
-## Usage
+## Quick Start
 
-### Dashboard Mode
+#### Step 1: Launch `omar`
 
 ```bash
-omar
+$ omar
+```
+
+Go [here](#supported-agent-backends) to see how to launch with other agent backends.
+
+#### Step 2: Tell your executive assistent (EA) to run a test prompt.
+
+Copy the following into your EA window:
+```
+Load and run <omar-root>/prompts/tests/compiler.md
+```
+
+You should see agents being spawned by the EA.
+
+Tip: Use ↑↓ to cycle through agents at the current level. Use → to drill into a deeper level. Use ← to back out.
+
+<!-- Need a GIF here -->
+
+#### Step 3: Shutdown the project.
+
+Go back to the EA and type in:
+```
+Shutdown the test project and its agents. Delete <omar-root>/junk/ folder.
 ```
 
 ## Supported Agent Backends
 
 Omar auto-detects which agent backend is available on your system:
 
-| Backend | Command | Auto-detected |
-|---------|---------|---------------|
-| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `claude --dangerously-skip-permissions` | Yes (first priority) |
-| [Opencode](https://github.com/nichochar/opencode) | `opencode` | Yes (second priority) |
-| Custom | Any command | Via config |
-
-If both are installed, `claude` takes priority. Override with the `default_command` config option.
+| Backend | How to launch |
+|---------|---------------|
+| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar` (default) |
+| [Opencode](https://github.com/anomalyco/opencode) | `omar --agent opencode` |
 
 ## License
 
