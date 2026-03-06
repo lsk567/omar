@@ -74,6 +74,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 }
 
+/// Public wrapper for status bar (used by dataflow view)
+pub fn render_status_bar_pub(frame: &mut Frame, app: &App, area: Rect) {
+    render_status_bar(frame, app, area);
+}
+
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let (running, idle) = app.health_counts();
     let total = app.total_agents();
@@ -671,6 +676,8 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(":Back "),
         Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Popup "),
+        Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Dataflow "),
         Span::styled("n", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":New "),
         Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
@@ -757,7 +764,8 @@ fn render_help_popup(frame: &mut Frame) {
         Line::from(""),
         Line::from("  q           Quit"),
         Line::from("  Esc, ←      Back (drill up)"),
-        Line::from("  Tab, →      Drill into selected agent"),
+        Line::from("  →           Drill into selected agent"),
+        Line::from("  Tab         Toggle flat/dataflow view"),
         Line::from("  ↑/↓, j/k   Move selection up/down"),
         Line::from("  Enter       Attach to selected agent"),
         Line::from("  n           Spawn new agent"),

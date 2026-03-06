@@ -595,7 +595,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         KeyCode::Esc => {
                             app.drill_up();
                         }
-                        KeyCode::Tab | KeyCode::Right => {
+                        KeyCode::Tab => {
+                            app.toggle_view();
+                        }
+                        KeyCode::Right => {
                             app.drill_down();
                         }
                         KeyCode::Left => {

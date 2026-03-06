@@ -26,6 +26,15 @@ pub enum ConfirmAction {
     Quit,
 }
 
+/// Dashboard view mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Default flat/grid view with agent cards
+    Flat,
+    /// LF-style dataflow diagram showing agent relationships
+    Dataflow,
+}
+
 /// Information about an agent for display
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
@@ -90,6 +99,7 @@ pub struct App {
     pub focus_child_indices: Vec<usize>,
     agent_parents: HashMap<String, String>,
     worker_tasks: HashMap<String, String>,
+    pub view_mode: ViewMode,
     client: TmuxClient,
     health_checker: HealthChecker,
     default_command: String,
@@ -127,6 +137,7 @@ impl App {
             focus_child_indices: Vec::new(),
             agent_parents: HashMap::new(),
             worker_tasks: HashMap::new(),
+            view_mode: ViewMode::Flat,
             client,
             health_checker,
             default_command: config.agent.default_command.clone(),
@@ -611,6 +622,14 @@ impl App {
         let msg = msg.into();
         self.persistent_warning = Some(msg.clone());
         self.status_message = Some(msg);
+    }
+
+    /// Toggle between flat and dataflow views
+    pub fn toggle_view(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Flat => ViewMode::Dataflow,
+            ViewMode::Dataflow => ViewMode::Flat,
+        };
     }
 
     /// Clear status message (persistent warnings are restored)
@@ -1251,6 +1270,23 @@ mod tests {
 
         let count = parents.values().filter(|p| *p == "omar-agent-api").count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_view_mode_toggle() {
+        // Default is Flat
+        let mode = ViewMode::Flat;
+        let toggled = match mode {
+            ViewMode::Flat => ViewMode::Dataflow,
+            ViewMode::Dataflow => ViewMode::Flat,
+        };
+        assert_eq!(toggled, ViewMode::Dataflow);
+
+        let toggled_back = match toggled {
+            ViewMode::Flat => ViewMode::Dataflow,
+            ViewMode::Dataflow => ViewMode::Flat,
+        };
+        assert_eq!(toggled_back, ViewMode::Flat);
     }
 
     #[test]
