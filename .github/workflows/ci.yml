@@ -166,11 +166,14 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Upload binary
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: omar-${{ matrix.os }}
-          path: target/release/omar
+          path: |
+            target/release/omar
+            target/release/omar-computer
+            target/release/omar-slack
 
   # Ensure all jobs pass before allowing merge
   ci-success:
