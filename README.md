@@ -44,7 +44,7 @@ make install
 $ omar
 ```
 
-<img src="docs/gif/demo-step-1-open-omar.gif" alt="demo-step-1" />
+<video src="docs/videos/demo-step-1-open-omar.mp4" alt="demo-step-1" autoplay loop muted playsinline></video>
 
 Go [here](#supported-agent-backends) to see how to launch with other agent backends.
 
@@ -55,13 +55,13 @@ Copy the following into your EA window:
 Load and run <omar-root>/prompts/tests/project-factory.md
 ```
 
-<img src="docs/gif/demo-step-2a-ea-prompt.gif" alt="demo-step-2a" />
+<video src="docs/videos/demo-step-2a-ea-prompt.mp4" alt="demo-step-2a" autoplay loop muted playsinline></video>
 
 You should see agents being spawned by the EA.
 
 Tip: Use ↑↓ to cycle through agents at the current level. Use → to drill into a deeper level. Use ← to back out.
 
-<img src="docs/gif/demo-step-2b-agent-spawn.gif" alt="demo-step-2b" />
+<video src="docs/videos/demo-step-2b-agent-spawn.mp4" alt="demo-step-2b" autoplay loop muted playsinline></video>
 
 #### Step 3: Shutdown the project.
 
@@ -70,7 +70,7 @@ Go back to the EA and type in:
 Shutdown the test project and its agents. Delete <omar-root>/junk/ folder.
 ```
 
-<img src="docs/gif/demo-step-3-shutdown.gif" alt="demo-step-3" />
+<video src="docs/videos/demo-step-3-shutdown.mp4" alt="demo-step-3" autoplay loop muted playsinline></video>
 
 ## Supported Agent Backends
 
