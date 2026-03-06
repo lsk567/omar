@@ -259,15 +259,15 @@ pub async fn spawn_agent(
         .command
         .unwrap_or_else(|| app.default_command().to_string());
 
-    let is_pm = req.role.as_deref() == Some("project-manager");
-    let cmd = if is_pm {
-        let prompt_file = prompts_dir().join("project-manager.md");
-        build_agent_command(&base_command, &prompt_file, &[])
-    } else if req.task.is_some() && req.role.as_deref() != Some("project-manager") {
-        // Worker with a task — use worker prompt with template substitutions
+    // Unified agent role: "project-manager" and "agent" both use agent.md prompt.
+    // Legacy "project-manager" role is treated as an alias for "agent".
+    let has_agent_prompt = matches!(req.role.as_deref(), Some("project-manager") | Some("agent"))
+        || req.task.is_some();
+    let cmd = if has_agent_prompt {
+        // Any agent with a role or task gets the unified agent prompt
         let parent = req.parent.as_deref().unwrap_or("ea");
         let task = req.task.as_deref().unwrap_or("");
-        let prompt_file = prompts_dir().join("worker.md");
+        let prompt_file = prompts_dir().join("agent.md");
         build_agent_command(
             &base_command,
             &prompt_file,
@@ -287,42 +287,19 @@ pub async fn spawn_agent(
         ));
     }
 
-    // Save parent mapping: explicit parent, or auto-infer from running PMs
+    // Save parent mapping if explicitly provided
     if let Some(ref parent) = req.parent {
         let resolved_parent = resolve_session_name(&prefix, parent);
         memory::save_agent_parent(&name, &resolved_parent);
-    } else if !is_pm {
-        // Auto-infer: non-PM agents are workers. Query tmux directly
-        // (app.agents() is stale — only updated on dashboard refresh).
-        if let Ok(sessions) = app.client().list_sessions() {
-            let pm_sessions: Vec<String> = sessions
-                .iter()
-                .filter(|s| {
-                    s.name
-                        .strip_prefix(&prefix)
-                        .unwrap_or(&s.name)
-                        .starts_with("pm-")
-                })
-                .map(|s| s.name.clone())
-                .collect();
-            if pm_sessions.len() == 1 {
-                memory::save_agent_parent(&name, &pm_sessions[0]);
-            }
-            // Multiple PMs: can't auto-infer, will show as Unassigned
-        }
     }
 
-    // Send first user message after a delay (role-dependent content)
+    // Send first user message after a delay
     if let Some(task) = req.task {
         // Always persist the original (short) task for dashboard display
         memory::save_worker_task(&name, &task);
 
-        let user_msg = if is_pm {
-            let short = display_name(&prefix, &name);
-            format!("YOUR NAME: {}\nYOUR TASK: {}", short, task)
-        } else {
-            "Start working on your assigned task now.".to_string()
-        };
+        let short = display_name(&prefix, &name);
+        let user_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", short, task);
 
         let client = app.client().clone();
         let session = name.clone();
@@ -336,8 +313,8 @@ pub async fn spawn_agent(
         });
     }
 
-    // Schedule a recurring status-prompt event for PMs
-    if is_pm {
+    // Schedule a recurring status-prompt event for agents with tasks
+    if has_agent_prompt {
         let short_name = display_name(&prefix, &name).to_string();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

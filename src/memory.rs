@@ -149,7 +149,7 @@ pub fn write_memory(agents: &[AgentInfo], manager: Option<&AgentInfo>, client: &
 
     // Active workers
     if !agents.is_empty() {
-        out.push_str("## Active Workers\n");
+        out.push_str("## Active Agents\n");
         for agent in agents {
             let health = agent.health.as_str();
             let task_desc = worker_tasks

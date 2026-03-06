@@ -300,35 +300,16 @@ impl App {
     fn compute_focus_child_indices(&self) -> Vec<usize> {
         let mut indices = Vec::new();
         if self.focus_parent == MANAGER_SESSION {
-            // Root view: show PMs + orphan workers (direct children of EA)
+            // Root view: show agents that are direct children of EA, plus orphans
             for (i, agent) in self.agents.iter().enumerate() {
-                let short = agent
-                    .session
-                    .name
-                    .strip_prefix(&self.session_prefix)
-                    .unwrap_or(&agent.session.name);
-                let is_pm = short.starts_with("pm-");
-                if is_pm {
-                    // PMs are always direct children of EA
-                    indices.push(i);
-                } else {
-                    // Non-PM: include if it has no parent, or its parent is not a live PM
-                    let parent = self.agent_parents.get(&agent.session.name);
-                    let has_live_pm_parent = parent
-                        .map(|p| {
-                            self.agents.iter().any(|a| {
-                                a.session.name == *p
-                                    && a.session
-                                        .name
-                                        .strip_prefix(&self.session_prefix)
-                                        .unwrap_or(&a.session.name)
-                                        .starts_with("pm-")
-                            })
-                        })
-                        .unwrap_or(false);
-                    if !has_live_pm_parent {
-                        indices.push(i);
-                    }
+                let parent = self.agent_parents.get(&agent.session.name);
+                match parent {
+                    // Explicit child of EA (manager session)
+                    Some(p) if *p == MANAGER_SESSION => indices.push(i),
+                    // Has a live parent that is NOT the EA → belongs deeper in the tree
+                    Some(p) if self.agents.iter().any(|a| a.session.name == *p) => {}
+                    // Parent is dead or missing → show as orphan at root
+                    _ => indices.push(i),
                 }
             }
         } else {
@@ -393,11 +374,7 @@ impl App {
             let short = session
                 .strip_prefix(&self.session_prefix)
                 .unwrap_or(session);
-            if let Some(rest) = short.strip_prefix("pm-") {
-                crumbs.push(format!("PM: {}", rest));
-            } else {
-                crumbs.push(short.to_string());
-            }
+            crumbs.push(short.to_string());
         }
         // Add current focus parent if not EA
         if self.focus_parent != MANAGER_SESSION {
@@ -405,11 +382,7 @@ impl App {
                 .focus_parent
                 .strip_prefix(&self.session_prefix)
                 .unwrap_or(&self.focus_parent);
-            if let Some(rest) = short.strip_prefix("pm-") {
-                crumbs.push(format!("PM: {}", rest));
-            } else {
-                crumbs.push(short.to_string());
-            }
+            crumbs.push(short.to_string());
         }
         crumbs
     }
@@ -679,38 +652,40 @@ impl App {
     }
 }
 
-/// Group agents into PM → worker hierarchies for grid display.
+/// Group agents into parent → children hierarchies for grid display.
 ///
-/// PMs are identified by the "pm-" prefix after stripping the session prefix.
-/// Workers are assigned to PMs via the agent_parents map (child → parent).
-/// Workers without a valid PM parent go into an orphan group (pm: None).
+/// Parents are agents that have children via the agent_parents map.
+/// Agents without a live parent go into an orphan group (pm: None).
 pub fn build_agent_groups<'a>(
     agents: &'a [AgentInfo],
     agent_parents: &HashMap<String, String>,
-    session_prefix: &str,
+    _session_prefix: &str,
 ) -> Vec<AgentGroup<'a>> {
-    let mut pms: Vec<&AgentInfo> = Vec::new();
-    let mut non_pms: Vec<&AgentInfo> = Vec::new();
+    // Find agents that are parents (have children pointing to them)
+    let mut parent_agents: Vec<&AgentInfo> = Vec::new();
+    let mut leaf_agents: Vec<&AgentInfo> = Vec::new();
+
     for agent in agents {
-        let short = agent
-            .session
-            .name
-            .strip_prefix(session_prefix)
-            .unwrap_or(&agent.session.name);
-        if short.starts_with("pm-") {
-            pms.push(agent);
+        let has_children = agent_parents
+            .values()
+            .any(|parent| *parent == agent.session.name);
+        if has_children {
+            parent_agents.push(agent);
         } else {
-            non_pms.push(agent);
+            leaf_agents.push(agent);
         }
     }
 
-    let mut pm_children: HashMap<String, Vec<&AgentInfo>> = HashMap::new();
+    let mut parent_children: HashMap<String, Vec<&AgentInfo>> = HashMap::new();
     let mut orphans: Vec<&AgentInfo> = Vec::new();
 
-    for agent in non_pms {
+    for agent in leaf_agents {
         if let Some(parent_session) = agent_parents.get(&agent.session.name) {
-            if pms.iter().any(|pm| pm.session.name == *parent_session) {
-                pm_children
+            if parent_agents
+                .iter()
+                .any(|p| p.session.name == *parent_session)
+            {
+                parent_children
                     .entry(parent_session.clone())
                     .or_default()
                     .push(agent);
@@ -724,10 +699,12 @@ pub fn build_agent_groups<'a>(
 
     let mut groups = Vec::new();
 
-    for pm in &pms {
-        let workers = pm_children.remove(&pm.session.name).unwrap_or_default();
+    for parent in &parent_agents {
+        let workers = parent_children
+            .remove(&parent.session.name)
+            .unwrap_or_default();
         groups.push(AgentGroup {
-            pm: Some(pm),
+            pm: Some(parent),
             workers,
         });
     }
@@ -744,11 +721,12 @@ pub fn build_agent_groups<'a>(
 
 /// Build the chain-of-command tree from current agents and parent mappings.
 ///
-/// Tree structure:
+/// Tree structure (recursive, arbitrary depth):
 ///   EA (root, depth 0)
-///   ├── PM agents (depth 1, identified by "pm-" prefix)
-///   │   └── Workers with that PM as parent (depth 2)
-///   └── Orphan workers with no parent (depth 1, under EA)
+///   ├── Agent with children (depth 1)
+///   │   └── Sub-agent (depth 2)
+///   │       └── Sub-sub-agent (depth 3) ...
+///   └── Orphan agents with no parent (depth 1, under EA)
 pub fn build_tree(
     agents: &[AgentInfo],
     manager: Option<&AgentInfo>,
@@ -768,31 +746,17 @@ pub fn build_tree(
         ancestor_is_last: vec![],
     });
 
-    // Partition agents into PMs and non-PMs
-    let mut pms: Vec<&AgentInfo> = Vec::new();
-    let mut non_pms: Vec<&AgentInfo> = Vec::new();
-    for agent in agents {
-        let short = agent
-            .session
-            .name
-            .strip_prefix(session_prefix)
-            .unwrap_or(&agent.session.name);
-        if short.starts_with("pm-") {
-            pms.push(agent);
-        } else {
-            non_pms.push(agent);
-        }
-    }
-
-    // For each non-PM, figure out if it has a PM parent
-    let mut pm_children: HashMap<String, Vec<&AgentInfo>> = HashMap::new();
+    // Build a children map: parent_session -> vec of child agents
+    let mut children_map: HashMap<String, Vec<&AgentInfo>> = HashMap::new();
     let mut orphans: Vec<&AgentInfo> = Vec::new();
 
-    for agent in &non_pms {
+    for agent in agents {
         if let Some(parent_session) = agent_parents.get(&agent.session.name) {
-            // Check that the parent PM actually exists
-            if pms.iter().any(|pm| pm.session.name == *parent_session) {
-                pm_children
+            // Check that the parent actually exists (either as agent or EA)
+            let parent_exists = *parent_session == MANAGER_SESSION
+                || agents.iter().any(|a| a.session.name == *parent_session);
+            if parent_exists {
+                children_map
                     .entry(parent_session.clone())
                     .or_default()
                     .push(agent);
@@ -804,79 +768,111 @@ pub fn build_tree(
         }
     }
 
-    // Add PM nodes (depth 1) and their worker children (depth 2)
-    for (pm_idx, pm) in pms.iter().enumerate() {
-        // PM is last among EA children only if it's the last PM AND there are no orphans
-        let is_last = pm_idx == pms.len() - 1 && orphans.is_empty();
+    // Recursively add nodes starting from EA's children
+    let ea_children = children_map.get(MANAGER_SESSION);
+    let total_root_children = ea_children.map(|c| c.len()).unwrap_or(0) + orphans.len();
 
-        let short = pm
-            .session
-            .name
-            .strip_prefix(session_prefix)
-            .unwrap_or(&pm.session.name);
-        let pm_display = if let Some(rest) = short.strip_prefix("pm-") {
-            format!("Project Manager: {}", rest)
-        } else {
-            short.to_string()
-        };
-
-        nodes.push(CommandTreeNode {
-            name: pm_display,
-            session_name: pm.session.name.clone(),
-            health: pm.health,
-            depth: 1,
-            is_last_sibling: is_last,
-            ancestor_is_last: vec![true], // EA is always last at depth 0
-        });
-
-        // Add workers under this PM (depth 2)
-        let children = pm_children.get(&pm.session.name);
-        if let Some(kids) = children {
-            for (kid_idx, kid) in kids.iter().enumerate() {
-                let kid_short = kid
+    #[allow(clippy::too_many_arguments)]
+    fn add_children(
+        nodes: &mut Vec<CommandTreeNode>,
+        children_map: &HashMap<String, Vec<&AgentInfo>>,
+        parent_session: &str,
+        depth: usize,
+        ancestor_is_last: &[bool],
+        session_prefix: &str,
+        total_siblings: usize,
+        start_idx: usize,
+    ) {
+        if let Some(children) = children_map.get(parent_session) {
+            for (idx, child) in children.iter().enumerate() {
+                let sibling_idx = start_idx + idx;
+                let is_last = sibling_idx == total_siblings - 1;
+                let short = child
                     .session
                     .name
                     .strip_prefix(session_prefix)
-                    .unwrap_or(&kid.session.name);
-                let kid_is_last = kid_idx == kids.len() - 1;
+                    .unwrap_or(&child.session.name);
+
                 nodes.push(CommandTreeNode {
-                    name: kid_short.to_string(),
-                    session_name: kid.session.name.clone(),
-                    health: kid.health,
-                    depth: 2,
-                    is_last_sibling: kid_is_last,
-                    ancestor_is_last: vec![true, is_last],
+                    name: short.to_string(),
+                    session_name: child.session.name.clone(),
+                    health: child.health,
+                    depth,
+                    is_last_sibling: is_last,
+                    ancestor_is_last: ancestor_is_last.to_vec(),
                 });
+
+                // Recurse into this child's children
+                let grandchildren_count = children_map
+                    .get(&child.session.name)
+                    .map(|c| c.len())
+                    .unwrap_or(0);
+                if grandchildren_count > 0 {
+                    let mut next_ancestors = ancestor_is_last.to_vec();
+                    next_ancestors.push(is_last);
+                    add_children(
+                        nodes,
+                        children_map,
+                        &child.session.name,
+                        depth + 1,
+                        &next_ancestors,
+                        session_prefix,
+                        grandchildren_count,
+                        0,
+                    );
+                }
             }
         }
     }
 
-    // Add orphan workers under a synthetic "Unassigned" group (depth 1)
-    if !orphans.is_empty() {
-        nodes.push(CommandTreeNode {
-            name: "Unassigned".to_string(),
-            session_name: String::new(),
-            health: HealthState::Idle,
-            depth: 1,
-            is_last_sibling: true, // always last child of EA
-            ancestor_is_last: vec![true],
-        });
+    // Add EA's direct children
+    let ea_direct_count = ea_children.map(|c| c.len()).unwrap_or(0);
+    add_children(
+        &mut nodes,
+        &children_map,
+        MANAGER_SESSION,
+        1,
+        &[true], // EA is always last at depth 0
+        session_prefix,
+        total_root_children,
+        0,
+    );
 
+    // Add orphan agents (no parent or dead parent) under EA
+    if !orphans.is_empty() {
         for (orphan_idx, orphan) in orphans.iter().enumerate() {
             let short = orphan
                 .session
                 .name
                 .strip_prefix(session_prefix)
                 .unwrap_or(&orphan.session.name);
-            let is_last = orphan_idx == orphans.len() - 1;
+            let sibling_idx = ea_direct_count + orphan_idx;
             nodes.push(CommandTreeNode {
                 name: short.to_string(),
                 session_name: orphan.session.name.clone(),
                 health: orphan.health,
-                depth: 2,
-                is_last_sibling: is_last,
-                ancestor_is_last: vec![true, true], // EA is last, Unassigned is last
+                depth: 1,
+                is_last_sibling: sibling_idx == total_root_children - 1,
+                ancestor_is_last: vec![true],
             });
+
+            // Orphans can also have children
+            let child_count = children_map
+                .get(&orphan.session.name)
+                .map(|c| c.len())
+                .unwrap_or(0);
+            if child_count > 0 {
+                add_children(
+                    &mut nodes,
+                    &children_map,
+                    &orphan.session.name,
+                    2,
+                    &[true, sibling_idx == total_root_children - 1],
+                    session_prefix,
+                    child_count,
+                    0,
+                );
+            }
         }
     }
 
@@ -907,34 +903,32 @@ mod tests {
     // ── build_agent_groups tests ──
 
     #[test]
-    fn test_groups_pm_with_workers() {
+    fn test_groups_parent_with_children() {
         let agents = vec![
-            make_agent("omar-agent-pm-rest-api", HealthState::Running),
+            make_agent("omar-agent-rest-api", HealthState::Running),
             make_agent("omar-agent-api", HealthState::Running),
             make_agent("omar-agent-auth", HealthState::Idle),
         ];
         let mut parents = HashMap::new();
         parents.insert(
             "omar-agent-api".to_string(),
-            "omar-agent-pm-rest-api".to_string(),
+            "omar-agent-rest-api".to_string(),
         );
         parents.insert(
             "omar-agent-auth".to_string(),
-            "omar-agent-pm-rest-api".to_string(),
+            "omar-agent-rest-api".to_string(),
         );
 
         let groups = build_agent_groups(&agents, &parents, "omar-agent-");
 
-        // One PM group, no orphans
+        // One parent group, no orphans
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].pm.unwrap().session.name, "omar-agent-pm-rest-api");
+        assert_eq!(groups[0].pm.unwrap().session.name, "omar-agent-rest-api");
         assert_eq!(groups[0].workers.len(), 2);
-        assert_eq!(groups[0].workers[0].session.name, "omar-agent-api");
-        assert_eq!(groups[0].workers[1].session.name, "omar-agent-auth");
     }
 
     #[test]
-    fn test_groups_all_orphans_no_pm() {
+    fn test_groups_all_orphans() {
         let agents = vec![
             make_agent("omar-agent-api", HealthState::Running),
             make_agent("omar-agent-auth", HealthState::Idle),
@@ -943,107 +937,92 @@ mod tests {
 
         let groups = build_agent_groups(&agents, &parents, "omar-agent-");
 
-        // One orphan group, no PM groups
+        // One orphan group
         assert_eq!(groups.len(), 1);
         assert!(groups[0].pm.is_none());
         assert_eq!(groups[0].workers.len(), 2);
     }
 
     #[test]
-    fn test_groups_pm_without_workers() {
-        let agents = vec![make_agent("omar-agent-pm-rest-api", HealthState::Running)];
+    fn test_groups_parent_without_children() {
+        // An agent with no children and no parent → orphan (not a "parent" group)
+        let agents = vec![make_agent("omar-agent-rest-api", HealthState::Running)];
         let parents = HashMap::new();
 
         let groups = build_agent_groups(&agents, &parents, "omar-agent-");
 
-        // One PM group with zero workers
+        // No children means it's not detected as a parent → orphan
         assert_eq!(groups.len(), 1);
-        assert!(groups[0].pm.is_some());
-        assert!(groups[0].workers.is_empty());
+        assert!(groups[0].pm.is_none());
+        assert_eq!(groups[0].workers.len(), 1);
     }
 
     #[test]
-    fn test_groups_mixed_pm_and_orphans() {
+    fn test_groups_mixed_parent_and_orphans() {
         let agents = vec![
-            make_agent("omar-agent-pm-api", HealthState::Running),
+            make_agent("omar-agent-api", HealthState::Running),
             make_agent("omar-agent-worker1", HealthState::Running),
             make_agent("omar-agent-orphan1", HealthState::Idle),
         ];
         let mut parents = HashMap::new();
         parents.insert(
             "omar-agent-worker1".to_string(),
-            "omar-agent-pm-api".to_string(),
+            "omar-agent-api".to_string(),
         );
 
         let groups = build_agent_groups(&agents, &parents, "omar-agent-");
 
-        // PM group + orphan group
+        // Parent group + orphan group
         assert_eq!(groups.len(), 2);
-
-        // First group: PM with worker1
-        assert_eq!(groups[0].pm.unwrap().session.name, "omar-agent-pm-api");
+        assert_eq!(groups[0].pm.unwrap().session.name, "omar-agent-api");
         assert_eq!(groups[0].workers.len(), 1);
-        assert_eq!(groups[0].workers[0].session.name, "omar-agent-worker1");
-
-        // Second group: orphan
         assert!(groups[1].pm.is_none());
         assert_eq!(groups[1].workers.len(), 1);
-        assert_eq!(groups[1].workers[0].session.name, "omar-agent-orphan1");
     }
 
     #[test]
     fn test_groups_stale_parent_becomes_orphan() {
         let agents = vec![make_agent("omar-agent-worker1", HealthState::Running)];
-        // Parent PM doesn't exist in agents list
         let mut parents = HashMap::new();
         parents.insert(
             "omar-agent-worker1".to_string(),
-            "omar-agent-pm-gone".to_string(),
+            "omar-agent-gone".to_string(),
         );
 
         let groups = build_agent_groups(&agents, &parents, "omar-agent-");
 
-        // Worker should be orphan since parent PM doesn't exist
         assert_eq!(groups.len(), 1);
         assert!(groups[0].pm.is_none());
         assert_eq!(groups[0].workers.len(), 1);
-        assert_eq!(groups[0].workers[0].session.name, "omar-agent-worker1");
     }
 
     #[test]
-    fn test_groups_two_pms_each_with_workers() {
+    fn test_groups_two_parents_each_with_children() {
         let agents = vec![
-            make_agent("omar-agent-pm-api", HealthState::Running),
-            make_agent("omar-agent-pm-frontend", HealthState::Running),
             make_agent("omar-agent-api", HealthState::Running),
+            make_agent("omar-agent-frontend", HealthState::Running),
+            make_agent("omar-agent-api-worker", HealthState::Running),
             make_agent("omar-agent-auth", HealthState::Running),
             make_agent("omar-agent-ui", HealthState::Idle),
         ];
         let mut parents = HashMap::new();
         parents.insert(
+            "omar-agent-api-worker".to_string(),
             "omar-agent-api".to_string(),
-            "omar-agent-pm-api".to_string(),
         );
-        parents.insert(
-            "omar-agent-auth".to_string(),
-            "omar-agent-pm-api".to_string(),
-        );
+        parents.insert("omar-agent-auth".to_string(), "omar-agent-api".to_string());
         parents.insert(
             "omar-agent-ui".to_string(),
-            "omar-agent-pm-frontend".to_string(),
+            "omar-agent-frontend".to_string(),
         );
 
         let groups = build_agent_groups(&agents, &parents, "omar-agent-");
 
-        // Two PM groups, no orphans
         assert_eq!(groups.len(), 2);
-
-        assert_eq!(groups[0].pm.unwrap().session.name, "omar-agent-pm-api");
+        assert_eq!(groups[0].pm.unwrap().session.name, "omar-agent-api");
         assert_eq!(groups[0].workers.len(), 2);
-
-        assert_eq!(groups[1].pm.unwrap().session.name, "omar-agent-pm-frontend");
+        assert_eq!(groups[1].pm.unwrap().session.name, "omar-agent-frontend");
         assert_eq!(groups[1].workers.len(), 1);
-        assert_eq!(groups[1].workers[0].session.name, "omar-agent-ui");
     }
 
     #[test]
@@ -1054,25 +1033,6 @@ mod tests {
         let groups = build_agent_groups(&agents, &parents, "omar-agent-");
 
         assert!(groups.is_empty());
-    }
-
-    #[test]
-    fn test_groups_empty_parents_with_pm() {
-        // PM exists but no parent mappings at all — workers become orphans
-        let agents = vec![
-            make_agent("omar-agent-pm-api", HealthState::Running),
-            make_agent("omar-agent-worker1", HealthState::Running),
-        ];
-        let parents = HashMap::new();
-
-        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
-
-        // PM group (no workers) + orphan group (worker1)
-        assert_eq!(groups.len(), 2);
-        assert!(groups[0].pm.is_some());
-        assert!(groups[0].workers.is_empty());
-        assert!(groups[1].pm.is_none());
-        assert_eq!(groups[1].workers.len(), 1);
     }
 
     // ── build_tree tests ──
@@ -1090,30 +1050,34 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tree_with_pm_and_workers() {
+    fn test_build_tree_with_parent_and_children() {
         let agents = vec![
-            make_agent("omar-agent-pm-rest-api", HealthState::Running),
+            make_agent("omar-agent-rest-api", HealthState::Running),
             make_agent("omar-agent-api", HealthState::Running),
             make_agent("omar-agent-auth", HealthState::Idle),
         ];
         let ea = make_agent("omar-agent-ea", HealthState::Running);
         let mut parents = HashMap::new();
         parents.insert(
+            "omar-agent-rest-api".to_string(),
+            MANAGER_SESSION.to_string(),
+        );
+        parents.insert(
             "omar-agent-api".to_string(),
-            "omar-agent-pm-rest-api".to_string(),
+            "omar-agent-rest-api".to_string(),
         );
         parents.insert(
             "omar-agent-auth".to_string(),
-            "omar-agent-pm-rest-api".to_string(),
+            "omar-agent-rest-api".to_string(),
         );
 
         let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
 
-        // EA + PM + 2 workers = 4 nodes
+        // EA + rest-api + 2 children = 4 nodes
         assert_eq!(tree.len(), 4);
         assert_eq!(tree[0].name, "Executive Assistant");
         assert_eq!(tree[0].depth, 0);
-        assert_eq!(tree[1].name, "Project Manager: rest-api");
+        assert_eq!(tree[1].name, "rest-api");
         assert_eq!(tree[1].depth, 1);
         assert!(tree[1].is_last_sibling);
         assert_eq!(tree[2].name, "api");
@@ -1125,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tree_orphan_workers() {
+    fn test_build_tree_orphan_agents() {
         let agents = vec![
             make_agent("omar-agent-debug", HealthState::Running),
             make_agent("omar-agent-test", HealthState::Idle),
@@ -1135,179 +1099,137 @@ mod tests {
 
         let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
 
-        // EA + Unassigned group + 2 orphans = 4 nodes
-        assert_eq!(tree.len(), 4);
-        assert_eq!(tree[1].name, "Unassigned");
+        // EA + 2 orphans directly under EA = 3 nodes
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree[1].name, "debug");
         assert_eq!(tree[1].depth, 1);
-        assert!(tree[1].is_last_sibling);
-        assert_eq!(tree[2].name, "debug");
-        assert_eq!(tree[2].depth, 2);
-        assert!(!tree[2].is_last_sibling);
-        assert_eq!(tree[3].name, "test");
-        assert_eq!(tree[3].depth, 2);
-        assert!(tree[3].is_last_sibling);
+        assert!(!tree[1].is_last_sibling);
+        assert_eq!(tree[2].name, "test");
+        assert_eq!(tree[2].depth, 1);
+        assert!(tree[2].is_last_sibling);
     }
 
     #[test]
-    fn test_build_tree_mixed_pm_and_orphans() {
+    fn test_build_tree_deep_hierarchy() {
+        // EA -> agent-a -> agent-b -> agent-c (3 levels deep)
         let agents = vec![
-            make_agent("omar-agent-pm-api", HealthState::Running),
-            make_agent("omar-agent-worker1", HealthState::Running),
-            make_agent("omar-agent-orphan1", HealthState::Idle),
+            make_agent("omar-agent-a", HealthState::Running),
+            make_agent("omar-agent-b", HealthState::Running),
+            make_agent("omar-agent-c", HealthState::Idle),
         ];
         let ea = make_agent("omar-agent-ea", HealthState::Running);
         let mut parents = HashMap::new();
-        parents.insert(
-            "omar-agent-worker1".to_string(),
-            "omar-agent-pm-api".to_string(),
-        );
+        parents.insert("omar-agent-a".to_string(), MANAGER_SESSION.to_string());
+        parents.insert("omar-agent-b".to_string(), "omar-agent-a".to_string());
+        parents.insert("omar-agent-c".to_string(), "omar-agent-b".to_string());
 
         let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
 
-        // EA + PM + worker1 + Unassigned + orphan1 = 5
-        assert_eq!(tree.len(), 5);
-        assert_eq!(tree[0].depth, 0); // EA
-        assert_eq!(tree[1].name, "Project Manager: api");
+        assert_eq!(tree.len(), 4);
+        assert_eq!(tree[0].name, "Executive Assistant");
+        assert_eq!(tree[0].depth, 0);
+        assert_eq!(tree[1].name, "a");
         assert_eq!(tree[1].depth, 1);
-        assert!(!tree[1].is_last_sibling); // not last because Unassigned follows
-        assert_eq!(tree[2].name, "worker1");
+        assert_eq!(tree[2].name, "b");
         assert_eq!(tree[2].depth, 2);
-        assert_eq!(tree[3].name, "Unassigned");
-        assert_eq!(tree[3].depth, 1);
-        assert!(tree[3].is_last_sibling);
-        assert_eq!(tree[4].name, "orphan1");
-        assert_eq!(tree[4].depth, 2);
-        assert!(tree[4].is_last_sibling);
+        assert_eq!(tree[3].name, "c");
+        assert_eq!(tree[3].depth, 3);
     }
 
     #[test]
     fn test_build_tree_stale_parent_treated_as_orphan() {
         let agents = vec![make_agent("omar-agent-worker1", HealthState::Running)];
         let ea = make_agent("omar-agent-ea", HealthState::Running);
-        // Parent PM doesn't exist in agents
         let mut parents = HashMap::new();
         parents.insert(
             "omar-agent-worker1".to_string(),
-            "omar-agent-pm-gone".to_string(),
+            "omar-agent-gone".to_string(),
         );
 
         let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
 
-        // worker1 should be under Unassigned since its PM doesn't exist
-        assert_eq!(tree.len(), 3);
-        assert_eq!(tree[1].name, "Unassigned");
+        // worker1 should be orphan under EA since parent doesn't exist
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[1].name, "worker1");
         assert_eq!(tree[1].depth, 1);
-        assert_eq!(tree[2].name, "worker1");
-        assert_eq!(tree[2].depth, 2);
     }
 
     // ── focus navigation tests ──
 
-    /// Helper to build a minimal App-like struct for focus testing.
-    /// We can't construct a full App (needs TmuxClient), so we test
-    /// compute_focus_child_indices, child_count, and breadcrumb via
-    /// the underlying logic directly.
-
     #[test]
-    fn test_focus_children_root_shows_pms_and_orphans() {
-        // Simulates: EA has 1 PM with 2 workers, 1 orphan
+    fn test_focus_children_root_shows_direct_ea_children_and_orphans() {
+        // EA -> api (with children: api-worker, auth), orphan
         let agents = [
-            make_agent("omar-agent-pm-api", HealthState::Running),
             make_agent("omar-agent-api", HealthState::Running),
+            make_agent("omar-agent-api-worker", HealthState::Running),
             make_agent("omar-agent-auth", HealthState::Idle),
             make_agent("omar-agent-orphan", HealthState::Idle),
         ];
         let mut parents = HashMap::new();
+        parents.insert("omar-agent-api".to_string(), MANAGER_SESSION.to_string());
         parents.insert(
+            "omar-agent-api-worker".to_string(),
             "omar-agent-api".to_string(),
-            "omar-agent-pm-api".to_string(),
         );
-        parents.insert(
-            "omar-agent-auth".to_string(),
-            "omar-agent-pm-api".to_string(),
-        );
+        parents.insert("omar-agent-auth".to_string(), "omar-agent-api".to_string());
 
-        // Manually compute focus children at root (MANAGER_SESSION)
-        let session_prefix = "omar-agent-";
-        let _focus_parent = MANAGER_SESSION;
+        // Compute focus children at root using the new logic
         let mut indices = Vec::new();
         for (i, agent) in agents.iter().enumerate() {
-            let short = agent
-                .session
-                .name
-                .strip_prefix(session_prefix)
-                .unwrap_or(&agent.session.name);
-            let is_pm = short.starts_with("pm-");
-            if is_pm {
-                indices.push(i);
-            } else {
-                let parent = parents.get(&agent.session.name);
-                let has_live_pm_parent = parent
-                    .map(|p| {
-                        agents.iter().any(|a| {
-                            a.session.name == *p
-                                && a.session
-                                    .name
-                                    .strip_prefix(session_prefix)
-                                    .unwrap_or(&a.session.name)
-                                    .starts_with("pm-")
-                        })
-                    })
-                    .unwrap_or(false);
-                if !has_live_pm_parent {
-                    indices.push(i);
-                }
+            let parent = parents.get(&agent.session.name);
+            match parent {
+                Some(p) if *p == MANAGER_SESSION => indices.push(i),
+                Some(p) if agents.iter().any(|a| a.session.name == *p) => {}
+                _ => indices.push(i),
             }
         }
 
-        // Root should show PM + orphan (not the PM's workers)
+        // Root should show: api (EA child) + orphan (no parent)
         assert_eq!(indices.len(), 2);
-        assert_eq!(agents[indices[0]].session.name, "omar-agent-pm-api");
+        assert_eq!(agents[indices[0]].session.name, "omar-agent-api");
         assert_eq!(agents[indices[1]].session.name, "omar-agent-orphan");
 
-        // Drill into PM: should show its workers
-        let focus_parent = "omar-agent-pm-api";
-        let mut pm_indices = Vec::new();
+        // Drill into api: should show its children
+        let focus_parent = "omar-agent-api";
+        let mut child_indices = Vec::new();
         for (i, agent) in agents.iter().enumerate() {
             if let Some(parent) = parents.get(&agent.session.name) {
                 if *parent == focus_parent {
-                    pm_indices.push(i);
+                    child_indices.push(i);
                 }
             }
         }
-        assert_eq!(pm_indices.len(), 2);
-        assert_eq!(agents[pm_indices[0]].session.name, "omar-agent-api");
-        assert_eq!(agents[pm_indices[1]].session.name, "omar-agent-auth");
-
-        let _ = focus_parent; // suppress unused warning
+        assert_eq!(child_indices.len(), 2);
+        assert_eq!(
+            agents[child_indices[0]].session.name,
+            "omar-agent-api-worker"
+        );
+        assert_eq!(agents[child_indices[1]].session.name, "omar-agent-auth");
     }
 
     #[test]
     fn test_child_count() {
         let parents: HashMap<String, String> = [
-            ("omar-agent-api", "omar-agent-pm-api"),
-            ("omar-agent-auth", "omar-agent-pm-api"),
-            ("omar-agent-ui", "omar-agent-pm-frontend"),
+            ("omar-agent-api", "omar-agent-rest-api"),
+            ("omar-agent-auth", "omar-agent-rest-api"),
+            ("omar-agent-ui", "omar-agent-frontend"),
         ]
         .iter()
         .map(|(c, p)| (c.to_string(), p.to_string()))
         .collect();
 
-        // PM-api has 2 children
         let count = parents
             .values()
-            .filter(|p| *p == "omar-agent-pm-api")
+            .filter(|p| *p == "omar-agent-rest-api")
             .count();
         assert_eq!(count, 2);
 
-        // PM-frontend has 1 child
         let count = parents
             .values()
-            .filter(|p| *p == "omar-agent-pm-frontend")
+            .filter(|p| *p == "omar-agent-frontend")
             .count();
         assert_eq!(count, 1);
 
-        // Worker has 0 children
         let count = parents.values().filter(|p| *p == "omar-agent-api").count();
         assert_eq!(count, 0);
     }
@@ -1325,49 +1247,33 @@ mod tests {
                 continue;
             }
             let short = session.strip_prefix(session_prefix).unwrap_or(session);
-            if let Some(rest) = short.strip_prefix("pm-") {
-                crumbs.push(format!("PM: {}", rest));
-            } else {
-                crumbs.push(short.to_string());
-            }
+            crumbs.push(short.to_string());
         }
         if focus_parent != MANAGER_SESSION {
             let short = focus_parent
                 .strip_prefix(session_prefix)
                 .unwrap_or(&focus_parent);
-            if let Some(rest) = short.strip_prefix("pm-") {
-                crumbs.push(format!("PM: {}", rest));
-            } else {
-                crumbs.push(short.to_string());
-            }
+            crumbs.push(short.to_string());
         }
         assert_eq!(crumbs, vec!["EA"]);
 
-        // Drilled into PM: ["EA", "PM: rest-api"]
+        // Drilled into agent: ["EA", "rest-api"]
         let focus_stack = vec![MANAGER_SESSION.to_string()];
-        let focus_parent = "omar-agent-pm-rest-api".to_string();
+        let focus_parent = "omar-agent-rest-api".to_string();
         let mut crumbs = vec!["EA".to_string()];
         for session in &focus_stack {
             if *session == MANAGER_SESSION {
                 continue;
             }
             let short = session.strip_prefix(session_prefix).unwrap_or(session);
-            if let Some(rest) = short.strip_prefix("pm-") {
-                crumbs.push(format!("PM: {}", rest));
-            } else {
-                crumbs.push(short.to_string());
-            }
+            crumbs.push(short.to_string());
         }
         if focus_parent != MANAGER_SESSION {
             let short = focus_parent
                 .strip_prefix(session_prefix)
                 .unwrap_or(&focus_parent);
-            if let Some(rest) = short.strip_prefix("pm-") {
-                crumbs.push(format!("PM: {}", rest));
-            } else {
-                crumbs.push(short.to_string());
-            }
+            crumbs.push(short.to_string());
         }
-        assert_eq!(crumbs, vec!["EA", "PM: rest-api"]);
+        assert_eq!(crumbs, vec!["EA", "rest-api"]);
     }
 }
