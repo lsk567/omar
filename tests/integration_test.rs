@@ -322,6 +322,49 @@ fn test_spawn_custom_command() {
     let _ = tmux(&["kill-session", "-t", &session_name]);
 }
 
+/// Test that extended-keys is set to "always" after spawning an agent.
+/// This ensures Shift+Enter and other modifier key sequences are forwarded
+/// through tmux to the inner application (e.g. Claude Code).
+#[test]
+fn test_extended_keys_enabled_after_spawn() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    cleanup_test_sessions();
+
+    let full_session = "omar-agent-test-extkeys";
+
+    // Clean up from previous runs
+    let _ = tmux(&["kill-session", "-t", full_session]);
+
+    // Spawn an agent via omar (this should enable extended-keys)
+    let output = Command::new("cargo")
+        .args(["run", "--", "spawn", "-n", "test-extkeys", "-c", "sleep 60"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Failed to run omar spawn");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Spawned agent: test-extkeys"),
+        "Should confirm spawn: {}",
+        stdout
+    );
+
+    // Verify extended-keys is set to "always"
+    let ext_keys = tmux(&["show-options", "-sv", "extended-keys"]).unwrap();
+    assert!(
+        ext_keys.trim() == "always",
+        "extended-keys should be 'always', got: '{}'",
+        ext_keys.trim()
+    );
+
+    // Cleanup
+    let _ = tmux(&["kill-session", "-t", full_session]);
+}
+
 /// Test that the omar binary can be built and shows help
 #[test]
 fn test_omar_help() {

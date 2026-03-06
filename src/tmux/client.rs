@@ -144,6 +144,20 @@ impl TmuxClient {
 
         args.push(command);
         self.run(&args)?;
+        self.enable_extended_keys()?;
+        Ok(())
+    }
+
+    /// Enable extended key sequences (Shift+Enter, etc.) on the tmux server.
+    ///
+    /// Sets `extended-keys always` so modifier key sequences (CSI u / kitty
+    /// keyboard protocol) are forwarded unconditionally to applications.
+    /// Without this, tmux only forwards them when the inner application
+    /// explicitly requests them — which breaks Shift+Enter in Claude Code.
+    ///
+    /// This is a server-level option and is idempotent.
+    pub fn enable_extended_keys(&self) -> Result<()> {
+        self.run(&["set-option", "-s", "extended-keys", "always"])?;
         Ok(())
     }
 
