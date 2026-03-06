@@ -161,8 +161,8 @@ impl Scheduler {
     }
 }
 
-pub(crate) fn deliver_to_tmux(receiver: &str, message: &str, ticker: &TickerBuffer) {
-    let target = format!("omar-agent-{}", receiver);
+pub(crate) fn deliver_to_tmux(prefix: &str, receiver: &str, message: &str, ticker: &TickerBuffer) {
+    let target = format!("{}{}", prefix, receiver);
     let result = Command::new("tmux")
         .args(["send-keys", "-t", &target, "-l", message])
         .output();
@@ -211,6 +211,7 @@ pub async fn run_event_loop(
     scheduler: Arc<Scheduler>,
     ticker: TickerBuffer,
     popup_receiver: PopupReceiver,
+    session_prefix: String,
 ) {
     loop {
         let next_ts = {
@@ -286,7 +287,7 @@ pub async fn run_event_loop(
                         continue;
                     }
                     let message = format_delivery(&batch, earliest_ts);
-                    deliver_to_tmux(receiver, &message, &ticker);
+                    deliver_to_tmux(&session_prefix, receiver, &message, &ticker);
 
                     // Re-insert recurring events with a fresh timestamp and ID
                     for ev in &batch {
@@ -487,9 +488,14 @@ mod tests {
             return;
         }
 
-        // deliver_to_tmux prepends "omar-agent-" to the receiver name
+        // deliver_to_tmux prepends the session prefix to the receiver name
         let ticker = TickerBuffer::new();
-        deliver_to_tmux("test-deliver", "hello-from-scheduler", &ticker);
+        deliver_to_tmux(
+            "omar-agent-",
+            "test-deliver",
+            "hello-from-scheduler",
+            &ticker,
+        );
 
         // Give tmux a moment to process the send-keys
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -540,7 +546,7 @@ mod tests {
         let ticker = TickerBuffer::new();
         let handle = tokio::spawn(async move {
             tokio::select! {
-                _ = run_event_loop(sched, ticker, new_popup_receiver()) => {}
+                _ = run_event_loop(sched, ticker, new_popup_receiver(), "omar-agent-".to_string()) => {}
                 _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
             }
         });

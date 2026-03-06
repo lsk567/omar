@@ -4,27 +4,22 @@ use anyhow::Result;
 use std::collections::HashMap;
 
 use crate::config::Config;
-use crate::manager::MANAGER_SESSION;
+use crate::manager::EaContext;
 use crate::memory;
+
+/// Resolve the current working directory as a String, falling back to ".".
+pub fn current_workdir() -> String {
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string())
+}
 use crate::projects::{self, Project};
 use crate::scheduler::{ScheduledEvent, TickerBuffer};
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
-// Re-export for API handlers
-pub use crate::manager::MANAGER_SESSION as MANAGER_SESSION_NAME;
-
 /// Shared app state for API access
 pub type SharedApp = App;
-
-/// What kind of confirmation the user is being prompted for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfirmAction {
-    /// Kill the selected agent
-    Kill,
-    /// Quit omar (kills EA)
-    Quit,
-}
 
 /// Information about an agent for display
 #[derive(Debug, Clone)]
@@ -63,26 +58,26 @@ pub struct AgentGroup<'a> {
 /// Application state
 pub struct App {
     pub agents: Vec<AgentInfo>,
-    pub manager: Option<AgentInfo>,
     pub command_tree: Vec<CommandTreeNode>,
     pub selected: usize,
     pub manager_selected: bool,
     pub should_quit: bool,
     pub show_help: bool,
-    pub pending_confirm: Option<ConfirmAction>,
+    pub show_confirm_kill: bool,
+    pub show_confirm_kill_ea: bool,
     pub filter: String,
     pub status_message: Option<String>,
-    /// Warning that persists across tick clears (e.g., tmux misconfiguration)
-    pub persistent_warning: Option<String>,
     pub projects: Vec<Project>,
     pub project_input_mode: bool,
     pub project_input: String,
+    pub ea_input_mode: bool,
+    pub ea_input: String,
     pub show_events: bool,
     pub scheduled_events: Vec<ScheduledEvent>,
     pub ticker: TickerBuffer,
     pub ticker_offset: usize,
     pub show_debug_console: bool,
-    /// Session name of the agent shown in the bottom panel (default: MANAGER_SESSION)
+    /// Session name of the agent shown in the bottom panel
     pub focus_parent: String,
     /// Stack for Esc navigation (drill-up restores previous parent)
     focus_stack: Vec<String>,
@@ -90,6 +85,14 @@ pub struct App {
     pub focus_child_indices: Vec<usize>,
     agent_parents: HashMap<String, String>,
     worker_tasks: HashMap<String, String>,
+    /// All EA contexts
+    pub eas: Vec<EaContext>,
+    /// Index of the active (focused) EA
+    pub active_ea: usize,
+    /// Manager sessions for each EA (parallel to `eas`)
+    pub managers: Vec<Option<AgentInfo>>,
+    /// Cached summaries for non-active EAs: (agent_count, running_count)
+    ea_summaries: Vec<(usize, usize)>,
     client: TmuxClient,
     health_checker: HealthChecker,
     default_command: String,
@@ -102,31 +105,47 @@ impl App {
         let client = TmuxClient::new(&config.dashboard.session_prefix);
         let health_checker = HealthChecker::new(client.clone(), config.health.idle_warning);
 
+        // Load persisted EA list, falling back to the default EA
+        let ea_ids = memory::load_ea_ids();
+        let eas: Vec<EaContext> = if ea_ids.is_empty() {
+            vec![EaContext::default()]
+        } else {
+            ea_ids.iter().map(|id| EaContext::new(id)).collect()
+        };
+        let managers = vec![None; eas.len()];
+        let ea_summaries = vec![(0, 0); eas.len()];
+        let active_ea = 0;
+
         Self {
             agents: Vec::new(),
-            manager: None,
             command_tree: Vec::new(),
             selected: 0,
             manager_selected: true,
             should_quit: false,
             show_help: false,
-            pending_confirm: None,
+            show_confirm_kill: false,
+            show_confirm_kill_ea: false,
             filter: String::new(),
             status_message: None,
-            persistent_warning: None,
-            projects: projects::load_projects(),
+            projects: projects::load_projects(&eas[active_ea].state_dir),
             project_input_mode: false,
             project_input: String::new(),
+            ea_input_mode: false,
+            ea_input: String::new(),
             show_events: false,
             scheduled_events: Vec::new(),
             ticker,
             ticker_offset: 0,
             show_debug_console: false,
-            focus_parent: MANAGER_SESSION.to_string(),
+            focus_parent: eas[active_ea].session_name.clone(),
             focus_stack: Vec::new(),
             focus_child_indices: Vec::new(),
             agent_parents: HashMap::new(),
             worker_tasks: HashMap::new(),
+            eas,
+            active_ea,
+            managers,
+            ea_summaries,
             client,
             health_checker,
             default_command: config.agent.default_command.clone(),
@@ -135,11 +154,18 @@ impl App {
         }
     }
 
+    /// Active EA context (shorthand)
+    pub fn ea(&self) -> &EaContext {
+        &self.eas[self.active_ea]
+    }
+
     /// True when any popup or input overlay is active.
     pub fn has_popup(&self) -> bool {
         self.show_help
-            || self.pending_confirm.is_some()
+            || self.show_confirm_kill
+            || self.show_confirm_kill_ea
             || self.project_input_mode
+            || self.ea_input_mode
             || self.show_events
             || self.show_debug_console
     }
@@ -150,42 +176,45 @@ impl App {
 
     /// Refresh the list of agents
     pub fn refresh(&mut self) -> Result<()> {
-        // Ensure manager exists
-        self.ensure_manager()?;
-
         // Get all sessions
         let sessions = self.client.list_all_sessions()?;
 
-        // Separate manager from other agents, filtering out non-omar sessions
-        let mut manager_session = None;
+        // Separate managers from other agents, filtering out non-omar sessions
+        let mut manager_map: HashMap<String, Session> = HashMap::new();
         let mut other_sessions = Vec::new();
 
         for session in sessions {
-            if session.name == MANAGER_SESSION {
-                manager_session = Some(session);
-            } else if session.name == DASHBOARD_SESSION {
-                // Skip the dashboard's own tmux session
-                continue;
-            } else if !self.session_prefix.is_empty()
-                && !session.name.starts_with(&self.session_prefix)
+            if self.eas.iter().any(|e| e.session_name == session.name) {
+                manager_map.insert(session.name.clone(), session);
+            } else if session.name == DASHBOARD_SESSION
+                || (!self.session_prefix.is_empty()
+                    && !session.name.starts_with(&self.session_prefix))
             {
-                // Skip sessions that don't match the configured prefix
                 continue;
             } else {
                 other_sessions.push(session);
             }
         }
 
-        // Update manager info
-        self.manager = manager_session.map(|session| {
-            let health_info = self.health_checker.check_detailed(&session.name);
-            let health = health_info.state;
-            AgentInfo {
-                session,
-                health,
-                health_info,
-            }
-        });
+        // Start any EA managers not yet running (using the session list we already have)
+        self.ensure_managers(&manager_map)?;
+
+        // Update managers for all EAs
+        self.managers = self
+            .eas
+            .iter()
+            .map(|ea| {
+                manager_map.remove(&ea.session_name).map(|session| {
+                    let health_info = self.health_checker.check_detailed(&session.name);
+                    let health = health_info.state;
+                    AgentInfo {
+                        session,
+                        health,
+                        health_info,
+                    }
+                })
+            })
+            .collect();
 
         // Update agents list (excluding attached sessions)
         // Attached sessions are likely the user's main terminal, not agents
@@ -212,7 +241,7 @@ impl App {
             .agents
             .iter()
             .map(|a| a.session.name.clone())
-            .chain(self.manager.iter().map(|m| m.session.name.clone()))
+            .chain(self.manager().iter().map(|m| m.session.name.clone()))
             .collect();
         self.health_checker.retain_sessions(&active);
 
@@ -223,21 +252,40 @@ impl App {
                 .retain(|a| a.session.name.to_lowercase().contains(&filter));
         }
 
-        // Reload projects from file (picks up API-side changes)
-        self.projects = projects::load_projects();
+        // Reload active EA's projects, parent mappings, and worker tasks
+        self.reload_ea_state();
 
-        // Load parent mappings, worker tasks, and build the chain-of-command tree
-        self.agent_parents = memory::load_agent_parents();
-        self.worker_tasks = memory::load_worker_tasks();
-        self.command_tree = build_tree(
+        // Pre-compute per-EA summaries for non-active EAs (avoids disk I/O in tree builder)
+        self.ea_summaries = self
+            .eas
+            .iter()
+            .enumerate()
+            .map(|(i, ea)| {
+                if i == self.active_ea {
+                    (0, 0) // Not used for active EA
+                } else {
+                    let parents = memory::load_agent_parents(&ea.state_dir);
+                    let count = parents.len();
+                    let running = self
+                        .agents
+                        .iter()
+                        .filter(|a| parents.contains_key(&a.session.name))
+                        .filter(|a| a.health == HealthState::Running)
+                        .count();
+                    (count, running)
+                }
+            })
+            .collect();
+
+        self.command_tree = build_multi_tree(
             &self.agents,
-            self.manager.as_ref(),
+            &self.managers,
             &self.agent_parents,
             &self.session_prefix,
+            &self.eas,
+            self.active_ea,
+            &self.ea_summaries,
         );
-
-        // Recompute focus children indices
-        self.focus_child_indices = self.compute_focus_child_indices();
 
         // Keep selection in bounds relative to focus children
         if !self.manager_selected
@@ -250,25 +298,31 @@ impl App {
         Ok(())
     }
 
-    /// Ensure manager session exists, start if not
-    fn ensure_manager(&self) -> Result<()> {
-        if self.client.has_session(MANAGER_SESSION)? {
-            return Ok(());
+    /// Start manager sessions for EAs that aren't already running.
+    /// Uses the pre-fetched session map to avoid extra tmux subprocess calls.
+    fn ensure_managers(&self, existing: &HashMap<String, Session>) -> Result<()> {
+        let workdir = current_workdir();
+
+        for ea in &self.eas {
+            if existing.contains_key(&ea.session_name) {
+                continue;
+            }
+
+            // Build command with EA system prompt + memory baked in
+            let cmd = crate::manager::build_ea_command(&self.default_command, ea);
+
+            self.client
+                .new_session(&ea.session_name, &cmd, Some(&workdir))?;
+
+            // Write memory after creating manager
+            memory::write_memory(
+                &ea.state_dir,
+                &ea.session_name,
+                &self.agents,
+                None,
+                &self.client,
+            );
         }
-
-        // Build command with EA system prompt + memory baked in
-        let cmd = crate::manager::build_ea_command(&self.default_command);
-
-        // Start manager session — system prompt set at process start
-        let workdir = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-
-        self.client
-            .new_session(MANAGER_SESSION, &cmd, Some(&workdir))?;
-
-        // Write memory after creating manager
-        memory::write_memory(&self.agents, None, &self.client);
 
         Ok(())
     }
@@ -283,9 +337,149 @@ impl App {
         &self.agents
     }
 
-    /// Get manager info (for API)
+    /// Get active manager info (for API)
     pub fn manager(&self) -> Option<&AgentInfo> {
-        self.manager.as_ref()
+        self.managers[self.active_ea].as_ref()
+    }
+
+    /// Write memory state for the active EA
+    fn flush_memory(&self) {
+        memory::write_memory(
+            &self.ea().state_dir,
+            &self.ea().session_name,
+            &self.agents,
+            self.manager(),
+            &self.client,
+        );
+    }
+
+    /// Reset focus navigation to the active EA root
+    fn reset_focus(&mut self) {
+        self.focus_parent = self.ea().session_name.clone();
+        self.focus_stack.clear();
+        self.manager_selected = true;
+        self.selected = 0;
+    }
+
+    /// Reload projects, agent parents, worker tasks, and focus indices for the active EA
+    fn reload_ea_state(&mut self) {
+        self.projects = projects::load_projects(&self.ea().state_dir);
+        self.agent_parents = memory::load_agent_parents(&self.ea().state_dir);
+        self.worker_tasks = memory::load_worker_tasks(&self.ea().state_dir);
+        self.focus_child_indices = self.compute_focus_child_indices();
+    }
+
+    /// Persist the current EA ID list to disk
+    fn persist_ea_ids(&self) {
+        let ids: Vec<String> = self.eas.iter().map(|e| e.id.clone()).collect();
+        memory::save_ea_ids(&ids);
+    }
+
+    /// Add a new EA, persist, and ensure its manager starts
+    pub fn add_ea(&mut self, id: &str) -> Result<()> {
+        // Sanitize: only allow alphanumeric, dash, underscore
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            anyhow::bail!("EA ID must be alphanumeric (dashes/underscores allowed)");
+        }
+
+        // Check for duplicate
+        if self.eas.iter().any(|e| e.id == id) {
+            anyhow::bail!("EA '{}' already exists", id);
+        }
+
+        // Transitioning from single to multi-EA: adopt untracked agents
+        // into the default EA so they don't vanish from the dashboard.
+        if self.eas.len() == 1 {
+            let default_ea = &self.eas[0];
+            let mut parents = memory::load_agent_parents(&default_ea.state_dir);
+            let mut adopted = false;
+            for agent in &self.agents {
+                if !parents.contains_key(&agent.session.name) {
+                    parents.insert(agent.session.name.clone(), default_ea.session_name.clone());
+                    adopted = true;
+                }
+            }
+            if adopted {
+                memory::write_agent_parents(&default_ea.state_dir, &parents);
+            }
+        }
+
+        let ea = EaContext::new(id);
+        std::fs::create_dir_all(&ea.state_dir).ok();
+        self.eas.push(ea);
+        self.managers.push(None);
+        self.ea_summaries.push((0, 0));
+        self.persist_ea_ids();
+
+        // Switch to the new EA
+        self.active_ea = self.eas.len() - 1;
+        self.reset_focus();
+        self.reload_ea_state();
+
+        Ok(())
+    }
+
+    /// Remove an EA and kill all its sessions
+    pub fn remove_ea(&mut self, index: usize) -> Result<()> {
+        if self.eas.len() <= 1 {
+            anyhow::bail!("Cannot remove the last EA");
+        }
+        if index >= self.eas.len() {
+            anyhow::bail!("EA index out of range");
+        }
+
+        let ea = &self.eas[index];
+
+        // Kill the manager session
+        let _ = self.client.kill_session(&ea.session_name);
+
+        // Kill all agents that belong to this EA (workers/PMs)
+        let parents = memory::load_agent_parents(&ea.state_dir);
+        for child in parents.keys() {
+            let _ = self.client.kill_session(child);
+        }
+
+        self.eas.remove(index);
+        self.managers.remove(index);
+        self.ea_summaries.remove(index);
+        self.persist_ea_ids();
+
+        // Fix active_ea
+        if self.active_ea >= self.eas.len() {
+            self.active_ea = self.eas.len() - 1;
+        }
+        self.reset_focus();
+
+        Ok(())
+    }
+
+    /// Switch active EA by index
+    pub fn switch_ea(&mut self, index: usize) {
+        if index < self.eas.len() && index != self.active_ea {
+            self.active_ea = index;
+            self.reset_focus();
+            self.reload_ea_state();
+        }
+    }
+
+    /// Cycle to next EA
+    pub fn next_ea(&mut self) {
+        let next = (self.active_ea + 1) % self.eas.len();
+        self.switch_ea(next);
+    }
+
+    /// Cycle to previous EA
+    pub fn prev_ea(&mut self) {
+        let prev = if self.active_ea == 0 {
+            self.eas.len() - 1
+        } else {
+            self.active_ea - 1
+        };
+        self.switch_ea(prev);
     }
 
     /// Group agents into PM → worker hierarchies for grid display
@@ -311,18 +505,23 @@ impl App {
     /// Compute indices into self.agents for focus_parent's direct children
     fn compute_focus_child_indices(&self) -> Vec<usize> {
         let mut indices = Vec::new();
-        if self.focus_parent == MANAGER_SESSION {
-            // Root view: show agents that are direct children of EA, plus orphans
+        if self.focus_parent == self.ea().session_name {
+            // Root view: show agents that are direct children of EA
             for (i, agent) in self.agents.iter().enumerate() {
-                let parent = self.agent_parents.get(&agent.session.name);
-                match parent {
-                    // Explicit child of EA (manager session)
-                    Some(p) if *p == MANAGER_SESSION => indices.push(i),
-                    // Has a live parent that is NOT the EA → belongs deeper in the tree
-                    Some(p) if self.agents.iter().any(|a| a.session.name == *p) => {}
-                    // Parent is dead or missing → show as orphan at root
-                    _ => indices.push(i),
+                if let Some(p) = self.agent_parents.get(&agent.session.name) {
+                    if *p == self.ea().session_name {
+                        // Explicit child of EA
+                        indices.push(i);
+                    } else if !self.agents.iter().any(|a| a.session.name == *p) {
+                        // Parent is dead → show as orphan at root
+                        indices.push(i);
+                    }
+                    // else: has a live parent deeper in the tree
+                } else if self.eas.len() <= 1 {
+                    // Single EA: untracked agents show as orphans (backward compat)
+                    indices.push(i);
                 }
+                // Multi-EA: agents not in agent_parents belong to a different EA; skip.
             }
         } else {
             // Non-root: show agents whose parent matches focus_parent
@@ -347,8 +546,8 @@ impl App {
 
     /// Get AgentInfo for the focus parent
     pub fn focus_parent_info(&self) -> Option<&AgentInfo> {
-        if self.focus_parent == MANAGER_SESSION {
-            self.manager.as_ref()
+        if self.focus_parent == self.ea().session_name {
+            self.manager()
         } else {
             self.agents
                 .iter()
@@ -358,7 +557,7 @@ impl App {
 
     /// Check if an agent has children (is a PM or EA)
     fn agent_has_children(&self, session_name: &str) -> bool {
-        if session_name == MANAGER_SESSION {
+        if session_name == self.ea().session_name {
             return true;
         }
         self.agent_parents.values().any(|p| p == session_name)
@@ -366,9 +565,8 @@ impl App {
 
     /// Count children for a given agent
     pub fn child_count(&self, session_name: &str) -> usize {
-        if session_name == MANAGER_SESSION {
-            // Count PMs + orphans
-            return self.compute_focus_child_indices().len();
+        if session_name == self.ea().session_name {
+            return self.focus_child_indices.len();
         }
         self.agent_parents
             .values()
@@ -380,7 +578,7 @@ impl App {
     pub fn breadcrumb(&self) -> Vec<String> {
         let mut crumbs: Vec<String> = vec!["EA".to_string()];
         for session in &self.focus_stack {
-            if *session == MANAGER_SESSION {
+            if *session == self.ea().session_name {
                 continue; // Already added EA
             }
             let short = session
@@ -389,7 +587,7 @@ impl App {
             crumbs.push(short.to_string());
         }
         // Add current focus parent if not EA
-        if self.focus_parent != MANAGER_SESSION {
+        if self.focus_parent != self.ea().session_name {
             let short = self
                 .focus_parent
                 .strip_prefix(&self.session_prefix)
@@ -524,25 +722,25 @@ impl App {
             // Safety: don't kill attached sessions (user's terminal)
             if agent.session.attached {
                 self.status_message = Some("Cannot kill attached session".to_string());
-                self.pending_confirm = None;
+                self.show_confirm_kill = false;
                 return Ok(());
             }
 
             // Safety: don't kill manager from 'd' key (use separate mechanism)
-            if agent.session.name == MANAGER_SESSION {
+            if agent.session.name == self.ea().session_name {
                 self.status_message = Some("Cannot kill manager with 'd'".to_string());
-                self.pending_confirm = None;
+                self.show_confirm_kill = false;
                 return Ok(());
             }
 
             let name = agent.session.name.clone();
             self.client.kill_session(&name)?;
-            memory::remove_agent_parent(&name);
+            memory::remove_agent_parent(&self.ea().state_dir, &name);
             self.status_message = Some(format!("Killed agent: {}", name));
             self.refresh()?;
-            memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
+            self.flush_memory();
         }
-        self.pending_confirm = None;
+        self.show_confirm_kill = false;
         Ok(())
     }
 
@@ -577,9 +775,7 @@ impl App {
 
         let name = self.generate_agent_name();
         let workdir = if self.default_workdir == "." {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string())
+            current_workdir()
         } else {
             self.default_workdir.clone()
         };
@@ -596,7 +792,7 @@ impl App {
             self.selected = pos;
         }
 
-        memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
+        self.flush_memory();
 
         Ok(())
     }
@@ -606,16 +802,9 @@ impl App {
         self.status_message = Some(msg.into());
     }
 
-    /// Set a persistent warning that survives clear_status() calls
-    pub fn set_persistent_warning(&mut self, msg: impl Into<String>) {
-        let msg = msg.into();
-        self.persistent_warning = Some(msg.clone());
-        self.status_message = Some(msg);
-    }
-
-    /// Clear status message (persistent warnings are restored)
+    /// Clear status message
     pub fn clear_status(&mut self) {
-        self.status_message = self.persistent_warning.clone();
+        self.status_message = None;
     }
 
     /// Get counts by health state: (running, idle)
@@ -631,7 +820,7 @@ impl App {
             }
         }
 
-        if let Some(ref manager) = self.manager {
+        if let Some(manager) = self.manager() {
             match manager.health {
                 HealthState::Running => running += 1,
                 HealthState::Idle => idle += 1,
@@ -643,7 +832,7 @@ impl App {
 
     /// Get total agent count (including manager)
     pub fn total_agents(&self) -> usize {
-        self.agents.len() + if self.manager.is_some() { 1 } else { 0 }
+        self.agents.len() + if self.manager().is_some() { 1 } else { 0 }
     }
 
     /// Get focus parent pane output (more lines for display)
@@ -658,16 +847,16 @@ impl App {
 
     /// Add a project and update memory
     pub fn add_project(&mut self, name: &str) {
-        let _ = projects::add_project(name);
-        self.projects = projects::load_projects();
-        memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
+        let _ = projects::add_project(&self.ea().state_dir, name);
+        self.projects = projects::load_projects(&self.ea().state_dir);
+        self.flush_memory();
     }
 
     /// Complete (remove) a project by id and update memory
     pub fn complete_project(&mut self, id: usize) {
-        let _ = projects::remove_project(id);
-        self.projects = projects::load_projects();
-        memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
+        let _ = projects::remove_project(&self.ea().state_dir, id);
+        self.projects = projects::load_projects(&self.ea().state_dir);
+        self.flush_memory();
     }
 }
 
@@ -738,6 +927,70 @@ pub fn build_agent_groups<'a>(
     groups
 }
 
+/// Build a multi-root command tree — one subtree per EA.
+///
+/// The active EA is fully expanded. Non-active EAs show a single collapsed
+/// root node with a summary (agent count, running count).
+pub fn build_multi_tree(
+    agents: &[AgentInfo],
+    managers: &[Option<AgentInfo>],
+    agent_parents: &HashMap<String, String>,
+    session_prefix: &str,
+    eas: &[EaContext],
+    active_ea: usize,
+    ea_summaries: &[(usize, usize)],
+) -> Vec<CommandTreeNode> {
+    let mut nodes = Vec::new();
+    for (i, ea) in eas.iter().enumerate() {
+        let manager = managers.get(i).and_then(|m| m.as_ref());
+        let is_last_root = i == eas.len() - 1;
+
+        if i == active_ea {
+            // Active EA: full subtree
+            let subtree = build_tree(
+                agents,
+                manager,
+                agent_parents,
+                session_prefix,
+                ea,
+                eas.len() > 1,
+            );
+            for (j, mut node) in subtree.into_iter().enumerate() {
+                if j == 0 && eas.len() > 1 {
+                    node.is_last_sibling = is_last_root;
+                }
+                nodes.push(node);
+            }
+        } else {
+            // Non-active EA: collapsed root with pre-computed summary
+            let ea_health = manager.map(|m| m.health).unwrap_or(HealthState::Idle);
+            let (child_count, running) = ea_summaries.get(i).copied().unwrap_or((0, 0));
+
+            let summary = if child_count == 0 {
+                format!("{} (no agents)", ea.display_name)
+            } else {
+                format!(
+                    "{} ({} agent{}, {} running)",
+                    ea.display_name,
+                    child_count,
+                    if child_count == 1 { "" } else { "s" },
+                    running
+                )
+            };
+
+            nodes.push(CommandTreeNode {
+                name: summary,
+                session_name: ea.session_name.clone(),
+                health: ea_health,
+                depth: 0,
+                is_last_sibling: is_last_root,
+                ancestor_is_last: vec![],
+            });
+        }
+    }
+    nodes
+}
+
 /// Build the chain-of-command tree from current agents and parent mappings.
 ///
 /// Tree structure (recursive, arbitrary depth):
@@ -751,14 +1004,16 @@ pub fn build_tree(
     manager: Option<&AgentInfo>,
     agent_parents: &HashMap<String, String>,
     session_prefix: &str,
+    ea: &EaContext,
+    multi_ea: bool,
 ) -> Vec<CommandTreeNode> {
     let mut nodes = Vec::new();
 
     // Root: EA
     let ea_health = manager.map(|m| m.health).unwrap_or(HealthState::Idle);
     nodes.push(CommandTreeNode {
-        name: "Executive Assistant".to_string(),
-        session_name: MANAGER_SESSION.to_string(),
+        name: ea.display_name.clone(),
+        session_name: ea.session_name.clone(),
         health: ea_health,
         depth: 0,
         is_last_sibling: true,
@@ -772,7 +1027,7 @@ pub fn build_tree(
     for agent in agents {
         if let Some(parent_session) = agent_parents.get(&agent.session.name) {
             // Check that the parent actually exists (either as agent or EA)
-            let parent_exists = *parent_session == MANAGER_SESSION
+            let parent_exists = *parent_session == ea.session_name
                 || agents.iter().any(|a| a.session.name == *parent_session);
             if parent_exists {
                 children_map
@@ -780,15 +1035,18 @@ pub fn build_tree(
                     .or_default()
                     .push(agent);
             } else {
+                // Parent listed but no longer running — show as orphan under this EA
                 orphans.push(agent);
             }
-        } else {
+        } else if !multi_ea {
+            // Single EA: untracked agents show as orphans (backward compat)
             orphans.push(agent);
         }
+        // Multi-EA: agents not in agent_parents belong to a different EA; skip.
     }
 
     // Recursively add nodes starting from EA's children
-    let ea_children = children_map.get(MANAGER_SESSION);
+    let ea_children = children_map.get(&ea.session_name as &str);
     let total_root_children = ea_children.map(|c| c.len()).unwrap_or(0) + orphans.len();
 
     #[allow(clippy::too_many_arguments)]
@@ -849,7 +1107,7 @@ pub fn build_tree(
     add_children(
         &mut nodes,
         &children_map,
-        MANAGER_SESSION,
+        &ea.session_name,
         1,
         &[true], // EA is always last at depth 0
         session_prefix,
@@ -901,6 +1159,7 @@ pub fn build_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manager::MANAGER_SESSION;
     use crate::tmux::{HealthInfo, HealthState, Session};
 
     fn make_agent(name: &str, health: HealthState) -> AgentInfo {
@@ -1061,7 +1320,14 @@ mod tests {
         let agents = vec![];
         let ea = make_agent("omar-agent-ea", HealthState::Running);
         let parents = HashMap::new();
-        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+        let tree = build_tree(
+            &agents,
+            Some(&ea),
+            &parents,
+            "omar-agent-",
+            &EaContext::default(),
+            false,
+        );
 
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].name, "Executive Assistant");
@@ -1090,7 +1356,14 @@ mod tests {
             "omar-agent-rest-api".to_string(),
         );
 
-        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+        let tree = build_tree(
+            &agents,
+            Some(&ea),
+            &parents,
+            "omar-agent-",
+            &EaContext::default(),
+            false,
+        );
 
         // EA + rest-api + 2 children = 4 nodes
         assert_eq!(tree.len(), 4);
@@ -1109,14 +1382,32 @@ mod tests {
 
     #[test]
     fn test_build_tree_orphan_agents() {
+        // Agents tracked by this EA (in agent_parents) but whose parent
+        // session doesn't exist should show as orphans under the EA.
         let agents = vec![
             make_agent("omar-agent-debug", HealthState::Running),
             make_agent("omar-agent-test", HealthState::Idle),
         ];
         let ea = make_agent("omar-agent-ea", HealthState::Running);
-        let parents = HashMap::new();
+        let mut parents = HashMap::new();
+        // Both agents point to a dead parent → orphan under EA
+        parents.insert(
+            "omar-agent-debug".to_string(),
+            "omar-agent-dead-pm".to_string(),
+        );
+        parents.insert(
+            "omar-agent-test".to_string(),
+            "omar-agent-dead-pm".to_string(),
+        );
 
-        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+        let tree = build_tree(
+            &agents,
+            Some(&ea),
+            &parents,
+            "omar-agent-",
+            &EaContext::default(),
+            false,
+        );
 
         // EA + 2 orphans directly under EA = 3 nodes
         assert_eq!(tree.len(), 3);
@@ -1142,7 +1433,14 @@ mod tests {
         parents.insert("omar-agent-b".to_string(), "omar-agent-a".to_string());
         parents.insert("omar-agent-c".to_string(), "omar-agent-b".to_string());
 
-        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+        let tree = build_tree(
+            &agents,
+            Some(&ea),
+            &parents,
+            "omar-agent-",
+            &EaContext::default(),
+            false,
+        );
 
         assert_eq!(tree.len(), 4);
         assert_eq!(tree[0].name, "Executive Assistant");
@@ -1165,7 +1463,14 @@ mod tests {
             "omar-agent-gone".to_string(),
         );
 
-        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+        let tree = build_tree(
+            &agents,
+            Some(&ea),
+            &parents,
+            "omar-agent-",
+            &EaContext::default(),
+            false,
+        );
 
         // worker1 should be orphan under EA since parent doesn't exist
         assert_eq!(tree.len(), 2);
@@ -1177,7 +1482,7 @@ mod tests {
 
     #[test]
     fn test_focus_children_root_shows_direct_ea_children_and_orphans() {
-        // EA -> api (with children: api-worker, auth), orphan
+        // EA -> api (with children: api-worker, auth), orphan (dead parent)
         let agents = [
             make_agent("omar-agent-api", HealthState::Running),
             make_agent("omar-agent-api-worker", HealthState::Running),
@@ -1191,19 +1496,23 @@ mod tests {
             "omar-agent-api".to_string(),
         );
         parents.insert("omar-agent-auth".to_string(), "omar-agent-api".to_string());
+        // Orphan's parent is dead — tracked by this EA but parent session gone
+        parents.insert(
+            "omar-agent-orphan".to_string(),
+            "omar-agent-dead-pm".to_string(),
+        );
 
-        // Compute focus children at root using the new logic
+        // Compute focus children at root (only agents in agent_parents)
         let mut indices = Vec::new();
         for (i, agent) in agents.iter().enumerate() {
-            let parent = parents.get(&agent.session.name);
-            match parent {
-                Some(p) if *p == MANAGER_SESSION => indices.push(i),
-                Some(p) if agents.iter().any(|a| a.session.name == *p) => {}
-                _ => indices.push(i),
+            if let Some(p) = parents.get(&agent.session.name) {
+                if *p == MANAGER_SESSION || !agents.iter().any(|a| a.session.name == *p) {
+                    indices.push(i);
+                }
             }
         }
 
-        // Root should show: api (EA child) + orphan (no parent)
+        // Root should show: api (EA child) + orphan (dead parent)
         assert_eq!(indices.len(), 2);
         assert_eq!(agents[indices[0]].session.name, "omar-agent-api");
         assert_eq!(agents[indices[1]].session.name, "omar-agent-orphan");
@@ -1294,5 +1603,69 @@ mod tests {
             crumbs.push(short.to_string());
         }
         assert_eq!(crumbs, vec!["EA", "rest-api"]);
+    }
+
+    #[test]
+    fn test_build_multi_tree_active_expanded_others_collapsed() {
+        let agents = vec![
+            make_agent("omar-agent-pm-rest-api", HealthState::Running),
+            make_agent("omar-agent-worker-1", HealthState::Idle),
+        ];
+        let ea_default = EaContext::default();
+        let ea_backend = EaContext::new("backend");
+        let eas = vec![ea_default.clone(), ea_backend.clone()];
+
+        let managers = vec![
+            Some(make_agent(MANAGER_SESSION, HealthState::Running)),
+            Some(make_agent(&ea_backend.session_name, HealthState::Running)),
+        ];
+
+        let mut parents = HashMap::new();
+        parents.insert(
+            "omar-agent-pm-rest-api".to_string(),
+            MANAGER_SESSION.to_string(),
+        );
+        parents.insert(
+            "omar-agent-worker-1".to_string(),
+            "omar-agent-pm-rest-api".to_string(),
+        );
+
+        // Pre-computed summaries: active EA (unused), backend EA (0 agents)
+        let ea_summaries = vec![(0, 0), (0, 0)];
+
+        // Active EA = 0 (default): first EA expanded, second collapsed
+        let tree = build_multi_tree(
+            &agents,
+            &managers,
+            &parents,
+            "omar-agent-",
+            &eas,
+            0,
+            &ea_summaries,
+        );
+
+        // First node: active EA root (expanded)
+        assert_eq!(tree[0].depth, 0);
+        assert_eq!(tree[0].session_name, MANAGER_SESSION);
+        assert!(!tree[0].is_last_sibling); // not last — there's a second EA
+
+        // There should be child nodes (PM + worker) for the active EA
+        let active_children: Vec<_> = tree.iter().skip(1).take_while(|n| n.depth > 0).collect();
+        assert!(
+            !active_children.is_empty(),
+            "active EA should have expanded children"
+        );
+
+        // Last node: collapsed EA root
+        let last = tree.last().unwrap();
+        assert_eq!(last.depth, 0);
+        assert_eq!(last.session_name, ea_backend.session_name);
+        assert!(last.is_last_sibling);
+        // Collapsed EA name includes summary
+        assert!(
+            last.name.contains("EA: backend"),
+            "collapsed name should contain EA display name: {}",
+            last.name
+        );
     }
 }

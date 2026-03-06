@@ -12,8 +12,58 @@ use crate::memory;
 use crate::tmux::TmuxClient;
 use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 
-/// Manager session name (exported for use in app.rs)
+/// Legacy constant — use `EaContext` instead.
 pub const MANAGER_SESSION: &str = "omar-agent-ea";
+
+/// The EA ID used for the default (legacy) EA instance.
+pub const DEFAULT_EA_ID: &str = "default";
+
+/// Context for a single EA instance. Encapsulates the session name,
+/// display name, and state directory so the codebase can support
+/// multiple EAs without hardcoded constants.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct EaContext {
+    /// Short identifier (e.g. "default", "backend")
+    pub id: String,
+    /// Full tmux session name (e.g. "omar-agent-ea")
+    pub session_name: String,
+    /// Human-readable name for UI (e.g. "Executive Assistant")
+    pub display_name: String,
+    /// Root directory for this EA's persistent state (e.g. ~/.omar/)
+    pub state_dir: PathBuf,
+}
+
+impl EaContext {
+    /// Create a new EA with the given ID.
+    /// - `"default"` produces the legacy layout (session `"omar-agent-ea"`, state in `~/.omar/`)
+    /// - Any other ID produces `"omar-agent-ea-{id}"` and `~/.omar/{id}/`
+    pub fn new(id: &str) -> Self {
+        let base = memory::omar_base_dir();
+
+        if id == DEFAULT_EA_ID {
+            Self {
+                id: DEFAULT_EA_ID.to_string(),
+                session_name: MANAGER_SESSION.to_string(),
+                display_name: "Executive Assistant".to_string(),
+                state_dir: base,
+            }
+        } else {
+            Self {
+                id: id.to_string(),
+                session_name: format!("omar-agent-ea-{}", id),
+                display_name: format!("EA: {}", id),
+                state_dir: base.join(id),
+            }
+        }
+    }
+}
+
+impl Default for EaContext {
+    fn default() -> Self {
+        Self::new(DEFAULT_EA_ID)
+    }
+}
 
 // Embed prompt files at compile time so they work regardless of CWD.
 const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
@@ -29,12 +79,10 @@ const EMBEDDED_PROMPTS: &[(&str, &str)] = &[
     ("agent.md", PROMPT_AGENT),
 ];
 
-/// Return the `~/.omar/prompts/` directory, writing embedded prompts on first call.
-pub fn prompts_dir() -> PathBuf {
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar")
-        .join("prompts");
+/// Return the prompts directory inside the EA's state dir, writing
+/// embedded prompts on first call.
+pub fn prompts_dir(ea: &EaContext) -> PathBuf {
+    let dir = ea.state_dir.join("prompts");
     std::fs::create_dir_all(&dir).ok();
 
     for (name, content) in EMBEDDED_PROMPTS {
@@ -93,11 +141,11 @@ pub fn build_agent_command(
 /// Build an EA command with memory state baked into the system prompt.
 ///
 /// Reads the EA prompt, appends the latest memory snapshot, writes a
-/// combined file to `~/.omar/ea_prompt_combined.md`, and returns the
-/// CLI command with the combined file as the system prompt.
-pub fn build_ea_command(base_command: &str) -> String {
-    let prompt_file = prompts_dir().join("executive-assistant.md");
-    let mem = memory::load_memory();
+/// combined file to the EA's state directory, and returns the CLI
+/// command with the combined file as the system prompt.
+pub fn build_ea_command(base_command: &str, ea: &EaContext) -> String {
+    let prompt_file = prompts_dir(ea).join("executive-assistant.md");
+    let mem = memory::load_memory(&ea.state_dir);
 
     if mem.is_empty() {
         return build_agent_command(base_command, &prompt_file, &[]);
@@ -109,32 +157,28 @@ pub fn build_ea_command(base_command: &str) -> String {
         prompt_content, mem
     );
 
-    let combined_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar")
-        .join("ea_prompt_combined.md");
-    std::fs::create_dir_all(combined_path.parent().unwrap()).ok();
+    let combined_path = ea.state_dir.join("ea_prompt_combined.md");
     std::fs::write(&combined_path, &combined).ok();
 
     build_agent_command(base_command, &combined_path, &[])
 }
 
 /// Start the manager agent session
-pub fn start_manager(client: &TmuxClient, command: &str) -> Result<()> {
+pub fn start_manager(client: &TmuxClient, command: &str, ea: &EaContext) -> Result<()> {
     // Check if manager already exists
-    if client.has_session(MANAGER_SESSION)? {
+    if client.has_session(&ea.session_name)? {
         println!("Manager session already exists. Attaching...");
-        client.attach_session(MANAGER_SESSION)?;
+        client.attach_session(&ea.session_name)?;
         return Ok(());
     }
 
     // Build command with EA system prompt + memory baked in
-    let cmd = build_ea_command(command);
+    let cmd = build_ea_command(command, ea);
 
     // Create manager session — system prompt set at process start
     println!("Starting manager agent...");
     client.new_session(
-        MANAGER_SESSION,
+        &ea.session_name,
         &cmd,
         Some(&std::env::current_dir()?.to_string_lossy()),
     )?;
@@ -144,19 +188,19 @@ pub fn start_manager(client: &TmuxClient, command: &str) -> Result<()> {
 
     // Attach to the session
     println!("Attaching to manager session...");
-    client.attach_session(MANAGER_SESSION)?;
+    client.attach_session(&ea.session_name)?;
 
     Ok(())
 }
 
 /// Run the manager in orchestration mode (interactive)
-pub fn run_manager_orchestration(client: &TmuxClient, command: &str) -> Result<()> {
+pub fn run_manager_orchestration(client: &TmuxClient, command: &str, ea: &EaContext) -> Result<()> {
     println!("=== OMAR Manager Orchestration Mode ===\n");
 
     // Check if manager exists
-    if !client.has_session(MANAGER_SESSION)? {
+    if !client.has_session(&ea.session_name)? {
         println!("No manager session found. Starting one...");
-        start_manager(client, command)?;
+        start_manager(client, command, ea)?;
         return Ok(());
     }
 
@@ -174,19 +218,19 @@ pub fn run_manager_orchestration(client: &TmuxClient, command: &str) -> Result<(
                 print_help();
             }
             "status" | "s" => {
-                show_status(client)?;
+                show_status(client, ea)?;
             }
             "attach" | "a" => {
-                client.attach_session(MANAGER_SESSION)?;
+                client.attach_session(&ea.session_name)?;
             }
             "check" | "c" => {
-                check_manager_output(client)?;
+                check_manager_output(client, ea)?;
             }
             "approve" | "y" => {
-                approve_plan(client, command)?;
+                approve_plan(client, command, ea)?;
             }
             "reject" | "n" => {
-                reject_plan(client)?;
+                reject_plan(client, ea)?;
             }
             "quit" | "q" => {
                 println!("Exiting orchestration mode.");
@@ -202,7 +246,7 @@ pub fn run_manager_orchestration(client: &TmuxClient, command: &str) -> Result<(
             }
             _ if !input.is_empty() => {
                 // Send to manager as a request
-                send_to_manager(client, input)?;
+                send_to_manager(client, input, ea)?;
             }
             _ => {}
         }
@@ -227,12 +271,12 @@ OMAR Manager Commands:
     );
 }
 
-fn show_status(client: &TmuxClient) -> Result<()> {
+fn show_status(client: &TmuxClient, ea: &EaContext) -> Result<()> {
     println!("\n=== Agent Status ===");
 
     // Show manager
-    if client.has_session(MANAGER_SESSION)? {
-        let output = client.capture_pane(MANAGER_SESSION, 3)?;
+    if client.has_session(&ea.session_name)? {
+        let output = client.capture_pane(&ea.session_name, 3)?;
         println!("Manager: Active");
         println!(
             "  Last output: {}",
@@ -261,8 +305,8 @@ fn show_status(client: &TmuxClient) -> Result<()> {
     Ok(())
 }
 
-fn check_manager_output(client: &TmuxClient) -> Result<()> {
-    let output = client.capture_pane(MANAGER_SESSION, 50)?;
+fn check_manager_output(client: &TmuxClient, ea: &EaContext) -> Result<()> {
+    let output = client.capture_pane(&ea.session_name, 50)?;
 
     if let Some(msg) = parse_manager_message(&output) {
         match msg {
@@ -303,8 +347,8 @@ fn check_manager_output(client: &TmuxClient) -> Result<()> {
     Ok(())
 }
 
-fn approve_plan(client: &TmuxClient, command: &str) -> Result<()> {
-    let output = client.capture_pane(MANAGER_SESSION, 50)?;
+fn approve_plan(client: &TmuxClient, command: &str, ea: &EaContext) -> Result<()> {
+    let output = client.capture_pane(&ea.session_name, 50)?;
 
     if let Some(ManagerMessage::Plan {
         description,
@@ -315,7 +359,7 @@ fn approve_plan(client: &TmuxClient, command: &str) -> Result<()> {
         println!("Spawning {} worker agents...\n", agents.len());
 
         for agent in &agents {
-            spawn_worker(client, agent, command)?;
+            spawn_worker(client, agent, command, ea)?;
         }
 
         // Notify manager that plan was approved
@@ -328,7 +372,7 @@ fn approve_plan(client: &TmuxClient, command: &str) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        send_to_manager(client, &approval_msg)?;
+        send_to_manager(client, &approval_msg, ea)?;
 
         println!("\nAll agents spawned. Use 'status' to monitor progress.");
     } else {
@@ -338,22 +382,26 @@ fn approve_plan(client: &TmuxClient, command: &str) -> Result<()> {
     Ok(())
 }
 
-fn reject_plan(client: &TmuxClient) -> Result<()> {
+fn reject_plan(client: &TmuxClient, ea: &EaContext) -> Result<()> {
     print!("Reason for rejection: ");
     io::stdout().flush()?;
 
     let mut reason = String::new();
     io::stdin().read_line(&mut reason)?;
 
-    send_to_manager(client, &format!("Plan rejected. Reason: {}", reason.trim()))?;
+    send_to_manager(
+        client,
+        &format!("Plan rejected. Reason: {}", reason.trim()),
+        ea,
+    )?;
     println!("Rejection sent to manager.");
 
     Ok(())
 }
 
-fn send_to_manager(client: &TmuxClient, message: &str) -> Result<()> {
-    client.send_keys_literal(MANAGER_SESSION, message)?;
-    client.send_keys(MANAGER_SESSION, "Enter")?;
+fn send_to_manager(client: &TmuxClient, message: &str, ea: &EaContext) -> Result<()> {
+    client.send_keys_literal(&ea.session_name, message)?;
+    client.send_keys(&ea.session_name, "Enter")?;
     println!("Sent to manager: {}", message);
     Ok(())
 }
@@ -372,7 +420,12 @@ fn send_to_agent(client: &TmuxClient, agent: &str, message: &str) -> Result<()> 
     Ok(())
 }
 
-fn spawn_worker(client: &TmuxClient, agent: &ProposedAgent, command: &str) -> Result<()> {
+fn spawn_worker(
+    client: &TmuxClient,
+    agent: &ProposedAgent,
+    command: &str,
+    ea: &EaContext,
+) -> Result<()> {
     let session_name = format!("{}{}", client.prefix(), agent.name);
 
     if client.has_session(&session_name)? {
@@ -382,7 +435,7 @@ fn spawn_worker(client: &TmuxClient, agent: &ProposedAgent, command: &str) -> Re
 
     // Build command with worker system prompt (template vars substituted via sed)
     let parent_name = client.prefix().to_string() + "manager";
-    let prompt_file = prompts_dir().join("worker.md");
+    let prompt_file = prompts_dir(ea).join("worker.md");
     let cmd = build_agent_command(
         command,
         &prompt_file,
@@ -405,7 +458,7 @@ fn spawn_worker(client: &TmuxClient, agent: &ProposedAgent, command: &str) -> Re
     client.send_keys(&session_name, "Enter")?;
 
     // Persist worker task description
-    memory::save_worker_task(&session_name, &agent.task);
+    memory::save_worker_task(&ea.state_dir, &session_name, &agent.task);
 
     println!("  {} - spawned ({})", agent.name, agent.role);
 

@@ -57,6 +57,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
             "/api/computer/mouse-position",
             get(handlers::computer_mouse_position),
         )
+        .route("/api/eas", get(handlers::list_eas))
         .layer(cors)
         .with_state(state)
 }

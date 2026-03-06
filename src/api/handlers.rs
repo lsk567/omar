@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use super::models::*;
-use crate::app::{SharedApp, MANAGER_SESSION_NAME};
+use crate::app::SharedApp;
 use crate::computer::{self, ComputerLock};
 use crate::manager::{build_agent_command, prompts_dir};
 use crate::memory;
@@ -165,13 +165,12 @@ pub async fn get_agent_summary(
             let session = a.session.name.clone();
             let health = a.health.as_str().to_string();
 
-            let tasks = memory::load_worker_tasks();
-            let task = tasks.get(&session).cloned();
+            let task = app.worker_tasks().get(&session).cloned();
 
-            let status = memory::load_agent_status(&session);
+            let status = memory::load_agent_status(&app.ea().state_dir, &session);
 
-            let parents = memory::load_agent_parents();
-            let children: Vec<String> = parents
+            let children: Vec<String> = app
+                .agent_parents()
                 .iter()
                 .filter(|(_, parent)| **parent == session)
                 .map(|(child, _)| display_name(&prefix, child).to_string())
@@ -213,7 +212,7 @@ pub async fn update_agent_status(
         ));
     }
 
-    memory::save_agent_status(&session_name, &req.status);
+    memory::save_agent_status(&app.ea().state_dir, &session_name, &req.status);
 
     Ok(Json(StatusResponse {
         status: "updated".to_string(),
@@ -248,11 +247,7 @@ pub async fn spawn_agent(
     }
 
     // Get workdir
-    let workdir = req.workdir.unwrap_or_else(|| {
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string())
-    });
+    let workdir = req.workdir.unwrap_or_else(crate::app::current_workdir);
 
     // Build the agent command — with system prompt via native CLI flag if a role is set
     let base_command = req
@@ -267,7 +262,7 @@ pub async fn spawn_agent(
         // Any agent with a role or task gets the unified agent prompt
         let parent = req.parent.as_deref().unwrap_or("ea");
         let task = req.task.as_deref().unwrap_or("");
-        let prompt_file = prompts_dir().join("agent.md");
+        let prompt_file = prompts_dir(app.ea()).join("agent.md");
         build_agent_command(
             &base_command,
             &prompt_file,
@@ -288,15 +283,16 @@ pub async fn spawn_agent(
     }
 
     // Save parent mapping if explicitly provided
+    let state_dir = app.ea().state_dir.clone();
     if let Some(ref parent) = req.parent {
         let resolved_parent = resolve_session_name(&prefix, parent);
-        memory::save_agent_parent(&name, &resolved_parent);
+        memory::save_agent_parent(&state_dir, &name, &resolved_parent);
     }
 
     // Send first user message after a delay
     if let Some(task) = req.task {
         // Always persist the original (short) task for dashboard display
-        memory::save_worker_task(&name, &task);
+        memory::save_worker_task(&state_dir, &name, &task);
 
         let short = display_name(&prefix, &name);
         let user_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", short, task);
@@ -351,8 +347,12 @@ pub async fn kill_agent(
     let prefix = app.client().prefix().to_string();
     let session_name = resolve_session_name(&prefix, &id);
 
-    // Don't allow killing manager via API
-    if session_name == MANAGER_SESSION_NAME || id == MANAGER_SESSION_NAME {
+    // Don't allow killing any EA manager via API
+    let is_ea = app
+        .eas
+        .iter()
+        .any(|e| session_name == e.session_name || id == e.session_name);
+    if is_ea {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -382,7 +382,7 @@ pub async fn kill_agent(
     }
 
     // Clean up parent mapping and cancel pending events for the killed agent
-    memory::remove_agent_parent(&session_name);
+    memory::remove_agent_parent(&app.ea().state_dir, &session_name);
     let short_name = display_name(&prefix, &session_name).to_string();
     state.scheduler.cancel_by_receiver(&short_name);
 
@@ -443,8 +443,9 @@ pub async fn send_input(
 }
 
 /// GET /api/projects
-pub async fn list_projects() -> Json<ListProjectsResponse> {
-    let projects = projects::load_projects();
+pub async fn list_projects(State(state): State<Arc<ApiState>>) -> Json<ListProjectsResponse> {
+    let app = state.app.lock().await;
+    let projects = projects::load_projects(&app.ea().state_dir);
     let list: Vec<ProjectResponse> = projects
         .iter()
         .map(|p| ProjectResponse {
@@ -457,9 +458,11 @@ pub async fn list_projects() -> Json<ListProjectsResponse> {
 
 /// POST /api/projects
 pub async fn add_project(
+    State(state): State<Arc<ApiState>>,
     Json(req): Json<AddProjectRequest>,
 ) -> Result<Json<ProjectResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match projects::add_project(&req.name) {
+    let app = state.app.lock().await;
+    match projects::add_project(&app.ea().state_dir, &req.name) {
         Ok(id) => Ok(Json(ProjectResponse { id, name: req.name })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -472,9 +475,11 @@ pub async fn add_project(
 
 /// DELETE /api/projects/:id
 pub async fn complete_project(
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<usize>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match projects::remove_project(id) {
+    let app = state.app.lock().await;
+    match projects::remove_project(&app.ea().state_dir, id) {
         Ok(true) => Ok(Json(StatusResponse {
             status: "completed".to_string(),
             message: Some(format!("Project {} removed", id)),
@@ -549,6 +554,24 @@ pub async fn list_events(
         .collect();
 
     Json(EventListResponse { events })
+}
+
+/// GET /api/eas
+pub async fn list_eas(State(state): State<Arc<ApiState>>) -> Json<ListEasResponse> {
+    let app = state.app.lock().await;
+    let eas = app
+        .eas
+        .iter()
+        .enumerate()
+        .map(|(i, ea)| EaInfo {
+            id: ea.id.clone(),
+            display_name: ea.display_name.clone(),
+            session_name: ea.session_name.clone(),
+            active: i == app.active_ea,
+            manager_running: app.managers[i].is_some(),
+        })
+        .collect();
+    Json(ListEasResponse { eas })
 }
 
 /// DELETE /api/events/:id

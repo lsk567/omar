@@ -279,3 +279,21 @@ pub struct ComputerAvailabilityResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_size: Option<ScreenSizeResponse>,
 }
+
+// ── EA models ──
+
+/// EA info in list response
+#[derive(Debug, Serialize)]
+pub struct EaInfo {
+    pub id: String,
+    pub display_name: String,
+    pub session_name: String,
+    pub active: bool,
+    pub manager_running: bool,
+}
+
+/// Response for listing EAs
+#[derive(Debug, Serialize)]
+pub struct ListEasResponse {
+    pub eas: Vec<EaInfo>,
+}

@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -45,7 +45,7 @@ impl EventHandler {
                         // Poll for crossterm events
                         if event::poll(Duration::from_millis(0)).unwrap_or(false) {
                             match event::read() {
-                                Ok(Event::Key(key)) => AppEvent::Key(key),
+                                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => AppEvent::Key(key),
                                 Ok(Event::Resize(w, h)) => AppEvent::Resize(w, h),
                                 _ => continue,
                             }

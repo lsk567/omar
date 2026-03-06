@@ -7,20 +7,19 @@ use ratatui::{
 };
 use regex::Regex;
 
-use crate::app::{AgentInfo, App, ConfirmAction};
+use crate::app::{AgentInfo, App};
 use crate::memory;
 use crate::tmux::HealthState;
 
 /// Render the entire dashboard
 pub fn render(frame: &mut Frame, app: &App) {
-    let status_height = if app.status_message.is_some() { 4 } else { 3 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(status_height), // Status bar (taller when warning shown)
-            Constraint::Percentage(55),        // Agent grid + projects sidebar
-            Constraint::Min(8),                // Manager panel (~33%)
-            Constraint::Length(1),             // Help bar
+            Constraint::Length(3),      // Status bar
+            Constraint::Percentage(55), // Agent grid + projects sidebar
+            Constraint::Min(8),         // Manager panel (~33%)
+            Constraint::Length(1),      // Help bar
         ])
         .split(frame.area());
 
@@ -57,12 +56,20 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_help_popup(frame);
     }
 
-    if let Some(action) = app.pending_confirm {
-        render_confirm_dialog(frame, app, action);
+    if app.show_confirm_kill {
+        render_confirm_kill(frame, app);
+    }
+
+    if app.show_confirm_kill_ea {
+        render_confirm_kill_ea(frame, app);
     }
 
     if app.project_input_mode {
         render_project_input(frame, app);
+    }
+
+    if app.ea_input_mode {
+        render_ea_input(frame, app);
     }
 
     if app.show_events {
@@ -82,18 +89,32 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap()
         .as_nanos() as u64;
 
+    let ea_short_name = app
+        .ea()
+        .session_name
+        .strip_prefix(app.client().prefix())
+        .unwrap_or(&app.ea().session_name);
     let next_ea_event = app
         .scheduled_events
         .iter()
-        .filter(|e| e.receiver == "ea")
+        .filter(|e| e.receiver == ea_short_name)
         .min_by_key(|e| e.timestamp);
     let next_event = app.scheduled_events.iter().min_by_key(|e| e.timestamp);
 
-    let mut status_text = vec![
-        Span::styled(
-            "One-Man Army ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+    let mut status_text = vec![Span::styled(
+        "One-Man Army ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if app.eas.len() > 1 {
+        status_text.push(Span::raw("| "));
+        status_text.push(Span::styled(
+            format!("{} ", app.ea().display_name),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    status_text.extend([
         Span::raw("| Agents: "),
         Span::styled(format!("{}", total), Style::default().fg(Color::White)),
         Span::raw(" | "),
@@ -108,7 +129,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             format!("{}", app.scheduled_events.len()),
             Style::default().fg(Color::Cyan),
         ),
-    ];
+    ]);
 
     if let Some(event) = next_ea_event {
         status_text.push(Span::raw(" | EA Wake: "));
@@ -235,8 +256,8 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
 
         // Build display title based on focus parent type
         let parent_name = &app.focus_parent;
-        let display_title = if *parent_name == crate::manager::MANAGER_SESSION {
-            "Executive Assistant".to_string()
+        let display_title = if *parent_name == app.ea().session_name {
+            app.ea().display_name.clone()
         } else {
             let short = parent_name
                 .strip_prefix(app.client().prefix())
@@ -405,17 +426,23 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
 
         if node.depth == 0 {
             // Root (EA): no connector, just name + icon
+            let is_active_ea = node.session_name == app.ea().session_name;
             let name_style = if is_focus {
                 Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD)
-            } else {
+            } else if is_active_ea {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
+            } else {
+                // Non-active EA (collapsed) — dimmed
+                Style::default().fg(Color::DarkGray)
             };
             if is_focus {
                 spans.push(Span::styled("►", Style::default().fg(Color::Magenta)));
+            } else if is_active_ea && app.eas.len() > 1 {
+                spans.push(Span::styled("▸", Style::default().fg(Color::Cyan)));
             }
             spans.push(Span::styled(format!(" {} ", node.name), name_style));
             spans.push(Span::styled(icon, Style::default().fg(health_color)));
@@ -547,13 +574,14 @@ fn render_summary_card(
     }
 
     // Status line (from status file, fallback to last_output)
-    let status_text = memory::load_agent_status(&agent.session.name).unwrap_or_else(|| {
-        if agent.health_info.last_output.is_empty() {
-            "waiting for the agent to report status".to_string()
-        } else {
-            agent.health_info.last_output.clone()
-        }
-    });
+    let status_text = memory::load_agent_status(&app.ea().state_dir, &agent.session.name)
+        .unwrap_or_else(|| {
+            if agent.health_info.last_output.is_empty() {
+                "waiting for the agent to report status".to_string()
+            } else {
+                agent.health_info.last_output.clone()
+            }
+        });
     lines.push(Line::from(vec![
         Span::styled("Status: ", Style::default().fg(Color::Yellow)),
         Span::styled(status_text, Style::default().fg(Color::White)),
@@ -583,15 +611,21 @@ fn render_summary_card(
             if remaining.is_empty() || w == 0 {
                 break;
             }
-            if remaining.len() <= w {
+            // Find the byte index corresponding to `w` characters (not bytes)
+            let byte_limit = remaining
+                .char_indices()
+                .nth(w)
+                .map(|(i, _)| i)
+                .unwrap_or(remaining.len());
+            if byte_limit >= remaining.len() {
                 wrapped.push(remaining.to_string());
                 remaining = "";
             } else {
                 // Try to break at a word boundary
-                let break_at = remaining[..w]
+                let break_at = remaining[..byte_limit]
                     .rfind(' ')
                     .map(|i| i + 1) // include the space on the current line
-                    .unwrap_or(w);
+                    .unwrap_or(byte_limit);
                 wrapped.push(remaining[..break_at].trim_end().to_string());
                 remaining = &remaining[break_at..];
             }
@@ -633,8 +667,10 @@ fn render_summary_card(
                 } else {
                     // Last line: truncate with ellipsis
                     let w = if is_first { first_width } else { cont_width };
-                    let truncated = if text.len() > w.saturating_sub(3) && w > 3 {
-                        format!("{}...", &text[..w - 3])
+                    let char_count = text.chars().count();
+                    let truncated = if char_count > w.saturating_sub(3) && w > 3 {
+                        let end: String = text.chars().take(w - 3).collect();
+                        format!("{}...", end)
                     } else {
                         format!("{}...", text)
                     };
@@ -660,7 +696,7 @@ fn render_summary_card(
 }
 
 fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let at_root = app.focus_parent == crate::manager::MANAGER_SESSION;
+    let at_root = app.focus_parent == app.ea().session_name;
 
     let mut help_text = vec![
         Span::styled("↑↓", Style::default().add_modifier(Modifier::BOLD)),
@@ -686,6 +722,23 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         ));
         help_text.push(Span::raw(":Back "));
+    }
+    help_text.push(Span::styled(
+        "E",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    help_text.push(Span::raw(":New EA "));
+    if app.eas.len() > 1 {
+        help_text.push(Span::styled(
+            "[/]",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        help_text.push(Span::raw(":Cycle EA "));
+        help_text.push(Span::styled(
+            "X",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        help_text.push(Span::raw(":Kill EA "));
     }
     help_text.push(Span::styled(
         "?",
@@ -785,51 +838,32 @@ fn render_help_popup(frame: &mut Frame) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
-    let (title, heading, detail, hint, width) = match action {
-        ConfirmAction::Kill => {
-            let name = app
-                .selected_agent()
-                .map(|a| a.session.name.clone())
-                .unwrap_or_else(|| "?".to_string());
-            (" Confirm ", "Kill this agent?", name, String::new(), 40)
-        }
-        ConfirmAction::Quit => (
-            " Confirm Quit ",
-            "Quit omar?",
-            "This will kill the EA session.".to_string(),
-            "Press z to walk away instead.".to_string(),
-            50,
-        ),
-    };
+fn render_confirm_dialog(frame: &mut Frame, message: &str, target_name: &str) {
+    let area = centered_rect(40, 20, frame.area());
 
-    let area = centered_rect(width, 20, frame.area());
-
-    let mut content = vec![
+    let content = vec![
         Line::from(""),
         Line::from(Span::styled(
-            heading,
+            message,
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(detail, Style::default().fg(Color::Yellow))),
+        Line::from(Span::styled(
+            target_name.to_string(),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("y", Style::default().fg(Color::Green)),
+            Span::raw(": Yes  "),
+            Span::styled("n", Style::default().fg(Color::Red)),
+            Span::raw(": No"),
+        ]),
     ];
-    if !hint.is_empty() {
-        content.push(Line::from(Span::styled(
-            hint,
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    content.push(Line::from(""));
-    content.push(Line::from(vec![
-        Span::styled("y", Style::default().fg(Color::Green)),
-        Span::raw(": Yes  "),
-        Span::styled("n", Style::default().fg(Color::Red)),
-        Span::raw(": No"),
-    ]));
 
     let block = Block::default()
-        .title(title)
+        .title(" Confirm ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red));
 
@@ -841,18 +875,40 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_project_input(frame: &mut Frame, app: &App) {
+fn render_confirm_kill(frame: &mut Frame, app: &App) {
+    let agent_name = app
+        .selected_agent()
+        .map(|a| a.session.name.clone())
+        .unwrap_or_else(|| "?".to_string());
+    render_confirm_dialog(frame, "Kill this agent?", &agent_name);
+}
+
+fn render_confirm_kill_ea(frame: &mut Frame, app: &App) {
+    render_confirm_dialog(
+        frame,
+        "Kill this EA and all its agents?",
+        &app.ea().display_name,
+    );
+}
+
+fn render_text_input_popup(
+    frame: &mut Frame,
+    heading: &str,
+    block_title: &str,
+    color: Color,
+    input: &str,
+) {
     let area = centered_rect(50, 20, frame.area());
 
     let content = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "Add Project",
+            heading.to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("> {}_", app.project_input),
+            format!("> {}_", input),
             Style::default().fg(Color::Cyan),
         )),
         Line::from(""),
@@ -863,9 +919,9 @@ fn render_project_input(frame: &mut Frame, app: &App) {
     ];
 
     let block = Block::default()
-        .title(" New Project ")
+        .title(block_title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(color));
 
     let paragraph = Paragraph::new(content)
         .block(block)
@@ -873,6 +929,26 @@ fn render_project_input(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
+}
+
+fn render_project_input(frame: &mut Frame, app: &App) {
+    render_text_input_popup(
+        frame,
+        "Add Project",
+        " New Project ",
+        Color::Cyan,
+        &app.project_input,
+    );
+}
+
+fn render_ea_input(frame: &mut Frame, app: &App) {
+    render_text_input_popup(
+        frame,
+        "New Executive Assistant",
+        " New EA ",
+        Color::Magenta,
+        &app.ea_input,
+    );
 }
 
 fn render_events_popup(frame: &mut Frame, app: &App) {
@@ -933,12 +1009,7 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
                 }
             };
 
-            // Truncate payload to fit
-            let payload = if event.payload.len() > 30 {
-                format!("{}...", &event.payload[..27])
-            } else {
-                event.payload.clone()
-            };
+            let payload = truncate_str(&event.payload, 30);
 
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1023,8 +1094,9 @@ fn render_debug_console(frame: &mut Frame, app: &App) {
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}…", &s[..max_len - 1])
+    if s.chars().count() > max_len {
+        let truncated: String = s.chars().take(max_len - 1).collect();
+        format!("{}…", truncated)
     } else {
         s.to_string()
     }

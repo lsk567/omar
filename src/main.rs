@@ -28,6 +28,7 @@ use tokio::sync::Mutex;
 use app::App;
 use config::Config;
 use event::{AppEvent, EventHandler};
+use manager::EaContext;
 use tmux::TmuxClient;
 
 /// Tmux session name used when omar auto-launches into tmux
@@ -79,9 +80,6 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ManagerAction>,
     },
-
-    /// Configure tmux for optimal omar experience
-    SetupTmux,
 }
 
 #[derive(Subcommand)]
@@ -112,15 +110,17 @@ async fn main() -> Result<()> {
         }
         Some(Commands::List) => list_agents(&client),
         Some(Commands::Kill { name }) => kill_agent(&client, &name),
-        Some(Commands::SetupTmux) => setup_tmux(),
-        Some(Commands::Manager { action }) => match action {
-            Some(ManagerAction::Start) | None => {
-                manager::start_manager(&client, &config.agent.default_command)
+        Some(Commands::Manager { action }) => {
+            let ea = EaContext::default();
+            match action {
+                Some(ManagerAction::Start) | None => {
+                    manager::start_manager(&client, &config.agent.default_command, &ea)
+                }
+                Some(ManagerAction::Orchestrate) => {
+                    manager::run_manager_orchestration(&client, &config.agent.default_command, &ea)
+                }
             }
-            Some(ManagerAction::Orchestrate) => {
-                manager::run_manager_orchestration(&client, &config.agent.default_command)
-            }
-        },
+        }
         None => {
             if std::env::var("TMUX").is_err() {
                 relaunch_in_tmux()
@@ -201,139 +201,6 @@ fn relaunch_in_tmux() -> Result<()> {
     // exec() replaces the current process; only returns on error
     let err = cmd.exec();
     anyhow::bail!("Failed to launch tmux: {}", err)
-}
-
-/// Recommended tmux settings for omar, keyed by option name.
-const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
-    ("mouse", "set -g mouse on", "mouse scrolling and selection"),
-    (
-        "extended-keys",
-        "set -g extended-keys on",
-        "Shift+Enter in agents",
-    ),
-    (
-        "set-clipboard",
-        "set -g set-clipboard on",
-        "clipboard integration",
-    ),
-];
-
-/// Additional raw lines that need to appear in tmux.conf (checked by substring).
-const TMUX_EXTRA_LINES: &[(&str, &str, &str)] = &[
-    (
-        "terminal-features',*:extkeys'",
-        "set -as terminal-features ',*:extkeys'",
-        "extended key passthrough",
-    ),
-    (
-        "terminal-features',*:clipboard'",
-        "set -as terminal-features ',*:clipboard'",
-        "clipboard passthrough",
-    ),
-];
-
-/// Check if any recommended tmux settings are missing.
-fn tmux_setup_needed() -> bool {
-    for &(opt, _, _) in TMUX_RECOMMENDED {
-        if let Ok(out) = std::process::Command::new("tmux")
-            .args(["show-options", "-gv", opt])
-            .output()
-        {
-            let val = String::from_utf8_lossy(&out.stdout);
-            if val.trim() != "on" {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Interactive tmux configuration setup.
-fn setup_tmux() -> Result<()> {
-    use std::io::Write;
-
-    let conf_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".tmux.conf");
-
-    let existing = std::fs::read_to_string(&conf_path).unwrap_or_default();
-
-    // Collect missing settings
-    let mut to_add: Vec<(&str, &str)> = Vec::new();
-
-    for &(opt, line, desc) in TMUX_RECOMMENDED {
-        if !existing.contains(line) {
-            // Also check if the option is already set at runtime
-            let already_on = std::process::Command::new("tmux")
-                .args(["show-options", "-gv", opt])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "on")
-                .unwrap_or(false);
-            if !already_on {
-                to_add.push((line, desc));
-            }
-        }
-    }
-
-    let normalized = existing.replace(' ', "");
-    for &(needle, line, desc) in TMUX_EXTRA_LINES {
-        if !normalized.contains(needle) {
-            to_add.push((line, desc));
-        }
-    }
-
-    if to_add.is_empty() {
-        println!("✓ tmux is already configured for omar.");
-        return Ok(());
-    }
-
-    println!(
-        "The following settings will be added to {}:\n",
-        conf_path.display()
-    );
-    for (line, desc) in &to_add {
-        println!("  {}  # {}", line, desc);
-    }
-
-    print!("\nApply? [Y/n] ");
-    std::io::stdout().flush()?;
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let input = input.trim().to_lowercase();
-
-    if !input.is_empty() && input != "y" && input != "yes" {
-        println!("Aborted.");
-        return Ok(());
-    }
-
-    // Append to tmux.conf
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&conf_path)?;
-
-    writeln!(file, "\n# omar recommended settings")?;
-    for (line, _) in &to_add {
-        writeln!(file, "{}", line)?;
-    }
-
-    // Apply to running tmux server
-    if std::process::Command::new("tmux")
-        .args(["list-sessions"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        let _ = std::process::Command::new("tmux")
-            .args(["source-file", &conf_path.to_string_lossy()])
-            .status();
-        println!("✓ Applied to ~/.tmux.conf and reloaded tmux.");
-    } else {
-        println!("✓ Applied to ~/.tmux.conf (tmux not running, will take effect next session).");
-    }
-
-    Ok(())
 }
 
 /// Locate the `omar-slack` binary. Checks next to the current executable
@@ -449,6 +316,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
         scheduler.clone(),
         ticker.clone(),
         popup_receiver.clone(),
+        config.dashboard.session_prefix.clone(),
     ));
 
     // Start API server if enabled
@@ -490,11 +358,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
         _ => {}
     }
 
-    // Warn if tmux config is missing recommended settings
-    if tmux_setup_needed() {
-        app.set_persistent_warning("⚠ tmux not configured for omar — run 'omar setup-tmux' to fix");
-    }
-
     // Initial refresh
     if let Err(e) = app.refresh() {
         app.set_status(format!("Error: {}", e));
@@ -512,6 +375,40 @@ async fn run_dashboard(config: Config) -> Result<()> {
         if let Some(event) = events.next().await {
             match event {
                 AppEvent::Key(key) => {
+                    // Handle EA input mode
+                    if app.ea_input_mode {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.ea_input_mode = false;
+                                app.ea_input.clear();
+                            }
+                            KeyCode::Enter => {
+                                let id = app.ea_input.clone();
+                                let id = id.trim();
+                                if !id.is_empty() {
+                                    match app.add_ea(id) {
+                                        Ok(()) => {
+                                            app.set_status(format!("EA '{}' created", id));
+                                        }
+                                        Err(e) => {
+                                            app.set_status(format!("Error: {}", e));
+                                        }
+                                    }
+                                }
+                                app.ea_input_mode = false;
+                                app.ea_input.clear();
+                            }
+                            KeyCode::Backspace => {
+                                app.ea_input.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                app.ea_input.push(c);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Handle project input mode
                     if app.project_input_mode {
                         match key.code {
@@ -539,23 +436,38 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
-                    // Handle confirmation dialog (kill or quit)
-                    if let Some(action) = app.pending_confirm {
+                    // Handle confirmation dialog
+                    if app.show_confirm_kill {
                         match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') => match action {
-                                app::ConfirmAction::Kill => {
-                                    if let Err(e) = app.kill_selected() {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                if let Err(e) = app.kill_selected() {
+                                    app.set_status(format!("Error: {}", e));
+                                }
+                            }
+                            _ => {
+                                app.show_confirm_kill = false;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Handle EA kill confirmation dialog
+                    if app.show_confirm_kill_ea {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                let name = app.ea().display_name.clone();
+                                match app.remove_ea(app.active_ea) {
+                                    Ok(()) => {
+                                        app.set_status(format!("Removed EA '{}'", name));
+                                    }
+                                    Err(e) => {
                                         app.set_status(format!("Error: {}", e));
                                     }
                                 }
-                                app::ConfirmAction::Quit => {
-                                    app.should_quit = true;
-                                }
-                            },
-                            _ => {
-                                app.pending_confirm = None;
                             }
+                            _ => {}
                         }
+                        app.show_confirm_kill_ea = false;
                         continue;
                     }
 
@@ -568,7 +480,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     // Handle events popup
                     if app.show_events {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Char('e') => {
+                            KeyCode::Esc | KeyCode::Char('e') | KeyCode::Char('q') => {
                                 app.show_events = false;
                             }
                             _ => {}
@@ -579,7 +491,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     // Handle debug console popup
                     if app.show_debug_console {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Char('D') => {
+                            KeyCode::Esc | KeyCode::Char('D') | KeyCode::Char('q') => {
                                 app.show_debug_console = false;
                             }
                             _ => {}
@@ -589,11 +501,13 @@ async fn run_dashboard(config: Config) -> Result<()> {
 
                     // Normal key handling
                     match key.code {
-                        KeyCode::Char('Q') => {
-                            app.pending_confirm = Some(app::ConfirmAction::Quit);
+                        KeyCode::Char('q') => {
+                            app.should_quit = true;
                         }
                         KeyCode::Esc => {
-                            app.drill_up();
+                            if !app.drill_up() {
+                                app.should_quit = true;
+                            }
                         }
                         KeyCode::Tab | KeyCode::Right => {
                             app.drill_down();
@@ -602,7 +516,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.drill_up();
                         }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.pending_confirm = Some(app::ConfirmAction::Quit);
+                            app.should_quit = true;
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
                             app.next();
@@ -653,7 +567,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('d') => {
                             if app.selected_agent().is_some() {
-                                app.pending_confirm = Some(app::ConfirmAction::Kill);
+                                app.show_confirm_kill = true;
                             }
                         }
                         KeyCode::Char('p') => {
@@ -670,6 +584,24 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.scheduled_events = scheduler.list();
                             app.scheduled_events.sort_by_key(|e| e.timestamp);
                             app.show_events = true;
+                        }
+                        KeyCode::Char('E') => {
+                            app.ea_input_mode = true;
+                        }
+                        KeyCode::Char('X') => {
+                            if app.eas.len() > 1 {
+                                app.show_confirm_kill_ea = true;
+                            } else {
+                                app.set_status("Cannot remove the last EA");
+                            }
+                        }
+                        KeyCode::Char(']') => {
+                            app.next_ea();
+                            app.set_status(format!("Switched to {}", app.ea().display_name));
+                        }
+                        KeyCode::Char('[') => {
+                            app.prev_ea();
+                            app.set_status(format!("Switched to {}", app.ea().display_name));
                         }
                         KeyCode::Char('D') => {
                             app.show_debug_console = true;
@@ -720,13 +652,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // Kill the EA session on exit
-    if app
-        .client()
-        .has_session(crate::manager::MANAGER_SESSION)
-        .unwrap_or(false)
-    {
-        let _ = app.client().kill_session(crate::manager::MANAGER_SESSION);
+    // Kill all EA sessions on exit
+    for ea in &app.eas {
+        let _ = app.client().kill_session(&ea.session_name);
     }
 
     // Kill Slack bridge on exit
