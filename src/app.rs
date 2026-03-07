@@ -26,6 +26,14 @@ pub enum ConfirmAction {
     Quit,
 }
 
+/// Which left-sidebar panel is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarPanel {
+    Projects,
+    Events,
+    ChainOfCommand,
+}
+
 /// Information about an agent for display
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
@@ -78,9 +86,13 @@ pub struct App {
     pub project_input_mode: bool,
     pub project_input: String,
     pub show_events: bool,
+    /// Enlarged sidebar popup (None = hidden)
+    pub sidebar_popup: Option<SidebarPanel>,
     pub scheduled_events: Vec<ScheduledEvent>,
     pub ticker: TickerBuffer,
     pub ticker_offset: usize,
+    pub quote_index: usize,
+    pub quote_order: Vec<usize>,
     pub show_debug_console: bool,
     /// Session name of the agent shown in the bottom panel (default: MANAGER_SESSION)
     pub focus_parent: String,
@@ -90,6 +102,12 @@ pub struct App {
     pub focus_child_indices: Vec<usize>,
     agent_parents: HashMap<String, String>,
     worker_tasks: HashMap<String, String>,
+    /// Whether the left sidebar is focused (vs the right agent panels)
+    pub sidebar_focused: bool,
+    /// Which sidebar panel is active
+    pub sidebar_panel: SidebarPanel,
+    /// Selected index within the active sidebar panel
+    pub sidebar_selected: usize,
     client: TmuxClient,
     health_checker: HealthChecker,
     default_command: String,
@@ -118,15 +136,35 @@ impl App {
             project_input_mode: false,
             project_input: String::new(),
             show_events: false,
+            sidebar_popup: None,
             scheduled_events: Vec::new(),
             ticker,
             ticker_offset: 0,
+            quote_index: 0,
+            quote_order: {
+                // Shuffle quote indices using time-seeded LCG
+                let n = crate::ui::QUOTE_COUNT;
+                let mut order: Vec<usize> = (0..n).collect();
+                let mut seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64;
+                for i in (1..n).rev() {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let j = (seed >> 33) as usize % (i + 1);
+                    order.swap(i, j);
+                }
+                order
+            },
             show_debug_console: false,
             focus_parent: MANAGER_SESSION.to_string(),
             focus_stack: Vec::new(),
             focus_child_indices: Vec::new(),
             agent_parents: HashMap::new(),
             worker_tasks: HashMap::new(),
+            sidebar_focused: false,
+            sidebar_panel: SidebarPanel::Projects,
+            sidebar_selected: 0,
             client,
             health_checker,
             default_command: config.agent.default_command.clone(),
@@ -142,6 +180,7 @@ impl App {
             || self.project_input_mode
             || self.show_events
             || self.show_debug_console
+            || self.sidebar_popup.is_some()
     }
 
     pub fn client(&self) -> &TmuxClient {
@@ -485,6 +524,24 @@ impl App {
         } else {
             self.manager_selected = true;
         }
+    }
+
+    /// Move sidebar focus to the next panel.
+    pub fn sidebar_next(&mut self) {
+        self.sidebar_panel = match self.sidebar_panel {
+            SidebarPanel::Projects => SidebarPanel::Events,
+            SidebarPanel::Events => SidebarPanel::ChainOfCommand,
+            SidebarPanel::ChainOfCommand => SidebarPanel::Projects,
+        };
+    }
+
+    /// Move sidebar focus to the previous panel.
+    pub fn sidebar_previous(&mut self) {
+        self.sidebar_panel = match self.sidebar_panel {
+            SidebarPanel::Projects => SidebarPanel::ChainOfCommand,
+            SidebarPanel::Events => SidebarPanel::Projects,
+            SidebarPanel::ChainOfCommand => SidebarPanel::Events,
+        };
     }
 
     /// Get currently selected agent (could be focus parent or a focus child)
