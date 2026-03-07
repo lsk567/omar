@@ -187,14 +187,24 @@ pub(crate) fn deliver_to_tmux(receiver: &str, message: &str, ticker: &TickerBuff
 fn format_delivery(events: &[ScheduledEvent], timestamp: u64) -> String {
     if events.len() == 1 {
         let ev = &events[0];
+        let tag = if ev.recurring_ns.is_some() {
+            "CRON"
+        } else {
+            "EVENT"
+        };
         format!(
-            "[EVENT at t={}]\nFrom {}: {}",
-            timestamp, ev.sender, ev.payload
+            "[{} at t={}]\nFrom {}: {}",
+            tag, timestamp, ev.sender, ev.payload
         )
     } else {
         let mut msg = format!("[EVENT BATCH at t={}]", timestamp);
         for ev in events {
-            msg.push_str(&format!("\nFrom {}: {}", ev.sender, ev.payload));
+            let tag = if ev.recurring_ns.is_some() {
+                "CRON"
+            } else {
+                "EVENT"
+            };
+            msg.push_str(&format!("\n[{}] From {}: {}", tag, ev.sender, ev.payload));
         }
         msg
     }
@@ -437,8 +447,28 @@ mod tests {
         let e2 = make_event("bob", "carol", 1000, "msg2");
         let msg = format_delivery(&[e1, e2], 1000);
         assert!(msg.contains("[EVENT BATCH at t=1000]"));
-        assert!(msg.contains("From alice: msg1"));
-        assert!(msg.contains("From carol: msg2"));
+        assert!(msg.contains("[EVENT] From alice: msg1"));
+        assert!(msg.contains("[EVENT] From carol: msg2"));
+    }
+
+    #[test]
+    fn test_format_cron_event() {
+        let mut ev = make_event("bob", "alice", 1000, "periodic check");
+        ev.recurring_ns = Some(60_000_000_000);
+        let msg = format_delivery(&[ev], 1000);
+        assert!(msg.contains("[CRON at t=1000]"));
+        assert!(msg.contains("From alice: periodic check"));
+        assert!(!msg.contains("[EVENT"));
+    }
+
+    #[test]
+    fn test_format_batch_mixed() {
+        let e1 = make_event("bob", "alice", 1000, "one-time");
+        let mut e2 = make_event("bob", "carol", 1000, "recurring");
+        e2.recurring_ns = Some(30_000_000_000);
+        let msg = format_delivery(&[e1, e2], 1000);
+        assert!(msg.contains("[EVENT] From alice: one-time"));
+        assert!(msg.contains("[CRON] From carol: recurring"));
     }
 
     /// Helper: check if tmux is available on this machine.

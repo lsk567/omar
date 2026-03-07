@@ -181,15 +181,21 @@ IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g
 If you need to schedule a future wake-up or send a delayed message to another agent, use the Events API:
 
 ```bash
-# Schedule an event (timestamp is in nanoseconds since Unix epoch)
+# Schedule a one-time event (timestamp in nanoseconds since Unix epoch)
 curl -X POST http://localhost:9876/api/events \
   -H "Content-Type: application/json" \
   -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <nanosecond-timestamp>, "payload": "reason for wakeup"}'
 
-# List pending events
+# Schedule a cron job (repeats every recurring_ns nanoseconds)
+# OMAR auto-reschedules after each delivery. Delivered as [CRON] instead of [EVENT].
+curl -X POST http://localhost:9876/api/events \
+  -H "Content-Type: application/json" \
+  -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <first-fire-ns>, "payload": "reason", "recurring_ns": 60000000000}'
+
+# List pending events (includes recurring_ns field for cron jobs)
 curl http://localhost:9876/api/events
 
-# Cancel a scheduled event
+# Cancel a scheduled event (also stops cron jobs)
 curl -X DELETE http://localhost:9876/api/events/<event-id>
 ```
 

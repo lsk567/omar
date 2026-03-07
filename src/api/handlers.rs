@@ -545,6 +545,7 @@ pub async fn list_events(
             timestamp: e.timestamp,
             payload: e.payload,
             created_at: e.created_at,
+            recurring_ns: e.recurring_ns,
         })
         .collect();
 

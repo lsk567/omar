@@ -896,7 +896,10 @@ fn render_event_queue(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::LightMagenta),
             ),
         ]));
-        // Underline separator
+    }
+
+    // Underline separator when there are header lines above the event list
+    if !lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "─".repeat(inner_width),
             Style::default().fg(Color::DarkGray),
@@ -1351,6 +1354,9 @@ fn render_project_input(frame: &mut Frame, app: &App) {
 
 fn render_events_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(70, 60, frame.area());
+    let inner_width = area.width.saturating_sub(2) as usize; // borders
+    let fixed_cols: usize = 14 + 14 + 16 + 14; // Sender + Receiver + Fires in + Type
+    let payload_width = inner_width.saturating_sub(fixed_cols + 1);
 
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
@@ -1369,7 +1375,10 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
         // Header
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{:<14} {:<14} {:<24} ", "Sender", "Receiver", "Timestamp"),
+                format!(
+                    "{:<14} {:<14} {:<16} {:<14} ",
+                    "Sender", "Receiver", "Fires in", "Type"
+                ),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -1382,7 +1391,7 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "─".repeat(70),
+            "─".repeat(inner_width),
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -1407,11 +1416,28 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
                 }
             };
 
-            // Truncate payload to fit
-            let payload = if event.payload.chars().count() > 30 {
-                format!("{}...", char_truncate(&event.payload, 27))
+            // Truncate payload to fill remaining width
+            let payload = if event.payload.chars().count() > payload_width {
+                format!(
+                    "{}...",
+                    char_truncate(&event.payload, payload_width.saturating_sub(3))
+                )
             } else {
                 event.payload.clone()
+            };
+
+            let type_str = match event.recurring_ns {
+                Some(ns) => {
+                    let secs = ns / 1_000_000_000;
+                    if secs < 60 {
+                        format!("cron ({}s)", secs)
+                    } else if secs < 3600 {
+                        format!("cron ({}m)", secs / 60)
+                    } else {
+                        format!("cron ({}h)", secs / 3600)
+                    }
+                }
+                None => "once".to_string(),
             };
 
             lines.push(Line::from(vec![
@@ -1424,8 +1450,16 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(
-                    format!("{:<24}", time_str),
+                    format!("{:<16}", time_str),
                     Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{:<14}", type_str),
+                    Style::default().fg(if event.recurring_ns.is_some() {
+                        Color::LightMagenta
+                    } else {
+                        Color::DarkGray
+                    }),
                 ),
                 Span::raw(payload),
             ]));
