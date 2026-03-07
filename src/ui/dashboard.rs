@@ -1354,6 +1354,9 @@ fn render_project_input(frame: &mut Frame, app: &App) {
 
 fn render_events_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(70, 60, frame.area());
+    let inner_width = area.width.saturating_sub(2) as usize; // borders
+    let fixed_cols: usize = 14 + 14 + 16 + 14; // Sender + Receiver + Fires in + Type
+    let payload_width = inner_width.saturating_sub(fixed_cols + 1);
 
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
@@ -1388,7 +1391,7 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "─".repeat(70),
+            "─".repeat(inner_width),
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -1413,9 +1416,12 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
                 }
             };
 
-            // Truncate payload to fit
-            let payload = if event.payload.chars().count() > 30 {
-                format!("{}...", char_truncate(&event.payload, 27))
+            // Truncate payload to fill remaining width
+            let payload = if event.payload.chars().count() > payload_width {
+                format!(
+                    "{}...",
+                    char_truncate(&event.payload, payload_width.saturating_sub(3))
+                )
             } else {
                 event.payload.clone()
             };
