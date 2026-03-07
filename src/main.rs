@@ -747,7 +747,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                 AppEvent::Tick => {
                     // Rotate quotes every ~30 ticks
                     tick_count += 1;
-                    if tick_count % 30 == 0 {
+                    if tick_count.is_multiple_of(30) {
                         app.quote_index = app.quote_index.wrapping_add(1);
                     }
 
