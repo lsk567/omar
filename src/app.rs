@@ -307,7 +307,7 @@ impl App {
             .new_session(MANAGER_SESSION, &cmd, Some(&workdir))?;
 
         // Write memory after creating manager
-        memory::write_memory(&self.agents, None, &self.client);
+        memory::write_memory(&self.agents, None, &self.client, &self.scheduled_events);
 
         Ok(())
     }
@@ -597,7 +597,12 @@ impl App {
             memory::remove_agent_parent(&name);
             self.status_message = Some(format!("Killed agent: {}", name));
             self.refresh()?;
-            memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
+            memory::write_memory(
+                &self.agents,
+                self.manager.as_ref(),
+                &self.client,
+                &self.scheduled_events,
+            );
         }
         self.pending_confirm = None;
         Ok(())
@@ -653,7 +658,12 @@ impl App {
             self.selected = pos;
         }
 
-        memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
+        memory::write_memory(
+            &self.agents,
+            self.manager.as_ref(),
+            &self.client,
+            &self.scheduled_events,
+        );
 
         Ok(())
     }
@@ -717,14 +727,24 @@ impl App {
     pub fn add_project(&mut self, name: &str) {
         let _ = projects::add_project(name);
         self.projects = projects::load_projects();
-        memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
+        memory::write_memory(
+            &self.agents,
+            self.manager.as_ref(),
+            &self.client,
+            &self.scheduled_events,
+        );
     }
 
     /// Complete (remove) a project by id and update memory
     pub fn complete_project(&mut self, id: usize) {
         let _ = projects::remove_project(id);
         self.projects = projects::load_projects();
-        memory::write_memory(&self.agents, self.manager.as_ref(), &self.client);
+        memory::write_memory(
+            &self.agents,
+            self.manager.as_ref(),
+            &self.client,
+            &self.scheduled_events,
+        );
     }
 }
 

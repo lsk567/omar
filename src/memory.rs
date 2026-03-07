@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use crate::app::AgentInfo;
 use crate::projects;
+use crate::scheduler::ScheduledEvent;
 use crate::tmux::TmuxClient;
 
 /// Ensure ~/.omar/ exists and return it
@@ -121,7 +122,12 @@ pub fn load_memory() -> String {
 ///
 /// Captures: active projects, worker states + tasks, manager status,
 /// and the manager's recent conversation context.
-pub fn write_memory(agents: &[AgentInfo], manager: Option<&AgentInfo>, client: &TmuxClient) {
+pub fn write_memory(
+    agents: &[AgentInfo],
+    manager: Option<&AgentInfo>,
+    client: &TmuxClient,
+    events: &[ScheduledEvent],
+) {
     let projects = projects::load_projects();
     let mut worker_tasks = load_worker_tasks();
 
@@ -159,6 +165,31 @@ pub fn write_memory(agents: &[AgentInfo], manager: Option<&AgentInfo>, client: &
             out.push_str(&format!(
                 "- {} ({}): {}\n",
                 agent.session.name, health, task_desc
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Scheduled events (cron jobs and pending one-time events)
+    if !events.is_empty() {
+        out.push_str("## Scheduled Events\n");
+        for ev in events {
+            let type_label = match ev.recurring_ns {
+                Some(ns) => {
+                    let secs = ns / 1_000_000_000;
+                    if secs < 60 {
+                        format!("cron every {}s", secs)
+                    } else if secs < 3600 {
+                        format!("cron every {}m", secs / 60)
+                    } else {
+                        format!("cron every {}h", secs / 3600)
+                    }
+                }
+                None => "once".to_string(),
+            };
+            out.push_str(&format!(
+                "- [{}] {} -> {}: {}\n",
+                type_label, ev.sender, ev.receiver, ev.payload
             ));
         }
         out.push('\n');
