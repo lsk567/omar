@@ -205,7 +205,11 @@ fn relaunch_in_tmux() -> Result<()> {
 
 /// Recommended tmux settings for omar, keyed by option name.
 const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
-    ("mouse", "set -g mouse on", "mouse scrolling and selection"),
+    (
+        "mouse",
+        "set -g mouse off",
+        "disable mouse to avoid scroll interference",
+    ),
     (
         "extended-keys",
         "set -g extended-keys on",
@@ -230,17 +234,24 @@ const TMUX_EXTRA_LINES: &[(&str, &str, &str)] = &[
         "set -as terminal-features ',*:clipboard'",
         "clipboard passthrough",
     ),
+    (
+        "bind-key-nC-\\\\",
+        "bind-key -n C-\\\\ detach-client",
+        "Ctrl+\\\\ to detach from popup",
+    ),
 ];
 
 /// Check if any recommended tmux settings are missing.
 fn tmux_setup_needed() -> bool {
-    for &(opt, _, _) in TMUX_RECOMMENDED {
+    for &(opt, cmd, _) in TMUX_RECOMMENDED {
+        // Extract expected value from the command string (last word)
+        let expected = cmd.split_whitespace().last().unwrap_or("on");
         if let Ok(out) = std::process::Command::new("tmux")
             .args(["show-options", "-gv", opt])
             .output()
         {
             let val = String::from_utf8_lossy(&out.stdout);
-            if val.trim() != "on" {
+            if val.trim() != expected {
                 return true;
             }
         }
@@ -264,12 +275,13 @@ fn setup_tmux() -> Result<()> {
     for &(opt, line, desc) in TMUX_RECOMMENDED {
         if !existing.contains(line) {
             // Also check if the option is already set at runtime
-            let already_on = std::process::Command::new("tmux")
+            let expected = line.split_whitespace().last().unwrap_or("on");
+            let already_set = std::process::Command::new("tmux")
                 .args(["show-options", "-gv", opt])
                 .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "on")
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == expected)
                 .unwrap_or(false);
-            if !already_on {
+            if !already_set {
                 to_add.push((line, desc));
             }
         }
@@ -503,6 +515,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
     // Event loop
     let tick_rate = Duration::from_secs(config.dashboard.refresh_interval);
     let mut events = EventHandler::new(tick_rate);
+    let mut tick_count: u64 = 0;
 
     loop {
         // Draw UI
@@ -568,7 +581,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     // Handle events popup
                     if app.show_events {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Char('e') => {
+                            KeyCode::Esc | KeyCode::Char('e') | KeyCode::Enter => {
                                 app.show_events = false;
                             }
                             _ => {}
@@ -587,6 +600,17 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
+                    // Handle sidebar enlarged popup
+                    if app.sidebar_popup.is_some() {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Enter => {
+                                app.sidebar_popup = None;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Normal key handling
                     match key.code {
                         KeyCode::Char('Q') => {
@@ -596,21 +620,53 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.drill_up();
                         }
                         KeyCode::Tab | KeyCode::Right => {
-                            app.drill_down();
+                            if app.sidebar_focused {
+                                app.sidebar_focused = false;
+                            } else {
+                                app.drill_down();
+                            }
                         }
                         KeyCode::Left => {
-                            app.drill_up();
+                            if !app.sidebar_focused {
+                                app.sidebar_focused = true;
+                            } else {
+                                app.drill_up();
+                            }
                         }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.pending_confirm = Some(app::ConfirmAction::Quit);
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
-                            app.next();
+                            if app.sidebar_focused {
+                                app.sidebar_next();
+                            } else {
+                                app.next();
+                            }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
-                            app.previous();
+                            if app.sidebar_focused {
+                                app.sidebar_previous();
+                            } else {
+                                app.previous();
+                            }
+                        }
+                        KeyCode::Char('h') => {
+                            app.sidebar_focused = true;
+                        }
+                        KeyCode::Char('l') => {
+                            app.sidebar_focused = false;
                         }
                         KeyCode::Enter => {
+                            if app.sidebar_focused {
+                                if app.sidebar_panel == app::SidebarPanel::Events {
+                                    app.scheduled_events = scheduler.list();
+                                    app.scheduled_events.sort_by_key(|e| e.timestamp);
+                                    app.show_events = true;
+                                } else {
+                                    app.sidebar_popup = Some(app.sidebar_panel);
+                                }
+                                continue;
+                            }
                             // Tell the scheduler which agent popup is open so it
                             // defers events for that receiver until the popup closes.
                             *popup_receiver.lock().unwrap() = app.selected_agent_short_name();
@@ -689,6 +745,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     }
                 }
                 AppEvent::Tick => {
+                    // Rotate quotes every ~30 ticks
+                    tick_count += 1;
+                    if tick_count.is_multiple_of(30) {
+                        app.quote_index = app.quote_index.wrapping_add(1);
+                    }
+
                     // Keep event snapshots fresh for status-bar countdowns and events popup.
                     app.scheduled_events = scheduler.list();
                     app.scheduled_events.sort_by_key(|e| e.timestamp);
