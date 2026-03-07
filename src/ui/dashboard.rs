@@ -896,7 +896,10 @@ fn render_event_queue(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::LightMagenta),
             ),
         ]));
-        // Underline separator
+    }
+
+    // Underline separator when there are header lines above the event list
+    if !lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "─".repeat(inner_width),
             Style::default().fg(Color::DarkGray),
