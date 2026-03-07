@@ -151,6 +151,9 @@ pub struct EventInfo {
     pub timestamp: u64,
     pub payload: String,
     pub created_at: u64,
+    /// If set, this is a cron job that repeats every `recurring_ns` nanoseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurring_ns: Option<u64>,
 }
 
 /// Response for listing events
