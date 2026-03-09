@@ -102,6 +102,7 @@ pub struct App {
     pub focus_child_indices: Vec<usize>,
     agent_parents: HashMap<String, String>,
     worker_tasks: HashMap<String, String>,
+    agent_statuses: HashMap<String, String>,
     /// Whether the left sidebar is focused (vs the right agent panels)
     pub sidebar_focused: bool,
     /// Which sidebar panel is active
@@ -162,6 +163,7 @@ impl App {
             focus_child_indices: Vec::new(),
             agent_parents: HashMap::new(),
             worker_tasks: HashMap::new(),
+            agent_statuses: HashMap::new(),
             sidebar_focused: false,
             sidebar_panel: SidebarPanel::Projects,
             sidebar_selected: 0,
@@ -325,6 +327,16 @@ impl App {
     /// Get manager info (for API)
     pub fn manager(&self) -> Option<&AgentInfo> {
         self.manager.as_ref()
+    }
+
+    /// Get an agent's self-reported status
+    pub fn agent_status(&self, session: &str) -> Option<&String> {
+        self.agent_statuses.get(session)
+    }
+
+    /// Update an agent's self-reported status
+    pub fn set_agent_status(&mut self, session: String, status: String) {
+        self.agent_statuses.insert(session, status);
     }
 
     /// Group agents into PM → worker hierarchies for grid display

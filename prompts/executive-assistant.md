@@ -133,14 +133,18 @@ CRITICAL — you MUST execute ALL three steps every time. Never skip the project
 3. Verify the project is gone: `curl http://localhost:9876/api/projects` — if the project still appears, delete it again
 4. Report the summary to the user
 
-## Persistent Memory (~/.omar/memory.md)
+## Persistent Memory
 
-Your session is killed when the user exits the dashboard. To resume context on restart, you MUST maintain `~/.omar/memory.md`. The dashboard automatically sends you this file's contents when you start.
+Memory is split into two files under `~/.omar/`:
+- **`system_state.md`** — written by the OMAR dashboard (read-only for you). Contains authoritative system state: active projects, agents, scheduled events (with exact periods and payloads), and manager status.
+- **`manager_notes.md`** — written by you. Your own notes: task summaries, completed work, user preferences, and any context you want to persist.
 
-Write to it after every state change (new task, agent spawned, agent finished, project completed):
+Both files are combined and sent to you on startup. **Only write to `manager_notes.md`** — never overwrite `system_state.md`.
+
+Write to `manager_notes.md` after every state change (new task, agent spawned, agent finished, project completed):
 ```bash
-cat > ~/.omar/memory.md << 'MEMORY'
-# EA State
+cat > ~/.omar/manager_notes.md << 'NOTES'
+# Manager Notes
 
 ## Active Tasks
 - Project id=1 "Build REST API" → Agent: rest-api (running)
@@ -151,10 +155,10 @@ cat > ~/.omar/memory.md << 'MEMORY'
 
 ## Notes
 - User prefers TypeScript
-MEMORY
+NOTES
 ```
 
-Keep it concise. Include: active project-to-agent mappings (with project IDs), completed work summaries, and any user preferences or context you've learned.
+Keep it concise. Include: task-to-agent mappings (with project IDs), completed work summaries, and any user preferences or context you've learned.
 
 ## Multiple Tasks
 
@@ -267,6 +271,16 @@ curl http://localhost:9876/api/events
 # Cancel a scheduled event (also stops cron jobs)
 curl -X DELETE http://localhost:9876/api/events/<event-id>
 ```
+
+### Recovering cron jobs after restart
+
+When OMAR restarts, the event queue is cleared — all cron jobs and pending events are lost. On startup, check whether expected cron jobs are missing:
+
+1. List current events: `curl http://localhost:9876/api/events`
+2. Compare against the "Scheduled Events" section in your startup memory (from `system_state.md`). It contains exact `period_ns` values and payloads for each cron job.
+3. If any cron jobs are missing, re-create them using the Events API with the same `recurring_ns` and `payload` from memory.
+
+Do this check early — before processing any user requests — so recurring monitoring and Slack polling resume without gaps.
 
 ## Slack Bridge Integration
 

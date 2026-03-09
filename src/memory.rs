@@ -1,7 +1,12 @@
-//! Persistent memory — state snapshots in ~/.omar/memory.md
+//! Persistent memory — split into two files under ~/.omar/
 //!
-//! Writes a human-readable markdown snapshot of the current OMAR state
-//! so a newly created manager session can resume seamlessly.
+//! - `system_state.md`  — written exclusively by the Rust backend (authoritative
+//!   system state: projects, agents, scheduled events, manager status).
+//! - `manager_notes.md` — written exclusively by the manager agent (semantic
+//!   context: task summaries, user preferences, completed work notes).
+//!
+//! `load_memory()` combines both files so the manager gets the full picture on
+//! restart without either side clobbering the other.
 
 use std::collections::HashMap;
 use std::fs;
@@ -21,9 +26,14 @@ fn omar_dir() -> PathBuf {
     dir
 }
 
-/// Path to the memory file
-fn memory_path() -> PathBuf {
-    omar_dir().join("memory.md")
+/// Path to the system state file (Rust-owned)
+fn system_state_path() -> PathBuf {
+    omar_dir().join("system_state.md")
+}
+
+/// Path to the manager notes file (manager-agent-owned)
+fn manager_notes_path() -> PathBuf {
+    omar_dir().join("manager_notes.md")
 }
 
 /// Path to worker task descriptions
@@ -91,36 +101,27 @@ pub fn remove_agent_parent(child: &str) {
     write_agent_parents(&parents);
 }
 
-/// Directory for agent status files
-fn status_dir() -> PathBuf {
-    let dir = omar_dir().join("status");
-    fs::create_dir_all(&dir).ok();
-    dir
+/// Combine system state and manager notes into a single memory string.
+fn combine_memory(system: &str, notes: &str) -> String {
+    match (system.is_empty(), notes.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => system.to_string(),
+        (true, false) => notes.to_string(),
+        (false, false) => format!("{}\n---\n\n{}", system, notes),
+    }
 }
 
-/// Load an agent's self-reported status from ~/.omar/status/<session>.md
-pub fn load_agent_status(session_name: &str) -> Option<String> {
-    let path = status_dir().join(format!("{}.md", session_name));
-    fs::read_to_string(&path)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-}
-
-/// Save an agent's status to ~/.omar/status/<session>.md
-pub fn save_agent_status(session_name: &str, status: &str) {
-    let path = status_dir().join(format!("{}.md", session_name));
-    fs::write(&path, status).ok();
-}
-
-/// Load the memory file contents (empty string if missing)
+/// Load combined memory: system_state.md + manager_notes.md
 pub fn load_memory() -> String {
-    let path = memory_path();
-    fs::read_to_string(&path).unwrap_or_default()
+    let system = fs::read_to_string(system_state_path()).unwrap_or_default();
+    let notes = fs::read_to_string(manager_notes_path()).unwrap_or_default();
+    combine_memory(&system, &notes)
 }
 
-/// Write a full state snapshot to ~/.omar/memory.md
+/// Write system state snapshot to ~/.omar/system_state.md
 ///
-/// Captures: active projects, worker states + tasks, manager status,
+/// Captures: active projects, worker states + tasks, scheduled events
+/// (with exact periods and payloads for recovery), manager status,
 /// and the manager's recent conversation context.
 pub fn write_memory(
     agents: &[AgentInfo],
@@ -170,26 +171,20 @@ pub fn write_memory(
         out.push('\n');
     }
 
-    // Scheduled events (cron jobs and pending one-time events)
+    // Scheduled events — include exact periods and full payloads for recovery
     if !events.is_empty() {
         out.push_str("## Scheduled Events\n");
         for ev in events {
             let type_label = match ev.recurring_ns {
                 Some(ns) => {
                     let secs = ns / 1_000_000_000;
-                    if secs < 60 {
-                        format!("cron every {}s", secs)
-                    } else if secs < 3600 {
-                        format!("cron every {}m", secs / 60)
-                    } else {
-                        format!("cron every {}h", secs / 3600)
-                    }
+                    format!("cron every {}s (period_ns={})", secs, ns)
                 }
                 None => "once".to_string(),
             };
             out.push_str(&format!(
-                "- [{}] {} -> {}: {}\n",
-                type_label, ev.sender, ev.receiver, ev.payload
+                "- id={} [{}] {} -> {}\n  payload: {}\n",
+                ev.id, type_label, ev.sender, ev.receiver, ev.payload
             ));
         }
         out.push('\n');
@@ -221,6 +216,59 @@ pub fn write_memory(
         }
     }
 
-    let path = memory_path();
+    let path = system_state_path();
     fs::write(&path, &out).ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combine_both_empty() {
+        assert_eq!(combine_memory("", ""), "");
+    }
+
+    #[test]
+    fn combine_system_only() {
+        let result = combine_memory("# OMAR State\n", "");
+        assert_eq!(result, "# OMAR State\n");
+    }
+
+    #[test]
+    fn combine_notes_only() {
+        let result = combine_memory("", "# Manager Notes\n");
+        assert_eq!(result, "# Manager Notes\n");
+    }
+
+    #[test]
+    fn combine_both_present() {
+        let result = combine_memory("# OMAR State\n", "# Manager Notes\n");
+        assert!(result.contains("# OMAR State\n"));
+        assert!(result.contains("---"));
+        assert!(result.contains("# Manager Notes\n"));
+        // System state comes first, then separator, then notes
+        let sep_pos = result.find("---").unwrap();
+        let state_pos = result.find("# OMAR State").unwrap();
+        let notes_pos = result.find("# Manager Notes").unwrap();
+        assert!(state_pos < sep_pos);
+        assert!(sep_pos < notes_pos);
+    }
+
+    #[test]
+    fn scheduled_event_format_includes_period_and_payload() {
+        // Verify the format string used in write_memory includes exact details
+        let ns: u64 = 300_000_000_000; // 300s = 5min
+        let secs = ns / 1_000_000_000;
+        let label = format!("cron every {}s (period_ns={})", secs, ns);
+        assert_eq!(label, "cron every 300s (period_ns=300000000000)");
+
+        let line = format!(
+            "- id={} [{}] {} -> {}\n  payload: {}\n",
+            "abc-123", label, "manager", "worker-1", "check deployment status"
+        );
+        assert!(line.contains("period_ns=300000000000"));
+        assert!(line.contains("payload: check deployment status"));
+        assert!(line.contains("id=abc-123"));
+    }
 }
