@@ -168,7 +168,7 @@ pub async fn get_agent_summary(
             let tasks = memory::load_worker_tasks();
             let task = tasks.get(&session).cloned();
 
-            let status = memory::load_agent_status(&session);
+            let status = app.agent_status(&session).cloned();
 
             let parents = memory::load_agent_parents();
             let children: Vec<String> = parents
@@ -200,7 +200,7 @@ pub async fn update_agent_status(
     Path(id): Path<String>,
     Json(req): Json<UpdateStatusRequest>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = state.app.lock().await;
+    let mut app = state.app.lock().await;
     let prefix = app.client().prefix().to_string();
     let session_name = resolve_session_name(&prefix, &id);
 
@@ -213,7 +213,7 @@ pub async fn update_agent_status(
         ));
     }
 
-    memory::save_agent_status(&session_name, &req.status);
+    app.set_agent_status(session_name.clone(), req.status);
 
     Ok(Json(StatusResponse {
         status: "updated".to_string(),

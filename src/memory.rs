@@ -101,27 +101,6 @@ pub fn remove_agent_parent(child: &str) {
     write_agent_parents(&parents);
 }
 
-/// Directory for agent status files
-fn status_dir() -> PathBuf {
-    let dir = omar_dir().join("status");
-    fs::create_dir_all(&dir).ok();
-    dir
-}
-
-/// Load an agent's self-reported status from ~/.omar/status/<session>.md
-pub fn load_agent_status(session_name: &str) -> Option<String> {
-    let path = status_dir().join(format!("{}.md", session_name));
-    fs::read_to_string(&path)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-}
-
-/// Save an agent's status to ~/.omar/status/<session>.md
-pub fn save_agent_status(session_name: &str, status: &str) {
-    let path = status_dir().join(format!("{}.md", session_name));
-    fs::write(&path, status).ok();
-}
-
 /// Combine system state and manager notes into a single memory string.
 fn combine_memory(system: &str, notes: &str) -> String {
     match (system.is_empty(), notes.is_empty()) {

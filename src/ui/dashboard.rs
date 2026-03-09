@@ -8,7 +8,6 @@ use ratatui::{
 use regex::Regex;
 
 use crate::app::{AgentInfo, App, ConfirmAction, SidebarPanel};
-use crate::memory;
 use crate::tmux::HealthState;
 
 const QUOTES: &[&str] = &[
@@ -1019,14 +1018,17 @@ fn render_summary_card(
         ]));
     }
 
-    // Status line (from status file, fallback to last_output)
-    let status_text = memory::load_agent_status(&agent.session.name).unwrap_or_else(|| {
-        if agent.health_info.last_output.is_empty() {
-            "waiting for the agent to report status".to_string()
-        } else {
-            agent.health_info.last_output.clone()
-        }
-    });
+    // Status line (from in-memory status, fallback to last_output)
+    let status_text = app
+        .agent_status(&agent.session.name)
+        .cloned()
+        .unwrap_or_else(|| {
+            if agent.health_info.last_output.is_empty() {
+                "waiting for the agent to report status".to_string()
+            } else {
+                agent.health_info.last_output.clone()
+            }
+        });
     lines.push(Line::from(vec![
         Span::styled("Status: ", Style::default().fg(Color::White)),
         Span::styled(status_text, Style::default().fg(Color::White)),
