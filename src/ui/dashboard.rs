@@ -336,7 +336,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Two-column layout: left sidebar (chain of command + projects), right (agents + parent)
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(0)])
+        .constraints([Constraint::Length(34), Constraint::Min(0)])
         .split(outer[1]);
 
     // Left column: projects, event queue, chain of command
