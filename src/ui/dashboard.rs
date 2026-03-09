@@ -1025,6 +1025,10 @@ fn render_summary_card(
                 format!("{} workers", child_count),
                 Style::default().fg(Color::White),
             ),
+            Span::styled(
+                " (press Tab to drill in)",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
     }
 
@@ -1150,16 +1154,14 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     let at_root = app.focus_parent == crate::manager::MANAGER_SESSION;
 
     let mut help_text = vec![
-        Span::styled("←→", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Panel "),
-        Span::styled("↑↓", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Nav | "),
+        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Chat "),
+        Span::styled("Ctrl+\\", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Close Chat | "),
         Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Drill-in "),
-        Span::styled("S-Tab", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Back | "),
-        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Chat | "),
+        Span::styled("Shift+Tab", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Back out | "),
         Span::styled("z", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Hold the line | "),
         Span::styled("Q", Style::default().add_modifier(Modifier::BOLD)),
