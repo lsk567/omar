@@ -192,7 +192,7 @@ const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
     ("mouse", "set -g mouse on", "mouse scrolling and selection"),
     (
         "extended-keys",
-        "set -g extended-keys on",
+        "set -g extended-keys always",
         "Shift+Enter in agents",
     ),
     (
