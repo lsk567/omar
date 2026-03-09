@@ -546,22 +546,44 @@ impl App {
         }
     }
 
-    /// Move sidebar focus to the next panel.
+    /// Move sidebar focus to the next panel, skipping Events when hidden.
     pub fn sidebar_next(&mut self) {
         self.sidebar_panel = match self.sidebar_panel {
-            SidebarPanel::Projects => SidebarPanel::Events,
+            SidebarPanel::Projects => {
+                if self.settings.show_event_queue {
+                    SidebarPanel::Events
+                } else {
+                    SidebarPanel::ChainOfCommand
+                }
+            }
             SidebarPanel::Events => SidebarPanel::ChainOfCommand,
             SidebarPanel::ChainOfCommand => SidebarPanel::Projects,
         };
     }
 
-    /// Move sidebar focus to the previous panel.
+    /// Move sidebar focus to the previous panel, skipping Events when hidden.
     pub fn sidebar_previous(&mut self) {
         self.sidebar_panel = match self.sidebar_panel {
             SidebarPanel::Projects => SidebarPanel::ChainOfCommand,
             SidebarPanel::Events => SidebarPanel::Projects,
-            SidebarPanel::ChainOfCommand => SidebarPanel::Events,
+            SidebarPanel::ChainOfCommand => {
+                if self.settings.show_event_queue {
+                    SidebarPanel::Events
+                } else {
+                    SidebarPanel::Projects
+                }
+            }
         };
+    }
+
+    /// Navigate focus toward the sidebar.
+    pub fn focus_sidebar(&mut self) {
+        self.sidebar_focused = true;
+    }
+
+    /// Navigate focus toward the main area.
+    pub fn focus_main(&mut self) {
+        self.sidebar_focused = false;
     }
 
     /// Get currently selected agent (could be focus parent or a focus child)

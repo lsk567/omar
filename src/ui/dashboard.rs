@@ -418,7 +418,12 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let (running, idle) = app.health_counts();
     let total = app.total_agents();
 
-    let status_spans = vec![
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    let mut status_spans = vec![
         Span::styled(
             "One-Man Army ",
             Style::default().add_modifier(Modifier::BOLD),
@@ -433,6 +438,29 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(format!("{} Idle", idle), Style::default().fg(Color::Yellow)),
     ];
+
+    // Events count
+    if !app.scheduled_events.is_empty() {
+        status_spans.push(Span::raw(" | Events: "));
+        status_spans.push(Span::styled(
+            format!("{}", app.scheduled_events.len()),
+            Style::default().fg(Color::LightMagenta),
+        ));
+    }
+
+    // EA Wake countdown
+    let next_ea_event = app
+        .scheduled_events
+        .iter()
+        .filter(|e| e.receiver == "ea")
+        .min_by_key(|e| e.timestamp);
+    if let Some(event) = next_ea_event {
+        status_spans.push(Span::raw(" | EA Wake: "));
+        status_spans.push(Span::styled(
+            format_countdown_ns(event.timestamp, now_ns),
+            Style::default().fg(Color::LightMagenta),
+        ));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -885,53 +913,11 @@ fn render_event_queue(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap()
         .as_nanos() as u64;
 
-    let inner_width = area.width.saturating_sub(4) as usize; // borders + padding
     let mut lines: Vec<Line> = Vec::new();
-
-    // Event count (only when non-empty)
-    if !app.scheduled_events.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<11}", "Events"),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::styled(
-                format!("{}", app.scheduled_events.len()),
-                Style::default().fg(Color::LightMagenta),
-            ),
-        ]));
-    }
-
-    // Summary line: EA Wake or next event
-    let next_ea_event = app
-        .scheduled_events
-        .iter()
-        .filter(|e| e.receiver == "ea")
-        .min_by_key(|e| e.timestamp);
-    if let Some(event) = next_ea_event {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<11}", "EA Wake"),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::styled(
-                format_countdown_ns(event.timestamp, now_ns),
-                Style::default().fg(Color::LightMagenta),
-            ),
-        ]));
-    }
-
-    // Underline separator when there are header lines above the event list
-    if !lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "─".repeat(inner_width),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
 
     // Event list
     let available = area.height.saturating_sub(2) as usize; // borders
-    let list_budget = available.saturating_sub(lines.len());
+    let list_budget = available;
 
     if !app.scheduled_events.is_empty() {
         for event in app.scheduled_events.iter().take(list_budget) {
@@ -1164,16 +1150,16 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     let at_root = app.focus_parent == crate::manager::MANAGER_SESSION;
 
     let mut help_text = vec![
+        Span::styled("←→", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Panel "),
         Span::styled("↑↓", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Nav | "),
-        Span::styled("→", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Drill-in | "),
-        Span::styled("←", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Drill-in "),
+        Span::styled("S-Tab", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Back | "),
         Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Chat | "),
-        Span::styled("Ctrl-\\", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Close Chat | "),
         Span::styled("z", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Hold the line | "),
         Span::styled("Q", Style::default().add_modifier(Modifier::BOLD)),
@@ -1260,9 +1246,11 @@ fn render_help_popup(frame: &mut Frame) {
         )),
         Line::from(""),
         Line::from("  q           Quit"),
-        Line::from("  Esc, ←      Back (drill up)"),
-        Line::from("  Tab, →      Drill into selected agent"),
+        Line::from("  ←/→, h/l   Switch panel (sidebar ↔ main)"),
         Line::from("  ↑/↓, j/k   Move selection up/down"),
+        Line::from("  Tab         Drill into selected agent"),
+        Line::from("  Shift+Tab   Back (drill up)"),
+        Line::from("  Esc         Back (drill up)"),
         Line::from("  Enter       Attach to selected agent"),
         Line::from("  n           Spawn new agent"),
         Line::from("  d           Kill selected agent"),

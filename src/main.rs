@@ -602,6 +602,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                             KeyCode::Enter => {
                                 app.settings.toggle(app.settings_selected);
+                                // If event queue was just hidden, move sidebar off Events panel
+                                if !app.settings.show_event_queue
+                                    && app.sidebar_panel == app::SidebarPanel::Events
+                                {
+                                    app.sidebar_panel = app::SidebarPanel::Projects;
+                                }
                             }
                             _ => {}
                         }
@@ -627,18 +633,30 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         KeyCode::Esc => {
                             app.drill_up();
                         }
-                        KeyCode::Tab | KeyCode::Right => {
-                            if app.sidebar_focused {
-                                app.sidebar_focused = false;
+                        KeyCode::Tab => {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                app.drill_up();
                             } else {
                                 app.drill_down();
                             }
                         }
-                        KeyCode::Left => {
-                            if !app.sidebar_focused {
-                                app.sidebar_focused = true;
+                        KeyCode::BackTab => {
+                            // Shift+Tab sends BackTab in most terminals
+                            app.drill_up();
+                        }
+                        KeyCode::Right => {
+                            // Navigate toward sidebar or main based on sidebar position
+                            if app.settings.sidebar_right {
+                                app.focus_sidebar();
                             } else {
-                                app.drill_up();
+                                app.focus_main();
+                            }
+                        }
+                        KeyCode::Left => {
+                            if app.settings.sidebar_right {
+                                app.focus_main();
+                            } else {
+                                app.focus_sidebar();
                             }
                         }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -659,10 +677,18 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Char('h') => {
-                            app.sidebar_focused = true;
+                            if app.settings.sidebar_right {
+                                app.focus_main();
+                            } else {
+                                app.focus_sidebar();
+                            }
                         }
                         KeyCode::Char('l') => {
-                            app.sidebar_focused = false;
+                            if app.settings.sidebar_right {
+                                app.focus_sidebar();
+                            } else {
+                                app.focus_main();
+                            }
                         }
                         KeyCode::Enter => {
                             if app.sidebar_focused {
