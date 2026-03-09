@@ -8,6 +8,7 @@ use crate::manager::MANAGER_SESSION;
 use crate::memory;
 use crate::projects::{self, Project};
 use crate::scheduler::{ScheduledEvent, TickerBuffer};
+use crate::settings::DashboardSettings;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -94,6 +95,9 @@ pub struct App {
     pub quote_index: usize,
     pub quote_order: Vec<usize>,
     pub show_debug_console: bool,
+    pub show_settings: bool,
+    pub settings_selected: usize,
+    pub settings: DashboardSettings,
     /// Session name of the agent shown in the bottom panel (default: MANAGER_SESSION)
     pub focus_parent: String,
     /// Stack for Esc navigation (drill-up restores previous parent)
@@ -158,6 +162,9 @@ impl App {
                 order
             },
             show_debug_console: false,
+            show_settings: false,
+            settings_selected: 0,
+            settings: DashboardSettings::load(),
             focus_parent: MANAGER_SESSION.to_string(),
             focus_stack: Vec::new(),
             focus_child_indices: Vec::new(),
@@ -182,6 +189,7 @@ impl App {
             || self.project_input_mode
             || self.show_events
             || self.show_debug_console
+            || self.show_settings
             || self.sidebar_popup.is_some()
     }
 
@@ -538,22 +546,78 @@ impl App {
         }
     }
 
-    /// Move sidebar focus to the next panel.
+    /// Move sidebar focus to the next panel, skipping Events when hidden.
     pub fn sidebar_next(&mut self) {
         self.sidebar_panel = match self.sidebar_panel {
-            SidebarPanel::Projects => SidebarPanel::Events,
+            SidebarPanel::Projects => {
+                if self.settings.show_event_queue {
+                    SidebarPanel::Events
+                } else {
+                    SidebarPanel::ChainOfCommand
+                }
+            }
             SidebarPanel::Events => SidebarPanel::ChainOfCommand,
             SidebarPanel::ChainOfCommand => SidebarPanel::Projects,
         };
     }
 
-    /// Move sidebar focus to the previous panel.
+    /// Move sidebar focus to the previous panel, skipping Events when hidden.
     pub fn sidebar_previous(&mut self) {
         self.sidebar_panel = match self.sidebar_panel {
             SidebarPanel::Projects => SidebarPanel::ChainOfCommand,
             SidebarPanel::Events => SidebarPanel::Projects,
-            SidebarPanel::ChainOfCommand => SidebarPanel::Events,
+            SidebarPanel::ChainOfCommand => {
+                if self.settings.show_event_queue {
+                    SidebarPanel::Events
+                } else {
+                    SidebarPanel::Projects
+                }
+            }
         };
+    }
+
+    /// Grid column count (matches render_agent_grid logic).
+    fn grid_cols(&self) -> usize {
+        2.min(self.focus_child_indices.len()).max(1)
+    }
+
+    /// Try to move selection left within the agent grid.
+    /// Returns true if the move happened, false if already at the left edge.
+    pub fn grid_left(&mut self) -> bool {
+        if self.sidebar_focused || self.manager_selected {
+            return false;
+        }
+        let cols = self.grid_cols();
+        if cols <= 1 {
+            return false;
+        }
+        let col = self.selected % cols;
+        if col > 0 {
+            self.selected -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Try to move selection right within the agent grid.
+    /// Returns true if the move happened, false if already at the right edge.
+    pub fn grid_right(&mut self) -> bool {
+        if self.sidebar_focused || self.manager_selected {
+            return false;
+        }
+        let cols = self.grid_cols();
+        if cols <= 1 {
+            return false;
+        }
+        let col = self.selected % cols;
+        let child_count = self.focus_child_indices.len();
+        if col + 1 < cols && self.selected + 1 < child_count {
+            self.selected += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Get currently selected agent (could be focus parent or a focus child)

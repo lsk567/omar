@@ -7,6 +7,7 @@ mod manager;
 mod memory;
 mod projects;
 mod scheduler;
+mod settings;
 mod tmux;
 mod ui;
 
@@ -188,14 +189,10 @@ fn relaunch_in_tmux() -> Result<()> {
 
 /// Recommended tmux settings for omar, keyed by option name.
 const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
-    (
-        "mouse",
-        "set -g mouse off",
-        "disable mouse to avoid scroll interference",
-    ),
+    ("mouse", "set -g mouse on", "mouse scrolling and selection"),
     (
         "extended-keys",
-        "set -g extended-keys on",
+        "set -g extended-keys always",
         "Shift+Enter in agents",
     ),
     (
@@ -256,17 +253,16 @@ fn setup_tmux() -> Result<()> {
     let mut to_add: Vec<(&str, &str)> = Vec::new();
 
     for &(opt, line, desc) in TMUX_RECOMMENDED {
-        if !existing.contains(line) {
-            // Also check if the option is already set at runtime
-            let expected = line.split_whitespace().last().unwrap_or("on");
-            let already_set = std::process::Command::new("tmux")
-                .args(["show-options", "-gv", opt])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == expected)
-                .unwrap_or(false);
-            if !already_set {
-                to_add.push((line, desc));
-            }
+        // Check runtime value — even if the line is in the config,
+        // a later conflicting line may override it.
+        let expected = line.split_whitespace().last().unwrap_or("on");
+        let runtime_ok = std::process::Command::new("tmux")
+            .args(["show-options", "-gv", opt])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == expected)
+            .unwrap_or(false);
+        if !runtime_ok {
+            to_add.push((line, desc));
         }
     }
 
@@ -313,17 +309,22 @@ fn setup_tmux() -> Result<()> {
         writeln!(file, "{}", line)?;
     }
 
-    // Apply to running tmux server
-    if std::process::Command::new("tmux")
+    // Apply settings directly to the running tmux server.
+    // source-file alone isn't reliable because earlier conflicting lines
+    // in the config (e.g., oh-my-tmux sets mouse off) can override ours.
+    let tmux_running = std::process::Command::new("tmux")
         .args(["list-sessions"])
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        let _ = std::process::Command::new("tmux")
-            .args(["source-file", &conf_path.to_string_lossy()])
-            .status();
-        println!("✓ Applied to ~/.tmux.conf and reloaded tmux.");
+        .unwrap_or(false);
+
+    if tmux_running {
+        for (line, _) in &to_add {
+            // Each line is a full tmux command (e.g. "set -g mouse on")
+            let args: Vec<&str> = line.split_whitespace().collect();
+            let _ = std::process::Command::new("tmux").args(&args).status();
+        }
+        println!("✓ Applied to ~/.tmux.conf and running tmux server.");
     } else {
         println!("✓ Applied to ~/.tmux.conf (tmux not running, will take effect next session).");
     }
@@ -583,6 +584,36 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
+                    // Handle settings popup
+                    if app.show_settings {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('S') => {
+                                app.show_settings = false;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if app.settings_selected > 0 {
+                                    app.settings_selected -= 1;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.settings_selected + 1 < app.settings.count() {
+                                    app.settings_selected += 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                app.settings.toggle(app.settings_selected);
+                                // If event queue was just hidden, move sidebar off Events panel
+                                if !app.settings.show_event_queue
+                                    && app.sidebar_panel == app::SidebarPanel::Events
+                                {
+                                    app.sidebar_panel = app::SidebarPanel::Projects;
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Handle sidebar enlarged popup
                     if app.sidebar_popup.is_some() {
                         match key.code {
@@ -602,18 +633,42 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         KeyCode::Esc => {
                             app.drill_up();
                         }
-                        KeyCode::Tab | KeyCode::Right => {
-                            if app.sidebar_focused {
-                                app.sidebar_focused = false;
+                        KeyCode::Tab => {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                app.drill_up();
                             } else {
                                 app.drill_down();
                             }
                         }
-                        KeyCode::Left => {
-                            if !app.sidebar_focused {
-                                app.sidebar_focused = true;
+                        KeyCode::BackTab => {
+                            // Shift+Tab sends BackTab in most terminals
+                            app.drill_up();
+                        }
+                        KeyCode::Right => {
+                            if app.settings.sidebar_right {
+                                // Sidebar is on the right: try grid right first, then sidebar
+                                if !app.grid_right() {
+                                    app.sidebar_focused = true;
+                                }
                             } else {
-                                app.drill_up();
+                                // Sidebar is on the left: try grid right (no fallback)
+                                // If at right edge of grid, stay put (sidebar is the other direction)
+                                if !app.grid_right() && app.sidebar_focused {
+                                    app.sidebar_focused = false;
+                                }
+                            }
+                        }
+                        KeyCode::Left => {
+                            if app.settings.sidebar_right {
+                                // Sidebar is on the right: try grid left (no fallback)
+                                if !app.grid_left() && app.sidebar_focused {
+                                    app.sidebar_focused = false;
+                                }
+                            } else {
+                                // Sidebar is on the left: try grid left first, then sidebar
+                                if !app.grid_left() {
+                                    app.sidebar_focused = true;
+                                }
                             }
                         }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -634,10 +689,32 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Char('h') => {
-                            app.sidebar_focused = true;
+                            // h = physical left
+                            if app.settings.sidebar_right {
+                                // Sidebar on right: left means try grid left, no sidebar fallback
+                                if !app.grid_left() && app.sidebar_focused {
+                                    app.sidebar_focused = false;
+                                }
+                            } else {
+                                // Sidebar on left: left means try grid left, then sidebar
+                                if !app.grid_left() {
+                                    app.sidebar_focused = true;
+                                }
+                            }
                         }
                         KeyCode::Char('l') => {
-                            app.sidebar_focused = false;
+                            // l = physical right
+                            if app.settings.sidebar_right {
+                                // Sidebar on right: right means try grid right, then sidebar
+                                if !app.grid_right() {
+                                    app.sidebar_focused = true;
+                                }
+                            } else {
+                                // Sidebar on left: right means try grid right, no sidebar fallback
+                                if !app.grid_right() && app.sidebar_focused {
+                                    app.sidebar_focused = false;
+                                }
+                            }
                         }
                         KeyCode::Enter => {
                             if app.sidebar_focused {
@@ -720,6 +797,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     .args(["detach-client"])
                                     .status();
                             }
+                        }
+                        KeyCode::Char('S') => {
+                            app.show_settings = true;
                         }
                         KeyCode::Char('?') => {
                             app.show_help = !app.show_help;

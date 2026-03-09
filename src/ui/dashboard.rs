@@ -333,34 +333,54 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_status_bar(frame, app, outer[0]);
 
-    // Two-column layout: left sidebar (chain of command + projects), right (agents + parent)
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(0)])
-        .split(outer[1]);
+    // Two-column layout: sidebar + main content (sidebar can be left or right)
+    let columns = if app.settings.sidebar_right {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(40)])
+            .split(outer[1]);
+        (cols[1], cols[0]) // (sidebar, main)
+    } else {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(40), Constraint::Min(0)])
+            .split(outer[1]);
+        (cols[0], cols[1]) // (sidebar, main)
+    };
+    let (sidebar_area, main_area) = columns;
 
-    // Left column: projects, event queue, chain of command
-    let left_col = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-        ])
-        .split(columns[0]);
+    // Sidebar: projects, (optional) event queue, chain of command
+    if app.settings.show_event_queue {
+        let sidebar = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 3),
+            ])
+            .split(sidebar_area);
 
-    render_projects_panel(frame, app, left_col[0]);
-    render_event_queue(frame, app, left_col[1]);
-    render_command_tree(frame, app, left_col[2]);
+        render_projects_panel(frame, app, sidebar[0]);
+        render_event_queue(frame, app, sidebar[1]);
+        render_command_tree(frame, app, sidebar[2]);
+    } else {
+        let sidebar = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .split(sidebar_area);
 
-    // Right column: agent grid on top (~2/3), focus parent on bottom (~1/3)
-    let right_col = Layout::default()
+        render_projects_panel(frame, app, sidebar[0]);
+        render_command_tree(frame, app, sidebar[1]);
+    }
+
+    // Main area: agent grid on top (~2/3), focus parent on bottom (~1/3)
+    let main_col = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(67), Constraint::Min(8)])
-        .split(columns[1]);
+        .split(main_area);
 
-    render_agent_grid(frame, app, right_col[0]);
-    render_focus_parent(frame, app, right_col[1]);
+    render_agent_grid(frame, app, main_col[0]);
+    render_focus_parent(frame, app, main_col[1]);
 
     render_help_bar(frame, app, outer[2]);
 
@@ -385,6 +405,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_debug_console(frame, app);
     }
 
+    if app.show_settings {
+        render_settings_popup(frame, app);
+    }
+
     if let Some(panel) = app.sidebar_popup {
         render_sidebar_popup(frame, app, panel);
     }
@@ -394,7 +418,12 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let (running, idle) = app.health_counts();
     let total = app.total_agents();
 
-    let status_spans = vec![
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    let mut status_spans = vec![
         Span::styled(
             "One-Man Army ",
             Style::default().add_modifier(Modifier::BOLD),
@@ -409,6 +438,29 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(format!("{} Idle", idle), Style::default().fg(Color::Yellow)),
     ];
+
+    // Events count
+    if !app.scheduled_events.is_empty() {
+        status_spans.push(Span::raw(" | Events: "));
+        status_spans.push(Span::styled(
+            format!("{}", app.scheduled_events.len()),
+            Style::default().fg(Color::LightMagenta),
+        ));
+    }
+
+    // EA Wake countdown
+    let next_ea_event = app
+        .scheduled_events
+        .iter()
+        .filter(|e| e.receiver == "ea")
+        .min_by_key(|e| e.timestamp);
+    if let Some(event) = next_ea_event {
+        status_spans.push(Span::raw(" | EA Wake: "));
+        status_spans.push(Span::styled(
+            format_countdown_ns(event.timestamp, now_ns),
+            Style::default().fg(Color::LightMagenta),
+        ));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -861,53 +913,11 @@ fn render_event_queue(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap()
         .as_nanos() as u64;
 
-    let inner_width = area.width.saturating_sub(4) as usize; // borders + padding
     let mut lines: Vec<Line> = Vec::new();
-
-    // Event count (only when non-empty)
-    if !app.scheduled_events.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<11}", "Events"),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::styled(
-                format!("{}", app.scheduled_events.len()),
-                Style::default().fg(Color::LightMagenta),
-            ),
-        ]));
-    }
-
-    // Summary line: EA Wake or next event
-    let next_ea_event = app
-        .scheduled_events
-        .iter()
-        .filter(|e| e.receiver == "ea")
-        .min_by_key(|e| e.timestamp);
-    if let Some(event) = next_ea_event {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<11}", "EA Wake"),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::styled(
-                format_countdown_ns(event.timestamp, now_ns),
-                Style::default().fg(Color::LightMagenta),
-            ),
-        ]));
-    }
-
-    // Underline separator when there are header lines above the event list
-    if !lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "─".repeat(inner_width),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
 
     // Event list
     let available = area.height.saturating_sub(2) as usize; // borders
-    let list_budget = available.saturating_sub(lines.len());
+    let list_budget = available;
 
     if !app.scheduled_events.is_empty() {
         for event in app.scheduled_events.iter().take(list_budget) {
@@ -1014,6 +1024,10 @@ fn render_summary_card(
             Span::styled(
                 format!("{} workers", child_count),
                 Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                " (Tab to drill in, Shift-Tab to back out)",
+                Style::default().fg(Color::DarkGray),
             ),
         ]));
     }
@@ -1140,16 +1154,14 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     let at_root = app.focus_parent == crate::manager::MANAGER_SESSION;
 
     let mut help_text = vec![
-        Span::styled("↑↓", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Nav | "),
-        Span::styled("→", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Drill-in | "),
-        Span::styled("←", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Back | "),
         Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Chat | "),
-        Span::styled("Ctrl-\\", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Chat "),
+        Span::styled("Ctrl+\\", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Close Chat | "),
+        Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Drill-in "),
+        Span::styled("Shift+Tab", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Back out | "),
         Span::styled("z", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Hold the line | "),
         Span::styled("Q", Style::default().add_modifier(Modifier::BOLD)),
@@ -1162,6 +1174,11 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
         ));
         help_text.push(Span::raw(":Back | "));
     }
+    help_text.push(Span::styled(
+        "S",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    help_text.push(Span::raw(":Settings "));
     help_text.push(Span::styled(
         "?",
         Style::default().add_modifier(Modifier::BOLD),
@@ -1231,9 +1248,11 @@ fn render_help_popup(frame: &mut Frame) {
         )),
         Line::from(""),
         Line::from("  q           Quit"),
-        Line::from("  Esc, ←      Back (drill up)"),
-        Line::from("  Tab, →      Drill into selected agent"),
+        Line::from("  ←/→, h/l   Switch panel (sidebar ↔ main)"),
         Line::from("  ↑/↓, j/k   Move selection up/down"),
+        Line::from("  Tab         Drill into selected agent"),
+        Line::from("  Shift+Tab   Back (drill up)"),
+        Line::from("  Esc         Back (drill up)"),
         Line::from("  Enter       Attach to selected agent"),
         Line::from("  n           Spawn new agent"),
         Line::from("  d           Kill selected agent"),
@@ -1521,6 +1540,68 @@ fn render_debug_console(frame: &mut Frame, app: &App) {
         .title(" Debug Console ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
+
+    let paragraph = Paragraph::new(lines).block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_settings_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 30, frame.area());
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Settings",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for i in 0..app.settings.count() {
+        if let Some((label, value)) = app.settings.item(i) {
+            let selected = i == app.settings_selected;
+            let toggle = if value { "[ON] " } else { "[OFF]" };
+            let toggle_color = if value { Color::Green } else { Color::Red };
+            let prefix = if selected { "▸ " } else { "  " };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default().fg(if selected {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(
+                    toggle,
+                    Style::default()
+                        .fg(toggle_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", label),
+                    Style::default().fg(if selected {
+                        Color::White
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓:Select  Enter:Toggle  Esc:Close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .title(" Settings ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(lines).block(block);
 
