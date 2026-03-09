@@ -333,44 +333,54 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_status_bar(frame, app, outer[0]);
 
-    // Two-column layout: left sidebar (chain of command + projects), right (agents + parent)
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(34), Constraint::Min(0)])
-        .split(outer[1]);
+    // Two-column layout: sidebar + main content (sidebar can be left or right)
+    let columns = if app.settings.sidebar_right {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(34)])
+            .split(outer[1]);
+        (cols[1], cols[0]) // (sidebar, main)
+    } else {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(34), Constraint::Min(0)])
+            .split(outer[1]);
+        (cols[0], cols[1]) // (sidebar, main)
+    };
+    let (sidebar_area, main_area) = columns;
 
-    // Left column: projects, (optional) event queue, chain of command
+    // Sidebar: projects, (optional) event queue, chain of command
     if app.settings.show_event_queue {
-        let left_col = Layout::default()
+        let sidebar = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Ratio(1, 3),
                 Constraint::Ratio(1, 3),
                 Constraint::Ratio(1, 3),
             ])
-            .split(columns[0]);
+            .split(sidebar_area);
 
-        render_projects_panel(frame, app, left_col[0]);
-        render_event_queue(frame, app, left_col[1]);
-        render_command_tree(frame, app, left_col[2]);
+        render_projects_panel(frame, app, sidebar[0]);
+        render_event_queue(frame, app, sidebar[1]);
+        render_command_tree(frame, app, sidebar[2]);
     } else {
-        let left_col = Layout::default()
+        let sidebar = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
-            .split(columns[0]);
+            .split(sidebar_area);
 
-        render_projects_panel(frame, app, left_col[0]);
-        render_command_tree(frame, app, left_col[1]);
+        render_projects_panel(frame, app, sidebar[0]);
+        render_command_tree(frame, app, sidebar[1]);
     }
 
-    // Right column: agent grid on top (~2/3), focus parent on bottom (~1/3)
-    let right_col = Layout::default()
+    // Main area: agent grid on top (~2/3), focus parent on bottom (~1/3)
+    let main_col = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(67), Constraint::Min(8)])
-        .split(columns[1]);
+        .split(main_area);
 
-    render_agent_grid(frame, app, right_col[0]);
-    render_focus_parent(frame, app, right_col[1]);
+    render_agent_grid(frame, app, main_col[0]);
+    render_focus_parent(frame, app, main_col[1]);
 
     render_help_bar(frame, app, outer[2]);
 

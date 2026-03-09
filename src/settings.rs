@@ -16,6 +16,8 @@ fn settings_path() -> PathBuf {
 pub struct DashboardSettings {
     #[serde(default = "default_true")]
     pub show_event_queue: bool,
+    #[serde(default)]
+    pub sidebar_right: bool,
 }
 
 fn default_true() -> bool {
@@ -26,6 +28,7 @@ impl Default for DashboardSettings {
     fn default() -> Self {
         Self {
             show_event_queue: true,
+            sidebar_right: false,
         }
     }
 }
@@ -48,13 +51,14 @@ impl DashboardSettings {
 
     /// Number of toggleable settings
     pub fn count(&self) -> usize {
-        1
+        2
     }
 
     /// Get label and current value for a setting by index
     pub fn item(&self, index: usize) -> Option<(&str, bool)> {
         match index {
             0 => Some(("Show event queue in sidebar", self.show_event_queue)),
+            1 => Some(("Sidebar on right side", self.sidebar_right)),
             _ => None,
         }
     }
@@ -63,6 +67,7 @@ impl DashboardSettings {
     pub fn toggle(&mut self, index: usize) {
         match index {
             0 => self.show_event_queue = !self.show_event_queue,
+            1 => self.sidebar_right = !self.sidebar_right,
             _ => {}
         }
         self.save();
@@ -77,6 +82,7 @@ mod tests {
     fn default_settings() {
         let s = DashboardSettings::default();
         assert!(s.show_event_queue);
+        assert!(!s.sidebar_right);
     }
 
     #[test]
@@ -85,25 +91,33 @@ mod tests {
         assert!(s.show_event_queue);
         s.show_event_queue = !s.show_event_queue;
         assert!(!s.show_event_queue);
+        assert!(!s.sidebar_right);
+        s.sidebar_right = !s.sidebar_right;
+        assert!(s.sidebar_right);
     }
 
     #[test]
     fn item_and_count() {
         let s = DashboardSettings::default();
-        assert_eq!(s.count(), 1);
+        assert_eq!(s.count(), 2);
         let (label, val) = s.item(0).unwrap();
         assert_eq!(label, "Show event queue in sidebar");
         assert!(val);
-        assert!(s.item(1).is_none());
+        let (label, val) = s.item(1).unwrap();
+        assert_eq!(label, "Sidebar on right side");
+        assert!(!val);
+        assert!(s.item(2).is_none());
     }
 
     #[test]
     fn roundtrip_json() {
         let s = DashboardSettings {
             show_event_queue: false,
+            sidebar_right: true,
         };
         let json = serde_json::to_string(&s).unwrap();
         let s2: DashboardSettings = serde_json::from_str(&json).unwrap();
         assert!(!s2.show_event_queue);
+        assert!(s2.sidebar_right);
     }
 }
