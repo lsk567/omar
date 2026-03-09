@@ -74,22 +74,8 @@ enum Commands {
         name: String,
     },
 
-    /// Start or attach to the manager agent
-    Manager {
-        #[command(subcommand)]
-        action: Option<ManagerAction>,
-    },
-
     /// Configure tmux for optimal omar experience
     SetupTmux,
-}
-
-#[derive(Subcommand)]
-enum ManagerAction {
-    /// Start the manager agent session
-    Start,
-    /// Run manager orchestration mode
-    Orchestrate,
 }
 
 #[tokio::main]
@@ -113,14 +99,6 @@ async fn main() -> Result<()> {
         Some(Commands::List) => list_agents(&client),
         Some(Commands::Kill { name }) => kill_agent(&client, &name),
         Some(Commands::SetupTmux) => setup_tmux(),
-        Some(Commands::Manager { action }) => match action {
-            Some(ManagerAction::Start) | None => {
-                manager::start_manager(&client, &config.agent.default_command)
-            }
-            Some(ManagerAction::Orchestrate) => {
-                manager::run_manager_orchestration(&client, &config.agent.default_command)
-            }
-        },
         None => {
             if std::env::var("TMUX").is_err() {
                 relaunch_in_tmux()
