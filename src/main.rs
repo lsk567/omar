@@ -167,12 +167,17 @@ fn kill_agent(client: &TmuxClient, name: &str) -> Result<()> {
 fn relaunch_in_tmux() -> Result<()> {
     use std::os::unix::process::CommandExt;
 
+    // Kill any stale dashboard session left behind by a previous crash.
+    // Without this, `new-session` would fail because the session already exists
+    // (but contains a dead shell instead of the dashboard).
+    let client = TmuxClient::new("");
+    let _ = client.kill_session(DASHBOARD_SESSION);
+
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let mut cmd = std::process::Command::new("tmux");
-    // -A: attach if session already exists, otherwise create it
-    cmd.args(["new-session", "-A", "-s", DASHBOARD_SESSION]);
+    cmd.args(["new-session", "-s", DASHBOARD_SESSION]);
     cmd.arg(&exe);
     cmd.args(&args);
 
