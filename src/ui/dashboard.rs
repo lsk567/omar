@@ -1010,9 +1010,9 @@ fn render_summary_card(
     let child_count = app.child_count(&agent.session.name);
     if child_count > 0 {
         lines.push(Line::from(vec![
-            Span::styled("Sub-agents: ", Style::default().fg(Color::White)),
+            Span::styled("▶ ", Style::default().fg(Color::Cyan)),
             Span::styled(
-                format!("{}", child_count),
+                format!("{} workers", child_count),
                 Style::default().fg(Color::White),
             ),
         ]));
@@ -1114,11 +1114,7 @@ fn render_summary_card(
                 } else {
                     // Last line: truncate with ellipsis
                     let w = if is_first { first_width } else { cont_width };
-                    let truncated = if text.len() > w.saturating_sub(3) && w > 3 {
-                        format!("{}...", &text[..w - 3])
-                    } else {
-                        format!("{}...", text)
-                    };
+                    let truncated = truncate_str(text, w);
                     if is_first {
                         lines.push(Line::from(vec![
                             Span::styled(label, Style::default().fg(Color::White)),
