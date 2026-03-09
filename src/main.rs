@@ -763,6 +763,14 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.set_status(format!("Error: {}", e));
                         }
                     }
+
+                    // Keep system_state.md in sync with live state
+                    memory::write_memory(
+                        &app.agents,
+                        app.manager.as_ref(),
+                        app.client(),
+                        &app.scheduled_events,
+                    );
                 }
                 AppEvent::TickerScroll => {
                     app.ticker_offset = app.ticker_offset.wrapping_add(1);
