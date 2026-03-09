@@ -253,17 +253,16 @@ fn setup_tmux() -> Result<()> {
     let mut to_add: Vec<(&str, &str)> = Vec::new();
 
     for &(opt, line, desc) in TMUX_RECOMMENDED {
-        if !existing.contains(line) {
-            // Also check if the option is already set at runtime
-            let expected = line.split_whitespace().last().unwrap_or("on");
-            let already_set = std::process::Command::new("tmux")
-                .args(["show-options", "-gv", opt])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == expected)
-                .unwrap_or(false);
-            if !already_set {
-                to_add.push((line, desc));
-            }
+        // Check runtime value — even if the line is in the config,
+        // a later conflicting line may override it.
+        let expected = line.split_whitespace().last().unwrap_or("on");
+        let runtime_ok = std::process::Command::new("tmux")
+            .args(["show-options", "-gv", opt])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == expected)
+            .unwrap_or(false);
+        if !runtime_ok {
+            to_add.push((line, desc));
         }
     }
 
@@ -310,17 +309,22 @@ fn setup_tmux() -> Result<()> {
         writeln!(file, "{}", line)?;
     }
 
-    // Apply to running tmux server
-    if std::process::Command::new("tmux")
+    // Apply settings directly to the running tmux server.
+    // source-file alone isn't reliable because earlier conflicting lines
+    // in the config (e.g., oh-my-tmux sets mouse off) can override ours.
+    let tmux_running = std::process::Command::new("tmux")
         .args(["list-sessions"])
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        let _ = std::process::Command::new("tmux")
-            .args(["source-file", &conf_path.to_string_lossy()])
-            .status();
-        println!("✓ Applied to ~/.tmux.conf and reloaded tmux.");
+        .unwrap_or(false);
+
+    if tmux_running {
+        for (line, _) in &to_add {
+            // Each line is a full tmux command (e.g. "set -g mouse on")
+            let args: Vec<&str> = line.split_whitespace().collect();
+            let _ = std::process::Command::new("tmux").args(&args).status();
+        }
+        println!("✓ Applied to ~/.tmux.conf and running tmux server.");
     } else {
         println!("✓ Applied to ~/.tmux.conf (tmux not running, will take effect next session).");
     }
