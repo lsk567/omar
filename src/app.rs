@@ -8,6 +8,7 @@ use crate::manager::MANAGER_SESSION;
 use crate::memory;
 use crate::projects::{self, Project};
 use crate::scheduler::{ScheduledEvent, TickerBuffer};
+use crate::settings::DashboardSettings;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -94,6 +95,9 @@ pub struct App {
     pub quote_index: usize,
     pub quote_order: Vec<usize>,
     pub show_debug_console: bool,
+    pub show_settings: bool,
+    pub settings_selected: usize,
+    pub settings: DashboardSettings,
     /// Session name of the agent shown in the bottom panel (default: MANAGER_SESSION)
     pub focus_parent: String,
     /// Stack for Esc navigation (drill-up restores previous parent)
@@ -158,6 +162,9 @@ impl App {
                 order
             },
             show_debug_console: false,
+            show_settings: false,
+            settings_selected: 0,
+            settings: DashboardSettings::load(),
             focus_parent: MANAGER_SESSION.to_string(),
             focus_stack: Vec::new(),
             focus_child_indices: Vec::new(),
@@ -182,6 +189,7 @@ impl App {
             || self.project_input_mode
             || self.show_events
             || self.show_debug_console
+            || self.show_settings
             || self.sidebar_popup.is_some()
     }
 

@@ -7,6 +7,7 @@ mod manager;
 mod memory;
 mod projects;
 mod scheduler;
+mod settings;
 mod tmux;
 mod ui;
 
@@ -579,6 +580,30 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
+                    // Handle settings popup
+                    if app.show_settings {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('S') => {
+                                app.show_settings = false;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if app.settings_selected > 0 {
+                                    app.settings_selected -= 1;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.settings_selected + 1 < app.settings.count() {
+                                    app.settings_selected += 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                app.settings.toggle(app.settings_selected);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Handle sidebar enlarged popup
                     if app.sidebar_popup.is_some() {
                         match key.code {
@@ -716,6 +741,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     .args(["detach-client"])
                                     .status();
                             }
+                        }
+                        KeyCode::Char('S') => {
+                            app.show_settings = true;
                         }
                         KeyCode::Char('?') => {
                             app.show_help = !app.show_help;

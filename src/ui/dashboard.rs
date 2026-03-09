@@ -339,19 +339,29 @@ pub fn render(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Length(34), Constraint::Min(0)])
         .split(outer[1]);
 
-    // Left column: projects, event queue, chain of command
-    let left_col = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-        ])
-        .split(columns[0]);
+    // Left column: projects, (optional) event queue, chain of command
+    if app.settings.show_event_queue {
+        let left_col = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 3),
+            ])
+            .split(columns[0]);
 
-    render_projects_panel(frame, app, left_col[0]);
-    render_event_queue(frame, app, left_col[1]);
-    render_command_tree(frame, app, left_col[2]);
+        render_projects_panel(frame, app, left_col[0]);
+        render_event_queue(frame, app, left_col[1]);
+        render_command_tree(frame, app, left_col[2]);
+    } else {
+        let left_col = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .split(columns[0]);
+
+        render_projects_panel(frame, app, left_col[0]);
+        render_command_tree(frame, app, left_col[1]);
+    }
 
     // Right column: agent grid on top (~2/3), focus parent on bottom (~1/3)
     let right_col = Layout::default()
@@ -383,6 +393,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if app.show_debug_console {
         render_debug_console(frame, app);
+    }
+
+    if app.show_settings {
+        render_settings_popup(frame, app);
     }
 
     if let Some(panel) = app.sidebar_popup {
@@ -1163,6 +1177,11 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
         help_text.push(Span::raw(":Back | "));
     }
     help_text.push(Span::styled(
+        "S",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    help_text.push(Span::raw(":Settings "));
+    help_text.push(Span::styled(
         "?",
         Style::default().add_modifier(Modifier::BOLD),
     ));
@@ -1521,6 +1540,68 @@ fn render_debug_console(frame: &mut Frame, app: &App) {
         .title(" Debug Console ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
+
+    let paragraph = Paragraph::new(lines).block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_settings_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 30, frame.area());
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Settings",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for i in 0..app.settings.count() {
+        if let Some((label, value)) = app.settings.item(i) {
+            let selected = i == app.settings_selected;
+            let toggle = if value { "[ON] " } else { "[OFF]" };
+            let toggle_color = if value { Color::Green } else { Color::Red };
+            let prefix = if selected { "▸ " } else { "  " };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default().fg(if selected {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(
+                    toggle,
+                    Style::default()
+                        .fg(toggle_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", label),
+                    Style::default().fg(if selected {
+                        Color::White
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓:Select  Enter:Toggle  Esc:Close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .title(" Settings ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(lines).block(block);
 
