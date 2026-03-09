@@ -16,7 +16,7 @@ fn settings_path() -> PathBuf {
 pub struct DashboardSettings {
     #[serde(default = "default_true")]
     pub show_event_queue: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub sidebar_right: bool,
 }
 
@@ -28,7 +28,7 @@ impl Default for DashboardSettings {
     fn default() -> Self {
         Self {
             show_event_queue: true,
-            sidebar_right: false,
+            sidebar_right: true,
         }
     }
 }
@@ -82,7 +82,7 @@ mod tests {
     fn default_settings() {
         let s = DashboardSettings::default();
         assert!(s.show_event_queue);
-        assert!(!s.sidebar_right);
+        assert!(s.sidebar_right);
     }
 
     #[test]
@@ -91,9 +91,9 @@ mod tests {
         assert!(s.show_event_queue);
         s.show_event_queue = !s.show_event_queue;
         assert!(!s.show_event_queue);
-        assert!(!s.sidebar_right);
-        s.sidebar_right = !s.sidebar_right;
         assert!(s.sidebar_right);
+        s.sidebar_right = !s.sidebar_right;
+        assert!(!s.sidebar_right);
     }
 
     #[test]
@@ -105,7 +105,7 @@ mod tests {
         assert!(val);
         let (label, val) = s.item(1).unwrap();
         assert_eq!(label, "Sidebar on right side");
-        assert!(!val);
+        assert!(val);
         assert!(s.item(2).is_none());
     }
 
@@ -113,11 +113,11 @@ mod tests {
     fn roundtrip_json() {
         let s = DashboardSettings {
             show_event_queue: false,
-            sidebar_right: true,
+            sidebar_right: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         let s2: DashboardSettings = serde_json::from_str(&json).unwrap();
         assert!(!s2.show_event_queue);
-        assert!(s2.sidebar_right);
+        assert!(!s2.sidebar_right);
     }
 }

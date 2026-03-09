@@ -337,13 +337,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     let columns = if app.settings.sidebar_right {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(34)])
+            .constraints([Constraint::Min(0), Constraint::Length(40)])
             .split(outer[1]);
         (cols[1], cols[0]) // (sidebar, main)
     } else {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(34), Constraint::Min(0)])
+            .constraints([Constraint::Length(40), Constraint::Min(0)])
             .split(outer[1]);
         (cols[0], cols[1]) // (sidebar, main)
     };
@@ -1026,7 +1026,7 @@ fn render_summary_card(
                 Style::default().fg(Color::White),
             ),
             Span::styled(
-                " (press Tab to drill in)",
+                " (Tab to drill in, Shift-Tab to back out)",
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
