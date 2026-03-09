@@ -645,18 +645,30 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.drill_up();
                         }
                         KeyCode::Right => {
-                            // Navigate toward sidebar or main based on sidebar position
                             if app.settings.sidebar_right {
-                                app.focus_sidebar();
+                                // Sidebar is on the right: try grid right first, then sidebar
+                                if !app.grid_right() {
+                                    app.sidebar_focused = true;
+                                }
                             } else {
-                                app.focus_main();
+                                // Sidebar is on the left: try grid right (no fallback)
+                                // If at right edge of grid, stay put (sidebar is the other direction)
+                                if !app.grid_right() && app.sidebar_focused {
+                                    app.sidebar_focused = false;
+                                }
                             }
                         }
                         KeyCode::Left => {
                             if app.settings.sidebar_right {
-                                app.focus_main();
+                                // Sidebar is on the right: try grid left (no fallback)
+                                if !app.grid_left() && app.sidebar_focused {
+                                    app.sidebar_focused = false;
+                                }
                             } else {
-                                app.focus_sidebar();
+                                // Sidebar is on the left: try grid left first, then sidebar
+                                if !app.grid_left() {
+                                    app.sidebar_focused = true;
+                                }
                             }
                         }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -677,17 +689,31 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Char('h') => {
+                            // h = physical left
                             if app.settings.sidebar_right {
-                                app.focus_main();
+                                // Sidebar on right: left means try grid left, no sidebar fallback
+                                if !app.grid_left() && app.sidebar_focused {
+                                    app.sidebar_focused = false;
+                                }
                             } else {
-                                app.focus_sidebar();
+                                // Sidebar on left: left means try grid left, then sidebar
+                                if !app.grid_left() {
+                                    app.sidebar_focused = true;
+                                }
                             }
                         }
                         KeyCode::Char('l') => {
+                            // l = physical right
                             if app.settings.sidebar_right {
-                                app.focus_sidebar();
+                                // Sidebar on right: right means try grid right, then sidebar
+                                if !app.grid_right() {
+                                    app.sidebar_focused = true;
+                                }
                             } else {
-                                app.focus_main();
+                                // Sidebar on left: right means try grid right, no sidebar fallback
+                                if !app.grid_right() && app.sidebar_focused {
+                                    app.sidebar_focused = false;
+                                }
                             }
                         }
                         KeyCode::Enter => {

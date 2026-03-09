@@ -576,14 +576,48 @@ impl App {
         };
     }
 
-    /// Navigate focus toward the sidebar.
-    pub fn focus_sidebar(&mut self) {
-        self.sidebar_focused = true;
+    /// Grid column count (matches render_agent_grid logic).
+    fn grid_cols(&self) -> usize {
+        2.min(self.focus_child_indices.len()).max(1)
     }
 
-    /// Navigate focus toward the main area.
-    pub fn focus_main(&mut self) {
-        self.sidebar_focused = false;
+    /// Try to move selection left within the agent grid.
+    /// Returns true if the move happened, false if already at the left edge.
+    pub fn grid_left(&mut self) -> bool {
+        if self.sidebar_focused || self.manager_selected {
+            return false;
+        }
+        let cols = self.grid_cols();
+        if cols <= 1 {
+            return false;
+        }
+        let col = self.selected % cols;
+        if col > 0 {
+            self.selected -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Try to move selection right within the agent grid.
+    /// Returns true if the move happened, false if already at the right edge.
+    pub fn grid_right(&mut self) -> bool {
+        if self.sidebar_focused || self.manager_selected {
+            return false;
+        }
+        let cols = self.grid_cols();
+        if cols <= 1 {
+            return false;
+        }
+        let col = self.selected % cols;
+        let child_count = self.focus_child_indices.len();
+        if col + 1 < cols && self.selected + 1 < child_count {
+            self.selected += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Get currently selected agent (could be focus parent or a focus child)
