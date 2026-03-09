@@ -272,6 +272,16 @@ curl http://localhost:9876/api/events
 curl -X DELETE http://localhost:9876/api/events/<event-id>
 ```
 
+### Recovering cron jobs after restart
+
+When OMAR restarts, the event queue is cleared — all cron jobs and pending events are lost. On startup, check whether expected cron jobs are missing:
+
+1. List current events: `curl http://localhost:9876/api/events`
+2. Compare against the "Scheduled Events" section in your startup memory (from `system_state.md`). It contains exact `period_ns` values and payloads for each cron job.
+3. If any cron jobs are missing, re-create them using the Events API with the same `recurring_ns` and `payload` from memory.
+
+Do this check early — before processing any user requests — so recurring monitoring and Slack polling resume without gaps.
+
 ## Slack Bridge Integration
 
 OMAR has a Slack bridge that routes messages from Slack to you via the event queue. When someone @mentions the bot in Slack, you receive an event with this format:
