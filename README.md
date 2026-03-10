@@ -8,7 +8,13 @@ Lead an army of 300 agents to solve humanity's biggest problems.
 
 **`omar` is a TUI for creating powerful agentic organizations.**
 
-<a href="https://omarmy.ai">omarmy.ai</a> • <a href="https://omarmy.ai/zh/">中文</a> • <a href="https://opensource.org/licenses/BSD-2-Clause"><img src="https://img.shields.io/badge/License-BSD_2--Clause-blue.svg" alt="License"/></a> • <a href="https://github.com/lsk567/omar/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/lsk567/omar/ci.yml?label=CI&logo=github" alt="CI Status"/></a> • <a href="https://discord.gg/X76PSzmfWr"><img src="https://img.shields.io/discord/1467663881588572182?label=Discord&logo=discord&logoColor=white&color=5865F2&cacheSeconds=60" alt="Discord"/></a>
+<p align="center">
+  <a href="https://omarmy.ai">omarmy.ai</a>&nbsp; • &nbsp;
+  <a href="https://omarmy.ai/zh/">中文</a>&nbsp; • &nbsp;
+  <a href="https://opensource.org/licenses/BSD-2-Clause"><img src="https://img.shields.io/badge/License-BSD_2--Clause-blue.svg" alt="License" valign="middle"/></a>&nbsp; • &nbsp;
+  <a href="https://github.com/lsk567/omar/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/lsk567/omar/ci.yml?label=CI&logo=github" alt="CI Status" valign="middle"/></a>&nbsp; • &nbsp;
+  <a href="https://discord.gg/X76PSzmfWr"><img src="https://img.shields.io/discord/1467663881588572182?label=Discord&logo=discord&logoColor=white&color=5865F2&cacheSeconds=60" alt="Discord" valign="middle"/></a>
+</p>
 
 </div>
 
