@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.suffix }})
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-arm64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: darwin-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            suffix: darwin-amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          mkdir omar-${{ matrix.suffix }}
+          cp target/${{ matrix.target }}/release/omar \
+             target/${{ matrix.target }}/release/omar-slack \
+             target/${{ matrix.target }}/release/omar-computer \
+             omar-${{ matrix.suffix }}/
+          tar czf omar-${{ matrix.suffix }}.tar.gz omar-${{ matrix.suffix }}/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omar-${{ matrix.suffix }}
+          path: omar-${{ matrix.suffix }}.tar.gz
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Generate checksums
+        run: |
+          cd $GITHUB_WORKSPACE
+          sha256sum omar-*/omar-*.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --repo ${{ github.repository }} \
+            --generate-notes \
+            omar-*/omar-*.tar.gz checksums.txt
+
+  update-homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Compute SHA256 hashes
+        id: hashes
+        run: |
+          echo "darwin_arm64=$(sha256sum omar-darwin-arm64/omar-darwin-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "darwin_amd64=$(sha256sum omar-darwin-amd64/omar-darwin-amd64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(sha256sum omar-linux-arm64/omar-linux-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_amd64=$(sha256sum omar-linux-amd64/omar-linux-amd64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Update formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          git clone https://x-access-token:${GH_TOKEN}@github.com/lsk567/homebrew-omar.git
+          cd homebrew-omar
+
+          python3 -c "
+          import re, sys
+          hashes = {
+              'darwin-arm64': '${{ steps.hashes.outputs.darwin_arm64 }}',
+              'darwin-amd64': '${{ steps.hashes.outputs.darwin_amd64 }}',
+              'linux-arm64':  '${{ steps.hashes.outputs.linux_arm64 }}',
+              'linux-amd64':  '${{ steps.hashes.outputs.linux_amd64 }}',
+          }
+          with open('Formula/omar.rb') as f:
+              content = f.read()
+          content = re.sub(r'version \".*?\"', 'version \"${VERSION}\"', content, count=1)
+          for platform, sha in hashes.items():
+              # Match the url line for this platform, then replace the sha256 on the next line
+              content = re.sub(
+                  r'(omar-' + re.escape(platform) + r'\.tar\.gz\"\n\s+sha256 \").*?(\")',
+                  r'\g<1>' + sha + r'\2',
+                  content
+              )
+          with open('Formula/omar.rb', 'w') as f:
+              f.write(content)
+          "
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/omar.rb
+          git commit -m "update omar to ${VERSION}"
+          git push
