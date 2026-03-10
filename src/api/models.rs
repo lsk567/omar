@@ -2,6 +2,48 @@
 
 use serde::{Deserialize, Serialize};
 
+// ── EA management models ──
+
+/// Request to create a new EA
+#[derive(Debug, Deserialize)]
+pub struct CreateEaRequest {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// EA info in responses
+#[derive(Debug, Serialize)]
+pub struct EaResponse {
+    pub id: u32,
+    pub name: String,
+    pub description: Option<String>,
+    pub agent_count: usize,
+    pub is_active: bool,
+}
+
+/// Response for listing EAs
+#[derive(Debug, Serialize)]
+pub struct ListEasResponse {
+    pub eas: Vec<EaResponse>,
+    pub active: u32,
+}
+
+/// Request to switch active EA
+#[derive(Debug, Deserialize)]
+pub struct SwitchEaRequest {
+    pub id: u32,
+}
+
+/// Response for EA deletion
+#[derive(Debug, Serialize)]
+pub struct DeleteEaResponse {
+    pub deleted_ea: u32,
+    pub agents_killed: usize,
+    pub events_cancelled: usize,
+}
+
+// ── Agent models ──
+
 /// Request to spawn a new agent
 #[derive(Debug, Deserialize)]
 pub struct SpawnAgentRequest {
@@ -115,7 +157,7 @@ pub struct AgentSummaryResponse {
     pub id: String,
     pub health: String,
     pub task: Option<String>,
-    /// Self-reported status from ~/.omar/status/<session>.md
+    /// Self-reported status
     pub status: Option<String>,
     /// Direct child agent names
     pub children: Vec<String>,
@@ -123,7 +165,7 @@ pub struct AgentSummaryResponse {
 
 // ── Event Scheduler models ──
 
-/// Request to schedule a new event
+/// Request to schedule a new event — ea_id comes from URL path, not body
 #[derive(Debug, Deserialize)]
 pub struct ScheduleEventRequest {
     pub sender: String,
@@ -133,6 +175,7 @@ pub struct ScheduleEventRequest {
     pub payload: String,
     /// If set, the event re-schedules itself at `now + recurring_ns` after each delivery.
     pub recurring_ns: Option<u64>,
+    // NO ea_id field — it comes from the URL path
 }
 
 /// Response after scheduling an event
@@ -140,6 +183,7 @@ pub struct ScheduleEventRequest {
 pub struct ScheduleEventResponse {
     pub id: String,
     pub timestamp: u64,
+    pub ea_id: u32,
 }
 
 /// Event info in list response
@@ -172,10 +216,14 @@ pub struct EventCancelResponse {
 // ── Computer Use models ──
 
 /// Request to acquire the computer use lock
+/// Fix V6: Optional ea_id prevents cross-EA identity collision.
+/// When provided, lock owner is stored as "{ea_id}:{agent}".
 #[derive(Debug, Deserialize)]
 pub struct ComputerLockRequest {
     /// Agent requesting the lock
     pub agent: String,
+    /// Optional EA ID for namespaced lock identity
+    pub ea_id: Option<u32>,
 }
 
 /// Response for lock operations
@@ -192,6 +240,8 @@ pub struct ComputerLockResponse {
 pub struct ScreenshotRequest {
     /// Agent requesting the screenshot (must hold the lock)
     pub agent: String,
+    /// EA ID for scoped lock identity (must match acquire-time ea_id)
+    pub ea_id: Option<u32>,
     /// Max width for resizing (optional)
     pub max_width: Option<u32>,
     /// Max height for resizing (optional)
@@ -212,6 +262,8 @@ pub struct ScreenshotResponse {
 pub struct MouseRequest {
     /// Agent performing the action (must hold the lock)
     pub agent: String,
+    /// EA ID for scoped lock identity (must match acquire-time ea_id)
+    pub ea_id: Option<u32>,
     /// Action: "move", "click", "double_click", "drag", "scroll"
     pub action: String,
     /// X coordinate
@@ -245,6 +297,8 @@ fn default_scroll_amount() -> u32 {
 pub struct KeyboardRequest {
     /// Agent performing the action (must hold the lock)
     pub agent: String,
+    /// EA ID for scoped lock identity (must match acquire-time ea_id)
+    pub ea_id: Option<u32>,
     /// Action: "type" or "key"
     pub action: String,
     /// For "type": text to type. For "key": key combo (e.g. "ctrl+s", "Return")

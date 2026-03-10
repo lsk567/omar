@@ -17,15 +17,15 @@ curl http://localhost:9876/api/computer/status
 Only one agent can control the computer at a time. You MUST acquire the lock before any action.
 
 ```bash
-# Acquire lock
+# Acquire lock — always include ea_id to prevent cross-EA identity collisions
 curl -X POST http://localhost:9876/api/computer/lock \
   -H "Content-Type: application/json" \
-  -d '{"agent": "<YOUR NAME>"}'
+  -d '{"agent": "<YOUR NAME>", "ea_id": <YOUR EA_ID>}'
 
 # Release lock when done
 curl -X DELETE http://localhost:9876/api/computer/lock \
   -H "Content-Type: application/json" \
-  -d '{"agent": "<YOUR NAME>"}'
+  -d '{"agent": "<YOUR NAME>", "ea_id": <YOUR EA_ID>}'
 ```
 
 Always release the lock when you're finished so other agents can use the computer.
@@ -36,12 +36,12 @@ Always release the lock when you're finished so other agents can use the compute
 # Full resolution
 curl -X POST http://localhost:9876/api/computer/screenshot \
   -H "Content-Type: application/json" \
-  -d '{"agent": "<YOUR NAME>"}'
+  -d '{"agent": "<YOUR NAME>", "ea_id": <YOUR EA_ID>}'
 
 # Resized (recommended — reduces payload size)
 curl -X POST http://localhost:9876/api/computer/screenshot \
   -H "Content-Type: application/json" \
-  -d '{"agent": "<YOUR NAME>", "max_width": 800, "max_height": 600}'
+  -d '{"agent": "<YOUR NAME>", "ea_id": <YOUR EA_ID>, "max_width": 800, "max_height": 600}'
 ```
 
 Returns `{"image_base64": "...", "width": N, "height": N, "format": "png"}`.
@@ -51,7 +51,7 @@ Returns `{"image_base64": "...", "width": N, "height": N, "format": "png"}`.
 ```bash
 curl -X POST http://localhost:9876/api/computer/mouse \
   -H "Content-Type: application/json" \
-  -d '{"agent": "<YOUR NAME>", "action": "<ACTION>", "x": X, "y": Y}'
+  -d '{"agent": "<YOUR NAME>", "ea_id": <YOUR EA_ID>, "action": "<ACTION>", "x": X, "y": Y}'
 ```
 
 Actions:
@@ -67,12 +67,12 @@ Actions:
 # Type text
 curl -X POST http://localhost:9876/api/computer/keyboard \
   -H "Content-Type: application/json" \
-  -d '{"agent": "<YOUR NAME>", "action": "type", "text": "hello world"}'
+  -d '{"agent": "<YOUR NAME>", "ea_id": <YOUR EA_ID>, "action": "type", "text": "hello world"}'
 
 # Press key combo
 curl -X POST http://localhost:9876/api/computer/keyboard \
   -H "Content-Type: application/json" \
-  -d '{"agent": "<YOUR NAME>", "action": "key", "text": "ctrl+s"}'
+  -d '{"agent": "<YOUR NAME>", "ea_id": <YOUR EA_ID>, "action": "key", "text": "ctrl+s"}'
 ```
 
 ### Read-Only Queries (no lock needed)

@@ -38,7 +38,7 @@ The OMAR API creates real tmux sessions that appear in the OMAR dashboard.
 
 ### Spawn a sub-agent
 ```bash
-curl -X POST http://localhost:9876/api/agents \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
   -H "Content-Type: application/json" \
   -d '{"name": "agent-name", "task": "Task description for the agent", "parent": "<YOUR NAME>"}'
 ```
@@ -47,24 +47,24 @@ curl -X POST http://localhost:9876/api/agents \
 
 ### List all agents
 ```bash
-curl http://localhost:9876/api/agents
+curl http://localhost:9876/api/ea/{{EA_ID}}/agents
 ```
 
 ### Get agent details (with recent output)
 ```bash
-curl http://localhost:9876/api/agents/agent-name
+curl http://localhost:9876/api/ea/{{EA_ID}}/agents/agent-name
 ```
 
 ### Send input to an agent
 ```bash
-curl -X POST http://localhost:9876/api/agents/agent-name/send \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents/agent-name/send \
   -H "Content-Type: application/json" \
   -d '{"text": "your message", "enter": true}'
 ```
 
 ### Kill an agent
 ```bash
-curl -X DELETE http://localhost:9876/api/agents/agent-name
+curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/agent-name
 ```
 
 ## Sub-Agent Management Guidelines
@@ -73,7 +73,7 @@ curl -X DELETE http://localhost:9876/api/agents/agent-name
 - Be specific about each agent's task — include file paths, function names, expected behavior
 - Spawn independent agents in parallel
 - Monitor health status: "running" = actively working, "idle" = may have finished or need input
-- When an agent's output shows task completion, kill it: `curl -X DELETE http://localhost:9876/api/agents/agent-name`
+- When an agent's output shows task completion, kill it: `curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/agent-name`
 
 ## Completion Protocol
 
@@ -92,7 +92,7 @@ Then immediately schedule a wake-up event for your parent so it can check your o
 
 ```bash
 NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 1_000_000)")
-curl -X POST http://localhost:9876/api/events \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"{{PARENT_NAME}}\", \"timestamp\": $NOW, \"payload\": \"[TASK COMPLETE] from <YOUR NAME>. Check output for results.\"}"
 ```
@@ -101,7 +101,7 @@ curl -X POST http://localhost:9876/api/events \
 
 OMAR sends you a periodic `[STATUS CHECK]` event every 60 seconds. When you receive one, update your status via the API:
 ```bash
-curl -X PUT http://localhost:9876/api/agents/<YOUR NAME>/status \
+curl -X PUT http://localhost:9876/api/ea/{{EA_ID}}/agents/<YOUR NAME>/status \
   -H "Content-Type: application/json" \
   -d '{"status": "Currently: <brief description of what you are doing>"}'
 ```
@@ -117,7 +117,7 @@ IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g
 2. Schedule a self-wake-up (e.g., 2 minutes out) to check progress:
 ```bash
 NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 120_000_000_000)")
-curl -X POST http://localhost:9876/api/events \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<YOUR NAME>\", \"timestamp\": $NOW, \"payload\": \"Check sub-agent progress\"}"
 ```
@@ -128,21 +128,21 @@ curl -X POST http://localhost:9876/api/events \
 
 ```bash
 # Schedule a one-time event (timestamp in nanoseconds since Unix epoch)
-curl -X POST http://localhost:9876/api/events \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
   -H "Content-Type: application/json" \
   -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <ns-timestamp>, "payload": "reason"}'
 
 # Schedule a cron job (repeats every recurring_ns nanoseconds)
 # OMAR auto-reschedules after each delivery. Delivered as [CRON] instead of [EVENT].
-curl -X POST http://localhost:9876/api/events \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
   -H "Content-Type: application/json" \
   -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <first-fire-ns>, "payload": "reason", "recurring_ns": 60000000000}'
 
 # List pending events (includes recurring_ns field for cron jobs)
-curl http://localhost:9876/api/events
+curl http://localhost:9876/api/ea/{{EA_ID}}/events
 
 # Cancel a scheduled event (also stops cron jobs)
-curl -X DELETE http://localhost:9876/api/events/<event-id>
+curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/events/<event-id>
 ```
 
 ## Skills

@@ -1,11 +1,11 @@
-//! Project management — CRUD on ~/.omar/tasks.md
+//! Project management — CRUD on per-EA tasks.md
 //!
 //! File format: numbered lines like `1. Project name`
 //! Renumbered sequentially on every save.
 
 use anyhow::Result;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -13,18 +13,15 @@ pub struct Project {
     pub name: String,
 }
 
-/// Path to the projects file (~/.omar/tasks.md)
-pub fn projects_path() -> PathBuf {
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar");
-    fs::create_dir_all(&dir).ok();
-    dir.join("tasks.md")
+/// Path to the projects file for an EA
+pub fn projects_path_in(state_dir: &Path) -> PathBuf {
+    fs::create_dir_all(state_dir).ok();
+    state_dir.join("tasks.md")
 }
 
-/// Load projects from file
-pub fn load_projects() -> Vec<Project> {
-    let path = projects_path();
+/// Load projects from an EA's state directory
+pub fn load_projects_from(state_dir: &Path) -> Vec<Project> {
+    let path = projects_path_in(state_dir);
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -55,9 +52,9 @@ fn parse_projects(content: &str) -> Vec<Project> {
     projects
 }
 
-/// Save projects to file (renumbered 1..n)
-pub fn save_projects(projects: &[Project]) -> Result<()> {
-    let path = projects_path();
+/// Save projects to an EA's state directory (renumbered 1..n)
+pub fn save_projects_to(state_dir: &Path, projects: &[Project]) -> Result<()> {
+    let path = projects_path_in(state_dir);
     let content: String = projects
         .iter()
         .enumerate()
@@ -73,26 +70,26 @@ pub fn save_projects(projects: &[Project]) -> Result<()> {
     Ok(())
 }
 
-/// Add a project, returns new id
-pub fn add_project(name: &str) -> Result<usize> {
-    let mut projects = load_projects();
+/// Add a project to an EA, returns new id
+pub fn add_project_in(state_dir: &Path, name: &str) -> Result<usize> {
+    let mut projects = load_projects_from(state_dir);
     let id = projects.len() + 1;
     projects.push(Project {
         id,
         name: name.to_string(),
     });
-    save_projects(&projects)?;
+    save_projects_to(state_dir, &projects)?;
     Ok(id)
 }
 
-/// Remove a project by id (1-based), returns whether it was found
-pub fn remove_project(id: usize) -> Result<bool> {
-    let mut projects = load_projects();
+/// Remove a project by id (1-based) from an EA, returns whether it was found
+pub fn remove_project_in(state_dir: &Path, id: usize) -> Result<bool> {
+    let mut projects = load_projects_from(state_dir);
     if id == 0 || id > projects.len() {
         return Ok(false);
     }
     projects.remove(id - 1);
-    save_projects(&projects)?;
+    save_projects_to(state_dir, &projects)?;
     Ok(true)
 }
 
@@ -130,31 +127,30 @@ mod tests {
     #[test]
     fn test_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tasks.md");
+        let state_dir = dir.path();
 
-        // Write directly to test save/load
-        let projects = [
-            Project {
-                id: 1,
-                name: "Alpha".to_string(),
-            },
-            Project {
-                id: 2,
-                name: "Beta".to_string(),
-            },
-        ];
-        let content: String = projects
-            .iter()
-            .enumerate()
-            .map(|(i, p)| format!("{}. {}", i + 1, p.name))
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        std::fs::write(&path, &content).unwrap();
+        add_project_in(state_dir, "Alpha").unwrap();
+        add_project_in(state_dir, "Beta").unwrap();
 
-        let parsed = parse_projects(&content);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].name, "Alpha");
-        assert_eq!(parsed[1].name, "Beta");
+        let loaded = load_projects_from(state_dir);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "Alpha");
+        assert_eq!(loaded[1].name, "Beta");
+    }
+
+    #[test]
+    fn test_remove_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+
+        add_project_in(state_dir, "Alpha").unwrap();
+        add_project_in(state_dir, "Beta").unwrap();
+        add_project_in(state_dir, "Gamma").unwrap();
+
+        assert!(remove_project_in(state_dir, 2).unwrap());
+        let loaded = load_projects_from(state_dir);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "Alpha");
+        assert_eq!(loaded[1].name, "Gamma");
     }
 }
