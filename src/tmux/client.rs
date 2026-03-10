@@ -144,6 +144,7 @@ impl TmuxClient {
 
         args.push(command);
         self.run(&args)?;
+        self.run(&["set-option", "-t", name, "history-limit", "10000"])?;
         Ok(())
     }
 

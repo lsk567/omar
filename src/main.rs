@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod computer;
 mod config;
+mod ea;
 mod event;
 mod manager;
 mod memory;
@@ -19,9 +20,15 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{KeyCode, KeyModifiers},
+    event::{
+        KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::Mutex;
@@ -77,6 +84,21 @@ enum Commands {
 
     /// Configure tmux for optimal omar experience
     SetupTmux,
+
+    /// Start or interact with the manager agent
+    Manager {
+        /// Manager action (start, orchestrate)
+        #[command(subcommand)]
+        action: Option<ManagerAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManagerAction {
+    /// Start the manager session
+    Start,
+    /// Run in orchestration mode (interactive)
+    Orchestrate,
 }
 
 #[tokio::main]
@@ -100,6 +122,31 @@ async fn main() -> Result<()> {
         Some(Commands::List) => list_agents(&client),
         Some(Commands::Kill { name }) => kill_agent(&client, &name),
         Some(Commands::SetupTmux) => setup_tmux(),
+        Some(Commands::Manager { action }) => {
+            let ea_id: ea::EaId = 0;
+            let ea_client = TmuxClient::new(ea::ea_prefix(ea_id, &config.dashboard.session_prefix));
+            let omar_dir = dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".omar");
+            match action {
+                Some(ManagerAction::Start) | None => manager::start_manager(
+                    &ea_client,
+                    &config.agent.default_command,
+                    ea_id,
+                    "Default",
+                    &omar_dir,
+                    &config.dashboard.session_prefix,
+                ),
+                Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(
+                    &ea_client,
+                    &config.agent.default_command,
+                    ea_id,
+                    "Default",
+                    &omar_dir,
+                    &config.dashboard.session_prefix,
+                ),
+            }
+        }
         None => {
             if std::env::var("TMUX").is_err() {
                 relaunch_in_tmux()
@@ -441,19 +488,35 @@ async fn run_dashboard(config: Config) -> Result<()> {
     let ticker = scheduler::TickerBuffer::new();
     let scheduler = Arc::new(scheduler::Scheduler::new());
     let popup_receiver = scheduler::new_popup_receiver();
+    let base_prefix = config.dashboard.session_prefix.clone();
     tokio::spawn(scheduler::run_event_loop(
         scheduler.clone(),
         ticker.clone(),
         popup_receiver.clone(),
+        base_prefix,
     ));
+
+    // Create SINGLE shared App instance (fixes V1: Two-App Problem / BUG-C2).
+    // Both the API server and dashboard operate on the same App via Arc<Mutex<App>>.
+    let shared_app = Arc::new(Mutex::new(App::new(
+        &config,
+        ticker.clone(),
+        scheduler.clone(),
+    )));
 
     // Start API server if enabled
     if config.api.enabled {
         let api_config = config.api.clone();
+        let (base_prefix, omar_dir) = {
+            let app_guard = shared_app.lock().await;
+            (app_guard.base_prefix.clone(), app_guard.omar_dir.clone())
+        };
         let api_state = Arc::new(api::handlers::ApiState {
-            app: Arc::new(Mutex::new(App::new(&config, ticker.clone()))),
+            app: shared_app.clone(), // Same Arc — single source of truth
             scheduler: scheduler.clone(),
             computer_lock: computer::new_lock(),
+            base_prefix,
+            omar_dir,
         });
         tokio::spawn(async move {
             if let Err(e) = api::start_server(api_state, &api_config).await {
@@ -472,43 +535,67 @@ async fn run_dashboard(config: Config) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    // Enable keyboard enhancement so Alt+arrow arrives as a single event with ALT modifier
+    // rather than two separate events (Esc, then arrow) which would break Alt+Left/Right EA switching.
+    let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app for dashboard (separate instance)
-    let mut app = App::new(&config, ticker);
-
     // Show bridge status
-    match (slack_bridge.is_some(), computer_bridge.is_some()) {
-        (true, true) => app.set_status("Slack & computer bridges started"),
-        (true, false) => app.set_status("Slack bridge started"),
-        (false, true) => app.set_status("Computer bridge started"),
-        _ => {}
+    {
+        let mut app = shared_app.lock().await;
+        match (slack_bridge.is_some(), computer_bridge.is_some()) {
+            (true, true) => app.set_status("Slack & computer bridges started"),
+            (true, false) => app.set_status("Slack bridge started"),
+            (false, true) => app.set_status("Computer bridge started"),
+            _ => {}
+        }
     }
 
     // Warn if tmux config is missing recommended settings
     if tmux_setup_needed() {
-        app.set_persistent_warning("⚠ tmux not configured for omar — run 'omar setup-tmux' to fix");
+        shared_app.lock().await.set_persistent_warning(
+            "⚠ tmux not configured for omar — run 'omar setup-tmux' to fix",
+        );
     }
 
     // Initial refresh
-    if let Err(e) = app.refresh() {
-        app.set_status(format!("Error: {}", e));
+    {
+        let mut app = shared_app.lock().await;
+        if let Err(e) = app.refresh() {
+            app.set_status(format!("Error: {}", e));
+        }
     }
 
-    // Event loop
+    // Event loop — locks shared_app per-phase (render, then handle).
+    // The lock is NOT held across events.next().await so API calls proceed.
     let tick_rate = Duration::from_secs(config.dashboard.refresh_interval);
     let mut events = EventHandler::new(tick_rate);
     let mut tick_count: u64 = 0;
 
     loop {
-        // Draw UI
-        terminal.draw(|f| ui::render(f, &app))?;
+        // Phase 1: Render (brief lock — read-only access to App)
+        {
+            let app = shared_app.lock().await;
+            terminal.draw(|f| ui::render(f, &app))?;
+        }
+        // Lock released — API calls can proceed during event wait
 
-        // Handle events
-        if let Some(event) = events.next().await {
+        // Phase 2: Wait for event (no lock held)
+        let event = events.next().await;
+
+        // Phase 3: Handle event (lock for mutation)
+        if let Some(event) = event {
             match event {
                 AppEvent::Key(key) => {
+                    let mut app = shared_app.lock().await;
+
                     // Handle project input mode
                     if app.project_input_mode {
                         match key.code {
@@ -536,17 +623,54 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
-                    // Handle confirmation dialog (kill or quit)
+                    // Handle EA name input mode (for spawning a new EA)
+                    if app.ea_input_mode {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.ea_input_mode = false;
+                                app.ea_input.clear();
+                            }
+                            KeyCode::Enter => {
+                                let name = app.ea_input.clone();
+                                if !name.trim().is_empty() {
+                                    if let Err(e) = app.create_ea(name.trim().to_string(), None) {
+                                        app.set_status(format!("Error: {}", e));
+                                    }
+                                }
+                                app.ea_input_mode = false;
+                                app.ea_input.clear();
+                            }
+                            KeyCode::Backspace => {
+                                app.ea_input.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                app.ea_input.push(c);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Handle confirmation dialog (kill, quit, or delete EA)
                     if let Some(action) = app.pending_confirm {
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') => match action {
                                 app::ConfirmAction::Kill => {
+                                    let short_name = app.selected_agent_short_name();
                                     if let Err(e) = app.kill_selected() {
                                         app.set_status(format!("Error: {}", e));
+                                    } else if let Some(name) = short_name {
+                                        scheduler.cancel_by_receiver_and_ea(&name, app.active_ea);
                                     }
                                 }
                                 app::ConfirmAction::Quit => {
                                     app.should_quit = true;
+                                }
+                                app::ConfirmAction::DeleteEa => {
+                                    let ea_id = app.active_ea;
+                                    if let Err(e) = app.delete_ea(ea_id) {
+                                        app.set_status(format!("Error: {}", e));
+                                    }
                                 }
                             },
                             _ => {
@@ -576,7 +700,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     // Handle debug console popup
                     if app.show_debug_console {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Char('D') => {
+                            KeyCode::Esc | KeyCode::Char('G') => {
                                 app.show_debug_console = false;
                             }
                             _ => {}
@@ -601,7 +725,8 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 }
                             }
                             KeyCode::Enter => {
-                                app.settings.toggle(app.settings_selected);
+                                let idx = app.settings_selected;
+                                app.settings.toggle(idx);
                                 // If event queue was just hidden, move sidebar off Events panel
                                 if !app.settings.show_event_queue
                                     && app.sidebar_panel == app::SidebarPanel::Events
@@ -645,7 +770,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.drill_up();
                         }
                         KeyCode::Right => {
-                            if app.settings.sidebar_right {
+                            if key.modifiers.contains(KeyModifiers::ALT) {
+                                app.cycle_next_ea();
+                            } else if app.settings.sidebar_right {
                                 // Sidebar is on the right: try grid right first, then sidebar
                                 if !app.grid_right() {
                                     app.sidebar_focused = true;
@@ -659,7 +786,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Left => {
-                            if app.settings.sidebar_right {
+                            if key.modifiers.contains(KeyModifiers::ALT) {
+                                app.cycle_previous_ea();
+                            } else if app.settings.sidebar_right {
                                 // Sidebar is on the right: try grid left (no fallback)
                                 if !app.grid_left() && app.sidebar_focused {
                                     app.sidebar_focused = false;
@@ -719,7 +848,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         KeyCode::Enter => {
                             if app.sidebar_focused {
                                 if app.sidebar_panel == app::SidebarPanel::Events {
-                                    app.scheduled_events = scheduler.list();
+                                    app.scheduled_events = scheduler.list_by_ea(app.active_ea);
                                     app.scheduled_events.sort_by_key(|e| e.timestamp);
                                     app.show_events = true;
                                 } else {
@@ -729,32 +858,66 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                             // Tell the scheduler which agent popup is open so it
                             // defers events for that receiver until the popup closes.
-                            *popup_receiver.lock().unwrap() = app.selected_agent_short_name();
+                            // Include ea_id so suppression is scoped per-EA.
+                            *popup_receiver.lock().unwrap() = app
+                                .selected_agent_short_name()
+                                .map(|name| (name, app.active_ea));
+
+                            // Release App lock before blocking popup call
+                            drop(app);
 
                             if std::env::var("TMUX").is_ok() {
-                                // Inside tmux: use display-popup overlay (stays on top of dashboard)
-                                if let Err(e) = app.attach_selected() {
-                                    app.set_status(format!("Error: {}", e));
+                                // Inside tmux: use display-popup overlay.
+                                // IMPORTANT: extract session info while holding the lock,
+                                // then release the lock BEFORE the blocking attach_popup call.
+                                // Holding the lock across attach_popup blocks all API handlers
+                                // that need app.lock() for the entire popup lifetime.
+                                let popup_info = {
+                                    let app = shared_app.lock().await;
+                                    app.selected_agent()
+                                        .map(|a| (a.session.name.clone(), app.client().clone()))
+                                }; // Lock released here
+                                if let Some((session_name, client)) = popup_info {
+                                    if let Err(e) = client.attach_popup(&session_name, "90%", "90%")
+                                    {
+                                        let mut app = shared_app.lock().await;
+                                        app.set_status(format!("Error: {}", e));
+                                    }
                                 }
                                 // Discard ticks that accumulated while popup was open
                                 events.drain();
-                                // Force redraw after popup closes
                                 terminal.clear()?;
                             } else {
                                 // Outside tmux: temporarily exit alternate screen
+                                if keyboard_enhanced {
+                                    let _ = execute!(
+                                        terminal.backend_mut(),
+                                        PopKeyboardEnhancementFlags
+                                    );
+                                }
                                 disable_raw_mode()?;
                                 execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
+                                let app = shared_app.lock().await;
                                 let result = app.attach_selected();
+                                drop(app);
 
                                 // Restore terminal
                                 execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                                 enable_raw_mode()?;
-                                // Discard ticks that accumulated while popup was open
+                                if keyboard_enhanced {
+                                    let _ = execute!(
+                                        terminal.backend_mut(),
+                                        PushKeyboardEnhancementFlags(
+                                            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                                        )
+                                    );
+                                }
                                 events.drain();
                                 terminal.clear()?;
 
                                 if let Err(e) = result {
+                                    let mut app = shared_app.lock().await;
                                     app.set_status(format!("Error: {}", e));
                                 }
                             }
@@ -772,6 +935,18 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 app.pending_confirm = Some(app::ConfirmAction::Kill);
                             }
                         }
+                        KeyCode::Char('N') => {
+                            // Open EA name prompt to spawn a new EA
+                            app.ea_input_mode = true;
+                        }
+                        KeyCode::Char('D') => {
+                            // Delete the currently active EA (last EA is protected)
+                            if app.registered_eas.len() > 1 {
+                                app.pending_confirm = Some(app::ConfirmAction::DeleteEa);
+                            } else {
+                                app.set_status("Cannot delete the only EA");
+                            }
+                        }
                         KeyCode::Char('p') => {
                             app.project_input_mode = true;
                         }
@@ -783,11 +958,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Char('e') => {
-                            app.scheduled_events = scheduler.list();
+                            // Fix V2: EA-scoped events instead of global list
+                            app.scheduled_events = scheduler.list_by_ea(app.active_ea);
                             app.scheduled_events.sort_by_key(|e| e.timestamp);
                             app.show_events = true;
                         }
-                        KeyCode::Char('D') => {
+                        KeyCode::Char('G') => {
                             app.show_debug_console = true;
                         }
                         KeyCode::Char('z') => {
@@ -808,14 +984,15 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     }
                 }
                 AppEvent::Tick => {
+                    let mut app = shared_app.lock().await;
                     // Rotate quotes every ~30 ticks
                     tick_count += 1;
                     if tick_count.is_multiple_of(30) {
                         app.quote_index = app.quote_index.wrapping_add(1);
                     }
 
-                    // Keep event snapshots fresh for status-bar countdowns and events popup.
-                    app.scheduled_events = scheduler.list();
+                    // Fix V2: EA-scoped events instead of global list
+                    app.scheduled_events = scheduler.list_by_ea(app.active_ea);
                     app.scheduled_events.sort_by_key(|e| e.timestamp);
 
                     // Skip refresh while a popup/input overlay is active
@@ -827,15 +1004,19 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                     }
 
-                    // Keep system_state.md in sync with live state
-                    memory::write_memory(
+                    // Keep system_state.md in sync with live state (EA-scoped)
+                    let state_dir = app.state_dir();
+                    let manager_session = app.manager_session_name();
+                    memory::write_memory_to(
+                        &state_dir,
                         &app.agents,
                         app.manager.as_ref(),
+                        &manager_session,
                         app.client(),
-                        &app.scheduled_events,
                     );
                 }
                 AppEvent::TickerScroll => {
+                    let mut app = shared_app.lock().await;
                     app.ticker_offset = app.ticker_offset.wrapping_add(1);
                 }
                 AppEvent::Resize(_, _) => {
@@ -844,22 +1025,47 @@ async fn run_dashboard(config: Config) -> Result<()> {
             }
         }
 
-        if app.should_quit {
+        // Check quit flag
+        let should_quit = {
+            let app = shared_app.lock().await;
+            if app.should_quit {
+                Some(app.omar_dir.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(omar_dir) = should_quit {
+            // Compact EA ID counter on clean quit so next session starts from a compact point
+            if let Err(e) = ea::compact_id_counter(&omar_dir) {
+                eprintln!("compact_id_counter failed: {}", e);
+            }
             break;
         }
     }
 
     // Restore terminal
+    if keyboard_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // Kill the EA session on exit
-    if app
-        .client()
-        .has_session(crate::manager::MANAGER_SESSION)
-        .unwrap_or(false)
+    // Fix V3: Kill ALL EAs' managers and workers on quit (not just active EA)
     {
-        let _ = app.client().kill_session(crate::manager::MANAGER_SESSION);
+        let app = shared_app.lock().await;
+        for ea_info in &app.registered_eas {
+            let prefix = ea::ea_prefix(ea_info.id, &app.base_prefix);
+            let manager = ea::ea_manager_session(ea_info.id, &app.base_prefix);
+            let client = TmuxClient::new(&prefix);
+            // Kill all worker sessions for this EA
+            for session in client.list_sessions().unwrap_or_default() {
+                let _ = client.kill_session(&session.name);
+            }
+            // Kill the manager session
+            if client.has_session(&manager).unwrap_or(false) {
+                let _ = client.kill_session(&manager);
+            }
+        }
     }
 
     // Kill Slack bridge on exit
