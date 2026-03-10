@@ -8,6 +8,7 @@ use ratatui::{
 use regex::Regex;
 
 use crate::app::{AgentInfo, App, ConfirmAction, SidebarPanel};
+use crate::memory;
 use crate::tmux::HealthState;
 
 const QUOTES: &[&str] = &[
@@ -325,26 +326,28 @@ pub fn render(frame: &mut Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),             // EA switcher bar
             Constraint::Length(status_height), // Status bar
             Constraint::Min(8),                // Main content area
             Constraint::Length(1),             // Help bar
         ])
         .split(frame.area());
 
-    render_status_bar(frame, app, outer[0]);
+    render_ea_bar(frame, app, outer[0]);
+    render_status_bar(frame, app, outer[1]);
 
     // Two-column layout: sidebar + main content (sidebar can be left or right)
     let columns = if app.config.dashboard.sidebar_right {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(40)])
-            .split(outer[1]);
+            .split(outer[2]);
         (cols[1], cols[0]) // (sidebar, main)
     } else {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(40), Constraint::Min(0)])
-            .split(outer[1]);
+            .split(outer[2]);
         (cols[0], cols[1]) // (sidebar, main)
     };
     let (sidebar_area, main_area) = columns;
@@ -382,7 +385,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_agent_grid(frame, app, main_col[0]);
     render_focus_parent(frame, app, main_col[1]);
 
-    render_help_bar(frame, app, outer[2]);
+    render_help_bar(frame, app, outer[3]);
 
     // Render overlays
     if app.show_help {
@@ -395,6 +398,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if app.project_input_mode {
         render_project_input(frame, app);
+    }
+
+    if app.ea_input_mode {
+        render_ea_input(frame, app);
     }
 
     if app.show_events {
@@ -520,6 +527,41 @@ fn render_status_row(frame: &mut Frame, app: &App, status_spans: &[Span], area: 
     }
 }
 
+fn render_ea_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let mut spans: Vec<Span> = vec![Span::styled("EA: ", Style::default().fg(Color::DarkGray))];
+    for ea in &app.registered_eas {
+        let is_active = ea.id == app.active_ea;
+        let label = format!("{}:{}", ea.id, ea.name);
+        if is_active {
+            spans.push(Span::styled(
+                format!("[{}]", label),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::raw(" | "));
+    }
+    if !app.registered_eas.is_empty() {
+        spans.pop(); // Remove trailing " | "
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        "Alt+Left",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw(":Prev "));
+    spans.push(Span::styled(
+        "Alt+Right",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw(":Next"));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn render_projects_panel(frame: &mut Frame, app: &App, area: Rect) {
     let panel_active = app.sidebar_focused && app.sidebar_panel == SidebarPanel::Projects;
     let border_color = if panel_active {
@@ -625,8 +667,20 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
 
         // Build display title based on focus parent type
         let parent_name = &app.focus_parent;
-        let display_title = if *parent_name == crate::manager::MANAGER_SESSION {
-            "Executive Assistant".to_string()
+        let is_manager = app
+            .manager
+            .as_ref()
+            .map(|m| m.session.name == *parent_name)
+            .unwrap_or(false);
+        let display_title = if is_manager {
+            // Show which EA this is
+            let ea_name = app
+                .registered_eas
+                .iter()
+                .find(|ea| ea.id == app.active_ea)
+                .map(|ea| ea.name.as_str())
+                .unwrap_or("EA");
+            format!("Executive Assistant ({})", ea_name)
         } else {
             let short = parent_name
                 .strip_prefix(app.client().prefix())
@@ -1014,6 +1068,21 @@ fn render_summary_card(
         ]));
     }
 
+    // Status line (from status file, fallback to last_output)
+    let state_dir = app.state_dir();
+    let status_text =
+        memory::load_agent_status_in(&state_dir, &agent.session.name).unwrap_or_else(|| {
+            if agent.health_info.last_output.is_empty() {
+                "waiting for the agent to report status".to_string()
+            } else {
+                agent.health_info.last_output.clone()
+            }
+        });
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", Style::default().fg(Color::White)),
+        Span::styled(status_text, Style::default().fg(Color::White)),
+    ]));
+
     // Task (multi-line word wrap to fill available card space)
     let task = app
         .worker_tasks()
@@ -1117,17 +1186,21 @@ fn render_summary_card(
 }
 
 fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let at_root = app.focus_parent == crate::manager::MANAGER_SESSION;
+    let at_root = app
+        .manager
+        .as_ref()
+        .map(|m| app.focus_parent == m.session.name)
+        .unwrap_or(true);
 
     let mut help_text = vec![
         Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Chat "),
-        Span::styled("Ctrl+\\", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Close Chat | "),
         Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Drill-in "),
-        Span::styled("Shift+Tab", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(":Back out | "),
+        Span::styled("n/N", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":New "),
+        Span::styled("d/D", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(":Kill | "),
         Span::styled("z", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(":Hold the line | "),
         Span::styled("Q", Style::default().add_modifier(Modifier::BOLD)),
@@ -1228,9 +1301,15 @@ fn render_help_popup(frame: &mut Frame) {
         Line::from("  Enter       Attach to selected agent"),
         Line::from("  n           Spawn new agent"),
         Line::from("  d           Kill selected agent"),
+        Line::from("  N           Spawn new EA (prompts for name)"),
+        Line::from("  D           Delete current EA (not the only one)"),
         Line::from("  p           Add a project"),
+        Line::from("  Alt+Left    Previous EA"),
+        Line::from("  Alt+Right   Next EA"),
         Line::from("  e           Show scheduled events"),
-        Line::from("  D           Debug console"),
+        Line::from("  G           Debug console"),
+        Line::from("  S           Settings"),
+        Line::from("  z           Detach (dashboard keeps running)"),
         Line::from("  r           Refresh agent list"),
         Line::from("  ?           Toggle this help"),
         Line::from(""),
@@ -1263,10 +1342,25 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
         ConfirmAction::Quit => (
             " Confirm Quit ",
             "Quit omar?",
-            "This will kill the EA session.".to_string(),
+            "This will kill ALL EA sessions and agents.".to_string(),
             "Press z to walk away instead.".to_string(),
             50,
         ),
+        ConfirmAction::DeleteEa => {
+            let ea_name = app
+                .registered_eas
+                .iter()
+                .find(|ea| ea.id == app.active_ea)
+                .map(|ea| format!("EA {}: {}", ea.id, ea.name))
+                .unwrap_or_else(|| format!("EA {}", app.active_ea));
+            (
+                " Confirm Delete EA ",
+                "Delete this EA?",
+                ea_name,
+                "This will kill all agents and remove all state.".to_string(),
+                55,
+            )
+        }
     };
 
     let area = centered_rect(width, 30, frame.area());
@@ -1330,6 +1424,40 @@ fn render_project_input(frame: &mut Frame, app: &App) {
 
     let block = Block::default()
         .title(" New Project ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let paragraph = Paragraph::new(content)
+        .block(block)
+        .alignment(ratatui::layout::Alignment::Center);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_ea_input(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 20, frame.area());
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Create New EA",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("> {}_", app.ea_input),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter to confirm, Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Block::default()
+        .title(" New EA ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
@@ -1504,7 +1632,7 @@ fn render_debug_console(frame: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Press Esc or 'D' to close",
+        "Press Esc or 'G' to close",
         Style::default().fg(Color::DarkGray),
     )));
 

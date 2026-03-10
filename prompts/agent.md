@@ -39,7 +39,7 @@ Returns which backends are installed, with availability status. Check this befor
 
 ### Spawn a sub-agent
 ```bash
-curl -X POST http://localhost:9876/api/agents \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
   -H "Content-Type: application/json" \
   -d '{"name": "agent-name", "task": "Task description for the agent", "parent": "<YOUR NAME>"}'
 ```
@@ -57,12 +57,12 @@ curl -X POST http://localhost:9876/api/agents \
 
 ### List all agents
 ```bash
-curl http://localhost:9876/api/agents
+curl http://localhost:9876/api/ea/{{EA_ID}}/agents
 ```
 
 ### Get agent details (with recent output)
 ```bash
-curl http://localhost:9876/api/agents/agent-name
+curl http://localhost:9876/api/ea/{{EA_ID}}/agents/agent-name
 ```
 Use the JSON `health` field to decide whether a sub-agent is still active. `"running"` means OMAR has seen recent pane changes; `"idle"` means it may be ready for input, finished, or stuck. Inspect the latest output before deciding what to do.
 
@@ -71,15 +71,14 @@ Use the JSON `health` field to decide whether a sub-agent is still active. `"run
 IMPORTANT: Do NOT use the `/send` endpoint for inter-agent communication. Use the Events API instead — it is more reliable.
 
 ```bash
-NOW=$(python3 -c "import time; print(time.time_ns() + 1_000_000)")
-curl -X POST http://localhost:9876/api/events \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents/agent-name/send \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<agent-name>\", \"timestamp\": $NOW, \"payload\": \"Your message here\"}"
 ```
 
 ### Kill an agent
 ```bash
-curl -X DELETE http://localhost:9876/api/agents/agent-name
+curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/agent-name
 ```
 
 ## Sub-Agent Management Guidelines
@@ -87,9 +86,8 @@ curl -X DELETE http://localhost:9876/api/agents/agent-name
 - Keep agent names short and descriptive (e.g., "api", "auth", "db", "test")
 - Be specific about each agent's task — include file paths, function names, expected behavior
 - Spawn independent agents in parallel
-- Monitor the API `health` status: `"running"` = actively working, `"idle"` = may have finished or need input
-- To communicate with sub-agents, always use the Events API — never `/send`
-- When an agent's output shows task completion, kill it: `curl -X DELETE http://localhost:9876/api/agents/agent-name`
+- Monitor health status: "running" = actively working, "idle" = may have finished or need input
+- When an agent's output shows task completion, kill it: `curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/agent-name`
 
 ## Completion Protocol
 
@@ -107,11 +105,25 @@ Summary:
 Then immediately schedule a wake-up event for your parent so it can check your output:
 
 ```bash
-NOW=$(python3 -c "import time; print(time.time_ns() + 1_000_000)")
-curl -X POST http://localhost:9876/api/events \
+NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 1_000_000)")
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<YOUR PARENT>\", \"timestamp\": $NOW, \"payload\": \"[TASK COMPLETE] from <YOUR NAME>. Check output for results.\"}"
 ```
+
+## Reporting Command Output
+
+When the EA asks you to run a command and report its output, always relay the output VERBATIM — do not summarize, paraphrase, or truncate API responses. If the output is very long, include at minimum the last 2000 characters verbatim.
+
+## Status Reporting
+
+OMAR sends you a periodic `[STATUS CHECK]` event every 60 seconds. When you receive one, update your status via the API:
+```bash
+curl -X PUT http://localhost:9876/api/ea/{{EA_ID}}/agents/<YOUR NAME>/status \
+  -H "Content-Type: application/json" \
+  -d '{"status": "Currently: <brief description of what you are doing>"}'
+```
+Also update proactively after spawning sub-agents or reaching a milestone.
 
 ## Scheduling and Wake-ups
 
@@ -122,8 +134,8 @@ IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g
 1. Spawn sub-agents
 2. Schedule a self-wake-up (e.g., 2 minutes out) to check progress:
 ```bash
-NOW=$(python3 -c "import time; print(time.time_ns() + 120_000_000_000)")
-curl -X POST http://localhost:9876/api/events \
+NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 120_000_000_000)")
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<YOUR NAME>\", \"timestamp\": $NOW, \"payload\": \"Check sub-agent progress\"}"
 ```
@@ -134,21 +146,21 @@ curl -X POST http://localhost:9876/api/events \
 
 ```bash
 # Schedule a one-time event (timestamp in nanoseconds since Unix epoch)
-curl -X POST http://localhost:9876/api/events \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
   -H "Content-Type: application/json" \
   -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <ns-timestamp>, "payload": "reason"}'
 
 # Schedule a cron job (repeats every recurring_ns nanoseconds)
 # OMAR auto-reschedules after each delivery. Delivered as [CRON] instead of [EVENT].
-curl -X POST http://localhost:9876/api/events \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
   -H "Content-Type: application/json" \
   -d '{"sender": "your-name", "receiver": "target-agent", "timestamp": <first-fire-ns>, "payload": "reason", "recurring_ns": 60000000000}'
 
 # List pending events (includes recurring_ns field for cron jobs)
-curl http://localhost:9876/api/events
+curl http://localhost:9876/api/ea/{{EA_ID}}/events
 
 # Cancel a scheduled event (also stops cron jobs)
-curl -X DELETE http://localhost:9876/api/events/<event-id>
+curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/events/<event-id>
 ```
 
 ## Skills

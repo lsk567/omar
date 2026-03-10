@@ -12,6 +12,12 @@ pub struct ScheduledEvent {
     /// If set, the event re-schedules itself with `timestamp = now + recurring_ns`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recurring_ns: Option<u64>,
+    /// EA that owns this event. Mandatory, from path parameter.
+    /// `#[serde(default)]` is intentional for backwards compatibility: events
+    /// serialized before multi-EA support lacked `ea_id` and are assigned to
+    /// EA 0 (the default/first EA) on deserialization.
+    #[serde(default)]
+    pub ea_id: u32,
 }
 
 // Reverse ordering so BinaryHeap (max-heap) behaves as a min-heap.
@@ -45,6 +51,7 @@ mod tests {
             payload: payload.to_string(),
             created_at: 0,
             recurring_ns: None,
+            ea_id: 0,
         }
     }
 

@@ -102,13 +102,13 @@ curl -s -X POST http://localhost:9876/api/computer/mouse \
 - To close a tmux popup overlay, use the tmux detach sequence (`ctrl+b d`) or the popup's own escape key — not omar's keybindings (they go to the inner session)
 - Spawn test agents via the API to populate the dashboard:
   ```bash
-  curl -s -X POST http://localhost:9876/api/agents \
+  curl -s -X POST http://localhost:9876/api/ea/0/agents \
     -H "Content-Type: application/json" \
     -d '{"name":"test-agent","task":"do something","role":"agent","parent":"ea"}'
   ```
 - Kill test agents when done:
   ```bash
-  curl -s -X DELETE http://localhost:9876/api/agents/test-agent
+  curl -s -X DELETE http://localhost:9876/api/ea/0/agents/test-agent
   ```
 
 ## Cleanup
