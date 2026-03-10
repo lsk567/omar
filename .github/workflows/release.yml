@@ -77,3 +77,54 @@ jobs:
             --repo ${{ github.repository }} \
             --generate-notes \
             omar-*/omar-*.tar.gz checksums.txt
+
+  update-homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Compute SHA256 hashes
+        id: hashes
+        run: |
+          echo "darwin_arm64=$(sha256sum omar-darwin-arm64/omar-darwin-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "darwin_amd64=$(sha256sum omar-darwin-amd64/omar-darwin-amd64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(sha256sum omar-linux-arm64/omar-linux-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_amd64=$(sha256sum omar-linux-amd64/omar-linux-amd64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Update formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          git clone https://x-access-token:${GH_TOKEN}@github.com/lsk567/homebrew-omar.git
+          cd homebrew-omar
+
+          python3 -c "
+          import re, sys
+          hashes = {
+              'darwin-arm64': '${{ steps.hashes.outputs.darwin_arm64 }}',
+              'darwin-amd64': '${{ steps.hashes.outputs.darwin_amd64 }}',
+              'linux-arm64':  '${{ steps.hashes.outputs.linux_arm64 }}',
+              'linux-amd64':  '${{ steps.hashes.outputs.linux_amd64 }}',
+          }
+          with open('Formula/omar.rb') as f:
+              content = f.read()
+          content = re.sub(r'version \".*?\"', 'version \"${VERSION}\"', content, count=1)
+          for platform, sha in hashes.items():
+              # Match the url line for this platform, then replace the sha256 on the next line
+              content = re.sub(
+                  r'(omar-' + re.escape(platform) + r'\.tar\.gz\"\n\s+sha256 \").*?(\")',
+                  r'\g<1>' + sha + r'\2',
+                  content
+              )
+          with open('Formula/omar.rb', 'w') as f:
+              f.write(content)
+          "
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/omar.rb
+          git commit -m "update omar to ${VERSION}"
+          git push
