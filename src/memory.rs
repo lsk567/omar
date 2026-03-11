@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use crate::app::AgentInfo;
 use crate::ea::EaId;
 use crate::projects;
+use crate::scheduler::ScheduledEvent;
 use crate::tmux::TmuxClient;
 
 /// Per-file-type mutexes to serialize concurrent read-modify-write operations.
@@ -137,6 +138,7 @@ pub fn write_memory_to(
     manager: Option<&AgentInfo>,
     manager_session: &str,
     client: &TmuxClient,
+    events: &[ScheduledEvent],
 ) {
     let project_list = projects::load_projects_from(state_dir);
 
@@ -174,6 +176,25 @@ pub fn write_memory_to(
             out.push_str(&format!(
                 "- {} ({}): {}\n",
                 agent.session.name, health, task_desc
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Scheduled events — include exact periods and full payloads for recovery
+    if !events.is_empty() {
+        out.push_str("## Scheduled Events\n");
+        for ev in events {
+            let type_label = match ev.recurring_ns {
+                Some(ns) => {
+                    let secs = ns / 1_000_000_000;
+                    format!("cron every {}s (period_ns={})", secs, ns)
+                }
+                None => "once".to_string(),
+            };
+            out.push_str(&format!(
+                "- id={} [{}] {} -> {}\n  payload: {}\n",
+                ev.id, type_label, ev.sender, ev.receiver, ev.payload
             ));
         }
         out.push('\n');
