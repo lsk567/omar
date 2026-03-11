@@ -83,8 +83,8 @@ pub fn ensure_default_ea(base_dir: &Path) -> anyhow::Result<Vec<EaInfo>> {
         if load_next_id_counter(base_dir) == 0 {
             save_next_id_counter(base_dir, 0)?;
         }
+        fs::create_dir_all(ea_state_dir(0, base_dir).join("status"))?;
     }
-    fs::create_dir_all(ea_state_dir(0, base_dir).join("status"))?;
     Ok(eas)
 }
 
