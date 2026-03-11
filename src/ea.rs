@@ -20,6 +20,18 @@ pub struct EaInfo {
     pub created_at: u64, // Unix timestamp
 }
 
+fn default_ea_info() -> EaInfo {
+    EaInfo {
+        id: 0,
+        name: "Default".to_string(),
+        description: Some("Primary executive assistant".to_string()),
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs(),
+    }
+}
+
 /// The tmux session prefix for an EA's worker agents.
 /// EA 0: "omar-agent-0-"
 /// EA 1: "omar-agent-1-"
@@ -60,6 +72,20 @@ pub fn load_registry(base_dir: &Path) -> Vec<EaInfo> {
         },
         Err(_) => Vec::new(),
     }
+}
+
+/// Ensure at least one default EA exists on disk.
+pub fn ensure_default_ea(base_dir: &Path) -> anyhow::Result<Vec<EaInfo>> {
+    let mut eas = load_registry(base_dir);
+    if eas.is_empty() {
+        eas.push(default_ea_info());
+        save_registry(base_dir, &eas)?;
+        if load_next_id_counter(base_dir) == 0 {
+            save_next_id_counter(base_dir, 0)?;
+        }
+    }
+    fs::create_dir_all(ea_state_dir(0, base_dir).join("status"))?;
+    Ok(eas)
 }
 
 /// Load the high-water mark counter for EA IDs.
@@ -253,6 +279,31 @@ mod tests {
         assert_eq!(ea_prefix(0, "omar-agent-"), "omar-agent-0-");
         assert_eq!(ea_prefix(1, "omar-agent-"), "omar-agent-1-");
         assert_eq!(ea_prefix(42, "omar-agent-"), "omar-agent-42-");
+    }
+
+    #[test]
+    fn test_ensure_default_ea_bootstraps_registry() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let eas = ensure_default_ea(dir.path()).unwrap();
+
+        assert_eq!(eas.len(), 1);
+        assert_eq!(eas[0].id, 0);
+        assert_eq!(eas[0].name, "Default");
+        assert!(ea_state_dir(0, dir.path()).join("status").exists());
+        assert_eq!(load_next_id_counter(dir.path()), 0);
+    }
+
+    #[test]
+    fn test_ensure_default_ea_preserves_existing_counter() {
+        let dir = tempfile::tempdir().unwrap();
+
+        save_next_id_counter(dir.path(), 7).unwrap();
+        let eas = ensure_default_ea(dir.path()).unwrap();
+
+        assert_eq!(eas.len(), 1);
+        assert_eq!(eas[0].id, 0);
+        assert_eq!(load_next_id_counter(dir.path()), 7);
     }
 
     #[test]

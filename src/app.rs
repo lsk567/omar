@@ -143,7 +143,10 @@ impl App {
         ea::migrate_legacy_state(&omar_dir);
         ea::migrate_legacy_sessions(&base_prefix);
 
-        let registered_eas = ea::load_registry(&omar_dir);
+        let registered_eas = ea::ensure_default_ea(&omar_dir).unwrap_or_else(|e| {
+            eprintln!("warn: ensure default EA: {}", e);
+            ea::load_registry(&omar_dir)
+        });
         // Use the lowest registered EA id as the initial active EA.
         // Hardcoding 0 would break if EA 0 was deleted and all remaining IDs are ≥ 1.
         let active_ea: EaId = registered_eas.iter().map(|e| e.id).min().unwrap_or(0);
@@ -1109,6 +1112,14 @@ impl App {
             if let Err(e) = std::fs::remove_dir_all(&state_dir) {
                 self.ticker
                     .push(format!("warn: remove state dir {:?}: {}", state_dir, e));
+            }
+        }
+
+        let notes_path = memory::manager_notes_path(&self.omar_dir, ea_id);
+        if notes_path.exists() {
+            if let Err(e) = std::fs::remove_file(&notes_path) {
+                self.ticker
+                    .push(format!("warn: remove notes {:?}: {}", notes_path, e));
             }
         }
 

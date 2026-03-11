@@ -40,12 +40,17 @@ pub fn prompts_dir(omar_dir: &Path) -> PathBuf {
     dir
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendKind {
-    Claude,
-    Codex,
-    Cursor,
-    Opencode,
+/// Escape a string for use in a sed replacement (with `|` as delimiter).
+///
+/// The sed expression is wrapped in single quotes in the generated shell command
+/// (e.g. `sed 's|PAT|REPL|g' file`), so any single quote in the replacement
+/// must be closed, escaped, and reopened: `'` → `'\''`.
+fn sed_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('&', "\\&")
+        .replace('\n', "\\n")
+        .replace('\'', "'\\''")
 }
 
 fn detect_backend_token(token: &str) -> Option<BackendKind> {
@@ -439,13 +444,13 @@ fn spawn_worker(
     }
 
     // Build command with worker system prompt (template vars substituted via sed)
-    let parent_name = ea::ea_manager_session(ea_id, base_prefix);
+    let parent_name = "ea";
     let prompt_file = prompts_dir(omar_dir).join("agent.md");
     let cmd = build_agent_command(
         command,
         &prompt_file,
         &[
-            ("{{PARENT_NAME}}", &parent_name),
+            ("{{PARENT_NAME}}", parent_name),
             ("{{TASK}}", &agent.task),
             ("{{EA_ID}}", &ea_id.to_string()),
         ],
@@ -461,14 +466,21 @@ fn spawn_worker(
     // Give it time to start
     thread::sleep(Duration::from_secs(1));
 
-    // Send first user message to kick off work
-    client.send_keys_literal(&session_name, "Start working on your assigned task now.")?;
+    // Give workers the same runtime bootstrap as API-spawned agents.
+    let short_name = session_name.strip_prefix(client.prefix()).unwrap_or(&session_name);
+    let user_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", short_name, agent.task);
+    client.send_keys_literal(&session_name, &user_msg)?;
     thread::sleep(Duration::from_millis(200));
     client.send_keys(&session_name, "Enter")?;
 
     // Persist worker task description to EA-scoped state dir
     let state_dir = ea::ea_state_dir(ea_id, omar_dir);
     memory::save_worker_task_in(&state_dir, &session_name, &agent.task);
+    memory::save_agent_parent_in(
+        &state_dir,
+        &session_name,
+        &ea::ea_manager_session(ea_id, base_prefix),
+    );
 
     println!("  {} - spawned ({})", agent.name, agent.role);
 
@@ -529,6 +541,10 @@ mod tests {
         assert_eq!(sed_escape("a\nb"), "a\\nb");
         // Combined
         assert_eq!(sed_escape("a\\|&\nb"), "a\\\\\\|\\&\\nb");
+        // Single quotes must be escaped so they don't terminate the surrounding
+        // shell single-quoted sed expression (BUG B fix).
+        assert_eq!(sed_escape("it's"), "it'\\''s");
+        assert_eq!(sed_escape("don't stop"), "don'\\''t stop");
     }
 
     #[test]

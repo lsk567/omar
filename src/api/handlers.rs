@@ -30,6 +30,10 @@ pub struct ApiState {
     pub computer_lock: ComputerLock,
     pub base_prefix: String,
     pub omar_dir: PathBuf,
+    pub health_idle_warning: i64,
+    /// Serializes the has_session → new_session sequence to prevent concurrent
+    /// spawns from racing past the collision check (TOCTOU race condition fix).
+    pub spawn_lock: Arc<Mutex<()>>,
 }
 
 /// Validate EA exists, returning prefix, manager session, and state_dir.
@@ -57,6 +61,30 @@ fn display_name<'a>(prefix: &str, session_name: &'a str) -> &'a str {
     session_name.strip_prefix(prefix).unwrap_or(session_name)
 }
 
+fn last_output_line(output: &str) -> String {
+    output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(80)
+        .collect()
+}
+
+fn health_from_activity(activity: i64, idle_warning: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_secs() as i64;
+    if now.saturating_sub(activity) <= idle_warning {
+        "running".to_string()
+    } else {
+        "idle".to_string()
+    }
+}
+
 // ── Global handlers ──
 
 /// GET /api/health
@@ -71,7 +99,7 @@ pub async fn health() -> Json<HealthResponse> {
 pub async fn list_eas(State(state): State<Arc<ApiState>>) -> Json<ListEasResponse> {
     let app = state.app.lock().await;
     let active = app.active_ea;
-    let registry = ea::load_registry(&state.omar_dir);
+    let registry = ea::ensure_default_ea(&state.omar_dir).unwrap_or_else(|_| ea::load_registry(&state.omar_dir));
 
     let eas = registry
         .iter()
@@ -113,15 +141,16 @@ pub async fn create_ea(
     // Acquire lock BEFORE register_ea to serialize concurrent creation
     let mut app = state.app.lock().await;
 
-    let ea_id =
-        ea::register_ea(&state.omar_dir, &req.name, req.description.as_deref()).map_err(|e| {
+    let ea_id = ea::register_ea(&state.omar_dir, &req.name, req.description.as_deref()).map_err(
+        |e| {
             (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: format!("Failed to create EA: {}", e),
                 }),
             )
-        })?;
+        },
+    )?;
 
     // Update app's registry (still under lock)
     app.registered_eas = ea::load_registry(&state.omar_dir);
@@ -287,17 +316,21 @@ pub async fn list_agents(
         .map(|s| AgentInfo {
             id: display_name(&prefix, &s.name).to_string(),
             status: "running".to_string(),
-            health: "running".to_string(),
-            last_output: String::new(),
+            health: health_from_activity(s.activity, state.health_idle_warning),
+            last_output: last_output_line(&client.capture_pane(&s.name, 50).unwrap_or_default()),
         })
         .collect();
 
     let manager = if client.has_session(&manager_session).unwrap_or(false) {
+        let output_tail = client.capture_pane(&manager_session, 50).unwrap_or_default();
+        let activity = client
+            .get_pane_activity(&manager_session)
+            .unwrap_or_default();
         Some(AgentInfo {
             id: manager_session.clone(),
             status: "running".to_string(),
-            health: "running".to_string(),
-            last_output: String::new(),
+            health: health_from_activity(activity, state.health_idle_warning),
+            last_output: last_output_line(&output_tail),
         })
     } else {
         None
@@ -335,8 +368,11 @@ pub async fn get_agent(
     Ok(Json(AgentDetailResponse {
         id: display_name(&prefix, &session_name).to_string(),
         status: "running".to_string(),
-        health: "running".to_string(),
-        last_output: String::new(),
+        health: health_from_activity(
+            client.get_pane_activity(&session_name).unwrap_or_default(),
+            state.health_idle_warning,
+        ),
+        last_output: last_output_line(&output_tail),
         output_tail,
     }))
 }
@@ -378,7 +414,10 @@ pub async fn get_agent_summary(
 
     Ok(Json(AgentSummaryResponse {
         id: display_name(&prefix, &session_name).to_string(),
-        health: "running".to_string(),
+        health: health_from_activity(
+            client.get_pane_activity(&session_name).unwrap_or_default(),
+            state.health_idle_warning,
+        ),
         task,
         status,
         children,
@@ -428,13 +467,16 @@ pub async fn spawn_agent(
     // filesystem/tmux errors are caught and returned as 500 responses downstream.
     let (prefix, manager_session, state_dir) = resolve_ea(ea_id, &state)?;
 
-    // Generate full session name
-    let session_name = match req.name {
-        Some(ref n) => {
+    // Generate full session name.
+    // If the request contains a non-empty `name`, that name is used as the
+    // agent ID (with the EA prefix prepended once).  An absent or empty name
+    // falls back to auto-generation.
+    let session_name = match req.name.as_deref() {
+        Some(n) if !n.trim().is_empty() => {
             let stripped = n.strip_prefix(&prefix).unwrap_or(n);
             format!("{}{}", prefix, stripped)
         }
-        None => generate_agent_name_in_ea(&prefix),
+        _ => generate_agent_name_in_ea(&prefix),
     };
 
     // Short name (for prompts and events)
@@ -456,22 +498,17 @@ pub async fn spawn_agent(
     };
 
     let client = TmuxClient::new(&prefix);
+    let prompt_parent_name = if parent_session == manager_session {
+        "ea".to_string()
+    } else {
+        display_name(&prefix, &parent_session).to_string()
+    };
 
-    // Lock App only to check for name collision and read default_command,
-    // then release before any blocking tmux/process calls.
+    // Read default_command from App (brief lock, released before blocking I/O).
     let base_command = {
         let app = state.app.lock().await;
-        if client.has_session(&session_name).unwrap_or(false) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: format!("Agent '{}' already exists", short_name),
-                }),
-            ));
-        }
         req.command
             .unwrap_or_else(|| app.default_command().to_string())
-        // `app` lock is dropped here, before any blocking I/O
     };
 
     // Get workdir
@@ -485,14 +522,13 @@ pub async fn spawn_agent(
     let has_agent_prompt = matches!(req.role.as_deref(), Some("project-manager") | Some("agent"))
         || req.task.is_some();
     let cmd = if has_agent_prompt {
-        let parent = req.parent.as_deref().unwrap_or("ea");
         let task = req.task.as_deref().unwrap_or("");
         let prompt_file = prompts_dir(&state.omar_dir).join("agent.md");
         build_agent_command(
             &base_command,
             &prompt_file,
             &[
-                ("{{PARENT_NAME}}", parent),
+                ("{{PARENT_NAME}}", &prompt_parent_name),
                 ("{{TASK}}", task),
                 ("{{EA_ID}}", &ea_id.to_string()),
             ],
@@ -504,7 +540,22 @@ pub async fn spawn_agent(
     // Ensure state directory exists
     std::fs::create_dir_all(&state_dir).ok();
 
-    // Spawn the agent (blocking tmux call — App lock is NOT held)
+    // Acquire the spawn lock to make the has_session → new_session sequence
+    // atomic, preventing parallel spawns from racing past the collision check
+    // (TOCTOU fix for BUG C).
+    let _spawn_guard = state.spawn_lock.lock().await;
+
+    // Collision check under spawn lock
+    if client.has_session(&session_name).unwrap_or(false) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("Agent '{}' already exists", short_name),
+            }),
+        ));
+    }
+
+    // Spawn the agent (blocking tmux call — spawn lock IS held, App lock is NOT)
     if let Err(e) = client.new_session(&session_name, &cmd, Some(&workdir)) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -513,6 +564,9 @@ pub async fn spawn_agent(
             }),
         ));
     }
+
+    // Release spawn lock — session now exists; subsequent requests will see it.
+    drop(_spawn_guard);
 
     // Save parent mapping only after spawn succeeds to avoid orphaned entries
     memory::save_agent_parent_in(&state_dir, &session_name, &parent_session);

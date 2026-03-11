@@ -87,31 +87,29 @@ async fn main() -> Result<()> {
         config.agent.default_command =
             config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
     }
-    let client = TmuxClient::new(&config.dashboard.session_prefix);
+    let (default_ea_id, default_ea_name, client) = default_cli_ea(&config)?;
 
     match cli.command {
         Some(Commands::List) => list_agents(&client),
         Some(Commands::SetupTmux) => setup_tmux(),
         Some(Commands::Manager { action }) => {
-            let ea_id: ea::EaId = 0;
-            let ea_client = TmuxClient::new(ea::ea_prefix(ea_id, &config.dashboard.session_prefix));
             let omar_dir = dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".omar");
             match action {
                 Some(ManagerAction::Start) | None => manager::start_manager(
-                    &ea_client,
+                    &client,
                     &config.agent.default_command,
-                    ea_id,
-                    "Default",
+                    default_ea_id,
+                    &default_ea_name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
                 ),
                 Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(
-                    &ea_client,
+                    &client,
                     &config.agent.default_command,
-                    ea_id,
-                    "Default",
+                    default_ea_id,
+                    &default_ea_name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
                 ),
@@ -125,6 +123,36 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn default_cli_ea(config: &Config) -> Result<(ea::EaId, String, TmuxClient)> {
+    let omar_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".omar");
+    let eas = ea::ensure_default_ea(&omar_dir)?;
+    let active = eas
+        .iter()
+        .min_by_key(|ea_info| ea_info.id)
+        .ok_or_else(|| anyhow::anyhow!("EA registry is empty"))?;
+    let client = TmuxClient::new(ea::ea_prefix(active.id, &config.dashboard.session_prefix));
+    Ok((active.id, active.name.clone(), client))
+}
+
+fn spawn_agent(
+    client: &TmuxClient,
+    name: &str,
+    command: &str,
+    workdir: Option<&str>,
+) -> Result<()> {
+    let full_name = format!("{}{}", client.prefix(), name);
+
+    if client.has_session(&full_name)? {
+        anyhow::bail!("Session '{}' already exists", name);
+    }
+
+    client.new_session(&full_name, command, workdir)?;
+    println!("Spawned agent: {}", name);
+    Ok(())
 }
 
 fn list_agents(client: &TmuxClient) -> Result<()> {
@@ -474,6 +502,8 @@ async fn run_dashboard(config: Config) -> Result<()> {
             computer_lock: computer::new_lock(),
             base_prefix,
             omar_dir,
+            health_idle_warning: config.health.idle_warning,
+            spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
         tokio::spawn(async move {
             if let Err(e) = api::start_server(api_state, &api_config).await {
