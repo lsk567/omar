@@ -342,16 +342,13 @@ impl App {
         {
             let mut new_statuses = HashMap::new();
             for agent in &self.agents {
-                if let Some(status) =
-                    memory::load_agent_status_in(&state_dir, &agent.session.name)
+                if let Some(status) = memory::load_agent_status_in(&state_dir, &agent.session.name)
                 {
                     new_statuses.insert(agent.session.name.clone(), status);
                 }
             }
             if let Some(ref mgr) = self.manager {
-                if let Some(status) =
-                    memory::load_agent_status_in(&state_dir, &mgr.session.name)
-                {
+                if let Some(status) = memory::load_agent_status_in(&state_dir, &mgr.session.name) {
                     new_statuses.insert(mgr.session.name.clone(), status);
                 }
             }
