@@ -372,8 +372,8 @@ fn test_omar_spawn_and_kill() {
 
     cleanup_test_sessions();
 
-    // Default prefix is "omar-agent-", so session name = "omar-agent-test-spawn"
-    let full_session = "omar-agent-test-spawn";
+    // CLI commands now target the default EA namespace.
+    let full_session = "omar-agent-0-test-spawn";
 
     // Clean up from previous test runs
     let _ = tmux(&["kill-session", "-t", full_session]);
