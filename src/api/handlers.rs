@@ -403,7 +403,16 @@ pub async fn get_agent_summary(
     let tasks = memory::load_worker_tasks_from(&state_dir);
     let task = tasks.get(&session_name).cloned();
 
-    let status = memory::load_agent_status_in(&state_dir, &session_name);
+    // Read status from the in-memory cache (populated by refresh()) when the
+    // requested EA is the active dashboard EA; fall back to disk for other EAs.
+    let status = {
+        let app = state.app.lock().await;
+        if app.active_ea == ea_id {
+            app.agent_status(&session_name).cloned()
+        } else {
+            memory::load_agent_status_in(&state_dir, &session_name)
+        }
+    };
 
     let parents = memory::load_agent_parents_from(&state_dir);
     let children: Vec<String> = parents
@@ -449,6 +458,15 @@ pub async fn update_agent_status(
     }
 
     memory::save_agent_status_in(&state_dir, &session_name, &req.status);
+
+    // Write through to the in-memory cache so the dashboard reads the latest
+    // status without waiting for the next refresh() cycle.
+    {
+        let mut app = state.app.lock().await;
+        if app.active_ea == ea_id {
+            app.set_agent_status(session_name.clone(), req.status.clone());
+        }
+    }
 
     Ok(Json(StatusResponse {
         status: "updated".to_string(),

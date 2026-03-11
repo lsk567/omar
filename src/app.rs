@@ -335,6 +335,26 @@ impl App {
         // Load parent mappings, worker tasks, and build the chain-of-command tree
         self.agent_parents = memory::load_agent_parents_from(&state_dir);
         self.worker_tasks = memory::load_worker_tasks_from(&state_dir);
+
+        // Cache agent statuses so render and API reads avoid per-frame disk I/O
+        {
+            let mut new_statuses = HashMap::new();
+            for agent in &self.agents {
+                if let Some(status) =
+                    memory::load_agent_status_in(&state_dir, &agent.session.name)
+                {
+                    new_statuses.insert(agent.session.name.clone(), status);
+                }
+            }
+            if let Some(ref mgr) = self.manager {
+                if let Some(status) =
+                    memory::load_agent_status_in(&state_dir, &mgr.session.name)
+                {
+                    new_statuses.insert(mgr.session.name.clone(), status);
+                }
+            }
+            self.agent_statuses = new_statuses;
+        }
         let active_tree = build_tree(
             &self.agents,
             self.manager.as_ref(),
@@ -428,12 +448,14 @@ impl App {
 
         // Write memory after creating manager
         let state_dir = self.state_dir();
+        let events = self.scheduler.list_by_ea(self.active_ea);
         memory::write_memory_to(
             &state_dir,
             &self.agents,
             None,
             &manager_session,
             &self.client,
+            &events,
         );
 
         Ok(())
@@ -796,12 +818,14 @@ impl App {
             memory::remove_agent_parent_in(&state_dir, &name);
             self.status_message = Some(format!("Killed agent: {}", name));
             self.refresh()?;
+            let events = self.scheduler.list_by_ea(self.active_ea);
             memory::write_memory_to(
                 &state_dir,
                 &self.agents,
                 self.manager.as_ref(),
                 &manager_session,
                 &self.client,
+                &events,
             );
         }
         self.pending_confirm = None;
@@ -862,12 +886,14 @@ impl App {
 
         let state_dir = self.state_dir();
         let manager_session = self.manager_session_name();
+        let events = self.scheduler.list_by_ea(self.active_ea);
         memory::write_memory_to(
             &state_dir,
             &self.agents,
             self.manager.as_ref(),
             &manager_session,
             &self.client,
+            &events,
         );
 
         Ok(())
@@ -944,12 +970,14 @@ impl App {
         let _ = projects::add_project_in(&state_dir, name);
         self.projects = projects::load_projects_from(&state_dir);
         let manager_session = self.manager_session_name();
+        let events = self.scheduler.list_by_ea(self.active_ea);
         memory::write_memory_to(
             &state_dir,
             &self.agents,
             self.manager.as_ref(),
             &manager_session,
             &self.client,
+            &events,
         );
     }
 
@@ -959,12 +987,14 @@ impl App {
         let _ = projects::remove_project_in(&state_dir, id);
         self.projects = projects::load_projects_from(&state_dir);
         let manager_session = self.manager_session_name();
+        let events = self.scheduler.list_by_ea(self.active_ea);
         memory::write_memory_to(
             &state_dir,
             &self.agents,
             self.manager.as_ref(),
             &manager_session,
             &self.client,
+            &events,
         );
     }
 

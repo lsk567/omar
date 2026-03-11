@@ -466,13 +466,6 @@ fn spawn_worker(
     // Give it time to start
     thread::sleep(Duration::from_secs(1));
 
-    // Give workers the same runtime bootstrap as API-spawned agents.
-    let short_name = session_name.strip_prefix(client.prefix()).unwrap_or(&session_name);
-    let user_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", short_name, agent.task);
-    client.send_keys_literal(&session_name, &user_msg)?;
-    thread::sleep(Duration::from_millis(200));
-    client.send_keys(&session_name, "Enter")?;
-
     // Persist worker task description to EA-scoped state dir
     let state_dir = ea::ea_state_dir(ea_id, omar_dir);
     memory::save_worker_task_in(&state_dir, &session_name, &agent.task);

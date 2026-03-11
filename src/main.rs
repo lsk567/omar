@@ -1000,6 +1000,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         app.manager.as_ref(),
                         &manager_session,
                         app.client(),
+                        &app.scheduled_events,
                     );
                 }
                 AppEvent::TickerScroll => {
