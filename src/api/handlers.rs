@@ -99,7 +99,8 @@ pub async fn health() -> Json<HealthResponse> {
 pub async fn list_eas(State(state): State<Arc<ApiState>>) -> Json<ListEasResponse> {
     let app = state.app.lock().await;
     let active = app.active_ea;
-    let registry = ea::ensure_default_ea(&state.omar_dir).unwrap_or_else(|_| ea::load_registry(&state.omar_dir));
+    let registry = ea::ensure_default_ea(&state.omar_dir)
+        .unwrap_or_else(|_| ea::load_registry(&state.omar_dir));
 
     let eas = registry
         .iter()
@@ -141,16 +142,15 @@ pub async fn create_ea(
     // Acquire lock BEFORE register_ea to serialize concurrent creation
     let mut app = state.app.lock().await;
 
-    let ea_id = ea::register_ea(&state.omar_dir, &req.name, req.description.as_deref()).map_err(
-        |e| {
+    let ea_id =
+        ea::register_ea(&state.omar_dir, &req.name, req.description.as_deref()).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: format!("Failed to create EA: {}", e),
                 }),
             )
-        },
-    )?;
+        })?;
 
     // Update app's registry (still under lock)
     app.registered_eas = ea::load_registry(&state.omar_dir);
@@ -322,7 +322,9 @@ pub async fn list_agents(
         .collect();
 
     let manager = if client.has_session(&manager_session).unwrap_or(false) {
-        let output_tail = client.capture_pane(&manager_session, 50).unwrap_or_default();
+        let output_tail = client
+            .capture_pane(&manager_session, 50)
+            .unwrap_or_default();
         let activity = client
             .get_pane_activity(&manager_session)
             .unwrap_or_default();
