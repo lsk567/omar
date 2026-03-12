@@ -1,4 +1,4 @@
-//! HTTP API for agent orchestration
+//! HTTP API for agent orchestration — all routes EA-scoped
 
 pub mod handlers;
 pub mod models;
@@ -14,7 +14,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::config::ApiConfig;
 use handlers::ApiState;
 
-/// Create the API router
+/// Create the API router with path-scoped EA routes
 pub fn create_router(state: Arc<ApiState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -22,21 +22,44 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .allow_headers(Any);
 
     Router::new()
+        // Global
         .route("/api/health", get(handlers::health))
-        .route("/api/agents", get(handlers::list_agents))
-        .route("/api/agents", post(handlers::spawn_agent))
-        .route("/api/agents/:id", get(handlers::get_agent))
-        .route("/api/agents/:id", delete(handlers::kill_agent))
-        .route("/api/agents/:id/summary", get(handlers::get_agent_summary))
-        .route("/api/agents/:id/status", put(handlers::update_agent_status))
-        .route("/api/agents/:id/send", post(handlers::send_input))
-        .route("/api/projects", get(handlers::list_projects))
-        .route("/api/projects", post(handlers::add_project))
-        .route("/api/projects/:id", delete(handlers::complete_project))
-        .route("/api/events", post(handlers::schedule_event))
-        .route("/api/events", get(handlers::list_events))
-        .route("/api/events/:id", delete(handlers::cancel_event))
-        // Computer use endpoints
+        // EA management (global)
+        .route("/api/eas", get(handlers::list_eas))
+        .route("/api/eas", post(handlers::create_ea))
+        .route("/api/eas/active", get(handlers::get_active_ea))
+        .route("/api/eas/active", put(handlers::switch_ea))
+        .route("/api/eas/:ea_id", delete(handlers::delete_ea))
+        // EA-scoped: agents
+        .route("/api/ea/:ea_id/agents", get(handlers::list_agents))
+        .route("/api/ea/:ea_id/agents", post(handlers::spawn_agent))
+        .route("/api/ea/:ea_id/agents/:name", get(handlers::get_agent))
+        .route("/api/ea/:ea_id/agents/:name", delete(handlers::kill_agent))
+        .route(
+            "/api/ea/:ea_id/agents/:name/summary",
+            get(handlers::get_agent_summary),
+        )
+        .route(
+            "/api/ea/:ea_id/agents/:name/status",
+            put(handlers::update_agent_status),
+        )
+        .route(
+            "/api/ea/:ea_id/agents/:name/send",
+            post(handlers::send_input),
+        )
+        // EA-scoped: projects
+        .route("/api/ea/:ea_id/projects", get(handlers::list_projects))
+        .route("/api/ea/:ea_id/projects", post(handlers::add_project))
+        .route(
+            "/api/ea/:ea_id/projects/:id",
+            delete(handlers::complete_project),
+        )
+        // EA-scoped: events
+        .route("/api/ea/:ea_id/events", post(handlers::schedule_event))
+        .route("/api/ea/:ea_id/events", get(handlers::list_events))
+        .route("/api/ea/:ea_id/events/pending", get(handlers::get_pending_events))
+        .route("/api/ea/:ea_id/events/:id", delete(handlers::cancel_event))
+        // Computer use (global — one screen, one mouse)
         .route("/api/computer/status", get(handlers::computer_status))
         .route("/api/computer/lock", post(handlers::computer_lock_acquire))
         .route(
