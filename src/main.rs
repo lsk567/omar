@@ -473,12 +473,14 @@ async fn run_dashboard(config: Config) -> Result<()> {
     let ticker = scheduler::TickerBuffer::new();
     let scheduler = Arc::new(scheduler::Scheduler::new());
     let popup_receiver = scheduler::new_popup_receiver();
+    let pending_ea_events = scheduler::new_pending_ea_events();
     let base_prefix = config.dashboard.session_prefix.clone();
     tokio::spawn(scheduler::run_event_loop(
         scheduler.clone(),
         ticker.clone(),
         popup_receiver.clone(),
         base_prefix,
+        pending_ea_events.clone(),
     ));
 
     // Create SINGLE shared App instance (fixes V1: Two-App Problem / BUG-C2).
@@ -504,6 +506,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
             omar_dir,
             health_idle_warning: config.health.idle_warning,
             spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_ea_events: pending_ea_events.clone(),
         });
         tokio::spawn(async move {
             if let Err(e) = api::start_server(api_state, &api_config).await {
