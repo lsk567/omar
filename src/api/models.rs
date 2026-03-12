@@ -51,6 +51,10 @@ pub struct AgentDetailResponse {
     pub health: String,
     pub last_output: String,
     pub output_tail: String,
+    /// True when a dashboard popup is open on this agent (kill-protected).
+    pub protected: bool,
+    /// True when the agent's output contains a completion signal.
+    pub completed: bool,
 }
 
 /// Request to send input to an agent
