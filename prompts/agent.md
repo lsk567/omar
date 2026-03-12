@@ -54,6 +54,7 @@ curl http://localhost:9876/api/agents
 ```bash
 curl http://localhost:9876/api/agents/agent-name
 ```
+Use the JSON `health` field to decide whether a sub-agent is still active. `"running"` means OMAR has seen recent pane changes; `"idle"` means it may be ready for input, finished, or stuck. Inspect the latest output before deciding what to do.
 
 ### Send input to an agent
 ```bash
@@ -72,7 +73,7 @@ curl -X DELETE http://localhost:9876/api/agents/agent-name
 - Keep agent names short and descriptive (e.g., "api", "auth", "db", "test")
 - Be specific about each agent's task — include file paths, function names, expected behavior
 - Spawn independent agents in parallel
-- Monitor health status: "running" = actively working, "idle" = may have finished or need input
+- Monitor the API `health` status: `"running"` = actively working, `"idle"` = may have finished or need input
 - When an agent's output shows task completion, kill it: `curl -X DELETE http://localhost:9876/api/agents/agent-name`
 
 ## Completion Protocol

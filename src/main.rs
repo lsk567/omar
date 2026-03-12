@@ -44,7 +44,7 @@ struct Cli {
     #[arg(short, long, default_value = "~/.config/omar/config.toml")]
     config: String,
 
-    /// Agent backend to use (e.g., "claude", "opencode")
+    /// Agent backend to use (e.g., "claude", "codex", "opencode")
     #[arg(short, long)]
     agent: Option<String>,
 }

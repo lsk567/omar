@@ -254,7 +254,7 @@ pub async fn spawn_agent(
             .unwrap_or_else(|_| ".".to_string())
     });
 
-    // Build the agent command — with system prompt via native CLI flag if a role is set
+    // Build the agent command — with backend-specific prompt injection if a role is set
     let base_command = req
         .command
         .unwrap_or_else(|| app.default_command().to_string());

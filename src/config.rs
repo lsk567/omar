@@ -128,11 +128,13 @@ fn default_command() -> String {
 /// Map shorthand agent names to full commands.
 ///
 /// - `"claude"` → `"claude --dangerously-skip-permissions"`
+/// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
 /// - `"opencode"` → `"opencode"`
 /// - anything else → passed through as-is
 pub fn resolve_backend(name: &str) -> String {
     match name {
         "claude" => "claude --dangerously-skip-permissions".to_string(),
+        "codex" => "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string(),
         "opencode" => "opencode".to_string(),
         other => other.to_string(),
     }
@@ -279,6 +281,10 @@ default_command = "bash"
             resolve_backend("claude"),
             "claude --dangerously-skip-permissions"
         );
+        assert_eq!(
+            resolve_backend("codex"),
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
+        );
         assert_eq!(resolve_backend("opencode"), "opencode");
     }
 
@@ -296,6 +302,16 @@ default_command = "opencode"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.agent.default_command, "opencode");
+    }
+
+    #[test]
+    fn test_parse_config_codex_backend() {
+        let toml = r#"
+[agent]
+default_command = "codex"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.default_command, "codex");
     }
 
     #[test]

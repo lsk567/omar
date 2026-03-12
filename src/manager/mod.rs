@@ -42,29 +42,31 @@ fn sed_escape(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// Build a CLI command with system prompt loaded from a file via native flag.
-///
-/// - `prompt_file`: absolute path to the prompt .md file
-/// - `substitutions`: `(pattern, replacement)` pairs for sed; empty = use `cat`
-///
-/// Detects backend from `base_command`:
-///   - contains "claude" → `--system-prompt`
-///   - contains "opencode" → `--prompt`
-pub fn build_agent_command(
-    base_command: &str,
-    prompt_file: &Path,
-    substitutions: &[(&str, &str)],
-) -> String {
-    let flag = if base_command.contains("claude") {
-        "--system-prompt"
-    } else if base_command.contains("opencode") {
-        "--prompt"
-    } else {
-        return base_command.to_string();
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Claude,
+    Codex,
+    Opencode,
+}
 
+fn detect_backend(base_command: &str) -> Option<BackendKind> {
+    let executable = base_command.split_whitespace().next()?;
+    let executable = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable);
+
+    match executable {
+        "claude" => Some(BackendKind::Claude),
+        "codex" => Some(BackendKind::Codex),
+        "opencode" => Some(BackendKind::Opencode),
+        _ => None,
+    }
+}
+
+fn build_prompt_shell_expr(prompt_file: &Path, substitutions: &[(&str, &str)]) -> String {
     let path_str = prompt_file.display();
-    let shell_expr = if substitutions.is_empty() {
+    if substitutions.is_empty() {
         format!("$(cat '{}')", path_str)
     } else {
         let sed_script: String = substitutions
@@ -73,9 +75,36 @@ pub fn build_agent_command(
             .collect::<Vec<_>>()
             .join("; ");
         format!("$(sed '{}' '{}')", sed_script, path_str)
-    };
+    }
+}
 
-    format!("{} {} \"{}\"", base_command, flag, shell_expr)
+/// Build a CLI command with system prompt loaded from a file via native flag.
+///
+/// - `prompt_file`: absolute path to the prompt .md file
+/// - `substitutions`: `(pattern, replacement)` pairs for sed; empty = use `cat`
+///
+/// Detects backend from `base_command`:
+///   - contains "claude" → `--system-prompt`
+///   - contains "codex" → `developer_instructions`
+///   - contains "opencode" → `--prompt`
+pub fn build_agent_command(
+    base_command: &str,
+    prompt_file: &Path,
+    substitutions: &[(&str, &str)],
+) -> String {
+    let shell_expr = build_prompt_shell_expr(prompt_file, substitutions);
+
+    match detect_backend(base_command) {
+        Some(BackendKind::Claude) => {
+            format!("{} --system-prompt \"{}\"", base_command, shell_expr)
+        }
+        Some(BackendKind::Codex) => format!(
+            "{} -c \"developer_instructions='''{}'''\"",
+            base_command, shell_expr
+        ),
+        Some(BackendKind::Opencode) => format!("{} --prompt \"{}\"", base_command, shell_expr),
+        None => base_command.to_string(),
+    }
 }
 
 /// Build an EA command with memory state baked into the system prompt.
@@ -127,6 +156,19 @@ mod tests {
     }
 
     #[test]
+    fn test_build_agent_command_codex() {
+        let cmd = build_agent_command(
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
+        );
+    }
+
+    #[test]
     fn test_build_agent_command_unknown_backend() {
         let cmd = build_agent_command("vim", Path::new("/tmp/prompts/ea.md"), &[]);
         assert_eq!(cmd, "vim");
@@ -142,6 +184,19 @@ mod tests {
         assert_eq!(
             cmd,
             "claude --system-prompt \"$(sed 's|{{PARENT_NAME}}|pm-api|g; s|{{TASK}}|build it|g' '/prompts/worker.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_codex_with_substitutions() {
+        let cmd = build_agent_command(
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
+            Path::new("/prompts/worker.md"),
+            &[("{{PARENT_NAME}}", "pm-api"), ("{{TASK}}", "build it")],
+        );
+        assert_eq!(
+            cmd,
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''$(sed 's|{{PARENT_NAME}}|pm-api|g; s|{{TASK}}|build it|g' '/prompts/worker.md')'''\""
         );
     }
 
