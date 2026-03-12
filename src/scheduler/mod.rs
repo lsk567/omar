@@ -191,32 +191,12 @@ pub(crate) fn deliver_to_tmux(
     base_prefix: &str,
     ticker: &TickerBuffer,
 ) {
-    let is_manager = receiver == "ea" || receiver == "omar";
-    let target = if is_manager {
+    let target = if receiver == "ea" || receiver == "omar" {
         ea::ea_manager_session(ea_id, base_prefix)
     } else {
         let prefix = ea::ea_prefix(ea_id, base_prefix);
         format!("{}{}", prefix, receiver)
     };
-
-    // Fix BUG D: When delivering to the EA manager pane the user may be
-    // actively composing a multi-line message (using shift+enter).  Sending
-    // the event text directly via send-keys would inject it into the middle
-    // of that in-progress input, corrupting or truncating the user's message.
-    //
-    // Mitigation: for the manager pane only, send Enter first so any partial
-    // input already in the buffer is submitted as its own (possibly incomplete)
-    // message before we inject the event.  The AI can always recover from an
-    // incomplete message; a silently corrupted one is much harder to diagnose.
-    //
-    // Worker agent panes are not affected: they are never typed into by the
-    // human, so their input buffers are always empty when idle.
-    if is_manager {
-        // Flush any partial input that the user may have been composing.
-        let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &target, "Enter"])
-            .output();
-    }
 
     let result = Command::new("tmux")
         .args(["send-keys", "-t", &target, "-l", message])
