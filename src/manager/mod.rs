@@ -49,12 +49,12 @@ enum BackendKind {
     Opencode,
 }
 
-fn detect_backend(base_command: &str) -> Option<BackendKind> {
-    let executable = base_command.split_whitespace().next()?;
-    let executable = Path::new(executable)
+fn detect_backend_token(token: &str) -> Option<BackendKind> {
+    let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')'));
+    let executable = Path::new(token)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(executable);
+        .unwrap_or(token);
 
     match executable {
         "claude" => Some(BackendKind::Claude),
@@ -62,6 +62,12 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
         "opencode" => Some(BackendKind::Opencode),
         _ => None,
     }
+}
+
+fn detect_backend(base_command: &str) -> Option<BackendKind> {
+    base_command
+        .split_whitespace()
+        .find_map(detect_backend_token)
 }
 
 fn build_prompt_shell_expr(prompt_file: &Path, substitutions: &[(&str, &str)]) -> String {
@@ -165,6 +171,45 @@ mod tests {
         assert_eq!(
             cmd,
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_claude() {
+        let cmd = build_agent_command(
+            "env ANTHROPIC_API_KEY=test claude --some-flag",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "env ANTHROPIC_API_KEY=test claude --some-flag --system-prompt \"$(cat '/tmp/prompts/ea.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_opencode() {
+        let cmd = build_agent_command(
+            "npx opencode --model local",
+            Path::new("/tmp/prompts/pm.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "npx opencode --model local --prompt \"$(cat '/tmp/prompts/pm.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_codex() {
+        let cmd = build_agent_command(
+            "env OPENAI_API_KEY=test codex --no-alt-screen",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "env OPENAI_API_KEY=test codex --no-alt-screen -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
         );
     }
 
