@@ -19,7 +19,7 @@ use crate::ea;
 use crate::manager::{build_agent_command, prompts_dir};
 use crate::memory;
 use crate::projects;
-use crate::scheduler::{event::ScheduledEvent, Scheduler};
+use crate::scheduler::{event::ScheduledEvent, PendingEaEvents, Scheduler};
 use crate::tmux::TmuxClient;
 
 /// Shared state for all API handlers
@@ -33,6 +33,9 @@ pub struct ApiState {
     /// Serializes the has_session → new_session sequence to prevent concurrent
     /// spawns from racing past the collision check (TOCTOU race condition fix).
     pub spawn_lock: Arc<Mutex<()>>,
+    /// Server-side queue of events pending delivery to each EA manager.
+    /// EA polls GET /api/ea/:ea_id/events/pending to drain its queue.
+    pub pending_ea_events: PendingEaEvents,
 }
 
 /// Validate EA exists, returning prefix, manager session, and state_dir.
@@ -898,6 +901,25 @@ pub async fn list_events(
         .collect();
 
     Ok(Json(EventListResponse { events }))
+}
+
+/// GET /api/ea/:ea_id/events/pending
+/// Drain and return all queued events for the given EA manager.
+/// Returns { "events": [...] }; empty array if nothing is queued.
+pub async fn get_pending_events(
+    Path(ea_id): Path<u32>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let _ = resolve_ea(ea_id, &state)?;
+
+    let events: Vec<String> = {
+        let mut map = state.pending_ea_events.lock().unwrap();
+        map.remove(&ea_id)
+            .map(|q| q.into_iter().collect())
+            .unwrap_or_default()
+    };
+
+    Ok(Json(serde_json::json!({ "events": events })))
 }
 
 /// DELETE /api/ea/:ea_id/events/:id

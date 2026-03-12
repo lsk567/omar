@@ -57,6 +57,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         // EA-scoped: events
         .route("/api/ea/:ea_id/events", post(handlers::schedule_event))
         .route("/api/ea/:ea_id/events", get(handlers::list_events))
+        .route("/api/ea/:ea_id/events/pending", get(handlers::get_pending_events))
         .route("/api/ea/:ea_id/events/:id", delete(handlers::cancel_event))
         // Computer use (global — one screen, one mouse)
         .route("/api/computer/status", get(handlers::computer_status))
