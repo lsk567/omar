@@ -245,7 +245,7 @@ IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g
 
 ### How it works
 
-After spawning an agent, schedule a self-wake-up so OMAR will nudge you to check on it later. When an event fires, OMAR delivers the payload as a message to your tmux session.
+After spawning an agent, schedule a self-wake-up so OMAR will queue a wake event for you to poll later. When an event fires, OMAR queues the payload — poll the events endpoint to receive it (see **Receiving Events** below).
 
 ### Monitoring workflow
 
@@ -257,7 +257,7 @@ curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"ea\", \"receiver\": \"ea\", \"timestamp\": $NOW, \"payload\": \"Check agent progress\"}"
 ```
-3. When woken, check the agent's output. If still running, schedule another check.
+3. Poll for queued events (see **Receiving Events**). When you find this wake event, check the agent's output. If still running, schedule another check.
 4. When agent reports `[TASK COMPLETE]`, clean up (kill agent, complete project, report).
 
 ### Events API
@@ -295,6 +295,23 @@ When OMAR restarts, the event queue is cleared — all cron jobs and pending eve
 3. If any cron jobs are missing, re-create them using the Events API with the same `recurring_ns` and `payload`.
 
 Do this check early — before processing any user requests — so recurring monitoring and Slack polling resume without gaps.
+
+## Receiving Events
+
+Events from the scheduler (agent completions, cron wake-ups, Slack messages) are delivered to a server-side queue rather than injected into your input. Poll for them regularly:
+
+```bash
+curl -s http://localhost:9876/api/ea/{{EA_ID}}/events/pending
+```
+
+Returns: `{ "events": [...] }` — drain is automatic (reading clears the queue).
+
+Poll at these moments:
+- Before responding to any user message
+- After completing a task or killing an agent
+- When you receive a blank/empty input (the display-message flash may have woken you)
+
+Process each event exactly as you would a directly-delivered message. If events contain `[TASK COMPLETE]`, handle cleanup immediately.
 
 ## Slack Bridge Integration
 
