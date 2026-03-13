@@ -57,6 +57,17 @@ curl -X POST http://localhost:9876/api/agents \
 ```
 - `name`: agent name (auto-generated if omitted)
 - `task`: task description (providing a task automatically assigns the agent prompt)
+- `backend`: agent backend shorthand — `"claude"`, `"codex"`, `"cursor"`, or `"opencode"` (defaults to config)
+- `model`: model override — appended as `--model <value>` (e.g. `"claude-sonnet-4-5-20250514"`, `"o3"`)
+
+#### Spawning with a specific backend and model
+```bash
+curl -X POST http://localhost:9876/api/agents \
+  -H "Content-Type: application/json" \
+  -d '{"name": "worker", "task": "Implement feature X", "backend": "opencode", "model": "anthropic/claude-sonnet-4-5-20250514"}'
+```
+
+You can mix backends in the same army. For example, spawn one agent with `"backend": "codex"` and another with `"backend": "claude"` depending on the task.
 
 #### Send input to an agent
 ```bash

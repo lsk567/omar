@@ -11,8 +11,14 @@ pub struct SpawnAgentRequest {
     pub task: Option<String>,
     /// Working directory
     pub workdir: Option<String>,
-    /// Command to run (defaults to config)
+    /// Command to run (defaults to config). Mutually exclusive with `backend`.
     pub command: Option<String>,
+    /// Backend shorthand: "claude", "codex", "cursor", "opencode".
+    /// Resolved to the full command via resolve_backend(). Mutually exclusive with `command`.
+    pub backend: Option<String>,
+    /// Model to use (e.g. "claude-sonnet-4-5-20250514", "o3", "anthropic/claude-sonnet-4-5-20250514").
+    /// Appended as `--model <value>` to the base command.
+    pub model: Option<String>,
     /// Optional role (e.g. "project-manager") — injects the agent prompt for supported backends
     pub role: Option<String>,
     /// Optional parent agent name (e.g. "pm-rest-api") for chain-of-command tracking
@@ -32,6 +38,12 @@ impl SpawnAgentRequest {
         }
         if self.command.is_none() {
             self.command = fallback.command;
+        }
+        if self.backend.is_none() {
+            self.backend = fallback.backend;
+        }
+        if self.model.is_none() {
+            self.model = fallback.model;
         }
         if self.role.is_none() {
             self.role = fallback.role;
