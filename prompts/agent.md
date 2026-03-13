@@ -20,14 +20,9 @@ IMPORTANT: When spawning sub-agents, you MUST use the OMAR HTTP API (curl comman
 Do NOT use your internal Task tool, background agents, or any built-in multi-agent features.
 The OMAR API creates real tmux sessions that appear in the OMAR dashboard.
 
-## Your Assignment
-
-**Parent:** {{PARENT_NAME}}
-**Task:** {{TASK}}
-
 ## Workflow
 
-1. Receive your assigned task (above)
+1. Receive your assigned task from the first user message (YOUR NAME, YOUR PARENT, YOUR TASK)
 2. Assess the task: can it be parallelized? Is it complex enough to benefit from sub-agents?
 3. **If doing it yourself:** complete the work directly, then output `[TASK COMPLETE]`
 4. **If spawning sub-agents:** break it down into 2-5 focused sub-tasks, spawn agents, monitor them
@@ -95,7 +90,7 @@ Then immediately schedule a wake-up event for your parent so it can check your o
 NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 1_000_000)")
 curl -X POST http://localhost:9876/api/events \
   -H "Content-Type: application/json" \
-  -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"{{PARENT_NAME}}\", \"timestamp\": $NOW, \"payload\": \"[TASK COMPLETE] from <YOUR NAME>. Check output for results.\"}"
+  -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<YOUR PARENT>\", \"timestamp\": $NOW, \"payload\": \"[TASK COMPLETE] from <YOUR NAME>. Check output for results.\"}"
 ```
 
 ## Scheduling and Wake-ups
