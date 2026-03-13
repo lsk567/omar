@@ -31,6 +31,12 @@ The OMAR API creates real tmux sessions that appear in the OMAR dashboard.
 
 ## HTTP API Reference (localhost:9876)
 
+### List available backends
+```bash
+curl http://localhost:9876/api/backends
+```
+Returns which backends are installed, with availability status. Check this before spawning agents with a specific backend.
+
 ### Spawn a sub-agent
 ```bash
 curl -X POST http://localhost:9876/api/agents \
@@ -39,6 +45,15 @@ curl -X POST http://localhost:9876/api/agents \
 ```
 
 **IMPORTANT:** Always include `"parent": "<YOUR NAME>"` when spawning sub-agents so the dashboard can show the chain of command.
+
+### Spawn with a specific backend and model
+```bash
+curl -X POST http://localhost:9876/api/agents \
+  -H "Content-Type: application/json" \
+  -d '{"name": "agent-name", "task": "Task description", "parent": "<YOUR NAME>", "backend": "codex", "model": "o3"}'
+```
+- `backend`: `"claude"`, `"codex"`, `"cursor"`, or `"opencode"` (defaults to system config if omitted)
+- `model`: model override appended as `--model <value>` (e.g. `"claude-sonnet-4-5-20250514"`, `"o3"`, `"anthropic/claude-sonnet-4-5-20250514"`)
 
 ### List all agents
 ```bash
@@ -133,7 +148,12 @@ curl -X DELETE http://localhost:9876/api/events/<event-id>
 
 ## Skills
 
-If your task requires special capabilities (e.g., controlling the desktop via mouse/keyboard/screenshots), check the skills folder at `prompts/skills/` for detailed instructions. Read the relevant skill file before proceeding. When spawning sub-agents that need a skill, include the skill contents in the agent's task description.
+If your task requires special capabilities, check the skills folder at `prompts/skills/` for detailed instructions. Read the relevant skill file before proceeding. When spawning sub-agents that need a skill, include the skill contents in the agent's task description.
+
+Available skills:
+- `prompts/skills/heterogeneous-backends.md` — spawning sub-agents with different backends and models
+- `prompts/skills/computer-use.md` — controlling the desktop via mouse/keyboard/screenshots
+- `prompts/skills/demo.md` — running demo commands for the user
 
 ## Focus
 

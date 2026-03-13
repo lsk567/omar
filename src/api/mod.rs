@@ -23,6 +23,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
 
     Router::new()
         .route("/api/health", get(handlers::health))
+        .route("/api/backends", get(handlers::list_backends))
         .route("/api/agents", get(handlers::list_agents))
         .route("/api/agents", post(handlers::spawn_agent))
         .route("/api/agents/:id", get(handlers::get_agent))

@@ -37,6 +37,14 @@ Name agents with short, descriptive names (e.g., `auth`, `api`, `refactor`).
 
 ## HTTP API Reference (localhost:9876)
 
+### Backends API
+
+#### List available backends
+```bash
+curl http://localhost:9876/api/backends
+```
+Returns which backends are installed on the system, with their resolved commands and availability status. Check this before spawning agents with a specific backend.
+
 ### Agents API
 
 #### List all agents
@@ -57,6 +65,17 @@ curl -X POST http://localhost:9876/api/agents \
 ```
 - `name`: agent name (auto-generated if omitted)
 - `task`: task description (providing a task automatically assigns the agent prompt)
+- `backend`: agent backend shorthand — `"claude"`, `"codex"`, `"cursor"`, or `"opencode"` (defaults to config)
+- `model`: model override — appended as `--model <value>` (e.g. `"claude-sonnet-4-5-20250514"`, `"o3"`)
+
+#### Spawning with a specific backend and model
+```bash
+curl -X POST http://localhost:9876/api/agents \
+  -H "Content-Type: application/json" \
+  -d '{"name": "worker", "task": "Implement feature X", "backend": "opencode", "model": "anthropic/claude-sonnet-4-5-20250514"}'
+```
+
+You can mix backends in the same army. For example, spawn one agent with `"backend": "codex"` and another with `"backend": "claude"` depending on the task.
 
 #### Send input to an agent
 ```bash
@@ -208,7 +227,12 @@ curl -X POST http://localhost:9876/api/agents/demo/send -H "Content-Type: applic
 
 ## Skills
 
-If a task requires special capabilities (e.g., controlling the desktop via mouse/keyboard/screenshots), check the skills folder at `prompts/skills/` for detailed instructions. Mention relevant skills when describing the task to an agent.
+If a task requires special capabilities, check the skills folder at `prompts/skills/` for detailed instructions. Mention relevant skills when describing the task to an agent.
+
+Available skills:
+- `prompts/skills/heterogeneous-backends.md` — spawning agents with different backends and models
+- `prompts/skills/computer-use.md` — controlling the desktop via mouse/keyboard/screenshots
+- `prompts/skills/demo.md` — running demo commands for the user
 
 ## Example
 
