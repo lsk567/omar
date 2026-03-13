@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::manager::MANAGER_SESSION;
@@ -81,6 +82,7 @@ pub struct App {
     pub pending_confirm: Option<ConfirmAction>,
     pub filter: String,
     pub status_message: Option<String>,
+    status_set_at: Option<Instant>,
     /// Warning that persists across tick clears (e.g., tmux misconfiguration)
     pub persistent_warning: Option<String>,
     pub projects: Vec<Project>,
@@ -135,6 +137,7 @@ impl App {
             pending_confirm: None,
             filter: String::new(),
             status_message: None,
+            status_set_at: None,
             persistent_warning: None,
             projects: projects::load_projects(),
             project_input_mode: false,
@@ -449,7 +452,10 @@ impl App {
     /// Drill down into the selected agent (Tab). Only works if the agent has children.
     pub fn drill_down(&mut self) {
         let session_name = if self.manager_selected {
-            // Already viewing EA's children; drill down into EA is a no-op
+            // On EA: hint to select a child if children exist, otherwise silent
+            if !self.focus_child_indices.is_empty() {
+                self.set_status("Highlight sub-agents to drill into them");
+            }
             return;
         } else {
             // Get the session name of the selected focus child
@@ -457,15 +463,18 @@ impl App {
                 if let Some(agent) = self.agents.get(idx) {
                     agent.session.name.clone()
                 } else {
+                    self.set_status("No agent selected");
                     return;
                 }
             } else {
+                self.set_status("No agent selected");
                 return;
             }
         };
 
         // Only drill down if the selected agent has children
         if !self.agent_has_children(&session_name) {
+            self.set_status("No sub-agents to drill into");
             return;
         }
 
@@ -478,12 +487,13 @@ impl App {
         let short = session_name
             .strip_prefix(&self.session_prefix)
             .unwrap_or(&session_name);
-        self.status_message = Some(format!("Viewing: {}", short));
+        self.set_status(format!("Viewing: {}", short));
     }
 
     /// Drill up to the parent view (Esc). Returns true if drilled up, false if at root.
     pub fn drill_up(&mut self) -> bool {
         if self.focus_stack.is_empty() {
+            self.set_status("Already at the top level");
             return false;
         }
         self.focus_parent = self.focus_stack.pop().unwrap();
@@ -644,14 +654,14 @@ impl App {
         if let Some(agent) = self.selected_agent() {
             // Safety: don't kill attached sessions (user's terminal)
             if agent.session.attached {
-                self.status_message = Some("Cannot kill attached session".to_string());
+                self.set_status("Cannot kill attached session");
                 self.pending_confirm = None;
                 return Ok(());
             }
 
             // Safety: don't kill manager from 'd' key (use separate mechanism)
             if agent.session.name == MANAGER_SESSION {
-                self.status_message = Some("Cannot kill manager with 'd'".to_string());
+                self.set_status("Cannot kill executive assistant with 'd'");
                 self.pending_confirm = None;
                 return Ok(());
             }
@@ -659,7 +669,7 @@ impl App {
             let name = agent.session.name.clone();
             self.client.kill_session(&name)?;
             memory::remove_agent_parent(&name);
-            self.status_message = Some(format!("Killed agent: {}", name));
+            self.set_status(format!("Killed agent: {}", name));
             self.refresh()?;
             memory::write_memory(
                 &self.agents,
@@ -714,7 +724,7 @@ impl App {
             .new_session(&name, &self.default_command, Some(&workdir))?;
 
         let short_name = name.strip_prefix(&self.session_prefix).unwrap_or(&name);
-        self.status_message = Some(format!("Spawned agent: {}", short_name));
+        self.set_status(format!("Spawned agent: {}", short_name));
         self.refresh()?;
 
         // Select the new agent
@@ -732,9 +742,10 @@ impl App {
         Ok(())
     }
 
-    /// Set status message
+    /// Set status message (persists for 3 seconds before auto-clearing)
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
+        self.status_set_at = Some(Instant::now());
     }
 
     /// Set a persistent warning that survives clear_status() calls
@@ -742,11 +753,20 @@ impl App {
         let msg = msg.into();
         self.persistent_warning = Some(msg.clone());
         self.status_message = Some(msg);
+        self.status_set_at = None; // persistent warnings don't expire
     }
 
-    /// Clear status message (persistent warnings are restored)
+    /// Clear status message if it has expired (3 seconds).
+    /// Persistent warnings are restored.
     pub fn clear_status(&mut self) {
-        self.status_message = self.persistent_warning.clone();
+        let expired = self
+            .status_set_at
+            .map(|t| t.elapsed().as_secs() >= 3)
+            .unwrap_or(true);
+        if expired {
+            self.status_message = self.persistent_warning.clone();
+            self.status_set_at = None;
+        }
     }
 
     /// Get counts by health state: (running, idle)

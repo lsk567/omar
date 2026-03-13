@@ -321,7 +321,7 @@ pub const QUOTE_COUNT: usize = QUOTES.len();
 
 /// Render the entire dashboard
 pub fn render(frame: &mut Frame, app: &App) {
-    let status_height = if app.status_message.is_some() { 4 } else { 3 };
+    let status_height = 3;
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -472,25 +472,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Status message takes a second line if present
-    if let Some(ref msg) = app.status_message {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(inner);
-
-        // Row 0: stats + quote
-        render_status_row(frame, app, &status_spans, rows[0]);
-
-        // Row 1: status message
-        let msg_paragraph = Paragraph::new(Line::from(Span::styled(
-            msg.clone(),
-            Style::default().fg(Color::Cyan),
-        )));
-        frame.render_widget(msg_paragraph, rows[1]);
-    } else {
-        render_status_row(frame, app, &status_spans, inner);
-    }
+    render_status_row(frame, app, &status_spans, inner);
 }
 
 /// Render the status info on the left and a scrolling quote on the right.
@@ -1169,14 +1151,19 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     ));
     help_text.push(Span::raw(":Help"));
 
-    let ticker_content = app.ticker.render(std::time::Duration::from_secs(5));
-
-    if ticker_content.is_empty() {
-        // No ticker content — full-width help text
-        let paragraph =
-            Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(paragraph, area);
+    // Right side: status message takes priority over ticker
+    let right_content = if let Some(ref msg) = app.status_message {
+        Some((msg.clone(), Style::default().fg(Color::Cyan)))
     } else {
+        let ticker_content = app.ticker.render(std::time::Duration::from_secs(5));
+        if !ticker_content.is_empty() {
+            Some((ticker_content, Style::default().fg(Color::Yellow)))
+        } else {
+            None
+        }
+    };
+
+    if let Some((right_text, right_style)) = right_content {
         // Compute help text width (sum of span widths)
         let help_width: u16 = help_text.iter().map(|s| s.width() as u16).sum();
         let help_col_width = help_width.saturating_add(1).min(area.width);
@@ -1191,17 +1178,16 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(help_paragraph, h_chunks[0]);
 
-        // Right: ticker (static if fits, scrolling if too long)
-        let ticker_area_width = h_chunks[1].width as usize;
-        if ticker_area_width > 0 {
-            let content_len = ticker_content.chars().count();
-            let visible = if content_len <= ticker_area_width {
-                // Fits — display statically, right-aligned
-                format!("{:>width$}", ticker_content, width = ticker_area_width)
+        // Right: status message or ticker
+        let right_area_width = h_chunks[1].width as usize;
+        if right_area_width > 0 {
+            let content_len = right_text.chars().count();
+            let visible = if content_len <= right_area_width {
+                format!("{:>width$}", right_text, width = right_area_width)
             } else {
                 // Too long — scroll
-                let padded: String = std::iter::repeat_n(' ', ticker_area_width)
-                    .chain(ticker_content.chars())
+                let padded: String = std::iter::repeat_n(' ', right_area_width)
+                    .chain(right_text.chars())
                     .collect();
                 let total_len = padded.chars().count();
                 let offset = app.ticker_offset % total_len;
@@ -1209,16 +1195,18 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
                     .chars()
                     .cycle()
                     .skip(offset)
-                    .take(ticker_area_width)
+                    .take(right_area_width)
                     .collect()
             };
 
-            let ticker_paragraph = Paragraph::new(Line::from(Span::styled(
-                visible,
-                Style::default().fg(Color::Yellow),
-            )));
-            frame.render_widget(ticker_paragraph, h_chunks[1]);
+            let right_paragraph = Paragraph::new(Line::from(Span::styled(visible, right_style)));
+            frame.render_widget(right_paragraph, h_chunks[1]);
         }
+    } else {
+        // No right content — full-width help text
+        let paragraph =
+            Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(paragraph, area);
     }
 }
 
