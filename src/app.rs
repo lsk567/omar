@@ -9,7 +9,6 @@ use crate::manager::MANAGER_SESSION;
 use crate::memory;
 use crate::projects::{self, Project};
 use crate::scheduler::{ScheduledEvent, TickerBuffer};
-use crate::settings::DashboardSettings;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -99,7 +98,7 @@ pub struct App {
     pub show_debug_console: bool,
     pub show_settings: bool,
     pub settings_selected: usize,
-    pub settings: DashboardSettings,
+    pub config: Config,
     /// Session name of the agent shown in the bottom panel (default: MANAGER_SESSION)
     pub focus_parent: String,
     /// Stack for Esc navigation (drill-up restores previous parent)
@@ -116,13 +115,10 @@ pub struct App {
     pub sidebar_selected: usize,
     client: TmuxClient,
     health_checker: HealthChecker,
-    default_command: String,
-    default_workdir: String,
-    session_prefix: String,
 }
 
 impl App {
-    pub fn new(config: &Config, ticker: TickerBuffer) -> Self {
+    pub fn new(config: Config, ticker: TickerBuffer) -> Self {
         let client = TmuxClient::new(&config.dashboard.session_prefix);
         let health_checker = HealthChecker::new(client.clone(), config.health.idle_warning);
 
@@ -166,7 +162,7 @@ impl App {
             show_debug_console: false,
             show_settings: false,
             settings_selected: 0,
-            settings: DashboardSettings::load(),
+            config,
             focus_parent: MANAGER_SESSION.to_string(),
             focus_stack: Vec::new(),
             focus_child_indices: Vec::new(),
@@ -177,9 +173,6 @@ impl App {
             sidebar_selected: 0,
             client,
             health_checker,
-            default_command: config.agent.default_command.clone(),
-            default_workdir: config.agent.default_workdir.clone(),
-            session_prefix: config.dashboard.session_prefix.clone(),
         }
     }
 
@@ -216,8 +209,10 @@ impl App {
             } else if session.name == DASHBOARD_SESSION {
                 // Skip the dashboard's own tmux session
                 continue;
-            } else if !self.session_prefix.is_empty()
-                && !session.name.starts_with(&self.session_prefix)
+            } else if !self.config.dashboard.session_prefix.is_empty()
+                && !session
+                    .name
+                    .starts_with(&self.config.dashboard.session_prefix)
             {
                 // Skip sessions that don't match the configured prefix
                 continue;
@@ -283,7 +278,7 @@ impl App {
             &self.agents,
             self.manager.as_ref(),
             &self.agent_parents,
-            &self.session_prefix,
+            &self.config.dashboard.session_prefix,
         );
 
         // Recompute focus children indices
@@ -307,7 +302,7 @@ impl App {
         }
 
         // Build command with EA system prompt + memory baked in
-        let cmd = crate::manager::build_ea_command(&self.default_command);
+        let cmd = crate::manager::build_ea_command(&self.config.agent.default_command);
 
         // Start manager session — system prompt set at process start
         let workdir = std::env::current_dir()
@@ -340,12 +335,16 @@ impl App {
 
     /// Group agents into PM → worker hierarchies for grid display
     pub fn agent_groups(&self) -> Vec<AgentGroup<'_>> {
-        build_agent_groups(&self.agents, &self.agent_parents, &self.session_prefix)
+        build_agent_groups(
+            &self.agents,
+            &self.agent_parents,
+            &self.config.dashboard.session_prefix,
+        )
     }
 
     /// Get default command
     pub fn default_command(&self) -> &str {
-        &self.default_command
+        &self.config.agent.default_command
     }
 
     /// Get the agent_parents map (for API/display)
@@ -434,7 +433,7 @@ impl App {
                 continue; // Already added EA
             }
             let short = session
-                .strip_prefix(&self.session_prefix)
+                .strip_prefix(&self.config.dashboard.session_prefix)
                 .unwrap_or(session);
             crumbs.push(short.to_string());
         }
@@ -442,7 +441,7 @@ impl App {
         if self.focus_parent != MANAGER_SESSION {
             let short = self
                 .focus_parent
-                .strip_prefix(&self.session_prefix)
+                .strip_prefix(&self.config.dashboard.session_prefix)
                 .unwrap_or(&self.focus_parent);
             crumbs.push(short.to_string());
         }
@@ -485,7 +484,7 @@ impl App {
         self.focus_child_indices = self.compute_focus_child_indices();
 
         let short = session_name
-            .strip_prefix(&self.session_prefix)
+            .strip_prefix(&self.config.dashboard.session_prefix)
             .unwrap_or(&session_name);
         self.set_status(format!("Viewing: {}", short));
     }
@@ -548,7 +547,7 @@ impl App {
     pub fn sidebar_next(&mut self) {
         self.sidebar_panel = match self.sidebar_panel {
             SidebarPanel::Projects => {
-                if self.settings.show_event_queue {
+                if self.config.dashboard.show_event_queue {
                     SidebarPanel::Events
                 } else {
                     SidebarPanel::ChainOfCommand
@@ -565,7 +564,7 @@ impl App {
             SidebarPanel::Projects => SidebarPanel::ChainOfCommand,
             SidebarPanel::Events => SidebarPanel::Projects,
             SidebarPanel::ChainOfCommand => {
-                if self.settings.show_event_queue {
+                if self.config.dashboard.show_event_queue {
                     SidebarPanel::Events
                 } else {
                     SidebarPanel::Projects
@@ -691,14 +690,14 @@ impl App {
             .collect();
 
         for i in 1..1000 {
-            let name = format!("{}{}", self.session_prefix, i);
+            let name = format!("{}{}", self.config.dashboard.session_prefix, i);
             if !existing.contains(name.as_str()) {
                 return name;
             }
         }
         format!(
             "{}{}",
-            self.session_prefix,
+            self.config.dashboard.session_prefix,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -712,18 +711,20 @@ impl App {
         self.refresh()?;
 
         let name = self.generate_agent_name();
-        let workdir = if self.default_workdir == "." {
+        let workdir = if self.config.agent.default_workdir == "." {
             std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".to_string())
         } else {
-            self.default_workdir.clone()
+            self.config.agent.default_workdir.clone()
         };
 
         self.client
-            .new_session(&name, &self.default_command, Some(&workdir))?;
+            .new_session(&name, &self.config.agent.default_command, Some(&workdir))?;
 
-        let short_name = name.strip_prefix(&self.session_prefix).unwrap_or(&name);
+        let short_name = name
+            .strip_prefix(&self.config.dashboard.session_prefix)
+            .unwrap_or(&name);
         self.set_status(format!("Spawned agent: {}", short_name));
         self.refresh()?;
 
