@@ -92,7 +92,17 @@ pub async fn get_agent(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<AgentDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = state.app.lock().await;
+    let mut app = state.app.lock().await;
+
+    // Refresh to pick up newly spawned sessions from tmux
+    if let Err(e) = app.refresh() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to refresh: {}", e),
+            }),
+        ));
+    }
 
     let prefix = app.client().prefix().to_string();
     let full_id = resolve_session_name(&prefix, &id);
