@@ -44,7 +44,7 @@ struct Cli {
     #[arg(short, long, default_value = "~/.config/omar/config.toml")]
     config: String,
 
-    /// Agent backend to use (e.g., "claude", "codex", "opencode")
+    /// Agent backend to use: claude, codex, cursor, opencode
     #[arg(short, long)]
     agent: Option<String>,
 }
@@ -84,7 +84,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = Config::load(&cli.config)?;
     if let Some(ref agent) = cli.agent {
-        config.agent.default_command = config::resolve_backend(agent);
+        config.agent.default_command =
+            config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
     }
     let client = TmuxClient::new(&config.dashboard.session_prefix);
 

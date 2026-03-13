@@ -131,14 +131,19 @@ fn default_command() -> String {
 /// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
 /// - `"cursor"` → `"cursor agent --yolo"`
 /// - `"opencode"` → `"opencode"`
-/// - anything else → passed through as-is
-pub fn resolve_backend(name: &str) -> String {
+/// - anything else → error
+pub fn resolve_backend(name: &str) -> Result<String, String> {
     match name {
-        "claude" => "claude --dangerously-skip-permissions".to_string(),
-        "codex" => "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string(),
-        "cursor" => "cursor agent --yolo".to_string(),
-        "opencode" => "opencode".to_string(),
-        other => other.to_string(),
+        "claude" => Ok("claude --dangerously-skip-permissions".to_string()),
+        "codex" => {
+            Ok("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string())
+        }
+        "cursor" => Ok("cursor agent --yolo".to_string()),
+        "opencode" => Ok("opencode".to_string()),
+        other => Err(format!(
+            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode",
+            other
+        )),
     }
 }
 
@@ -280,21 +285,21 @@ default_command = "bash"
     #[test]
     fn test_resolve_backend_known_names() {
         assert_eq!(
-            resolve_backend("claude"),
+            resolve_backend("claude").unwrap(),
             "claude --dangerously-skip-permissions"
         );
         assert_eq!(
-            resolve_backend("codex"),
+            resolve_backend("codex").unwrap(),
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
         );
-        assert_eq!(resolve_backend("cursor"), "cursor agent --yolo");
-        assert_eq!(resolve_backend("opencode"), "opencode");
+        assert_eq!(resolve_backend("cursor").unwrap(), "cursor agent --yolo");
+        assert_eq!(resolve_backend("opencode").unwrap(), "opencode");
     }
 
     #[test]
-    fn test_resolve_backend_passthrough() {
-        assert_eq!(resolve_backend("aider --yes"), "aider --yes");
-        assert_eq!(resolve_backend("custom-agent"), "custom-agent");
+    fn test_resolve_backend_unknown_errors() {
+        assert!(resolve_backend("aider").is_err());
+        assert!(resolve_backend("agent").is_err());
     }
 
     #[test]
