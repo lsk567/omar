@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Request to spawn a new agent
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct SpawnAgentRequest {
     /// Agent name (auto-generated if not provided)
     pub name: Option<String>,
@@ -13,10 +13,34 @@ pub struct SpawnAgentRequest {
     pub workdir: Option<String>,
     /// Command to run (defaults to config)
     pub command: Option<String>,
-    /// Optional role (e.g. "project-manager") — injects a system prompt
+    /// Optional role (e.g. "project-manager") — injects the agent prompt for supported backends
     pub role: Option<String>,
     /// Optional parent agent name (e.g. "pm-rest-api") for chain-of-command tracking
     pub parent: Option<String>,
+}
+
+impl SpawnAgentRequest {
+    pub fn with_fallbacks(mut self, fallback: Self) -> Self {
+        if self.name.is_none() {
+            self.name = fallback.name;
+        }
+        if self.task.is_none() {
+            self.task = fallback.task;
+        }
+        if self.workdir.is_none() {
+            self.workdir = fallback.workdir;
+        }
+        if self.command.is_none() {
+            self.command = fallback.command;
+        }
+        if self.role.is_none() {
+            self.role = fallback.role;
+        }
+        if self.parent.is_none() {
+            self.parent = fallback.parent;
+        }
+        self
+    }
 }
 
 /// Response after spawning an agent

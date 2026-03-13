@@ -101,12 +101,12 @@ Look for:
 
 ### Detecting Agent Activity State
 
-When you check an agent's output via `curl http://localhost:9876/api/agents/<name>`, look at the status line **after the last `❯` prompt symbol** to determine whether the agent is working or idle:
+When you check an agent via `curl http://localhost:9876/api/agents/<name>`, use the JSON response to determine whether the agent is working or idle:
 
-- **Agent is actively working:** You will see an activity indicator phrase after the `❯` prompt, such as "Deliberating…", "Sautéing…", "Fiddle-faddling…", "Evaporating…", "Sublimating…", "Unravelling…", "Brewed for…", etc. These are processing indicators — the agent is busy. **Wait for it to finish** before sending input.
-- **Agent is idle:** You will see only a bare `❯` prompt with no activity indicator below it. This means the agent has finished its current work and is **waiting for input** — you should send it a message or take action.
+- **Agent is actively working:** The JSON `health` field is `"running"`. This means OMAR has observed recent pane changes. **Wait for it to finish** before sending input. Use `output_tail` to inspect what it is doing.
+- **Agent is idle:** The JSON `health` field is `"idle"`. This means OMAR has not seen recent pane changes. The agent may be waiting for input, finished, or stuck. Inspect `output_tail` before deciding whether to send input, replace it, or clean it up.
 
-This distinction is important: sending input to an agent that is mid-operation can interrupt its work. Always confirm the agent is idle (bare `❯` with no status phrase) before sending follow-up messages or nudges.
+This distinction is important: sending input to an agent that is mid-operation can interrupt its work. Always confirm the agent is idle via the `health` field before sending follow-up messages or nudges.
 
 ### Handling Stuck Agents
 
@@ -122,7 +122,7 @@ curl -X POST http://localhost:9876/api/agents \
   -d '{"name": "<name>", "task": "Same task description with full context"}'
 ```
 
-**Do not over-nudge active agents.** When monitoring agents, do NOT send excessive nudges while an agent is actively working (has an activity indicator like a spinner or progress phrase). Only nudge when the agent is idle (bare `❯` prompt with no activity indicator) AND not making progress. Over-nudging active agents disrupts their flow.
+**Do not over-nudge active agents.** When monitoring agents, do NOT send excessive nudges while an agent is actively working (`"health": "running"`). Only nudge when the agent is idle (`"health": "idle"`) AND not making progress. Over-nudging active agents disrupts their flow.
 
 ## When an Agent Finishes
 

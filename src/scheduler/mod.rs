@@ -169,6 +169,10 @@ pub(crate) fn deliver_to_tmux(receiver: &str, message: &str, ticker: &TickerBuff
 
     match result {
         Ok(output) if output.status.success() => {
+            // Small delay so tmux finishes processing bracketed paste
+            // before we send the Enter key to submit it.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
             // Send Enter to submit the message
             let _ = Command::new("tmux")
                 .args(["send-keys", "-t", &target, "Enter"])
