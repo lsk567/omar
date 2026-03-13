@@ -452,7 +452,10 @@ impl App {
     /// Drill down into the selected agent (Tab). Only works if the agent has children.
     pub fn drill_down(&mut self) {
         let session_name = if self.manager_selected {
-            self.set_status("Already at top level");
+            // On EA: hint to select a child if children exist, otherwise silent
+            if !self.focus_child_indices.is_empty() {
+                self.set_status("Highlight sub-agents to drill into them");
+            }
             return;
         } else {
             // Get the session name of the selected focus child
@@ -490,6 +493,7 @@ impl App {
     /// Drill up to the parent view (Esc). Returns true if drilled up, false if at root.
     pub fn drill_up(&mut self) -> bool {
         if self.focus_stack.is_empty() {
+            self.set_status("Already at the top level");
             return false;
         }
         self.focus_parent = self.focus_stack.pop().unwrap();
