@@ -1,8 +1,9 @@
 //! API endpoint handlers
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -39,6 +40,44 @@ fn resolve_session_name(prefix: &str, id: &str) -> String {
 /// Strip the session prefix to get the user-facing short name.
 fn display_name<'a>(prefix: &str, session_name: &'a str) -> &'a str {
     session_name.strip_prefix(prefix).unwrap_or(session_name)
+}
+
+fn parse_spawn_agent_request(
+    query: SpawnAgentRequest,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<SpawnAgentRequest, String> {
+    let trimmed = body
+        .iter()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .copied()
+        .collect::<Vec<_>>();
+    let looks_like_json = matches!(trimmed.first(), Some(b'{'));
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let wants_json = content_type.starts_with("application/json")
+        || (looks_like_json && !content_type.starts_with("text/plain"));
+
+    if body.is_empty() {
+        return Ok(query);
+    }
+
+    if wants_json {
+        let req: SpawnAgentRequest =
+            serde_json::from_slice(body).map_err(|e| format!("Invalid JSON spawn request: {e}"))?;
+        return Ok(req.with_fallbacks(query));
+    }
+
+    let task = std::str::from_utf8(body)
+        .map_err(|e| format!("Spawn request body must be valid UTF-8: {e}"))?
+        .to_string();
+
+    Ok(SpawnAgentRequest {
+        task: Some(task),
+        ..query
+    })
 }
 
 /// GET /api/health
@@ -224,8 +263,21 @@ pub async fn update_agent_status(
 /// POST /api/agents
 pub async fn spawn_agent(
     State(state): State<Arc<ApiState>>,
-    Json(req): Json<SpawnAgentRequest>,
+    Query(query): Query<SpawnAgentRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<SpawnAgentResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let req = parse_spawn_agent_request(query, &headers, &body).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "{}. Use JSON or send the task as text/plain with query params like /api/agents?name=worker&parent=ea",
+                    error
+                ),
+            }),
+        )
+    })?;
     let app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
@@ -307,8 +359,8 @@ pub async fn spawn_agent(
             // Wait for the agent process to start
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let _ = client.send_keys_literal(&session, &user_msg);
-            // Small delay so tmux finishes buffering the text before Enter
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Delay so tmux finishes processing bracketed paste before Enter
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let _ = client.send_keys(&session, "Enter");
         });
     }
@@ -425,7 +477,7 @@ pub async fn send_input(
 
     // Send enter if requested (small delay so tmux finishes buffering the text)
     if req.enter {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if let Err(e) = app.client().send_keys(&session_name, "Enter") {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -855,5 +907,72 @@ pub async fn computer_mouse_position(
                 error: format!("Failed to get mouse position: {}", e),
             }),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_spawn_agent_request;
+    use crate::api::models::SpawnAgentRequest;
+    use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    #[test]
+    fn parse_spawn_agent_request_accepts_plain_text_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        let req = parse_spawn_agent_request(
+            SpawnAgentRequest {
+                name: Some("worker-1".to_string()),
+                parent: Some("ea".to_string()),
+                ..SpawnAgentRequest::default()
+            },
+            &headers,
+            b"Fix user's issue\nPreserve \"quotes\".",
+        )
+        .unwrap();
+
+        assert_eq!(req.name.as_deref(), Some("worker-1"));
+        assert_eq!(req.parent.as_deref(), Some("ea"));
+        assert_eq!(
+            req.task.as_deref(),
+            Some("Fix user's issue\nPreserve \"quotes\".")
+        );
+    }
+
+    #[test]
+    fn parse_spawn_agent_request_accepts_headerless_json() {
+        let req = parse_spawn_agent_request(
+            SpawnAgentRequest {
+                parent: Some("ea".to_string()),
+                ..SpawnAgentRequest::default()
+            },
+            &HeaderMap::new(),
+            br#"{"name":"worker-2","task":"Implement feature","command":"bash"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(req.name.as_deref(), Some("worker-2"));
+        assert_eq!(req.parent.as_deref(), Some("ea"));
+        assert_eq!(req.task.as_deref(), Some("Implement feature"));
+        assert_eq!(req.command.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn parse_spawn_agent_request_respects_explicit_text_plain() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        let req = parse_spawn_agent_request(
+            SpawnAgentRequest::default(),
+            &headers,
+            br#"{"not":"json for OMAR, just literal task text"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            req.task.as_deref(),
+            Some(r#"{"not":"json for OMAR, just literal task text"}"#)
+        );
     }
 }
