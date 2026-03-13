@@ -7,7 +7,6 @@ mod manager;
 mod memory;
 mod projects;
 mod scheduler;
-mod settings;
 mod tmux;
 mod ui;
 
@@ -40,9 +39,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Path to config file
-    #[arg(short, long, default_value = "~/.config/omar/config.toml")]
-    config: String,
+    /// Path to config file [default: ~/.omar/config.toml]
+    #[arg(short, long)]
+    config: Option<String>,
 
     /// Agent backend to use: claude, codex, cursor, opencode
     #[arg(short, long)]
@@ -61,7 +60,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut config = Config::load(&cli.config)?;
+    let mut config = Config::load(cli.config.as_deref())?;
     if let Some(ref agent) = cli.agent {
         config.agent.default_command =
             config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -393,7 +392,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
     if config.api.enabled {
         let api_config = config.api.clone();
         let api_state = Arc::new(api::handlers::ApiState {
-            app: Arc::new(Mutex::new(App::new(&config, ticker.clone()))),
+            app: Arc::new(Mutex::new(App::new(config.clone(), ticker.clone()))),
             scheduler: scheduler.clone(),
             computer_lock: computer::new_lock(),
         });
@@ -418,7 +417,8 @@ async fn run_dashboard(config: Config) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app for dashboard (separate instance)
-    let mut app = App::new(&config, ticker);
+    let tick_rate = Duration::from_secs(config.dashboard.refresh_interval);
+    let mut app = App::new(config, ticker);
 
     // Show bridge status
     match (slack_bridge.is_some(), computer_bridge.is_some()) {
@@ -439,7 +439,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
     }
 
     // Event loop
-    let tick_rate = Duration::from_secs(config.dashboard.refresh_interval);
     let mut events = EventHandler::new(tick_rate);
     let mut tick_count: u64 = 0;
 
@@ -538,14 +537,14 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 }
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
-                                if app.settings_selected + 1 < app.settings.count() {
+                                if app.settings_selected + 1 < app.config.settings_count() {
                                     app.settings_selected += 1;
                                 }
                             }
                             KeyCode::Enter => {
-                                app.settings.toggle(app.settings_selected);
+                                app.config.toggle_setting(app.settings_selected);
                                 // If event queue was just hidden, move sidebar off Events panel
-                                if !app.settings.show_event_queue
+                                if !app.config.dashboard.show_event_queue
                                     && app.sidebar_panel == app::SidebarPanel::Events
                                 {
                                     app.sidebar_panel = app::SidebarPanel::Projects;
@@ -587,7 +586,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.drill_up();
                         }
                         KeyCode::Right => {
-                            if app.settings.sidebar_right {
+                            if app.config.dashboard.sidebar_right {
                                 // Sidebar is on the right: try grid right first, then sidebar
                                 if !app.grid_right() {
                                     app.sidebar_focused = true;
@@ -601,7 +600,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Left => {
-                            if app.settings.sidebar_right {
+                            if app.config.dashboard.sidebar_right {
                                 // Sidebar is on the right: try grid left (no fallback)
                                 if !app.grid_left() && app.sidebar_focused {
                                     app.sidebar_focused = false;
@@ -632,7 +631,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('h') => {
                             // h = physical left
-                            if app.settings.sidebar_right {
+                            if app.config.dashboard.sidebar_right {
                                 // Sidebar on right: left means try grid left, no sidebar fallback
                                 if !app.grid_left() && app.sidebar_focused {
                                     app.sidebar_focused = false;
@@ -646,7 +645,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('l') => {
                             // l = physical right
-                            if app.settings.sidebar_right {
+                            if app.config.dashboard.sidebar_right {
                                 // Sidebar on right: right means try grid right, then sidebar
                                 if !app.grid_right() {
                                     app.sidebar_focused = true;

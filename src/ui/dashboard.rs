@@ -334,7 +334,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_status_bar(frame, app, outer[0]);
 
     // Two-column layout: sidebar + main content (sidebar can be left or right)
-    let columns = if app.settings.sidebar_right {
+    let columns = if app.config.dashboard.sidebar_right {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(40)])
@@ -350,7 +350,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let (sidebar_area, main_area) = columns;
 
     // Sidebar: projects, (optional) event queue, chain of command
-    if app.settings.show_event_queue {
+    if app.config.dashboard.show_event_queue {
         let sidebar = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1530,8 +1530,8 @@ fn render_settings_popup(frame: &mut Frame, app: &App) {
         Line::from(""),
     ];
 
-    for i in 0..app.settings.count() {
-        if let Some((label, value)) = app.settings.item(i) {
+    for i in 0..app.config.settings_count() {
+        if let Some((label, value)) = app.config.settings_item(i) {
             let selected = i == app.settings_selected;
             let toggle = if value { "[ON] " } else { "[OFF]" };
             let toggle_color = if value { Color::Green } else { Color::Red };

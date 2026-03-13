@@ -28,6 +28,14 @@ pub struct DashboardConfig {
     /// Session name prefix for agent sessions
     #[serde(default = "default_session_prefix")]
     pub session_prefix: String,
+
+    /// Show event queue in sidebar
+    #[serde(default = "default_true")]
+    pub show_event_queue: bool,
+
+    /// Sidebar on right side
+    #[serde(default = "default_true")]
+    pub sidebar_right: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +77,10 @@ pub struct ApiConfig {
     /// Port to listen on
     #[serde(default = "default_api_port")]
     pub port: u16,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_refresh_interval() -> u64 {
@@ -168,6 +180,8 @@ impl Default for DashboardConfig {
         Self {
             refresh_interval: default_refresh_interval(),
             session_prefix: default_session_prefix(),
+            show_event_queue: true,
+            sidebar_right: true,
         }
     }
 }
@@ -202,12 +216,25 @@ impl Default for ApiConfig {
 }
 
 impl Config {
-    /// Load config from file, or return defaults if file doesn't exist
-    pub fn load(path: &str) -> Result<Self> {
-        let expanded_path = expand_tilde(path);
+    /// Default config path: ~/.omar/config.toml
+    pub fn default_path() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".omar")
+            .join("config.toml")
+    }
+
+    /// Load config from file. Creates default config at ~/.omar/config.toml on first run.
+    pub fn load(path: Option<&str>) -> Result<Self> {
+        let expanded_path = match path {
+            Some(p) => expand_tilde(p),
+            None => Self::default_path(),
+        };
 
         if !expanded_path.exists() {
-            return Ok(Self::default());
+            let config = Self::default();
+            config.save();
+            return Ok(config);
         }
 
         let contents =
@@ -216,12 +243,42 @@ impl Config {
         toml::from_str(&contents).context("Failed to parse config file")
     }
 
-    /// Get the default config path
-    pub fn default_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("omar")
-            .join("config.toml")
+    /// Save config to its default path (~/.omar/config.toml)
+    pub fn save(&self) {
+        let path = Self::default_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Ok(contents) = toml::to_string_pretty(self) {
+            std::fs::write(&path, contents).ok();
+        }
+    }
+
+    /// Number of toggleable settings
+    pub fn settings_count(&self) -> usize {
+        2
+    }
+
+    /// Get label and current value for a setting by index
+    pub fn settings_item(&self, index: usize) -> Option<(&str, bool)> {
+        match index {
+            0 => Some((
+                "Show event queue in sidebar",
+                self.dashboard.show_event_queue,
+            )),
+            1 => Some(("Sidebar on right side", self.dashboard.sidebar_right)),
+            _ => None,
+        }
+    }
+
+    /// Toggle a setting by index and save
+    pub fn toggle_setting(&mut self, index: usize) {
+        match index {
+            0 => self.dashboard.show_event_queue = !self.dashboard.show_event_queue,
+            1 => self.dashboard.sidebar_right = !self.dashboard.sidebar_right,
+            _ => {}
+        }
+        self.save();
     }
 }
 
@@ -243,8 +300,36 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.dashboard.refresh_interval, 1);
         assert_eq!(config.dashboard.session_prefix, "omar-agent-");
+        assert!(config.dashboard.show_event_queue);
+        assert!(config.dashboard.sidebar_right);
         assert_eq!(config.health.idle_warning, 15);
         assert_eq!(config.health.idle_critical, 300);
+    }
+
+    #[test]
+    fn test_settings_toggle() {
+        let mut config = Config::default();
+        assert!(config.dashboard.show_event_queue);
+        assert_eq!(config.settings_count(), 2);
+        assert_eq!(
+            config.settings_item(0),
+            Some(("Show event queue in sidebar", true))
+        );
+        // Toggle without saving to disk (just test the in-memory toggle)
+        config.dashboard.show_event_queue = !config.dashboard.show_event_queue;
+        assert!(!config.dashboard.show_event_queue);
+    }
+
+    #[test]
+    fn test_parse_config_with_settings() {
+        let toml = r#"
+[dashboard]
+show_event_queue = false
+sidebar_right = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.dashboard.show_event_queue);
+        assert!(!config.dashboard.sidebar_right);
     }
 
     #[test]
