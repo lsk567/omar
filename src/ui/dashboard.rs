@@ -321,7 +321,7 @@ pub const QUOTE_COUNT: usize = QUOTES.len();
 
 /// Render the entire dashboard
 pub fn render(frame: &mut Frame, app: &App) {
-    let status_height = if app.status_message.is_some() { 4 } else { 3 };
+    let status_height = 3;
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -472,25 +472,16 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Status message takes a second line if present
+    // Append status message inline
     if let Some(ref msg) = app.status_message {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(inner);
-
-        // Row 0: stats + quote
-        render_status_row(frame, app, &status_spans, rows[0]);
-
-        // Row 1: status message
-        let msg_paragraph = Paragraph::new(Line::from(Span::styled(
-            msg.clone(),
+        status_spans.push(Span::raw("  "));
+        status_spans.push(Span::styled(
+            format!("| {}", msg),
             Style::default().fg(Color::Cyan),
-        )));
-        frame.render_widget(msg_paragraph, rows[1]);
-    } else {
-        render_status_row(frame, app, &status_spans, inner);
+        ));
     }
+
+    render_status_row(frame, app, &status_spans, inner);
 }
 
 /// Render the status info on the left and a scrolling quote on the right.
