@@ -168,8 +168,6 @@ pub async fn get_agent_summary(
             let tasks = memory::load_worker_tasks();
             let task = tasks.get(&session).cloned();
 
-            let status = app.agent_status(&session).cloned();
-
             let parents = memory::load_agent_parents();
             let children: Vec<String> = parents
                 .iter()
@@ -181,7 +179,6 @@ pub async fn get_agent_summary(
                 id: display_name(&prefix, &session).to_string(),
                 health,
                 task,
-                status,
                 children,
             }))
         }
@@ -192,33 +189,6 @@ pub async fn get_agent_summary(
             }),
         )),
     }
-}
-
-/// PUT /api/agents/:id/status
-pub async fn update_agent_status(
-    State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
-    Json(req): Json<UpdateStatusRequest>,
-) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut app = state.app.lock().await;
-    let prefix = app.client().prefix().to_string();
-    let session_name = resolve_session_name(&prefix, &id);
-
-    if !app.client().has_session(&session_name).unwrap_or(false) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Agent '{}' not found", id),
-            }),
-        ));
-    }
-
-    app.set_agent_status(session_name.clone(), req.status);
-
-    Ok(Json(StatusResponse {
-        status: "updated".to_string(),
-        message: Some(format!("Status updated for '{}'", id)),
-    }))
 }
 
 /// POST /api/agents
@@ -311,26 +281,6 @@ pub async fn spawn_agent(
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let _ = client.send_keys(&session, "Enter");
         });
-    }
-
-    // Schedule a recurring status-prompt event for agents with tasks
-    if has_agent_prompt {
-        let short_name = display_name(&prefix, &name).to_string();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let interval: u64 = 60_000_000_000; // 60 seconds
-        let event = ScheduledEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            sender: "omar".to_string(),
-            receiver: short_name,
-            timestamp: now + interval,
-            payload: "[STATUS CHECK] Update your status via the API: curl -X PUT http://localhost:9876/api/agents/<YOUR NAME>/status -H 'Content-Type: application/json' -d '{\"status\": \"<1-line status>\"}'".to_string(),
-            created_at: now,
-            recurring_ns: Some(interval),
-        };
-        state.scheduler.insert(event);
     }
 
     let short = display_name(&prefix, &name).to_string();

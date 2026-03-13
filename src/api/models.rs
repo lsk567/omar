@@ -103,20 +103,12 @@ pub struct ListProjectsResponse {
     pub projects: Vec<ProjectResponse>,
 }
 
-/// Request to update an agent's status
-#[derive(Debug, Deserialize)]
-pub struct UpdateStatusRequest {
-    pub status: String,
-}
-
 /// Agent summary response (lightweight card info)
 #[derive(Debug, Serialize)]
 pub struct AgentSummaryResponse {
     pub id: String,
     pub health: String,
     pub task: Option<String>,
-    /// Self-reported status from ~/.omar/status/<session>.md
-    pub status: Option<String>,
     /// Direct child agent names
     pub children: Vec<String>,
 }
