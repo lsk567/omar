@@ -40,6 +40,15 @@ curl -X POST http://localhost:9876/api/agents \
 
 **IMPORTANT:** Always include `"parent": "<YOUR NAME>"` when spawning sub-agents so the dashboard can show the chain of command.
 
+### Spawn with a specific backend and model
+```bash
+curl -X POST http://localhost:9876/api/agents \
+  -H "Content-Type: application/json" \
+  -d '{"name": "agent-name", "task": "Task description", "parent": "<YOUR NAME>", "backend": "codex", "model": "o3"}'
+```
+- `backend`: `"claude"`, `"codex"`, `"cursor"`, or `"opencode"` (defaults to system config if omitted)
+- `model`: model override appended as `--model <value>` (e.g. `"claude-sonnet-4-5-20250514"`, `"o3"`, `"anthropic/claude-sonnet-4-5-20250514"`)
+
 ### List all agents
 ```bash
 curl http://localhost:9876/api/agents
