@@ -326,7 +326,7 @@ pub async fn spawn_agent(
         let short = display_name(&prefix, &name);
         let parent = req.parent.as_deref().unwrap_or("ea");
         let user_msg = format!(
-            "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
+            "YOUR NAME: {}.\nYOUR PARENT: {}.\nYOUR TASK: {}",
             short, parent, task
         );
 
