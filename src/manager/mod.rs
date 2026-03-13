@@ -34,14 +34,6 @@ pub fn prompts_dir() -> PathBuf {
     dir
 }
 
-/// Escape a string for use in a sed replacement (with `|` as delimiter).
-fn sed_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('|', "\\|")
-        .replace('&', "\\&")
-        .replace('\n', "\\n")
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
     Claude,
@@ -70,35 +62,14 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
         .find_map(detect_backend_token)
 }
 
-fn build_prompt_shell_expr(prompt_file: &Path, substitutions: &[(&str, &str)]) -> String {
-    let path_str = prompt_file.display();
-    if substitutions.is_empty() {
-        format!("$(cat '{}')", path_str)
-    } else {
-        let sed_script: String = substitutions
-            .iter()
-            .map(|(pat, repl)| format!("s|{}|{}|g", pat, sed_escape(repl)))
-            .collect::<Vec<_>>()
-            .join("; ");
-        format!("$(sed '{}' '{}')", sed_script, path_str)
-    }
-}
-
 /// Build a CLI command with system prompt loaded from a file via native flag.
-///
-/// - `prompt_file`: absolute path to the prompt .md file
-/// - `substitutions`: `(pattern, replacement)` pairs for sed; empty = use `cat`
 ///
 /// Detects backend from `base_command`:
 ///   - contains "claude" → `--system-prompt`
 ///   - contains "codex" → `developer_instructions`
 ///   - contains "opencode" → `--prompt`
-pub fn build_agent_command(
-    base_command: &str,
-    prompt_file: &Path,
-    substitutions: &[(&str, &str)],
-) -> String {
-    let shell_expr = build_prompt_shell_expr(prompt_file, substitutions);
+pub fn build_agent_command(base_command: &str, prompt_file: &Path) -> String {
+    let shell_expr = format!("$(cat '{}')", prompt_file.display());
 
     match detect_backend(base_command) {
         Some(BackendKind::Claude) => {
@@ -123,7 +94,7 @@ pub fn build_ea_command(base_command: &str) -> String {
     let mem = memory::load_memory();
 
     if mem.is_empty() {
-        return build_agent_command(base_command, &prompt_file, &[]);
+        return build_agent_command(base_command, &prompt_file);
     }
 
     let prompt_content = std::fs::read_to_string(&prompt_file).unwrap_or_default();
@@ -139,7 +110,7 @@ pub fn build_ea_command(base_command: &str) -> String {
     std::fs::create_dir_all(combined_path.parent().unwrap()).ok();
     std::fs::write(&combined_path, &combined).ok();
 
-    build_agent_command(base_command, &combined_path, &[])
+    build_agent_command(base_command, &combined_path)
 }
 
 #[cfg(test)]
@@ -148,7 +119,7 @@ mod tests {
 
     #[test]
     fn test_build_agent_command_claude() {
-        let cmd = build_agent_command("claude --some-flag", Path::new("/tmp/prompts/ea.md"), &[]);
+        let cmd = build_agent_command("claude --some-flag", Path::new("/tmp/prompts/ea.md"));
         assert_eq!(
             cmd,
             "claude --some-flag --system-prompt \"$(cat '/tmp/prompts/ea.md')\""
@@ -157,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_build_agent_command_opencode() {
-        let cmd = build_agent_command("opencode", Path::new("/tmp/prompts/pm.md"), &[]);
+        let cmd = build_agent_command("opencode", Path::new("/tmp/prompts/pm.md"));
         assert_eq!(cmd, "opencode --prompt \"$(cat '/tmp/prompts/pm.md')\"");
     }
 
@@ -166,7 +137,6 @@ mod tests {
         let cmd = build_agent_command(
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
             Path::new("/tmp/prompts/ea.md"),
-            &[],
         );
         assert_eq!(
             cmd,
@@ -179,7 +149,6 @@ mod tests {
         let cmd = build_agent_command(
             "env ANTHROPIC_API_KEY=test claude --some-flag",
             Path::new("/tmp/prompts/ea.md"),
-            &[],
         );
         assert_eq!(
             cmd,
@@ -192,7 +161,6 @@ mod tests {
         let cmd = build_agent_command(
             "npx opencode --model local",
             Path::new("/tmp/prompts/pm.md"),
-            &[],
         );
         assert_eq!(
             cmd,
@@ -205,7 +173,6 @@ mod tests {
         let cmd = build_agent_command(
             "env OPENAI_API_KEY=test codex --no-alt-screen",
             Path::new("/tmp/prompts/ea.md"),
-            &[],
         );
         assert_eq!(
             cmd,
@@ -215,44 +182,7 @@ mod tests {
 
     #[test]
     fn test_build_agent_command_unknown_backend() {
-        let cmd = build_agent_command("vim", Path::new("/tmp/prompts/ea.md"), &[]);
+        let cmd = build_agent_command("vim", Path::new("/tmp/prompts/ea.md"));
         assert_eq!(cmd, "vim");
-    }
-
-    #[test]
-    fn test_build_agent_command_with_substitutions() {
-        let cmd = build_agent_command(
-            "claude",
-            Path::new("/prompts/worker.md"),
-            &[("{{PARENT_NAME}}", "pm-api"), ("{{TASK}}", "build it")],
-        );
-        assert_eq!(
-            cmd,
-            "claude --system-prompt \"$(sed 's|{{PARENT_NAME}}|pm-api|g; s|{{TASK}}|build it|g' '/prompts/worker.md')\""
-        );
-    }
-
-    #[test]
-    fn test_build_agent_command_codex_with_substitutions() {
-        let cmd = build_agent_command(
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
-            Path::new("/prompts/worker.md"),
-            &[("{{PARENT_NAME}}", "pm-api"), ("{{TASK}}", "build it")],
-        );
-        assert_eq!(
-            cmd,
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''$(sed 's|{{PARENT_NAME}}|pm-api|g; s|{{TASK}}|build it|g' '/prompts/worker.md')'''\""
-        );
-    }
-
-    #[test]
-    fn test_sed_escape() {
-        assert_eq!(sed_escape("hello"), "hello");
-        assert_eq!(sed_escape("a\\b"), "a\\\\b");
-        assert_eq!(sed_escape("a|b"), "a\\|b");
-        assert_eq!(sed_escape("a&b"), "a\\&b");
-        assert_eq!(sed_escape("a\nb"), "a\\nb");
-        // Combined
-        assert_eq!(sed_escape("a\\|&\nb"), "a\\\\\\|\\&\\nb");
     }
 }

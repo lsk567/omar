@@ -296,15 +296,8 @@ pub async fn spawn_agent(
     let has_agent_prompt = matches!(req.role.as_deref(), Some("project-manager") | Some("agent"))
         || req.task.is_some();
     let cmd = if has_agent_prompt {
-        // Any agent with a role or task gets the unified agent prompt
-        let parent = req.parent.as_deref().unwrap_or("ea");
-        let task = req.task.as_deref().unwrap_or("");
         let prompt_file = prompts_dir().join("agent.md");
-        build_agent_command(
-            &base_command,
-            &prompt_file,
-            &[("{{PARENT_NAME}}", parent), ("{{TASK}}", task)],
-        )
+        build_agent_command(&base_command, &prompt_file)
     } else {
         base_command.clone()
     };
@@ -331,7 +324,11 @@ pub async fn spawn_agent(
         memory::save_worker_task(&name, &task);
 
         let short = display_name(&prefix, &name);
-        let user_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", short, task);
+        let parent = req.parent.as_deref().unwrap_or("ea");
+        let user_msg = format!(
+            "YOUR NAME: {}.\nYOUR PARENT: {}.\nYOUR TASK: {}",
+            short, parent, task
+        );
 
         let client = app.client().clone();
         let session = name.clone();
