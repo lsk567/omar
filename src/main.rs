@@ -51,29 +51,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Spawn a new agent session
-    Spawn {
-        /// Name for the agent session
-        #[arg(short, long)]
-        name: String,
-
-        /// Command to run in the session (defaults to configured default_command)
-        #[arg(short, long)]
-        command: Option<String>,
-
-        /// Working directory
-        #[arg(short, long)]
-        workdir: Option<String>,
-    },
-
     /// List all agent sessions
     List,
-
-    /// Kill an agent session
-    Kill {
-        /// Name of the session to kill
-        name: String,
-    },
 
     /// Configure tmux for optimal omar experience
     SetupTmux,
@@ -90,16 +69,7 @@ async fn main() -> Result<()> {
     let client = TmuxClient::new(&config.dashboard.session_prefix);
 
     match cli.command {
-        Some(Commands::Spawn {
-            name,
-            command,
-            workdir,
-        }) => {
-            let cmd = command.unwrap_or_else(|| config.agent.default_command.clone());
-            spawn_agent(&client, &name, &cmd, workdir.as_deref())
-        }
         Some(Commands::List) => list_agents(&client),
-        Some(Commands::Kill { name }) => kill_agent(&client, &name),
         Some(Commands::SetupTmux) => setup_tmux(),
         None => {
             if std::env::var("TMUX").is_err() {
@@ -109,23 +79,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-}
-
-fn spawn_agent(
-    client: &TmuxClient,
-    name: &str,
-    command: &str,
-    workdir: Option<&str>,
-) -> Result<()> {
-    let full_name = format!("{}{}", client.prefix(), name);
-
-    if client.has_session(&full_name)? {
-        anyhow::bail!("Session '{}' already exists", name);
-    }
-
-    client.new_session(&full_name, command, workdir)?;
-    println!("Spawned agent: {}", name);
-    Ok(())
 }
 
 fn list_agents(client: &TmuxClient) -> Result<()> {
@@ -148,18 +101,6 @@ fn list_agents(client: &TmuxClient) -> Result<()> {
         println!("{:<20} {:<12} {:<10}", name, attached, session.pane_pid);
     }
 
-    Ok(())
-}
-
-fn kill_agent(client: &TmuxClient, name: &str) -> Result<()> {
-    let full_name = format!("{}{}", client.prefix(), name);
-
-    if !client.has_session(&full_name)? {
-        anyhow::bail!("Session '{}' not found", name);
-    }
-
-    client.kill_session(&full_name)?;
-    println!("Killed agent: {}", name);
     Ok(())
 }
 
