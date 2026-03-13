@@ -38,6 +38,7 @@ pub fn prompts_dir() -> PathBuf {
 enum BackendKind {
     Claude,
     Codex,
+    Cursor,
     Opencode,
 }
 
@@ -51,6 +52,7 @@ fn detect_backend_token(token: &str) -> Option<BackendKind> {
     match executable {
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
+        "cursor" => Some(BackendKind::Cursor),
         "opencode" => Some(BackendKind::Opencode),
         _ => None,
     }
@@ -67,6 +69,7 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
 /// Detects backend from `base_command`:
 ///   - contains "claude" → `--system-prompt`
 ///   - contains "codex" → `developer_instructions`
+///   - contains "cursor" → system prompt as last argument
 ///   - contains "opencode" → `--prompt`
 pub fn build_agent_command(base_command: &str, prompt_file: &Path) -> String {
     let shell_expr = format!("$(cat '{}')", prompt_file.display());
@@ -79,6 +82,7 @@ pub fn build_agent_command(base_command: &str, prompt_file: &Path) -> String {
             "{} -c \"developer_instructions='''{}'''\"",
             base_command, shell_expr
         ),
+        Some(BackendKind::Cursor) => format!("{} \"{}\"", base_command, shell_expr),
         Some(BackendKind::Opencode) => format!("{} --prompt \"{}\"", base_command, shell_expr),
         None => base_command.to_string(),
     }
@@ -178,6 +182,12 @@ mod tests {
             cmd,
             "env OPENAI_API_KEY=test codex --no-alt-screen -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
         );
+    }
+
+    #[test]
+    fn test_build_agent_command_cursor() {
+        let cmd = build_agent_command("cursor agent --yolo", Path::new("/tmp/prompts/ea.md"));
+        assert_eq!(cmd, "cursor agent --yolo \"$(cat '/tmp/prompts/ea.md')\"");
     }
 
     #[test]

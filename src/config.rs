@@ -129,12 +129,14 @@ fn default_command() -> String {
 ///
 /// - `"claude"` → `"claude --dangerously-skip-permissions"`
 /// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
+/// - `"cursor"` → `"cursor agent --yolo"`
 /// - `"opencode"` → `"opencode"`
 /// - anything else → passed through as-is
 pub fn resolve_backend(name: &str) -> String {
     match name {
         "claude" => "claude --dangerously-skip-permissions".to_string(),
         "codex" => "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string(),
+        "cursor" => "cursor agent --yolo".to_string(),
         "opencode" => "opencode".to_string(),
         other => other.to_string(),
     }
@@ -285,6 +287,7 @@ default_command = "bash"
             resolve_backend("codex"),
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
         );
+        assert_eq!(resolve_backend("cursor"), "cursor agent --yolo");
         assert_eq!(resolve_backend("opencode"), "opencode");
     }
 
