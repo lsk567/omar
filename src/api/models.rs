@@ -99,6 +99,20 @@ pub struct SendInputRequest {
     pub enter: bool,
 }
 
+/// Backend availability info
+#[derive(Debug, Serialize)]
+pub struct BackendInfo {
+    pub name: String,
+    pub available: bool,
+    pub command: String,
+}
+
+/// Response for listing available backends
+#[derive(Debug, Serialize)]
+pub struct BackendsResponse {
+    pub backends: Vec<BackendInfo>,
+}
+
 /// Generic status response
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {

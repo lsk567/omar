@@ -88,6 +88,33 @@ pub async fn health() -> Json<HealthResponse> {
     })
 }
 
+/// GET /api/backends
+/// Returns which agent backends are installed and available on the system.
+pub async fn list_backends() -> Json<BackendsResponse> {
+    use std::process::Command;
+
+    let backends = ["claude", "codex", "cursor", "opencode"];
+    let infos = backends
+        .iter()
+        .map(|&name| {
+            let resolved = crate::config::resolve_backend(name).unwrap();
+            // Extract the executable (first token) to check availability
+            let executable = resolved.split_whitespace().next().unwrap_or(name);
+            let available = Command::new(executable)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            BackendInfo {
+                name: name.to_string(),
+                available,
+                command: resolved,
+            }
+        })
+        .collect();
+
+    Json(BackendsResponse { backends: infos })
+}
+
 /// GET /api/agents
 pub async fn list_agents(
     State(state): State<Arc<ApiState>>,

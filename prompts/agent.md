@@ -31,6 +31,12 @@ The OMAR API creates real tmux sessions that appear in the OMAR dashboard.
 
 ## HTTP API Reference (localhost:9876)
 
+### List available backends
+```bash
+curl http://localhost:9876/api/backends
+```
+Returns which backends are installed, with availability status. Check this before spawning agents with a specific backend.
+
 ### Spawn a sub-agent
 ```bash
 curl -X POST http://localhost:9876/api/agents \

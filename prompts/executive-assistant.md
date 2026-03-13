@@ -37,6 +37,14 @@ Name agents with short, descriptive names (e.g., `auth`, `api`, `refactor`).
 
 ## HTTP API Reference (localhost:9876)
 
+### Backends API
+
+#### List available backends
+```bash
+curl http://localhost:9876/api/backends
+```
+Returns which backends are installed on the system, with their resolved commands and availability status. Check this before spawning agents with a specific backend.
+
 ### Agents API
 
 #### List all agents
