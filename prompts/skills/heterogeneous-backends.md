@@ -21,7 +21,7 @@ curl -X POST http://localhost:9876/api/agents \
 |------------|--------------|--------------------------------------------|
 | Claude Code| `"claude"`   | `--model <model-id>`                       |
 | Codex CLI  | `"codex"`    | `--model <model-id>`                       |
-| Cursor     | `"cursor"`   | No CLI model flag (uses Cursor settings)   |
+| Cursor     | `"cursor"`   | `--model` passed through but may be ignored |
 | OpenCode   | `"opencode"` | `--model <provider>/<model-id>`            |
 
 ### Common model names

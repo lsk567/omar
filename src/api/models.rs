@@ -11,10 +11,10 @@ pub struct SpawnAgentRequest {
     pub task: Option<String>,
     /// Working directory
     pub workdir: Option<String>,
-    /// Command to run (defaults to config). Mutually exclusive with `backend`.
+    /// Command to run (defaults to config). Cannot be used together with `backend`.
     pub command: Option<String>,
     /// Backend shorthand: "claude", "codex", "cursor", "opencode".
-    /// Resolved to the full command via resolve_backend(). Mutually exclusive with `command`.
+    /// Resolved to the full command via resolve_backend(). Cannot be used together with `command`.
     pub backend: Option<String>,
     /// Model to use (e.g. "claude-sonnet-4-5-20250514", "o3", "anthropic/claude-sonnet-4-5-20250514").
     /// Appended as `--model <value>` to the base command.

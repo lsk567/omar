@@ -91,26 +91,32 @@ pub async fn health() -> Json<HealthResponse> {
 /// GET /api/backends
 /// Returns which agent backends are installed and available on the system.
 pub async fn list_backends() -> Json<BackendsResponse> {
-    use std::process::Command;
+    let infos = tokio::task::spawn_blocking(|| {
+        use std::process::Command;
 
-    let backends = ["claude", "codex", "cursor", "opencode"];
-    let infos = backends
-        .iter()
-        .map(|&name| {
-            let resolved = crate::config::resolve_backend(name).unwrap();
-            // Extract the executable (first token) to check availability
-            let executable = resolved.split_whitespace().next().unwrap_or(name);
-            let available = Command::new(executable)
-                .arg("--version")
-                .output()
-                .is_ok_and(|o| o.status.success());
-            BackendInfo {
-                name: name.to_string(),
-                available,
-                command: resolved,
-            }
-        })
-        .collect();
+        let backends = ["claude", "codex", "cursor", "opencode"];
+        backends
+            .iter()
+            .filter_map(|&name| {
+                let resolved = match crate::config::resolve_backend(name) {
+                    Ok(cmd) => cmd,
+                    Err(_) => return None,
+                };
+                let executable = resolved.split_whitespace().next().unwrap_or(name);
+                let available = Command::new(executable)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|o| o.status.success());
+                Some(BackendInfo {
+                    name: name.to_string(),
+                    available,
+                    command: resolved,
+                })
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
 
     Json(BackendsResponse { backends: infos })
 }
@@ -313,6 +319,17 @@ pub async fn spawn_agent(
             .unwrap_or_else(|_| ".".to_string())
     });
 
+    // Reject if both backend and command are set
+    if req.backend.is_some() && req.command.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Cannot specify both 'backend' and 'command'. Use one or the other."
+                    .to_string(),
+            }),
+        ));
+    }
+
     // Resolve base command: backend shorthand > explicit command > config default
     let base_command = if let Some(ref backend) = req.backend {
         match crate::config::resolve_backend(backend) {
@@ -326,7 +343,21 @@ pub async fn spawn_agent(
             .unwrap_or_else(|| app.default_command().to_string())
     };
 
-    // Append --model flag if specified
+    // Validate and append --model flag if specified
+    if let Some(ref model) = req.model {
+        if !model
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid model name. Only alphanumeric, '-', '_', '.', '/' allowed."
+                        .to_string(),
+                }),
+            ));
+        }
+    }
     let base_command = match req.model {
         Some(ref model) => format!("{} --model {}", base_command, model),
         None => base_command,
