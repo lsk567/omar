@@ -148,7 +148,12 @@ curl -X DELETE http://localhost:9876/api/events/<event-id>
 
 ## Skills
 
-If your task requires special capabilities (e.g., controlling the desktop via mouse/keyboard/screenshots), check the skills folder at `prompts/skills/` for detailed instructions. Read the relevant skill file before proceeding. When spawning sub-agents that need a skill, include the skill contents in the agent's task description.
+If your task requires special capabilities, check the skills folder at `prompts/skills/` for detailed instructions. Read the relevant skill file before proceeding. When spawning sub-agents that need a skill, include the skill contents in the agent's task description.
+
+Available skills:
+- `prompts/skills/heterogeneous-backends.md` — spawning sub-agents with different backends and models
+- `prompts/skills/computer-use.md` — controlling the desktop via mouse/keyboard/screenshots
+- `prompts/skills/demo.md` — running demo commands for the user
 
 ## Focus
 

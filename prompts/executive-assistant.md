@@ -227,7 +227,12 @@ curl -X POST http://localhost:9876/api/agents/demo/send -H "Content-Type: applic
 
 ## Skills
 
-If a task requires special capabilities (e.g., controlling the desktop via mouse/keyboard/screenshots), check the skills folder at `prompts/skills/` for detailed instructions. Mention relevant skills when describing the task to an agent.
+If a task requires special capabilities, check the skills folder at `prompts/skills/` for detailed instructions. Mention relevant skills when describing the task to an agent.
+
+Available skills:
+- `prompts/skills/heterogeneous-backends.md` — spawning agents with different backends and models
+- `prompts/skills/computer-use.md` — controlling the desktop via mouse/keyboard/screenshots
+- `prompts/skills/demo.md` — running demo commands for the user
 
 ## Example
 
