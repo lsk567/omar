@@ -97,16 +97,6 @@ curl -X POST http://localhost:9876/api/events \
   -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"{{PARENT_NAME}}\", \"timestamp\": $NOW, \"payload\": \"[TASK COMPLETE] from <YOUR NAME>. Check output for results.\"}"
 ```
 
-## Status Reporting
-
-OMAR sends you a periodic `[STATUS CHECK]` event every 60 seconds. When you receive one, update your status via the API:
-```bash
-curl -X PUT http://localhost:9876/api/agents/<YOUR NAME>/status \
-  -H "Content-Type: application/json" \
-  -d '{"status": "Currently: <brief description of what you are doing>"}'
-```
-Also update proactively after spawning sub-agents or reaching a milestone.
-
 ## Scheduling and Wake-ups
 
 IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler — use its Events API instead.
