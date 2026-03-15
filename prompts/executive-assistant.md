@@ -35,6 +35,25 @@ The API automatically injects the agent system prompt when a task is provided. Y
 
 Name agents with short, descriptive names (e.g., `auth`, `api`, `refactor`).
 
+## Planning Mode
+
+Planning mode is available across supported backends. For design, investigation, or explicitly plan-only tasks, prefer putting the worker into the backend's planning mode when terminal control is available. On Codex, Claude, and Opencode, `Shift-Tab` cycles collaboration modes in the TUI.
+
+## Session Continuation
+
+Session continuation is not the normal OMAR workflow. Prefer spawning a fresh worker unless the user explicitly asks to continue a previous worker or chat.
+
+When continuation is explicitly requested, prefer a backend-specific `command` override that uses the backend's native resume or fork behavior rather than reconstructing context manually.
+
+Backend-specific examples:
+- Codex: `codex resume <SESSION_ID>` or `codex fork <SESSION_ID>`
+- Claude: `claude --resume <SESSION_ID>` or `claude --resume <SESSION_ID> --fork-session`
+- Opencode: `opencode --session <SESSION_ID>` or `opencode --session <SESSION_ID> --fork`
+
+Notes:
+- Prefer explicit session IDs over `--last` / `--continue` because multiple workers may share the same cwd.
+- Use fork-style continuation when you want prior context as input but want a fresh branch of work.
+
 ## HTTP API Reference (localhost:9876)
 
 ### Backends API

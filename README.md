@@ -32,7 +32,7 @@ Lead an army of 300 agents to solve humanity's biggest problems.
 #### Prerequisites
 
 - **tmux 3.0+** — `brew install tmux` (macOS) or `apt install tmux` (Debian/Ubuntu)
-- [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex CLI](https://developers.openai.com/codex/cli), or [Opencode](https://github.com/anomalyco/opencode)
+- [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex CLI](https://developers.openai.com/codex/cli), [Cursor](https://www.cursor.com/), or [Opencode](https://github.com/anomalyco/opencode)
 
 #### One-liner (recommended)
 
@@ -101,6 +101,7 @@ Omar auto-detects which agent backend is available on your system:
 |---------|---------------|
 | [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar` (default) |
 | [Codex CLI](https://developers.openai.com/codex/cli) | `omar --agent codex` |
+| [Cursor](https://www.cursor.com/) | `omar --agent cursor` |
 | [Opencode](https://github.com/anomalyco/opencode) | `omar --agent opencode` |
 
 ## License
