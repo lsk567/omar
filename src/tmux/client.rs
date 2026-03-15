@@ -128,9 +128,30 @@ impl TmuxClient {
         Ok(())
     }
 
-    /// Send literal text to a pane
+    /// Send literal text to a pane.
+    ///
+    /// For small payloads uses `send-keys -l` directly. For large payloads
+    /// (>= 2 KB) writes to a temporary file and uses `load-buffer` +
+    /// `paste-buffer` to avoid tmux's internal message-size limit, which
+    /// silently drops oversized `send-keys -l` arguments.
+    pub const LARGE_PAYLOAD_THRESHOLD: usize = 2048;
+
     pub fn send_keys_literal(&self, target: &str, text: &str) -> Result<()> {
-        self.run(&["send-keys", "-t", target, "-l", text])?;
+        if text.len() < Self::LARGE_PAYLOAD_THRESHOLD {
+            self.run(&["send-keys", "-t", target, "-l", text])?;
+        } else {
+            // Write to a temp file, load into tmux buffer, paste, then clean up.
+            // This avoids passing large text as a command-line argument.
+            let tmp_path =
+                std::env::temp_dir().join(format!("omar-task-{}.txt", uuid::Uuid::new_v4()));
+            std::fs::write(&tmp_path, text).context("Failed to write task to temp file")?;
+            let path_str = tmp_path
+                .to_str()
+                .context("Temp file path is not valid UTF-8")?;
+            self.run(&["load-buffer", path_str])?;
+            std::fs::remove_file(&tmp_path).ok(); // best-effort cleanup
+            self.run(&["paste-buffer", "-t", target])?;
+        }
         Ok(())
     }
 
@@ -213,5 +234,13 @@ mod tests {
     fn test_client_with_different_prefix() {
         let client = TmuxClient::new("test-");
         assert_eq!(client.prefix(), "test-");
+    }
+
+    #[test]
+    fn large_payload_threshold_is_reasonable() {
+        // Threshold must be large enough that typical short tasks go through send-keys
+        // but small enough to catch the ~1-3 KB tasks that silently fail
+        const { assert!(TmuxClient::LARGE_PAYLOAD_THRESHOLD >= 512) };
+        const { assert!(TmuxClient::LARGE_PAYLOAD_THRESHOLD <= 8192) };
     }
 }
