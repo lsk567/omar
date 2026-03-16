@@ -91,6 +91,10 @@ backend (`sleep 2 && exec bash`) and verifies the polling pattern works.
 
 - Spawned `inject-opencode` agent via OMAR API with opencode backend to review the fix
 - Event sent requesting review of the diff
+- **Ironic finding:** The opencode agent itself was affected by the very bug we're fixing!
+  The running OMAR binary still had the old 2-second fixed delay code. The opencode TUI
+  rendered but the task was never injected — the agent sat idle at its prompt. This
+  serves as a live reproduction of the bug and validates the fix approach.
 
 ## Decision
 
