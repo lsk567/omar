@@ -106,14 +106,22 @@ fn list_agents(client: &TmuxClient) -> Result<()> {
 /// Re-launch omar inside a tmux session.
 /// Called when the dashboard is started outside of tmux so that popups,
 /// attach, and other tmux-dependent features work correctly.
+///
+/// If an existing dashboard session is alive, attaches to it instead of
+/// killing and recreating it. This preserves the in-memory scheduler
+/// (cron jobs, pending events) across detach/reattach cycles.
 fn relaunch_in_tmux() -> Result<()> {
     use std::os::unix::process::CommandExt;
 
-    // Kill any stale dashboard session left behind by a previous crash.
-    // Without this, `new-session` would fail because the session already exists
-    // (but contains a dead shell instead of the dashboard).
     let client = TmuxClient::new("");
-    let _ = client.kill_session(DASHBOARD_SESSION);
+
+    // If the dashboard session already exists, just attach to it.
+    if client.has_session(DASHBOARD_SESSION).unwrap_or(false) {
+        let err = std::process::Command::new("tmux")
+            .args(["attach-session", "-t", DASHBOARD_SESSION])
+            .exec();
+        anyhow::bail!("Failed to attach to tmux: {}", err);
+    }
 
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
