@@ -20,6 +20,25 @@ IMPORTANT: When spawning sub-agents, you MUST use the OMAR HTTP API (curl comman
 Do NOT use your internal Task tool, background agents, or any built-in multi-agent features.
 The OMAR API creates real tmux sessions that appear in the OMAR dashboard.
 
+## Planning Mode
+
+Planning mode is available across supported backends. For design docs, investigations, or tasks that explicitly ask for a plan, prefer the backend's planning mode when it is available. On Codex, Claude, and Opencode, `Shift-Tab` cycles collaboration modes in the TUI.
+
+## Session Continuation
+
+Session continuation is not the default workflow. Prefer spawning a fresh worker unless the user or your parent explicitly asks you to continue a previous worker or chat.
+
+When continuation is explicitly requested, prefer the backend's native resume or fork behavior through the OMAR `command` override instead of reconstructing context by hand.
+
+Backend-specific examples:
+- Codex: `codex resume <SESSION_ID>` or `codex fork <SESSION_ID>`
+- Claude: `claude --resume <SESSION_ID>` or `claude --resume <SESSION_ID> --fork-session`
+- Opencode: `opencode --session <SESSION_ID>` or `opencode --session <SESSION_ID> --fork`
+
+Notes:
+- Prefer explicit session IDs over `--last` / `--continue`; those shortcuts are unreliable when several workers share a cwd.
+- Use fork-style continuation when you want prior context as input but want a new branch of work.
+
 ## Workflow
 
 1. Receive your assigned task from the first user message (YOUR NAME, YOUR PARENT, YOUR TASK)
