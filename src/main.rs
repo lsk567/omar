@@ -107,20 +107,28 @@ fn list_agents(client: &TmuxClient) -> Result<()> {
 /// Called when the dashboard is started outside of tmux so that popups,
 /// attach, and other tmux-dependent features work correctly.
 ///
-/// If an existing dashboard session is alive, attaches to it instead of
-/// killing and recreating it. This preserves the in-memory scheduler
-/// (cron jobs, pending events) across detach/reattach cycles.
+/// If an existing dashboard session exists, tries to attach to it.
+/// This preserves the in-memory scheduler (cron jobs, pending events)
+/// across detach/reattach cycles. If attach fails (stale session),
+/// kills the session and creates a fresh one.
 fn relaunch_in_tmux() -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let client = TmuxClient::new("");
 
-    // If the dashboard session already exists, just attach to it.
-    if client.has_session(DASHBOARD_SESSION).unwrap_or(false) {
-        let err = std::process::Command::new("tmux")
+    // If the dashboard session exists, try to attach to it.
+    if client.has_session(DASHBOARD_SESSION)? {
+        let status = std::process::Command::new("tmux")
             .args(["attach-session", "-t", DASHBOARD_SESSION])
-            .exec();
-        anyhow::bail!("Failed to attach to tmux: {}", err);
+            .status();
+
+        match status {
+            Ok(s) if s.success() => return Ok(()),
+            _ => {
+                // Attach failed — stale session. Kill it and create a new one.
+                let _ = client.kill_session(DASHBOARD_SESSION);
+            }
+        }
     }
 
     let exe = std::env::current_exe()?;
