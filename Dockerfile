@@ -85,6 +85,24 @@ COPY docker/config.toml /etc/omar/config.toml
 COPY docker/entrypoint.sh /usr/local/bin/omar-entrypoint
 COPY . /workspace
 
+RUN cat <<'EOF' >/etc/profile.d/omar-history.sh
+export HISTFILE="${HISTFILE:-$HOME/.omar/bash_history}"
+export HISTSIZE=50000
+export HISTFILESIZE=50000
+shopt -s histappend 2>/dev/null || true
+if [ -f "${HISTFILE}" ]; then
+  size=$(wc -c < "${HISTFILE}")
+  if [ "${size}" -gt 52428800 ]; then
+    tail -c 52428800 "${HISTFILE}" > "${HISTFILE}.tmp" && mv "${HISTFILE}.tmp" "${HISTFILE}"
+  fi
+fi
+PROMPT_COMMAND="history -a${PROMPT_COMMAND:+;${PROMPT_COMMAND}}"
+EOF
+
+RUN for bin in /usr/local/cargo/bin/*; do \
+      ln -sf "${bin}" "/usr/local/bin/$(basename "${bin}")"; \
+    done
+
 RUN chmod +x /usr/local/bin/omar-entrypoint \
     && chown -R omar:omar /etc/omar /home/omar /workspace
 

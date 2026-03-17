@@ -63,14 +63,15 @@ cd omar && make install
 The repository includes a Docker-based dev environment with `tmux`, Rust, and all three OMAR binaries preinstalled.
 
 ```bash
+# Build image, launch container, connect to the OMAR dashboard directly
+# If already build and running, then connect to existing container/session
+./scripts/omar-docker.sh
+
+# Open a shell in the running container
+./scripts/docker-shell.sh
+
 # Build and start a long-lived dev container
 docker compose up --build -d omar
-
-# Enter the container
-docker exec -it omar bash
-
-# Attach to the OMAR dashboard session
-tmux attach -t omar-dashboard
 ```
 
 Notes:
@@ -78,6 +79,8 @@ Notes:
 - The repo is mounted at `/workspace`
 - Persistent OMAR state lives in `./.docker-data/home`
 - Container startup actions are logged to `~/.omar/container-init.log`
+- The container bootstrap runs `omar setup-tmux` automatically and sets tmux scrollback history to `9999`
+- Interactive bash history is saved to `~/.omar/bash_history` and trimmed to at most `50 MB`
 - The container-specific config binds the API on `0.0.0.0:9876` and defaults agent workdirs to `/workspace`
 - Optional profiles are available for Slack and computer-use bridges:
 
@@ -86,6 +89,7 @@ docker compose --profile slack up --build -d
 docker compose --profile computer up --build -d
 ```
 
+- If you still prefer raw Docker commands, `docker compose exec omar bash` and `docker compose exec omar tmux attach -t omar-dashboard` still work
 - Run `scripts/docker-sanity.sh` for a full Docker smoke test
 - Set `OMAR_API_PORT` if port `9876` is already occupied on your host
 

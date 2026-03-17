@@ -23,6 +23,17 @@ copy_default_config() {
   fi
 }
 
+apply_tmux_setup() {
+  if [ "${OMAR_SETUP_TMUX:-1}" = "0" ]; then
+    log "Skipping omar setup-tmux"
+    return
+  fi
+
+  tmux start-server >/dev/null 2>&1 || true
+  log "Applying tmux configuration with omar setup-tmux"
+  printf '\n' | omar setup-tmux 2>&1 | tee -a "${LOG_FILE}"
+}
+
 record_environment() {
   log "Container user: $(id -un) ($(id -u):$(id -g))"
   log "Workspace: ${PWD}"
@@ -47,6 +58,7 @@ start_omar_session() {
 }
 
 copy_default_config
+apply_tmux_setup
 record_environment
 
 if [ "${OMAR_AUTO_START:-0}" = "1" ]; then

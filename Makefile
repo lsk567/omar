@@ -1,4 +1,4 @@
-.PHONY: build install uninstall docker-sanity
+.PHONY: build install uninstall docker-up docker-down docker-shell docker-dashboard docker-sanity
 
 BINARIES := omar omar-computer omar-slack
 INSTALL_DIR := $(HOME)/.cargo/bin
@@ -12,6 +12,18 @@ install: build
 
 uninstall:
 	rm -f $(addprefix $(INSTALL_DIR)/,$(BINARIES))
+
+docker-up:
+	docker compose up -d omar
+
+docker-down:
+	docker compose down
+
+docker-shell:
+	./scripts/docker-shell.sh
+
+docker-dashboard:
+	./scripts/docker-dashboard.sh
 
 docker-sanity:
 	./scripts/docker-sanity.sh

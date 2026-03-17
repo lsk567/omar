@@ -65,6 +65,9 @@ printf '\n'
 printf '==> Verifying tmux sessions and init log\n'
 docker compose exec -T omar bash -lc 'tmux has-session -t omar-dashboard && tmux has-session -t omar-agent-ea && test -f "$HOME/.omar/container-init.log"'
 
+printf '==> Verifying tmux setup and cargo availability in login shell\n'
+docker compose exec -T omar bash -lc 'command -v cargo >/dev/null && test "$(tmux show-options -gv history-limit)" = "9999" && test -f "$HOME/.tmux.conf"'
+
 printf '==> Validating optional compose profiles\n'
 docker compose --profile slack config >/dev/null
 docker compose --profile computer config >/dev/null

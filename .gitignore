@@ -19,6 +19,7 @@ junk/
 
 # AI agent config
 CLAUDE.md
+.cursor/
 
 # Docker local state
 .docker-data/home/*
