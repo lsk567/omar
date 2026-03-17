@@ -1,0 +1,7 @@
+.git
+.github
+.cursor
+.DS_Store
+target
+**/target
+.docker-data/home

@@ -58,6 +58,37 @@ git clone https://github.com/lsk567/omar.git
 cd omar && make install
 ```
 
+### Docker
+
+The repository includes a Docker-based dev environment with `tmux`, Rust, and all three OMAR binaries preinstalled.
+
+```bash
+# Build and start a long-lived dev container
+docker compose up --build -d omar
+
+# Enter the container
+docker exec -it omar bash
+
+# Attach to the OMAR dashboard session
+tmux attach -t omar-dashboard
+```
+
+Notes:
+
+- The repo is mounted at `/workspace`
+- Persistent OMAR state lives in `./.docker-data/home`
+- Container startup actions are logged to `~/.omar/container-init.log`
+- The container-specific config binds the API on `0.0.0.0:9876` and defaults agent workdirs to `/workspace`
+- Optional profiles are available for Slack and computer-use bridges:
+
+```bash
+docker compose --profile slack up --build -d
+docker compose --profile computer up --build -d
+```
+
+- Run `scripts/docker-sanity.sh` for a full Docker smoke test
+- Set `OMAR_API_PORT` if port `9876` is already occupied on your host
+
 ## Quick Start
 
 #### Step 1: Launch `omar`

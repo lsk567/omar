@@ -175,10 +175,19 @@ jobs:
             target/release/omar-computer
             target/release/omar-slack
 
+  docker:
+    name: Docker Sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Docker sanity suite
+        run: ./scripts/docker-sanity.sh
+
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, opencode-compat, build]
+    needs: [check, fmt, clippy, test, opencode-compat, build, docker]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -189,7 +198,8 @@ jobs:
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
              [[ "${{ needs.opencode-compat.result }}" != "success" ]] || \
-             [[ "${{ needs.build.result }}" != "success" ]]; then
+             [[ "${{ needs.build.result }}" != "success" ]] || \
+             [[ "${{ needs.docker.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
           fi

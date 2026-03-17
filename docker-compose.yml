@@ -1,0 +1,79 @@
+x-omar-build: &omar-build
+  context: .
+  dockerfile: Dockerfile
+  target: dev
+
+x-omar-environment: &omar-environment
+  HOME: /home/omar
+  CARGO_HOME: /home/omar/.cargo
+  RUST_LOG: ${RUST_LOG:-info}
+
+x-omar-volumes: &omar-volumes
+  - .:/workspace
+  - ./.docker-data/home:/home/omar
+
+services:
+  omar:
+    build: *omar-build
+    image: omar:dev
+    container_name: omar
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      <<: *omar-environment
+      OMAR_AUTO_START: "1"
+      OMAR_SESSION_NAME: omar-dashboard
+      OMAR_START_COMMAND: omar
+    volumes: *omar-volumes
+    ports:
+      - "${OMAR_API_PORT:-9876}:9876"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9876/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  omar-slack:
+    profiles: ["slack"]
+    build: *omar-build
+    image: omar:dev
+    working_dir: /workspace
+    depends_on:
+      omar:
+        condition: service_healthy
+    environment:
+      <<: *omar-environment
+      OMAR_AUTO_START: "0"
+      OMAR_URL: http://omar:9876
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
+      SLACK_BRIDGE_PORT: ${SLACK_BRIDGE_PORT:-9877}
+    volumes: *omar-volumes
+    command: ["omar-slack"]
+    ports:
+      - "${SLACK_BRIDGE_PORT:-9877}:9877"
+
+  omar-computer:
+    profiles: ["computer"]
+    build: *omar-build
+    image: omar:dev
+    working_dir: /workspace
+    depends_on:
+      omar:
+        condition: service_healthy
+    environment:
+      <<: *omar-environment
+      OMAR_AUTO_START: "0"
+      COMPUTER_BRIDGE_PORT: ${COMPUTER_BRIDGE_PORT:-9878}
+      DISPLAY: ${DISPLAY:-}
+      XAUTHORITY: /tmp/.Xauthority
+    volumes:
+      - .:/workspace
+      - ./.docker-data/home:/home/omar
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-/dev/null}:/tmp/.Xauthority:ro
+    command: ["omar-computer"]
+    ports:
+      - "${COMPUTER_BRIDGE_PORT:-9878}:9878"

@@ -1,0 +1,8 @@
+[agent]
+default_command = "bash"
+default_workdir = "/workspace"
+
+[api]
+enabled = true
+host = "0.0.0.0"
+port = 9876

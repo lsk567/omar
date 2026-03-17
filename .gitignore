@@ -1,7 +1,6 @@
 # Rust
 /target/
 **/target/
-Cargo.lock
 
 # IDE
 .idea/
@@ -20,3 +19,7 @@ junk/
 
 # AI agent config
 CLAUDE.md
+
+# Docker local state
+.docker-data/home/*
+!.docker-data/home/.gitkeep
