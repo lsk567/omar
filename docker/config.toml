@@ -1,5 +1,4 @@
 [agent]
-default_command = "bash"
 default_workdir = "/workspace"
 
 [api]

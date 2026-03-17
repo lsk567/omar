@@ -27,13 +27,34 @@ RUN apt-get update \
         imagemagick \
         less \
         libssl3 \
+        nodejs \
+        npm \
         procps \
         python3 \
         tmux \
         tini \
         xauth \
         xdotool \
-    && rm -rf /var/lib/apt/lists/*
+    && npm install -g @anthropic-ai/claude-code @openai/codex \
+    && curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path \
+    && curl -fsSL https://cursor.com/install | bash \
+    && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode \
+    && mkdir -p /opt/cursor-agent \
+    && cp -a /root/.local/share/cursor-agent/versions/*/. /opt/cursor-agent/ \
+    && ln -sf /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent \
+    && ln -sf /opt/cursor-agent/cursor-agent /usr/local/bin/agent \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
+
+RUN cat <<'EOF' >/usr/local/bin/cursor
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "agent" ]; then
+  shift
+fi
+exec /usr/local/bin/agent "$@"
+EOF
+
+RUN chmod +x /usr/local/bin/cursor
 
 RUN useradd --create-home --home-dir /home/omar --shell /bin/bash --uid 1000 omar
 
@@ -68,13 +89,34 @@ RUN apt-get update \
         imagemagick \
         less \
         libssl-dev \
+        nodejs \
+        npm \
         procps \
         python3 \
         tmux \
         tini \
         xauth \
         xdotool \
-    && rm -rf /var/lib/apt/lists/*
+    && npm install -g @anthropic-ai/claude-code @openai/codex \
+    && curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path \
+    && curl -fsSL https://cursor.com/install | bash \
+    && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode \
+    && mkdir -p /opt/cursor-agent \
+    && cp -a /root/.local/share/cursor-agent/versions/*/. /opt/cursor-agent/ \
+    && ln -sf /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent \
+    && ln -sf /opt/cursor-agent/cursor-agent /usr/local/bin/agent \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
+
+RUN cat <<'EOF' >/usr/local/bin/cursor
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "agent" ]; then
+  shift
+fi
+exec /usr/local/bin/agent "$@"
+EOF
+
+RUN chmod +x /usr/local/bin/cursor
 
 RUN useradd --create-home --home-dir /home/omar --shell /bin/bash --uid 1000 omar
 

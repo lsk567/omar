@@ -60,7 +60,7 @@ cd omar && make install
 
 ### Docker
 
-The repository includes a Docker-based dev environment with `tmux`, Rust, and all three OMAR binaries preinstalled.
+The repository includes a Docker-based dev environment with `tmux`, Rust, Claude Code, Codex CLI, OpenCode, Cursor CLI compatibility, and all three OMAR binaries preinstalled.
 
 ```bash
 # Build image, launch container, connect to the OMAR dashboard directly
@@ -82,6 +82,9 @@ Notes:
 - The container bootstrap runs `omar setup-tmux` automatically and sets tmux scrollback history to `9999`
 - Interactive bash history is saved to `~/.omar/bash_history` and trimmed to at most `50 MB`
 - The container-specific config binds the API on `0.0.0.0:9876` and defaults agent workdirs to `/workspace`
+- The Executive Assistant uses OMAR's normal backend detection instead of forcing a blank `bash` shell
+- Claude Code is installed in the container, so the default Executive Assistant can launch a real agent session immediately
+- `claude`, `codex`, `opencode`, and `cursor` are all available in the container to preserve OMAR's heterogeneous backend workflow
 - Optional profiles are available for Slack and computer-use bridges:
 
 ```bash

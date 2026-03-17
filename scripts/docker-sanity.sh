@@ -66,7 +66,8 @@ printf '==> Verifying tmux sessions and init log\n'
 docker compose exec -T omar bash -lc 'tmux has-session -t omar-dashboard && tmux has-session -t omar-agent-ea && test -f "$HOME/.omar/container-init.log"'
 
 printf '==> Verifying tmux setup and cargo availability in login shell\n'
-docker compose exec -T omar bash -lc 'command -v cargo >/dev/null && test "$(tmux show-options -gv history-limit)" = "9999" && test -f "$HOME/.tmux.conf"'
+docker compose exec -T omar bash -lc 'command -v cargo >/dev/null && claude --version >/dev/null && codex --version >/dev/null && opencode --version >/dev/null && cursor --version >/dev/null && test "$(tmux show-options -gv history-limit)" = "9999" && test -f "$HOME/.tmux.conf"'
+docker compose exec -T omar python3 -c 'from pathlib import Path; config=(Path.home()/".omar"/"config.toml").read_text(); assert '\''default_command = "bash"'\'' not in config, config; assert '\''default_workdir = "/workspace"'\'' in config, config'
 
 printf '==> Validating optional compose profiles\n'
 docker compose --profile slack config >/dev/null
