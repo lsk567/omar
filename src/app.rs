@@ -232,14 +232,12 @@ impl App {
             }
         });
 
-        // Update agents list (excluding attached sessions)
-        // Attached sessions are likely the user's main terminal, not agents
-        let filtered: Vec<Session> = other_sessions
-            .into_iter()
-            .filter(|session| !session.attached)
-            .collect();
-
-        self.agents = filtered
+        // Update agents list.
+        // NOTE: We intentionally include attached sessions. When a user opens
+        // the popup view (tmux display-popup + attach), the agent session
+        // becomes "attached" but is still a valid agent. Filtering attached
+        // sessions would cause the API to return "not found" for that agent.
+        self.agents = other_sessions
             .into_iter()
             .map(|session| {
                 let health_info = self.health_checker.check_detailed(&session.name);
@@ -1456,5 +1454,40 @@ mod tests {
             crumbs.push(short.to_string());
         }
         assert_eq!(crumbs, vec!["EA", "rest-api"]);
+    }
+
+    // ── attached session tests ──
+
+    #[test]
+    fn test_attached_agent_included_in_groups() {
+        // Agents that are attached (e.g., via popup view) should still appear
+        let mut attached = make_agent("omar-agent-api", HealthState::Running);
+        attached.session.attached = true;
+        let agents = vec![attached, make_agent("omar-agent-auth", HealthState::Idle)];
+        let parents = HashMap::new();
+
+        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
+
+        // Both agents should appear (attached agent is not filtered)
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].pm.is_none());
+        assert_eq!(groups[0].workers.len(), 2);
+    }
+
+    #[test]
+    fn test_attached_agent_included_in_tree() {
+        // An attached agent should still appear in the command tree
+        let mut attached = make_agent("omar-agent-api", HealthState::Running);
+        attached.session.attached = true;
+        let agents = vec![attached];
+        let ea = make_agent("omar-agent-ea", HealthState::Running);
+        let mut parents = HashMap::new();
+        parents.insert("omar-agent-api".to_string(), MANAGER_SESSION.to_string());
+
+        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[1].name, "api");
+        assert_eq!(tree[1].depth, 1);
     }
 }

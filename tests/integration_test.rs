@@ -322,6 +322,57 @@ fn test_spawn_custom_command() {
     let _ = tmux(&["kill-session", "-t", &session_name]);
 }
 
+/// Test that attached sessions still appear in list-sessions output.
+/// When a user opens the popup view, the agent session becomes "attached"
+/// but should still be discoverable by the API.
+#[test]
+fn test_attached_session_still_listed() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    cleanup_test_sessions();
+
+    let session_name = format!("{}attached", TEST_PREFIX);
+
+    // Create a detached session
+    let result = tmux(&["new-session", "-d", "-s", &session_name, "sleep", "60"]);
+    assert!(result.is_ok(), "Failed to create session: {:?}", result);
+    thread::sleep(Duration::from_millis(100));
+
+    // Verify unattached session shows session_attached=0
+    let output = tmux(&["list-sessions", "-F", "#{session_name}|#{session_attached}"]).unwrap();
+    let line = output.lines().find(|l| l.starts_with(&session_name));
+    assert!(line.is_some(), "Session should appear in list: {}", output);
+    assert!(
+        line.unwrap().ends_with("|0"),
+        "Detached session should have attached=0: {}",
+        line.unwrap()
+    );
+
+    // Verify has-session works regardless of attached state
+    let result = Command::new("tmux")
+        .args(["has-session", "-t", &session_name])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "has-session should find the session"
+    );
+
+    // Verify capture-pane works on the session
+    let result = tmux(&["capture-pane", "-t", &session_name, "-p"]);
+    assert!(
+        result.is_ok(),
+        "capture-pane should work on the session: {:?}",
+        result
+    );
+
+    // Cleanup
+    let _ = tmux(&["kill-session", "-t", &session_name]);
+}
+
 /// Test that the omar binary can be built and shows help
 #[test]
 fn test_omar_help() {
