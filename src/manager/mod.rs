@@ -217,10 +217,7 @@ mod tests {
 
     #[test]
     fn test_build_agent_command_wrapped_gemini() {
-        let cmd = build_agent_command(
-            "env FOO=bar gemini --yolo",
-            Path::new("/tmp/prompts/ea.md"),
-        );
+        let cmd = build_agent_command("env FOO=bar gemini --yolo", Path::new("/tmp/prompts/ea.md"));
         assert_eq!(
             cmd,
             "TERM=xterm-256color env FOO=bar gemini --yolo -i \"$(cat '/tmp/prompts/ea.md')\""

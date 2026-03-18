@@ -142,7 +142,7 @@ fn detect_agent_command() -> String {
         .output()
         .is_ok_and(|o| o.status.success())
     {
-        return "opencode --dangerously-skip-permissions".to_string();
+        return "OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode".to_string();
     }
 
     if Command::new("cursor")
@@ -177,7 +177,7 @@ pub fn resolve_backend(name: &str) -> Result<String, String> {
         }
         "cursor" => Ok("cursor agent --yolo".to_string()),
         "gemini" => Ok("gemini --yolo".to_string()),
-        "opencode" => Ok("opencode --dangerously-skip-permissions".to_string()),
+        "opencode" => Ok("OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode".to_string()),
         other => Err(format!(
             "Unknown backend '{}'. Supported: claude, codex, cursor, gemini, opencode",
             other
@@ -407,7 +407,7 @@ default_command = "bash"
         assert_eq!(resolve_backend("gemini").unwrap(), "gemini --yolo");
         assert_eq!(
             resolve_backend("opencode").unwrap(),
-            "opencode --dangerously-skip-permissions"
+            "OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode"
         );
     }
 
