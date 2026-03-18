@@ -43,7 +43,7 @@ struct Cli {
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Agent backend to use: claude, codex, cursor, opencode
+    /// Agent backend to use: claude, codex, cursor, gemini, opencode
     #[arg(short, long)]
     agent: Option<String>,
 }
