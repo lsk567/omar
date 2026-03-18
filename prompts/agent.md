@@ -66,11 +66,15 @@ curl http://localhost:9876/api/agents/agent-name
 ```
 Use the JSON `health` field to decide whether a sub-agent is still active. `"running"` means OMAR has seen recent pane changes; `"idle"` means it may be ready for input, finished, or stuck. Inspect the latest output before deciding what to do.
 
-### Send input to an agent
+### Send a message to a sub-agent (via Events API)
+
+IMPORTANT: Do NOT use the `/send` endpoint for inter-agent communication. Use the Events API instead — it is more reliable.
+
 ```bash
-curl -X POST http://localhost:9876/api/agents/agent-name/send \
+NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 1_000_000)")
+curl -X POST http://localhost:9876/api/events \
   -H "Content-Type: application/json" \
-  -d '{"text": "your message", "enter": true}'
+  -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<agent-name>\", \"timestamp\": $NOW, \"payload\": \"Your message here\"}"
 ```
 
 ### Kill an agent
@@ -84,6 +88,7 @@ curl -X DELETE http://localhost:9876/api/agents/agent-name
 - Be specific about each agent's task — include file paths, function names, expected behavior
 - Spawn independent agents in parallel
 - Monitor the API `health` status: `"running"` = actively working, `"idle"` = may have finished or need input
+- To communicate with sub-agents, always use the Events API — never `/send`
 - When an agent's output shows task completion, kill it: `curl -X DELETE http://localhost:9876/api/agents/agent-name`
 
 ## Completion Protocol

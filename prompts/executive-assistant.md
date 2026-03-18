@@ -77,12 +77,13 @@ curl -X POST http://localhost:9876/api/agents \
 
 You can mix backends in the same army. For example, spawn one agent with `"backend": "codex"` and another with `"backend": "claude"` depending on the task.
 
-#### Send input to an agent
+#### Send input to a non-agent window (demo only)
 ```bash
 curl -X POST http://localhost:9876/api/agents/<name>/send \
   -H "Content-Type: application/json" \
   -d '{"text": "your message", "enter": true}'
 ```
+This endpoint is ONLY for demo/bash windows. Do NOT use it for inter-agent communication — use the Events API instead.
 
 #### Kill an agent
 ```bash
@@ -116,20 +117,18 @@ curl http://localhost:9876/api/agents/<name>
 
 Look for:
 - `[TASK COMPLETE]` — Agent finished all work. Kill it and complete the project.
-- If the agent appears stuck or idle for too long, send it a nudge via the send endpoint.
+- If the agent appears stuck or idle for too long, send it a message via the Events API (never use `/send` for agents).
 
 ### Detecting Agent Activity State
 
 When you check an agent via `curl http://localhost:9876/api/agents/<name>`, use the JSON response to determine whether the agent is working or idle:
 
-- **Agent is actively working:** The JSON `health` field is `"running"`. This means OMAR has observed recent pane changes. **Wait for it to finish** before sending input. Use `output_tail` to inspect what it is doing.
-- **Agent is idle:** The JSON `health` field is `"idle"`. This means OMAR has not seen recent pane changes. The agent may be waiting for input, finished, or stuck. Inspect `output_tail` before deciding whether to send input, replace it, or clean it up.
-
-This distinction is important: sending input to an agent that is mid-operation can interrupt its work. Always confirm the agent is idle via the `health` field before sending follow-up messages or nudges.
+- **Agent is actively working:** The JSON `health` field is `"running"`. This means OMAR has observed recent pane changes. **Wait for it to finish**. Use `output_tail` to inspect what it is doing.
+- **Agent is idle:** The JSON `health` field is `"idle"`. This means OMAR has not seen recent pane changes. The agent may be waiting for input, finished, or stuck. Inspect `output_tail` before deciding whether to message it via events, replace it, or clean it up.
 
 ### Handling Stuck Agents
 
-**Kill and replace — don't nudge repeatedly.** If an agent is stuck (idle too long, stuck in plan mode, not making progress after multiple nudges), do NOT keep nudging it. Kill it and spawn a fresh replacement with the same task and full context. Nudging a stuck agent wastes time — a fresh agent with the same instructions will be more effective.
+**Kill and replace — don't nudge repeatedly.** If an agent is stuck (idle too long, stuck in plan mode, not making progress), do NOT keep messaging it. Kill it and spawn a fresh replacement with the same task and full context.
 
 ```bash
 # Kill the stuck agent
@@ -140,8 +139,6 @@ curl -X POST http://localhost:9876/api/agents \
   -H "Content-Type: application/json" \
   -d '{"name": "<name>", "task": "Same task description with full context"}'
 ```
-
-**Do not over-nudge active agents.** When monitoring agents, do NOT send excessive nudges while an agent is actively working (`"health": "running"`). Only nudge when the agent is idle (`"health": "idle"`) AND not making progress. Over-nudging active agents disrupts their flow.
 
 ## When an Agent Finishes
 
