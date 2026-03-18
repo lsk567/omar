@@ -109,7 +109,7 @@ fn default_error_patterns() -> Vec<String> {
 }
 
 /// Detect which agent command is available on the system.
-/// Checks PATH for `claude` first, then `opencode`, falling back to `claude`.
+/// Checks PATH for `claude` first, then `codex`, then `cursor`, then `gemini`, then `opencode`, falling back to `claude`.
 fn detect_agent_command() -> String {
     use std::process::Command;
 
@@ -121,12 +121,36 @@ fn detect_agent_command() -> String {
         return "claude --dangerously-skip-permissions".to_string();
     }
 
+    if Command::new("codex")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string();
+    }
+
+    if Command::new("gemini")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return "gemini --yolo".to_string();
+    }
+
     if Command::new("opencode")
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success())
     {
-        return "opencode".to_string();
+        return "OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode".to_string();
+    }
+
+    if Command::new("cursor")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return "cursor agent --yolo".to_string();
     }
 
     // Fallback to claude even if not found (user may install it later)
@@ -142,7 +166,8 @@ fn default_command() -> String {
 /// - `"claude"` → `"claude --dangerously-skip-permissions"`
 /// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
 /// - `"cursor"` → `"cursor agent --yolo"`
-/// - `"opencode"` → `"opencode"`
+/// - `"gemini"` → `"gemini --yolo"`
+/// - `"opencode"` → `"opencode --dangerously-skip-permissions"`
 /// - anything else → error
 pub fn resolve_backend(name: &str) -> Result<String, String> {
     match name {
@@ -151,9 +176,10 @@ pub fn resolve_backend(name: &str) -> Result<String, String> {
             Ok("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string())
         }
         "cursor" => Ok("cursor agent --yolo".to_string()),
-        "opencode" => Ok("opencode".to_string()),
+        "gemini" => Ok("gemini --yolo".to_string()),
+        "opencode" => Ok("OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode".to_string()),
         other => Err(format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode",
+            "Unknown backend '{}'. Supported: claude, codex, cursor, gemini, opencode",
             other
         )),
     }
@@ -378,7 +404,11 @@ default_command = "bash"
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
         );
         assert_eq!(resolve_backend("cursor").unwrap(), "cursor agent --yolo");
-        assert_eq!(resolve_backend("opencode").unwrap(), "opencode");
+        assert_eq!(resolve_backend("gemini").unwrap(), "gemini --yolo");
+        assert_eq!(
+            resolve_backend("opencode").unwrap(),
+            "OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode"
+        );
     }
 
     #[test]
