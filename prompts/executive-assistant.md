@@ -77,7 +77,7 @@ curl -X POST http://localhost:9876/api/agents \
 
 You can mix backends in the same army. For example, spawn one agent with `"backend": "codex"` and another with `"backend": "claude"` depending on the task.
 
-#### Send input to a non-agent window (demo only)
+#### Send input to a demo/bash window
 ```bash
 curl -X POST http://localhost:9876/api/agents/<name>/send \
   -H "Content-Type: application/json" \
@@ -264,7 +264,7 @@ After spawning an agent, schedule a self-wake-up so OMAR will nudge you to check
 1. Spawn an agent
 2. Schedule a self-wake-up (e.g., 3 minutes out) to check progress:
 ```bash
-NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 180_000_000_000)")
+NOW=$(python3 -c "import time; print(time.time_ns() + 180_000_000_000)")
 curl -X POST http://localhost:9876/api/events \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"ea\", \"receiver\": \"ea\", \"timestamp\": $NOW, \"payload\": \"Check agent progress\"}"

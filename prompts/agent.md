@@ -71,7 +71,7 @@ Use the JSON `health` field to decide whether a sub-agent is still active. `"run
 IMPORTANT: Do NOT use the `/send` endpoint for inter-agent communication. Use the Events API instead — it is more reliable.
 
 ```bash
-NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 1_000_000)")
+NOW=$(python3 -c "import time; print(time.time_ns() + 1_000_000)")
 curl -X POST http://localhost:9876/api/events \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<agent-name>\", \"timestamp\": $NOW, \"payload\": \"Your message here\"}"
@@ -107,7 +107,7 @@ Summary:
 Then immediately schedule a wake-up event for your parent so it can check your output:
 
 ```bash
-NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 1_000_000)")
+NOW=$(python3 -c "import time; print(time.time_ns() + 1_000_000)")
 curl -X POST http://localhost:9876/api/events \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<YOUR PARENT>\", \"timestamp\": $NOW, \"payload\": \"[TASK COMPLETE] from <YOUR NAME>. Check output for results.\"}"
@@ -122,7 +122,7 @@ IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g
 1. Spawn sub-agents
 2. Schedule a self-wake-up (e.g., 2 minutes out) to check progress:
 ```bash
-NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 120_000_000_000)")
+NOW=$(python3 -c "import time; print(time.time_ns() + 120_000_000_000)")
 curl -X POST http://localhost:9876/api/events \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<YOUR NAME>\", \"timestamp\": $NOW, \"payload\": \"Check sub-agent progress\"}"
