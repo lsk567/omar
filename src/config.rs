@@ -368,6 +368,18 @@ default_command = "bash"
     }
 
     #[test]
+    fn test_parse_config_without_default_command_uses_detected_default() {
+        let toml = r#"
+[agent]
+default_workdir = "/workspace"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.default_workdir, "/workspace");
+        assert_eq!(config.agent.default_command, default_command());
+        assert_ne!(config.agent.default_command, "bash");
+    }
+
+    #[test]
     fn test_resolve_backend_known_names() {
         assert_eq!(
             resolve_backend("claude").unwrap(),
