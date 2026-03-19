@@ -322,11 +322,14 @@ fn test_spawn_custom_command() {
     let _ = tmux(&["kill-session", "-t", &session_name]);
 }
 
-/// Test that attached sessions still appear in list-sessions output.
-/// When a user opens the popup view, the agent session becomes "attached"
-/// but should still be discoverable by the API.
+/// Test that tmux session discovery APIs (list-sessions, has-session,
+/// capture-pane) work correctly on agent sessions.
+///
+/// The attached-session filtering regression is covered by the
+/// `filter_sessions_includes_attached` unit test in app.rs. This
+/// integration test verifies the underlying tmux operations work.
 #[test]
-fn test_attached_session_still_listed() {
+fn test_session_discovery() {
     if !tmux_available() {
         eprintln!("Skipping test: tmux not available");
         return;
@@ -334,24 +337,22 @@ fn test_attached_session_still_listed() {
 
     cleanup_test_sessions();
 
-    let session_name = format!("{}attached", TEST_PREFIX);
+    let session_name = format!("{}discovery", TEST_PREFIX);
 
     // Create a detached session
     let result = tmux(&["new-session", "-d", "-s", &session_name, "sleep", "60"]);
     assert!(result.is_ok(), "Failed to create session: {:?}", result);
     thread::sleep(Duration::from_millis(100));
 
-    // Verify unattached session shows session_attached=0
-    let output = tmux(&["list-sessions", "-F", "#{session_name}|#{session_attached}"]).unwrap();
-    let line = output.lines().find(|l| l.starts_with(&session_name));
-    assert!(line.is_some(), "Session should appear in list: {}", output);
+    // Verify list-sessions includes the session
+    let output = tmux(&["list-sessions", "-F", "#{session_name}"]).unwrap();
     assert!(
-        line.unwrap().ends_with("|0"),
-        "Detached session should have attached=0: {}",
-        line.unwrap()
+        output.lines().any(|l| l == session_name),
+        "Session should appear in list-sessions: {}",
+        output
     );
 
-    // Verify has-session works regardless of attached state
+    // Verify has-session finds it
     let result = Command::new("tmux")
         .args(["has-session", "-t", &session_name])
         .output()
@@ -361,7 +362,7 @@ fn test_attached_session_still_listed() {
         "has-session should find the session"
     );
 
-    // Verify capture-pane works on the session
+    // Verify capture-pane works
     let result = tmux(&["capture-pane", "-t", &session_name, "-p"]);
     assert!(
         result.is_ok(),
