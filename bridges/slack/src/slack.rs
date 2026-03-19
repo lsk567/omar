@@ -314,6 +314,13 @@ impl SlackClient {
     }
 }
 
+/// How long to wait for any WebSocket message before assuming the connection is dead.
+/// Slack Socket Mode typically sends pings every ~30s, so 90s is generous.
+const WS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How often to send a client-side ping to detect dead connections.
+const WS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Internal: run the Socket Mode WebSocket loop. Returns on disconnection.
 async fn run_socket_mode_loop(
     http: &Client,
@@ -351,44 +358,85 @@ async fn run_socket_mode_loop(
 
     info!("Socket Mode connected");
 
-    // 3. Process messages
-    while let Some(msg_result) = ws_read.next().await {
-        let msg = match msg_result {
-            Ok(m) => m,
-            Err(e) => {
-                error!("WebSocket read error: {}", e);
-                break;
-            }
-        };
+    // 3. Process messages with read timeout and periodic keepalive ping
+    let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
+    ping_interval.tick().await; // consume the immediate first tick
 
-        match msg {
-            WsMessage::Text(text) => {
-                handle_socket_message(&text, bot_user_id, tx, &mut ws_write).await;
+    loop {
+        tokio::select! {
+            // Branch 1: incoming WebSocket message (with timeout)
+            msg_option = tokio::time::timeout(WS_READ_TIMEOUT, ws_read.next()) => {
+                let msg_result = match msg_option {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        info!("WebSocket stream ended");
+                        break;
+                    }
+                    Err(_) => {
+                        warn!("No WebSocket message received in {:?}, assuming dead connection", WS_READ_TIMEOUT);
+                        break;
+                    }
+                };
+
+                let msg = match msg_result {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!("WebSocket read error: {}", e);
+                        break;
+                    }
+                };
+
+                match msg {
+                    WsMessage::Text(text) => {
+                        let action = handle_socket_message(&text, bot_user_id, tx, &mut ws_write).await;
+                        if action == LoopAction::Reconnect {
+                            info!("Disconnect requested, breaking loop to reconnect");
+                            break;
+                        }
+                    }
+                    WsMessage::Ping(data) => {
+                        if let Err(e) = ws_write.send(WsMessage::Pong(data)).await {
+                            error!("Failed to send pong: {}", e);
+                            break;
+                        }
+                    }
+                    WsMessage::Close(_) => {
+                        info!("WebSocket closed by server");
+                        break;
+                    }
+                    _ => {}
+                }
             }
-            WsMessage::Ping(data) => {
-                if let Err(e) = ws_write.send(WsMessage::Pong(data)).await {
-                    error!("Failed to send pong: {}", e);
+            // Branch 2: periodic client-side ping to detect dead connections
+            _ = ping_interval.tick() => {
+                debug!("Sending keepalive ping");
+                if let Err(e) = ws_write.send(WsMessage::Ping(vec![])).await {
+                    error!("Failed to send keepalive ping: {}", e);
                     break;
                 }
             }
-            WsMessage::Close(_) => {
-                info!("WebSocket closed by server");
-                break;
-            }
-            _ => {}
         }
     }
 
     Ok(())
 }
 
+/// Signals whether the WebSocket loop should continue or reconnect.
+#[derive(Debug, PartialEq, Eq)]
+enum LoopAction {
+    Continue,
+    Reconnect,
+}
+
 /// Parse a Socket Mode envelope and handle it.
+/// Returns `LoopAction::Reconnect` when Slack requests a disconnect.
 async fn handle_socket_message<S>(
     text: &str,
     bot_user_id: &str,
     tx: &mpsc::UnboundedSender<SlackMessage>,
     ws_write: &mut S,
-) where
+) -> LoopAction
+where
     S: futures_util::Sink<WsMessage> + Unpin,
     S::Error: std::fmt::Display,
 {
@@ -400,7 +448,7 @@ async fn handle_socket_message<S>(
                 e,
                 &text[..200.min(text.len())]
             );
-            return;
+            return LoopAction::Continue;
         }
     };
 
@@ -423,18 +471,23 @@ async fn handle_socket_message<S>(
             if let Some(payload) = envelope.payload {
                 handle_events_api_payload(payload, bot_user_id, tx);
             }
+            LoopAction::Continue
         }
         Some("hello") => {
             info!("Received Socket Mode hello");
+            LoopAction::Continue
         }
         Some("disconnect") => {
-            info!("Received Socket Mode disconnect request");
+            info!("Received Socket Mode disconnect request — will reconnect");
+            LoopAction::Reconnect
         }
         Some(other) => {
             debug!("Ignoring envelope type: {}", other);
+            LoopAction::Continue
         }
         None => {
             debug!("Envelope with no type");
+            LoopAction::Continue
         }
     }
 }
@@ -534,5 +587,169 @@ fn handle_events_api_payload(
 
     if tx.send(msg).is_err() {
         error!("Message channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A simple in-memory sink that collects sent WebSocket messages.
+    struct MockWsSink {
+        sent: Vec<WsMessage>,
+    }
+
+    impl MockWsSink {
+        fn new() -> Self {
+            Self { sent: Vec::new() }
+        }
+    }
+
+    impl futures_util::Sink<WsMessage> for MockWsSink {
+        type Error = String;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, item: WsMessage) -> Result<(), Self::Error> {
+            self.get_mut().sent.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_envelope_triggers_reconnect() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut sink = MockWsSink::new();
+
+        let envelope = r#"{"envelope_id":"abc123","type":"disconnect"}"#;
+        let action = handle_socket_message(envelope, "U_BOT", &tx, &mut sink).await;
+
+        assert_eq!(action, LoopAction::Reconnect);
+        // Should still ack the envelope
+        assert_eq!(sink.sent.len(), 1);
+        let ack_text = match &sink.sent[0] {
+            WsMessage::Text(t) => t.clone(),
+            _ => panic!("Expected Text message"),
+        };
+        assert!(ack_text.contains("abc123"));
+    }
+
+    #[tokio::test]
+    async fn test_hello_envelope_continues() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut sink = MockWsSink::new();
+
+        let envelope = r#"{"type":"hello"}"#;
+        let action = handle_socket_message(envelope, "U_BOT", &tx, &mut sink).await;
+
+        assert_eq!(action, LoopAction::Continue);
+    }
+
+    #[tokio::test]
+    async fn test_events_api_forwards_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = MockWsSink::new();
+
+        let envelope = r#"{
+            "envelope_id": "ev_123",
+            "type": "events_api",
+            "payload": {
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "user": "U_USER",
+                    "text": "hello world",
+                    "ts": "1234567890.000100"
+                }
+            }
+        }"#;
+
+        let action = handle_socket_message(envelope, "U_BOT", &tx, &mut sink).await;
+
+        assert_eq!(action, LoopAction::Continue);
+        // Should have forwarded the message
+        let msg = rx.try_recv().expect("Should have received a message");
+        assert_eq!(msg.channel, "C123");
+        assert_eq!(msg.user, "U_USER");
+        assert_eq!(msg.text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_own_messages_are_skipped() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = MockWsSink::new();
+
+        // Message from the bot itself
+        let envelope = r#"{
+            "envelope_id": "ev_456",
+            "type": "events_api",
+            "payload": {
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "user": "U_BOT",
+                    "text": "I said something",
+                    "ts": "1234567890.000200"
+                }
+            }
+        }"#;
+
+        let action = handle_socket_message(envelope, "U_BOT", &tx, &mut sink).await;
+
+        assert_eq!(action, LoopAction::Continue);
+        // Should NOT have forwarded (own message)
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_malformed_envelope_continues() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut sink = MockWsSink::new();
+
+        let action = handle_socket_message("not json", "U_BOT", &tx, &mut sink).await;
+        assert_eq!(action, LoopAction::Continue);
+        assert!(sink.sent.is_empty()); // no ack sent for unparseable envelope
+    }
+
+    #[test]
+    fn test_slack_message_thread_key() {
+        let msg = SlackMessage {
+            channel: "C123".into(),
+            user: "U1".into(),
+            text: "hi".into(),
+            ts: "1234.5678".into(),
+            thread_ts: Some("1234.0000".into()),
+            channel_type: None,
+            bot_id: None,
+            subtype: None,
+        };
+        assert_eq!(msg.thread_key(), "1234.0000");
+        assert!(msg.is_threaded_reply());
+
+        let msg2 = SlackMessage {
+            thread_ts: None,
+            ..msg.clone()
+        };
+        assert_eq!(msg2.thread_key(), "1234.5678");
+        assert!(!msg2.is_threaded_reply());
     }
 }
