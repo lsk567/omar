@@ -818,7 +818,10 @@ impl App {
 /// configured prefix. Attached sessions are intentionally included —
 /// when a user opens the popup view, the agent session becomes "attached"
 /// but is still a valid agent.
-pub fn filter_sessions(sessions: Vec<Session>, prefix: &str) -> (Option<Session>, Vec<Session>) {
+pub(crate) fn filter_sessions(
+    sessions: Vec<Session>,
+    prefix: &str,
+) -> (Option<Session>, Vec<Session>) {
     let mut manager_session = None;
     let mut other_sessions = Vec::new();
 

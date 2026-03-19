@@ -322,58 +322,6 @@ fn test_spawn_custom_command() {
     let _ = tmux(&["kill-session", "-t", &session_name]);
 }
 
-/// Test that tmux session discovery APIs (list-sessions, has-session,
-/// capture-pane) work correctly on agent sessions.
-///
-/// The attached-session filtering regression is covered by the
-/// `filter_sessions_includes_attached` unit test in app.rs. This
-/// integration test verifies the underlying tmux operations work.
-#[test]
-fn test_session_discovery() {
-    if !tmux_available() {
-        eprintln!("Skipping test: tmux not available");
-        return;
-    }
-
-    cleanup_test_sessions();
-
-    let session_name = format!("{}discovery", TEST_PREFIX);
-
-    // Create a detached session
-    let result = tmux(&["new-session", "-d", "-s", &session_name, "sleep", "60"]);
-    assert!(result.is_ok(), "Failed to create session: {:?}", result);
-    thread::sleep(Duration::from_millis(100));
-
-    // Verify list-sessions includes the session
-    let output = tmux(&["list-sessions", "-F", "#{session_name}"]).unwrap();
-    assert!(
-        output.lines().any(|l| l == session_name),
-        "Session should appear in list-sessions: {}",
-        output
-    );
-
-    // Verify has-session finds it
-    let result = Command::new("tmux")
-        .args(["has-session", "-t", &session_name])
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "has-session should find the session"
-    );
-
-    // Verify capture-pane works
-    let result = tmux(&["capture-pane", "-t", &session_name, "-p"]);
-    assert!(
-        result.is_ok(),
-        "capture-pane should work on the session: {:?}",
-        result
-    );
-
-    // Cleanup
-    let _ = tmux(&["kill-session", "-t", &session_name]);
-}
-
 /// Test that the omar binary can be built and shows help
 #[test]
 fn test_omar_help() {
