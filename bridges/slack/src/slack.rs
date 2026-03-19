@@ -358,33 +358,35 @@ async fn run_socket_mode_loop(
 
     info!("Socket Mode connected");
 
-    // 3. Process messages with read timeout and periodic keepalive ping
+    // 3. Process messages with read deadline and periodic keepalive ping.
+    //
+    // We track a persistent read deadline that is only reset after a
+    // successful read.  This avoids the pitfall where `tokio::select!`
+    // drops and recreates the timeout future on every ping tick, which
+    // would prevent the read timeout from ever firing.
     let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
     ping_interval.tick().await; // consume the immediate first tick
 
+    let mut read_deadline = tokio::time::Instant::now() + WS_READ_TIMEOUT;
+
     loop {
         tokio::select! {
-            // Branch 1: incoming WebSocket message (with timeout)
-            msg_option = tokio::time::timeout(WS_READ_TIMEOUT, ws_read.next()) => {
-                let msg_result = match msg_option {
-                    Ok(Some(r)) => r,
-                    Ok(None) => {
-                        info!("WebSocket stream ended");
+            // Branch 1: incoming WebSocket message
+            msg_option = ws_read.next() => {
+                let msg = match msg_option {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        error!("WebSocket read error: {}", e);
                         break;
                     }
-                    Err(_) => {
-                        warn!("No WebSocket message received in {:?}, assuming dead connection", WS_READ_TIMEOUT);
+                    None => {
+                        info!("WebSocket stream ended");
                         break;
                     }
                 };
 
-                let msg = match msg_result {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!("WebSocket read error: {}", e);
-                        break;
-                    }
-                };
+                // Got a message — reset the read deadline
+                read_deadline = tokio::time::Instant::now() + WS_READ_TIMEOUT;
 
                 match msg {
                     WsMessage::Text(text) => {
@@ -414,6 +416,11 @@ async fn run_socket_mode_loop(
                     error!("Failed to send keepalive ping: {}", e);
                     break;
                 }
+            }
+            // Branch 3: read deadline expired — no data received for too long
+            _ = tokio::time::sleep_until(read_deadline) => {
+                warn!("No WebSocket message received in {:?}, assuming dead connection", WS_READ_TIMEOUT);
+                break;
             }
         }
     }
