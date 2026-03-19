@@ -825,9 +825,9 @@ pub fn filter_sessions(sessions: Vec<Session>, prefix: &str) -> (Option<Session>
     for session in sessions {
         if session.name == MANAGER_SESSION {
             manager_session = Some(session);
-        } else if session.name == DASHBOARD_SESSION {
-            continue;
-        } else if !prefix.is_empty() && !session.name.starts_with(prefix) {
+        } else if session.name == DASHBOARD_SESSION
+            || (!prefix.is_empty() && !session.name.starts_with(prefix))
+        {
             continue;
         } else {
             other_sessions.push(session);
