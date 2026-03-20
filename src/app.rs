@@ -199,27 +199,8 @@ impl App {
         // Get all sessions
         let sessions = self.client.list_all_sessions()?;
 
-        // Separate manager from other agents, filtering out non-omar sessions
-        let mut manager_session = None;
-        let mut other_sessions = Vec::new();
-
-        for session in sessions {
-            if session.name == MANAGER_SESSION {
-                manager_session = Some(session);
-            } else if session.name == DASHBOARD_SESSION {
-                // Skip the dashboard's own tmux session
-                continue;
-            } else if !self.config.dashboard.session_prefix.is_empty()
-                && !session
-                    .name
-                    .starts_with(&self.config.dashboard.session_prefix)
-            {
-                // Skip sessions that don't match the configured prefix
-                continue;
-            } else {
-                other_sessions.push(session);
-            }
-        }
+        let (manager_session, other_sessions) =
+            filter_sessions(sessions, &self.config.dashboard.session_prefix);
 
         // Update manager info
         self.manager = manager_session.map(|session| {
@@ -232,14 +213,12 @@ impl App {
             }
         });
 
-        // Update agents list (excluding attached sessions)
-        // Attached sessions are likely the user's main terminal, not agents
-        let filtered: Vec<Session> = other_sessions
-            .into_iter()
-            .filter(|session| !session.attached)
-            .collect();
-
-        self.agents = filtered
+        // Update agents list.
+        // NOTE: We intentionally include attached sessions. When a user opens
+        // the popup view (tmux display-popup + attach), the agent session
+        // becomes "attached" but is still a valid agent. Filtering attached
+        // sessions would cause the API to return "not found" for that agent.
+        self.agents = other_sessions
             .into_iter()
             .map(|session| {
                 let health_info = self.health_checker.check_detailed(&session.name);
@@ -831,6 +810,34 @@ impl App {
             &self.scheduled_events,
         );
     }
+}
+
+/// Separate tmux sessions into manager vs. agent sessions.
+///
+/// Filters out the dashboard session and sessions that don't match the
+/// configured prefix. Attached sessions are intentionally included —
+/// when a user opens the popup view, the agent session becomes "attached"
+/// but is still a valid agent.
+pub(crate) fn filter_sessions(
+    sessions: Vec<Session>,
+    prefix: &str,
+) -> (Option<Session>, Vec<Session>) {
+    let mut manager_session = None;
+    let mut other_sessions = Vec::new();
+
+    for session in sessions {
+        if session.name == MANAGER_SESSION {
+            manager_session = Some(session);
+        } else if session.name == DASHBOARD_SESSION
+            || (!prefix.is_empty() && !session.name.starts_with(prefix))
+        {
+            continue;
+        } else {
+            other_sessions.push(session);
+        }
+    }
+
+    (manager_session, other_sessions)
 }
 
 /// Group agents into parent → children hierarchies for grid display.
@@ -1456,5 +1463,97 @@ mod tests {
             crumbs.push(short.to_string());
         }
         assert_eq!(crumbs, vec!["EA", "rest-api"]);
+    }
+
+    // ── attached session tests ──
+
+    #[test]
+    fn test_attached_agent_included_in_groups() {
+        // Agents that are attached (e.g., via popup view) should still appear
+        let mut attached = make_agent("omar-agent-api", HealthState::Running);
+        attached.session.attached = true;
+        let agents = vec![attached, make_agent("omar-agent-auth", HealthState::Idle)];
+        let parents = HashMap::new();
+
+        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
+
+        // Both agents should appear (attached agent is not filtered)
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].pm.is_none());
+        assert_eq!(groups[0].workers.len(), 2);
+    }
+
+    #[test]
+    fn test_attached_agent_included_in_tree() {
+        // An attached agent should still appear in the command tree
+        let mut attached = make_agent("omar-agent-api", HealthState::Running);
+        attached.session.attached = true;
+        let agents = vec![attached];
+        let ea = make_agent("omar-agent-ea", HealthState::Running);
+        let mut parents = HashMap::new();
+        parents.insert("omar-agent-api".to_string(), MANAGER_SESSION.to_string());
+
+        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[1].name, "api");
+        assert_eq!(tree[1].depth, 1);
+    }
+
+    // ── filter_sessions tests ──
+
+    fn make_session(name: &str, attached: bool) -> Session {
+        Session {
+            name: name.to_string(),
+            activity: 0,
+            attached,
+            pane_pid: 0,
+        }
+    }
+
+    #[test]
+    fn test_filter_sessions_basic() {
+        let sessions = vec![
+            make_session(MANAGER_SESSION, false),
+            make_session(DASHBOARD_SESSION, false),
+            make_session("omar-agent-api", false),
+            make_session("omar-agent-auth", false),
+            make_session("unrelated-session", false),
+        ];
+
+        let (manager, agents) = filter_sessions(sessions, "omar-agent-");
+
+        assert!(manager.is_some());
+        assert_eq!(manager.unwrap().name, MANAGER_SESSION);
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].name, "omar-agent-api");
+        assert_eq!(agents[1].name, "omar-agent-auth");
+    }
+
+    #[test]
+    fn test_filter_sessions_includes_attached() {
+        let sessions = vec![
+            make_session(MANAGER_SESSION, false),
+            make_session("omar-agent-api", false),
+            make_session("omar-agent-auth", true), // attached (user has popup open)
+        ];
+
+        let (_, agents) = filter_sessions(sessions, "omar-agent-");
+
+        // Attached sessions must NOT be filtered out
+        assert_eq!(agents.len(), 2);
+        assert!(agents
+            .iter()
+            .any(|a| a.name == "omar-agent-auth" && a.attached));
+    }
+
+    #[test]
+    fn test_filter_sessions_no_manager() {
+        let sessions = vec![make_session("omar-agent-worker", false)];
+
+        let (manager, agents) = filter_sessions(sessions, "omar-agent-");
+
+        assert!(manager.is_none());
+        assert_eq!(agents.len(), 1);
     }
 }
