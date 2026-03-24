@@ -94,7 +94,7 @@ pub async fn list_backends() -> Json<BackendsResponse> {
     let infos = tokio::task::spawn_blocking(|| {
         use std::process::Command;
 
-        let backends = ["claude", "codex", "cursor", "opencode"];
+        let backends = ["claude", "codex", "cursor", "gemini", "opencode"];
         backends
             .iter()
             .filter_map(|&name| {
