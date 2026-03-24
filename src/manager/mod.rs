@@ -100,33 +100,40 @@ pub fn build_agent_command(base_command: &str, prompt_file: &Path) -> String {
 /// Reads the EA prompt, appends the latest memory snapshot, writes a
 /// combined file to `~/.omar/ea_prompt_combined.md`, and returns the
 /// CLI command with the combined file as the system prompt.
-pub fn build_ea_command(base_command: &str) -> String {
-    let prompt_file = prompts_dir().join("executive-assistant.md");
-    let mem = memory::load_memory();
-
+fn build_ea_command_with_memory(
+    base_command: &str,
+    prompt_file: &Path,
+    mem: &str,
+    home_dir: &Path,
+) -> String {
     if mem.is_empty() {
-        return build_agent_command(base_command, &prompt_file);
+        return build_agent_command(base_command, prompt_file);
     }
 
-    let prompt_content = std::fs::read_to_string(&prompt_file).unwrap_or_default();
+    let prompt_content = std::fs::read_to_string(prompt_file).unwrap_or_default();
     let combined = format!(
         "{}\n\n---\n\n## Current OMAR State (from previous session)\n\n{}",
         prompt_content, mem
     );
 
-    let combined_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar")
-        .join("ea_prompt_combined.md");
+    let combined_path = home_dir.join(".omar").join("ea_prompt_combined.md");
     std::fs::create_dir_all(combined_path.parent().unwrap()).ok();
     std::fs::write(&combined_path, &combined).ok();
 
     build_agent_command(base_command, &combined_path)
 }
 
+pub fn build_ea_command(base_command: &str) -> String {
+    let prompt_file = prompts_dir().join("executive-assistant.md");
+    let mem = memory::load_memory();
+    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    build_ea_command_with_memory(base_command, &prompt_file, &mem, &home_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_build_agent_command_claude() {
@@ -216,5 +223,45 @@ mod tests {
     fn test_build_agent_command_unknown_backend() {
         let cmd = build_agent_command("vim", Path::new("/tmp/prompts/ea.md"));
         assert_eq!(cmd, "vim");
+    }
+
+    #[test]
+    fn test_build_ea_command_uses_executive_assistant_prompt_without_memory() {
+        let tmp = tempdir().unwrap();
+        let home_dir = tmp.path();
+        let prompt_file = home_dir.join("executive-assistant.md");
+        std::fs::write(&prompt_file, "EA prompt").unwrap();
+
+        let cmd = build_ea_command_with_memory("claude", &prompt_file, "", home_dir);
+        assert_eq!(
+            cmd,
+            format!(
+                "claude --system-prompt \"$(cat '{}')\"",
+                prompt_file.display()
+            )
+        );
+    }
+
+    #[test]
+    fn test_build_ea_command_uses_combined_prompt_when_memory_exists() {
+        let tmp = tempdir().unwrap();
+        let home_dir = tmp.path();
+        let prompt_file = home_dir.join("executive-assistant.md");
+        std::fs::write(&prompt_file, "EA prompt").unwrap();
+
+        let cmd = build_ea_command_with_memory("codex", &prompt_file, "Saved state", home_dir);
+        let combined_path = home_dir.join(".omar").join("ea_prompt_combined.md");
+
+        assert_eq!(
+            cmd,
+            format!(
+                "codex -c \"developer_instructions='''$(cat '{}')'''\"",
+                combined_path.display()
+            )
+        );
+
+        let combined = std::fs::read_to_string(&combined_path).unwrap();
+        assert!(combined.contains("EA prompt"));
+        assert!(combined.contains("Saved state"));
     }
 }

@@ -147,6 +147,7 @@ fn relaunch_in_tmux() -> Result<()> {
 /// Recommended tmux settings for omar, keyed by option name.
 const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
     ("mouse", "set -g mouse on", "mouse scrolling and selection"),
+    ("history-limit", "set -g history-limit 9999", "larger scrollback history"),
     (
         "extended-keys",
         "set -g extended-keys always",
