@@ -1,10 +1,8 @@
 <div align="center">
 
-# one-man army
+# Open Multi-Agent Runtime
 
-<img src="docs/img/thermopylae.png" alt="thermopylae" width="450" />
-
-Lead an army of 300 agents to solve humanity's biggest problems.
+Lead a team of 100 agents to solve humanity's biggest problems.
 
 **`omar` is a TUI for creating powerful agentic organizations.**
 
