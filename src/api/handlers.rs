@@ -390,7 +390,7 @@ pub async fn spawn_agent(
         memory::save_agent_parent(&name, &resolved_parent);
     }
 
-    // Send first user message after a delay
+    // Send first user message once the backend is ready
     if let Some(task) = req.task {
         // Always persist the original (short) task for dashboard display
         memory::save_worker_task(&name, &task);
@@ -405,12 +405,43 @@ pub async fn spawn_agent(
         let client = app.client().clone();
         let session = name.clone();
         tokio::spawn(async move {
-            // Wait for the agent process to start
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let _ = client.send_keys_literal(&session, &user_msg);
+            // Poll until the backend process renders output (up to 30 seconds).
+            // A fixed sleep races against slow-starting backends (claude, cursor);
+            // polling capture_pane for non-empty content guarantees the process is
+            // alive and has rendered its UI before we inject the task.
+            let ready = wait_for_pane_ready(&client, &session, 30).await;
+            if !ready {
+                eprintln!(
+                    "[omar] warning: timed out waiting for pane '{}' to become ready; \
+                     sending task anyway",
+                    session
+                );
+            }
+
+            // Send the task text, retrying on transient tmux errors.
+            let mut sent = false;
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                if client.send_keys_literal(&session, &user_msg).is_ok() {
+                    sent = true;
+                    break;
+                }
+            }
+            if !sent {
+                eprintln!(
+                    "[omar] error: failed to inject task into '{}' after 3 attempts",
+                    session
+                );
+                return;
+            }
+
             // Delay so tmux finishes processing bracketed paste before Enter
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let _ = client.send_keys(&session, "Enter");
+            if let Err(e) = client.send_keys(&session, "Enter") {
+                eprintln!("[omar] error: failed to send Enter to '{}': {}", session, e);
+            }
         });
     }
 
@@ -936,6 +967,38 @@ pub async fn computer_mouse_position(
                 error: format!("Failed to get mouse position: {}", e),
             }),
         )),
+    }
+}
+
+/// Poll `capture_pane` until the pane has non-whitespace content, indicating
+/// the backend process has started and rendered its UI/prompt.
+///
+/// Returns `true` if the pane became ready within `timeout_secs`, `false` on timeout.
+/// Uses exponential back-off: 250ms → 500ms → 1s → 2s (capped).
+async fn wait_for_pane_ready(
+    client: &crate::tmux::TmuxClient,
+    session: &str,
+    timeout_secs: u64,
+) -> bool {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut interval = Duration::from_millis(250);
+    let max_interval = Duration::from_secs(2);
+
+    loop {
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        if let Ok(content) = client.capture_pane(session, 20) {
+            if content.chars().any(|c| !c.is_whitespace()) {
+                return true;
+            }
+        }
+
+        tokio::time::sleep(interval).await;
+        interval = (interval * 2).min(max_interval);
     }
 }
 

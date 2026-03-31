@@ -322,6 +322,65 @@ fn test_spawn_custom_command() {
     let _ = tmux(&["kill-session", "-t", &session_name]);
 }
 
+/// Test that task injection works reliably by simulating the polling pattern
+/// used in the spawn_agent handler. Launches a slow-starting command and
+/// verifies that waiting for pane content before sending keys works.
+#[test]
+fn test_task_injection_waits_for_readiness() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    cleanup_test_sessions();
+
+    let session_name = format!("{}task-inject", TEST_PREFIX);
+
+    // Simulate a slow-starting backend: sleep 2 seconds then start a shell.
+    // The old code used a fixed 2s delay which would race against this.
+    let result = tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        &session_name,
+        "bash",
+        "-c",
+        "sleep 2 && exec bash",
+    ]);
+    assert!(result.is_ok(), "Failed to create session: {:?}", result);
+
+    // Poll until pane has non-whitespace content (same pattern as the fix)
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(content) = tmux(&["capture-pane", "-t", &session_name, "-p"]) {
+            if content.chars().any(|c| !c.is_whitespace()) {
+                ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    assert!(ready, "Pane should become ready within 10 seconds");
+
+    // Now inject text (simulates task injection)
+    let task = "echo RELIABLE_TASK_INJECTION";
+    let _ = tmux(&["send-keys", "-t", &session_name, "-l", task]);
+    thread::sleep(Duration::from_millis(100));
+    let _ = tmux(&["send-keys", "-t", &session_name, "Enter"]);
+    thread::sleep(Duration::from_millis(500));
+
+    let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
+    assert!(
+        output.contains("RELIABLE_TASK_INJECTION"),
+        "Task should be injected after readiness polling: {}",
+        output
+    );
+
+    // Cleanup
+    let _ = tmux(&["kill-session", "-t", &session_name]);
+}
+
 /// Test that the omar binary can be built and shows help
 #[test]
 fn test_omar_help() {
