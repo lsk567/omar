@@ -65,7 +65,7 @@ curl -X POST http://localhost:9876/api/agents \
 ```
 - `name`: agent name (auto-generated if omitted)
 - `task`: task description (providing a task automatically assigns the agent prompt)
-- `backend`: agent backend shorthand — `"claude"`, `"codex"`, `"cursor"`, or `"opencode"` (defaults to config)
+- `backend`: agent backend shorthand — `"claude"`, `"codex"`, `"cursor"`, `"gemini"`, or `"opencode"` (defaults to config)
 - `model`: model override — appended as `--model <value>` (e.g. `"claude-sonnet-4-5-20250514"`, `"o3"`)
 
 #### Spawning with a specific backend and model
