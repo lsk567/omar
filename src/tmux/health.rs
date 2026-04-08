@@ -195,6 +195,20 @@ mod tests {
         let session = "omar-test-auth-failure-live";
         let clean_session = "omar-test-auth-failure-clean";
 
+        // Cleanup guard: kill sessions on drop (including panics)
+        struct Cleanup(&'static str, &'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", self.0])
+                    .output();
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", self.1])
+                    .output();
+            }
+        }
+        let _cleanup = Cleanup(session, clean_session);
+
         // Cleanup any leftover sessions
         tmux(&["kill-session", "-t", session]);
         tmux(&["kill-session", "-t", clean_session]);
@@ -212,7 +226,6 @@ mod tests {
             "Enter",
         ]) {
             eprintln!("Skipping test: tmux send-keys failed (sandbox or environment issue)");
-            tmux(&["kill-session", "-t", session]);
             return;
         }
         thread::sleep(Duration::from_millis(1000));
@@ -247,9 +260,5 @@ mod tests {
             !info.auth_failure,
             "Should NOT detect auth failure in clean pane"
         );
-
-        // Cleanup
-        tmux(&["kill-session", "-t", session]);
-        tmux(&["kill-session", "-t", clean_session]);
     }
 }

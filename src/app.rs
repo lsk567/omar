@@ -818,19 +818,18 @@ impl App {
         // No secrets — only localhost URLs and the Slack channel ID.
         let slack_channel = &self.config.watchdog.slack_channel;
         let failed_list = failed_agents.join(", ");
+        let slack_display = if slack_channel.is_empty() {
+            "(not configured)"
+        } else {
+            slack_channel
+        };
         let task_msg = format!(
             "AUTH FAILURE DETECTED.\n\
-             Failed agents: {}\n\
-             Slack channel: {}\n\
-             Omar API: http://localhost:{}\n\
-             Slack bridge: http://localhost:9877",
-            failed_list,
-            if slack_channel.is_empty() {
-                "(not configured)"
-            } else {
-                slack_channel
-            },
-            self.config.api.port,
+Failed agents: {}\n\
+Slack channel: {}\n\
+Omar API: http://localhost:{}\n\
+Slack bridge: http://localhost:9877",
+            failed_list, slack_display, self.config.api.port,
         );
 
         let client = self.client.clone();
