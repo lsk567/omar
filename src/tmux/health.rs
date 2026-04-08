@@ -36,6 +36,8 @@ pub struct HealthChecker {
     client: TmuxClient,
     /// Last captured pane content per session name
     last_frames: HashMap<String, String>,
+    /// Patterns that indicate auth failure (case-insensitive match)
+    auth_failure_patterns: Vec<String>,
 }
 
 impl HealthChecker {
@@ -43,7 +45,13 @@ impl HealthChecker {
         Self {
             client,
             last_frames: HashMap::new(),
+            auth_failure_patterns: Vec::new(),
         }
+    }
+
+    pub fn with_auth_failure_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.auth_failure_patterns = patterns;
+        self
     }
 
     /// Check the health of a session by comparing against the previous frame.
@@ -72,12 +80,11 @@ impl HealthChecker {
     pub fn check_detailed(&mut self, session_name: &str) -> HealthInfo {
         let state = self.check(session_name);
 
-        let last_output = self
-            .last_frames
-            .get(session_name)
-            .map(|frame| {
-                frame
-                    .lines()
+        let frame = self.last_frames.get(session_name);
+
+        let last_output = frame
+            .map(|f| {
+                f.lines()
                     .next_back()
                     .unwrap_or("")
                     .trim()
@@ -87,7 +94,20 @@ impl HealthChecker {
             })
             .unwrap_or_default();
 
-        HealthInfo { state, last_output }
+        let auth_failure = frame
+            .map(|f| {
+                let lower = f.to_lowercase();
+                self.auth_failure_patterns
+                    .iter()
+                    .any(|pat| lower.contains(&pat.to_lowercase()))
+            })
+            .unwrap_or(false);
+
+        HealthInfo {
+            state,
+            last_output,
+            auth_failure,
+        }
     }
 
     /// Remove stale entries for sessions that no longer exist
@@ -102,6 +122,8 @@ impl HealthChecker {
 pub struct HealthInfo {
     pub state: HealthState,
     pub last_output: String,
+    /// Whether auth failure patterns were detected in the pane output
+    pub auth_failure: bool,
 }
 
 #[cfg(test)]
@@ -118,5 +140,38 @@ mod tests {
     fn test_health_state_icons() {
         assert_eq!(HealthState::Running.icon(), "●");
         assert_eq!(HealthState::Idle.icon(), "○");
+    }
+
+    #[test]
+    fn test_auth_failure_detection_in_frame() {
+        let patterns = vec!["session expired".to_string(), "login required".to_string()];
+
+        // Simulate: frame content contains auth failure
+        let frame_with_auth_failure =
+            "Some output\nError: Your session expired. Please sign in again.\nMore output";
+        let lower = frame_with_auth_failure.to_lowercase();
+        let detected = patterns
+            .iter()
+            .any(|pat| lower.contains(&pat.to_lowercase()));
+        assert!(detected);
+
+        // Simulate: normal frame content
+        let normal_frame = "Building project...\nCompilation successful\nRunning tests";
+        let lower = normal_frame.to_lowercase();
+        let detected = patterns
+            .iter()
+            .any(|pat| lower.contains(&pat.to_lowercase()));
+        assert!(!detected);
+    }
+
+    #[test]
+    fn test_auth_failure_case_insensitive() {
+        let patterns = vec!["session expired".to_string()];
+        let frame = "SESSION EXPIRED: please log in";
+        let lower = frame.to_lowercase();
+        let detected = patterns
+            .iter()
+            .any(|pat| lower.contains(&pat.to_lowercase()));
+        assert!(detected);
     }
 }

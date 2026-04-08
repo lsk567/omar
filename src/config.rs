@@ -17,6 +17,9 @@ pub struct Config {
 
     #[serde(default)]
     pub api: ApiConfig,
+
+    #[serde(default)]
+    pub fallback: FallbackConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +80,18 @@ pub struct ApiConfig {
     /// Port to listen on
     #[serde(default = "default_api_port")]
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FallbackConfig {
+    /// Command to use when auth failure is detected (empty = fallback disabled).
+    /// Example: "env ANTHROPIC_API_KEY=sk-or-xxx ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 claude --dangerously-skip-permissions --model anthropic/claude-sonnet-4-5-20250514"
+    #[serde(default)]
+    pub command: String,
+
+    /// Patterns in agent output that indicate an authentication failure
+    #[serde(default = "default_auth_failure_patterns")]
+    pub auth_failure_patterns: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -163,6 +178,17 @@ fn default_workdir() -> String {
     ".".to_string()
 }
 
+fn default_auth_failure_patterns() -> Vec<String> {
+    vec![
+        "session expired".to_string(),
+        "authentication failed".to_string(),
+        "please sign in".to_string(),
+        "login required".to_string(),
+        "subscription expired".to_string(),
+        "log in with".to_string(),
+    ]
+}
+
 fn default_api_enabled() -> bool {
     true
 }
@@ -211,6 +237,15 @@ impl Default for ApiConfig {
             enabled: default_api_enabled(),
             host: default_api_host(),
             port: default_api_port(),
+        }
+    }
+}
+
+impl Default for FallbackConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            auth_failure_patterns: default_auth_failure_patterns(),
         }
     }
 }
@@ -415,5 +450,43 @@ default_command = "aider --yes"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.agent.default_command, "aider --yes");
+    }
+
+    #[test]
+    fn test_default_fallback_config() {
+        let config = Config::default();
+        assert!(config.fallback.command.is_empty());
+        assert!(!config.fallback.auth_failure_patterns.is_empty());
+        assert!(config
+            .fallback
+            .auth_failure_patterns
+            .iter()
+            .any(|p| p == "session expired"));
+    }
+
+    #[test]
+    fn test_parse_fallback_config() {
+        let toml = r#"
+[fallback]
+command = "env ANTHROPIC_API_KEY=sk-or-xxx claude --dangerously-skip-permissions"
+auth_failure_patterns = ["session expired", "login required"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.fallback.command,
+            "env ANTHROPIC_API_KEY=sk-or-xxx claude --dangerously-skip-permissions"
+        );
+        assert_eq!(config.fallback.auth_failure_patterns.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_config_without_fallback_uses_defaults() {
+        let toml = r#"
+[agent]
+default_command = "claude --dangerously-skip-permissions"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.fallback.command.is_empty());
+        assert!(!config.fallback.auth_failure_patterns.is_empty());
     }
 }

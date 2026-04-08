@@ -148,6 +148,11 @@ fn relaunch_in_tmux() -> Result<()> {
 const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
     ("mouse", "set -g mouse on", "mouse scrolling and selection"),
     (
+        "history-limit",
+        "set -g history-limit 9999",
+        "larger scrollback history",
+    ),
+    (
         "extended-keys",
         "set -g extended-keys always",
         "Shift+Enter in agents",
@@ -434,6 +439,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
 
     // Create app for dashboard (separate instance)
     let tick_rate = Duration::from_secs(config.dashboard.refresh_interval);
+    let app_ticker = ticker.clone();
     let mut app = App::new(config, ticker);
 
     // Show bridge status
@@ -782,6 +788,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         if let Err(e) = app.refresh() {
                             app.set_status(format!("Error: {}", e));
                         }
+
+                        // Check for auth failures and respawn with fallback if configured
+                        app.check_auth_failures(&app_ticker);
                     }
 
                     // Keep system_state.md in sync with live state
