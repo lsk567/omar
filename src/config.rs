@@ -19,7 +19,7 @@ pub struct Config {
     pub api: ApiConfig,
 
     #[serde(default)]
-    pub fallback: FallbackConfig,
+    pub watchdog: WatchdogConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,15 +83,20 @@ pub struct ApiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FallbackConfig {
-    /// Command to use when auth failure is detected (empty = fallback disabled).
-    /// Example: "env ANTHROPIC_API_KEY=sk-or-xxx ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 claude --dangerously-skip-permissions --model anthropic/claude-sonnet-4-5-20250514"
+pub struct WatchdogConfig {
+    /// Command to run the watchdog agent (empty = watchdog disabled).
+    /// Should be an untrusted/free backend — no secrets will be passed.
+    /// Example: "opencode --model openrouter/openrouter/free"
     #[serde(default)]
     pub command: String,
 
     /// Patterns in agent output that indicate an authentication failure
     #[serde(default = "default_auth_failure_patterns")]
     pub auth_failure_patterns: Vec<String>,
+
+    /// Slack channel ID for watchdog alerts (empty = no Slack alerts)
+    #[serde(default)]
+    pub slack_channel: String,
 }
 
 fn default_true() -> bool {
@@ -180,12 +185,12 @@ fn default_workdir() -> String {
 
 fn default_auth_failure_patterns() -> Vec<String> {
     vec![
-        "session expired".to_string(),
-        "authentication failed".to_string(),
-        "please sign in".to_string(),
-        "login required".to_string(),
-        "subscription expired".to_string(),
-        "log in with".to_string(),
+        // Claude Code
+        "please run /login".to_string(),
+        // Codex
+        "401 unauthorized".to_string(),
+        // TODO: opencode
+        // TODO: cursor
     ]
 }
 
@@ -241,11 +246,12 @@ impl Default for ApiConfig {
     }
 }
 
-impl Default for FallbackConfig {
+impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
             command: String::new(),
             auth_failure_patterns: default_auth_failure_patterns(),
+            slack_channel: String::new(),
         }
     }
 }
@@ -453,40 +459,43 @@ default_command = "aider --yes"
     }
 
     #[test]
-    fn test_default_fallback_config() {
+    fn test_default_watchdog_config() {
         let config = Config::default();
-        assert!(config.fallback.command.is_empty());
-        assert!(!config.fallback.auth_failure_patterns.is_empty());
+        assert!(config.watchdog.command.is_empty());
+        assert!(config.watchdog.slack_channel.is_empty());
+        assert!(!config.watchdog.auth_failure_patterns.is_empty());
         assert!(config
-            .fallback
+            .watchdog
             .auth_failure_patterns
             .iter()
-            .any(|p| p == "session expired"));
+            .any(|p| p == "please run /login"));
     }
 
     #[test]
-    fn test_parse_fallback_config() {
+    fn test_parse_watchdog_config() {
         let toml = r#"
-[fallback]
-command = "env ANTHROPIC_API_KEY=sk-or-xxx claude --dangerously-skip-permissions"
+[watchdog]
+command = "claude --dangerously-skip-permissions"
+slack_channel = "C0123456789"
 auth_failure_patterns = ["session expired", "login required"]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(
-            config.fallback.command,
-            "env ANTHROPIC_API_KEY=sk-or-xxx claude --dangerously-skip-permissions"
+            config.watchdog.command,
+            "claude --dangerously-skip-permissions"
         );
-        assert_eq!(config.fallback.auth_failure_patterns.len(), 2);
+        assert_eq!(config.watchdog.slack_channel, "C0123456789");
+        assert_eq!(config.watchdog.auth_failure_patterns.len(), 2);
     }
 
     #[test]
-    fn test_parse_config_without_fallback_uses_defaults() {
+    fn test_parse_config_without_watchdog_uses_defaults() {
         let toml = r#"
 [agent]
 default_command = "claude --dangerously-skip-permissions"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert!(config.fallback.command.is_empty());
-        assert!(!config.fallback.auth_failure_patterns.is_empty());
+        assert!(config.watchdog.command.is_empty());
+        assert!(!config.watchdog.auth_failure_patterns.is_empty());
     }
 }

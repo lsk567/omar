@@ -22,7 +22,8 @@ pub struct ServerState {
 #[derive(Debug, Deserialize)]
 pub struct SlackReplyRequest {
     pub channel: String,
-    pub thread_ts: String,
+    #[serde(default)]
+    pub thread_ts: Option<String>,
     pub text: String,
 }
 
@@ -40,7 +41,7 @@ async fn handle_reply(
     Json(req): Json<SlackReplyRequest>,
 ) -> impl IntoResponse {
     info!(
-        "Reply request: channel={} thread={} text_len={}",
+        "Reply request: channel={} thread={:?} text_len={}",
         req.channel,
         req.thread_ts,
         req.text.len()
@@ -51,7 +52,7 @@ async fn handle_reply(
         .post_message_chunked(
             &req.channel,
             &req.text,
-            Some(&req.thread_ts),
+            req.thread_ts.as_deref(),
             state.max_message_length,
         )
         .await

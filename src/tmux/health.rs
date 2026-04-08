@@ -36,7 +36,7 @@ pub struct HealthChecker {
     client: TmuxClient,
     /// Last captured pane content per session name
     last_frames: HashMap<String, String>,
-    /// Patterns that indicate auth failure (case-insensitive match)
+    /// Patterns that indicate auth failure (pre-lowercased for fast matching)
     auth_failure_patterns: Vec<String>,
 }
 
@@ -50,7 +50,7 @@ impl HealthChecker {
     }
 
     pub fn with_auth_failure_patterns(mut self, patterns: Vec<String>) -> Self {
-        self.auth_failure_patterns = patterns;
+        self.auth_failure_patterns = patterns.into_iter().map(|p| p.to_lowercase()).collect();
         self
     }
 
@@ -99,7 +99,7 @@ impl HealthChecker {
                 let lower = f.to_lowercase();
                 self.auth_failure_patterns
                     .iter()
-                    .any(|pat| lower.contains(&pat.to_lowercase()))
+                    .any(|pat| lower.contains(pat.as_str()))
             })
             .unwrap_or(false);
 
@@ -144,34 +144,112 @@ mod tests {
 
     #[test]
     fn test_auth_failure_detection_in_frame() {
-        let patterns = vec!["session expired".to_string(), "login required".to_string()];
+        let patterns = ["session expired", "login required"];
 
         // Simulate: frame content contains auth failure
         let frame_with_auth_failure =
             "Some output\nError: Your session expired. Please sign in again.\nMore output";
         let lower = frame_with_auth_failure.to_lowercase();
-        let detected = patterns
-            .iter()
-            .any(|pat| lower.contains(&pat.to_lowercase()));
+        let detected = patterns.iter().any(|pat| lower.contains(pat));
         assert!(detected);
 
         // Simulate: normal frame content
         let normal_frame = "Building project...\nCompilation successful\nRunning tests";
         let lower = normal_frame.to_lowercase();
-        let detected = patterns
-            .iter()
-            .any(|pat| lower.contains(&pat.to_lowercase()));
+        let detected = patterns.iter().any(|pat| lower.contains(pat));
         assert!(!detected);
     }
 
     #[test]
     fn test_auth_failure_case_insensitive() {
-        let patterns = vec!["session expired".to_string()];
+        let patterns = ["session expired"];
         let frame = "SESSION EXPIRED: please log in";
         let lower = frame.to_lowercase();
-        let detected = patterns
-            .iter()
-            .any(|pat| lower.contains(&pat.to_lowercase()));
+        let detected = patterns.iter().any(|pat| lower.contains(pat));
         assert!(detected);
+    }
+
+    /// Test auth failure detection via a live tmux session.
+    /// Creates a tmux pane, sends a fake auth failure message,
+    /// and verifies HealthChecker picks it up.
+    #[test]
+    fn test_auth_failure_detection_live_tmux() {
+        use std::process::Command;
+        use std::thread;
+        use std::time::Duration;
+
+        fn tmux(args: &[&str]) -> bool {
+            Command::new("tmux")
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        // Check tmux is available
+        if !tmux(&["-V"]) {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let session = "omar-test-auth-failure-live";
+        let clean_session = "omar-test-auth-failure-clean";
+
+        // Cleanup any leftover sessions
+        tmux(&["kill-session", "-t", session]);
+        tmux(&["kill-session", "-t", clean_session]);
+
+        // Create a session with a shell
+        assert!(tmux(&["new-session", "-d", "-s", session]));
+        thread::sleep(Duration::from_millis(500));
+
+        // Send a fake auth failure message into the pane
+        if !tmux(&[
+            "send-keys",
+            "-t",
+            session,
+            "echo 'Please run /login'",
+            "Enter",
+        ]) {
+            eprintln!("Skipping test: tmux send-keys failed (sandbox or environment issue)");
+            tmux(&["kill-session", "-t", session]);
+            return;
+        }
+        thread::sleep(Duration::from_millis(1000));
+
+        // Use HealthChecker to detect it
+        let client = TmuxClient::new("omar-test-");
+        let mut checker = HealthChecker::new(client, 30)
+            .with_auth_failure_patterns(vec!["please run /login".to_string()]);
+
+        let info = checker.check_detailed(session);
+        assert!(
+            info.auth_failure,
+            "Should detect auth failure in pane output, got: {:?}",
+            info.last_output
+        );
+
+        // Also verify a clean session does NOT trigger auth failure
+        assert!(tmux(&["new-session", "-d", "-s", clean_session]));
+        thread::sleep(Duration::from_millis(500));
+
+        assert!(tmux(&[
+            "send-keys",
+            "-t",
+            clean_session,
+            "echo 'all good'",
+            "Enter"
+        ]));
+        thread::sleep(Duration::from_millis(1000));
+
+        let info = checker.check_detailed(clean_session);
+        assert!(
+            !info.auth_failure,
+            "Should NOT detect auth failure in clean pane"
+        );
+
+        // Cleanup
+        tmux(&["kill-session", "-t", session]);
+        tmux(&["kill-session", "-t", clean_session]);
     }
 }

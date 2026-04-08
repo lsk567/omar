@@ -146,6 +146,7 @@ pub async fn list_agents(
             status: "running".to_string(),
             health: a.health.as_str().to_string(),
             last_output: a.health_info.last_output.clone(),
+            auth_failure: a.health_info.auth_failure,
         })
         .collect();
 
@@ -154,6 +155,7 @@ pub async fn list_agents(
         status: "running".to_string(),
         health: m.health.as_str().to_string(),
         last_output: m.health_info.last_output.clone(),
+        auth_failure: m.health_info.auth_failure,
     });
 
     Ok(Json(ListAgentsResponse { agents, manager }))
@@ -202,6 +204,7 @@ pub async fn get_agent(
                 health: a.health.as_str().to_string(),
                 last_output: a.health_info.last_output.clone(),
                 output_tail,
+                auth_failure: a.health_info.auth_failure,
             }))
         }
         None => Err((

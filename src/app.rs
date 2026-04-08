@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::config::Config;
@@ -115,15 +115,15 @@ pub struct App {
     pub sidebar_selected: usize,
     client: TmuxClient,
     health_checker: HealthChecker,
-    /// Sessions already respawned with fallback (prevents infinite loops)
-    respawned_sessions: HashSet<String>,
+    /// Whether the watchdog agent has been spawned
+    watchdog_spawned: bool,
 }
 
 impl App {
     pub fn new(config: Config, ticker: TickerBuffer) -> Self {
         let client = TmuxClient::new(&config.dashboard.session_prefix);
         let health_checker = HealthChecker::new(client.clone(), config.health.idle_warning)
-            .with_auth_failure_patterns(config.fallback.auth_failure_patterns.clone());
+            .with_auth_failure_patterns(config.watchdog.auth_failure_patterns.clone());
 
         Self {
             agents: Vec::new(),
@@ -176,7 +176,7 @@ impl App {
             sidebar_selected: 0,
             client,
             health_checker,
-            respawned_sessions: HashSet::new(),
+            watchdog_spawned: false,
         }
     }
 
@@ -747,118 +747,106 @@ impl App {
         Ok(())
     }
 
-    /// Check all agents for auth failures and spawn mirror agents using the
-    /// fallback command. The original sessions are kept alive so they can
-    /// resume once the backend recovers. Returns true if any mirror was spawned.
+    /// Check all agents for auth failures and spawn a single watchdog agent
+    /// to monitor errors and notify the user via Slack. Returns true if the
+    /// watchdog was spawned.
     pub fn check_auth_failures(&mut self, ticker: &TickerBuffer) -> bool {
-        if self.config.fallback.command.is_empty() {
+        if self.config.watchdog.command.is_empty() || self.watchdog_spawned {
             return false;
         }
 
-        // Collect sessions that need a mirror
-        let mut to_mirror: Vec<(String, bool)> = Vec::new(); // (session_name, is_manager)
+        // Collect names of agents with auth failures
+        let prefix = &self.config.dashboard.session_prefix;
+        let mut failed_agents: Vec<String> = Vec::new();
 
         if let Some(ref mgr) = self.manager {
-            if mgr.health_info.auth_failure && !self.respawned_sessions.contains(&mgr.session.name)
-            {
-                to_mirror.push((mgr.session.name.clone(), true));
+            if mgr.health_info.auth_failure {
+                let short = mgr
+                    .session
+                    .name
+                    .strip_prefix(prefix)
+                    .unwrap_or(&mgr.session.name);
+                failed_agents.push(short.to_string());
             }
         }
 
         for agent in &self.agents {
-            if agent.health_info.auth_failure
-                && !self.respawned_sessions.contains(&agent.session.name)
-            {
-                to_mirror.push((agent.session.name.clone(), false));
+            if agent.health_info.auth_failure {
+                let short = agent
+                    .session
+                    .name
+                    .strip_prefix(prefix)
+                    .unwrap_or(&agent.session.name);
+                failed_agents.push(short.to_string());
             }
         }
 
-        if to_mirror.is_empty() {
+        if failed_agents.is_empty() {
             return false;
         }
 
-        let fallback_cmd = &self.config.fallback.command;
-        let prefix = self.config.dashboard.session_prefix.clone();
+        let watchdog_session = format!("{}watchdog", prefix);
 
-        for (session_name, is_manager) in &to_mirror {
-            let short_name = session_name.strip_prefix(&prefix).unwrap_or(session_name);
-            let mirror_session = format!("{}-fallback", session_name);
-            let mirror_short = format!("{}-fallback", short_name);
-
-            // Skip if mirror already exists
-            if self.client.has_session(&mirror_session).unwrap_or(false) {
-                self.respawned_sessions.insert(session_name.clone());
-                continue;
-            }
-
-            ticker.push(format!(
-                "AUTH FAILURE in '{}' — spawning fallback mirror '{}'",
-                short_name, mirror_short
-            ));
-
-            let task = self.worker_tasks.get(session_name).cloned();
-            let parent = self.agent_parents.get(session_name).cloned();
-
-            let workdir = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string());
-
-            let cmd = if *is_manager {
-                crate::manager::build_ea_command(fallback_cmd)
-            } else if task.is_some() {
-                let prompt_file = crate::manager::prompts_dir().join("agent.md");
-                crate::manager::build_agent_command(fallback_cmd, &prompt_file)
-            } else {
-                fallback_cmd.to_string()
-            };
-
-            if let Err(e) = self
-                .client
-                .new_session(&mirror_session, &cmd, Some(&workdir))
-            {
-                ticker.push(format!(
-                    "Failed to spawn fallback '{}': {}",
-                    mirror_short, e
-                ));
-                continue;
-            }
-
-            // Record parent for the mirror so it shows up in chain-of-command
-            if let Some(ref p) = parent {
-                memory::save_agent_parent(&mirror_session, p);
-            }
-
-            // Send the task to the mirror agent
-            if let Some(ref task_text) = task {
-                memory::save_worker_task(&mirror_session, task_text);
-                let parent_short = parent
-                    .as_deref()
-                    .and_then(|p| p.strip_prefix(&prefix))
-                    .unwrap_or("ea");
-                let user_msg = format!(
-                    "YOUR NAME: {}.\nYOUR PARENT: {}.\nYOUR TASK: {}",
-                    mirror_short, parent_short, task_text
-                );
-                let client = self.client.clone();
-                let session = mirror_session.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                    let _ = client.send_keys_literal(&session, &user_msg);
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    let _ = client.send_keys(&session, "Enter");
-                });
-            }
-
-            self.respawned_sessions.insert(session_name.clone());
-            ticker.push(format!(
-                "Fallback '{}' running (degraded mode)",
-                mirror_short
-            ));
+        // Skip if watchdog already exists
+        if self.client.has_session(&watchdog_session).unwrap_or(false) {
+            self.watchdog_spawned = true;
+            return false;
         }
 
+        ticker.push(format!(
+            "AUTH FAILURE in {} agent(s) — spawning watchdog",
+            failed_agents.len()
+        ));
+
+        let watchdog_cmd = &self.config.watchdog.command;
+        let prompt_file = crate::manager::prompts_dir().join("watchdog.md");
+        let cmd = crate::manager::build_agent_command(watchdog_cmd, &prompt_file);
+
+        let workdir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        if let Err(e) = self
+            .client
+            .new_session(&watchdog_session, &cmd, Some(&workdir))
+        {
+            ticker.push(format!("Failed to spawn watchdog: {}", e));
+            return false;
+        }
+
+        // Build the initial task message for the watchdog.
+        // No secrets — only localhost URLs and the Slack channel ID.
+        let slack_channel = &self.config.watchdog.slack_channel;
+        let failed_list = failed_agents.join(", ");
+        let task_msg = format!(
+            "AUTH FAILURE DETECTED.\n\
+             Failed agents: {}\n\
+             Slack channel: {}\n\
+             Omar API: http://localhost:{}\n\
+             Slack bridge: http://localhost:9877",
+            failed_list,
+            if slack_channel.is_empty() {
+                "(not configured)"
+            } else {
+                slack_channel
+            },
+            self.config.api.port,
+        );
+
+        let client = self.client.clone();
+        let session = watchdog_session;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = client.send_keys_literal(&session, &task_msg);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = client.send_keys(&session, "Enter");
+        });
+
+        self.watchdog_spawned = true;
+
         self.set_persistent_warning(format!(
-            "⚠ Auth failure: {} mirror agent(s) spawned with fallback — check subscription",
-            to_mirror.len()
+            "⚠ Auth failure in {} agent(s) — watchdog monitoring",
+            failed_agents.len()
         ));
 
         true

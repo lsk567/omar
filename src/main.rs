@@ -789,7 +789,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.set_status(format!("Error: {}", e));
                         }
 
-                        // Check for auth failures and respawn with fallback if configured
+                        // Check for auth failures and spawn watchdog if configured
                         app.check_auth_failures(&app_ticker);
                     }
 
