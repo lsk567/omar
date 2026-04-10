@@ -633,10 +633,11 @@ pub async fn log_justification(
         justification: req.justification.clone(),
     };
 
-    let ea_name = app.manager()
+    let ea_name = app
+        .manager()
         .map(|m| m.session.name.clone())
         .unwrap_or_else(|| "ea".to_string());
-    
+
     let session_id = app.session_id.clone();
     let filename = format!("justifications_{}_{}.jsonl", ea_name, session_id);
 
