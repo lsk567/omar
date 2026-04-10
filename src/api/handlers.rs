@@ -427,7 +427,7 @@ pub async fn kill_agent(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = state.app.lock().await;
+    let mut app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
     let session_name = resolve_session_name(&prefix, &id);
@@ -448,6 +448,24 @@ pub async fn kill_agent(
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: format!("Agent '{}' not found", id),
+            }),
+        ));
+    }
+
+    // Don't kill sessions the user is currently viewing in a popup
+    let _ = app.refresh();
+    let is_attached = app
+        .agents()
+        .iter()
+        .any(|a| a.session.name == session_name && a.session.attached);
+    if is_attached {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: format!(
+                    "Agent '{}' is currently attached (user has popup open). Detach first.",
+                    id
+                ),
             }),
         ));
     }
