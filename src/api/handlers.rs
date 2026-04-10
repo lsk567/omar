@@ -42,6 +42,19 @@ fn display_name<'a>(prefix: &str, session_name: &'a str) -> &'a str {
     session_name.strip_prefix(prefix).unwrap_or(session_name)
 }
 
+/// Check if a session is currently attached (user has a tmux client connected).
+/// Caller must call `app.refresh()` first to ensure agent state is current.
+fn is_session_attached(app: &SharedApp, session_name: &str) -> bool {
+    is_attached_in(app.agents(), session_name)
+}
+
+/// Pure helper: returns true if the named session appears in `agents` and is attached.
+fn is_attached_in(agents: &[crate::app::AgentInfo], session_name: &str) -> bool {
+    agents
+        .iter()
+        .any(|a| a.session.name == session_name && a.session.attached)
+}
+
 fn parse_spawn_agent_request(
     query: SpawnAgentRequest,
     headers: &HeaderMap,
@@ -452,20 +465,22 @@ pub async fn kill_agent(
         ));
     }
 
-    // Don't kill sessions the user is currently viewing in a popup
-    let _ = app.refresh();
-    let is_attached = app
-        .agents()
-        .iter()
-        .any(|a| a.session.name == session_name && a.session.attached);
+    // Don't kill sessions the user is currently attached to (e.g., popup view).
+    // Fail closed: if refresh fails we cannot confirm attachment state.
+    if let Err(e) = app.refresh() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to refresh before kill: {}", e),
+            }),
+        ));
+    }
+    let is_attached = is_session_attached(&app, &session_name);
     if is_attached {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
-                error: format!(
-                    "Agent '{}' is currently attached (user has popup open). Detach first.",
-                    id
-                ),
+                error: format!("Cannot kill attached session '{}'", id),
             }),
         ));
     }
@@ -959,9 +974,48 @@ pub async fn computer_mouse_position(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_spawn_agent_request;
+    use super::{is_attached_in, parse_spawn_agent_request};
     use crate::api::models::SpawnAgentRequest;
+    use crate::app::AgentInfo;
+    use crate::tmux::{HealthInfo, HealthState, Session};
     use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    fn make_agent(name: &str, attached: bool) -> AgentInfo {
+        AgentInfo {
+            session: Session {
+                name: name.to_string(),
+                activity: 0,
+                attached,
+                pane_pid: 0,
+            },
+            health: HealthState::Running,
+            health_info: HealthInfo {
+                state: HealthState::Running,
+                last_output: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn is_attached_in_returns_true_for_attached_session() {
+        let agents = vec![
+            make_agent("omar-agent-foo", false),
+            make_agent("omar-agent-bar", true),
+        ];
+        assert!(is_attached_in(&agents, "omar-agent-bar"));
+    }
+
+    #[test]
+    fn is_attached_in_returns_false_for_detached_session() {
+        let agents = vec![make_agent("omar-agent-foo", false)];
+        assert!(!is_attached_in(&agents, "omar-agent-foo"));
+    }
+
+    #[test]
+    fn is_attached_in_returns_false_for_unknown_session() {
+        let agents = vec![make_agent("omar-agent-foo", true)];
+        assert!(!is_attached_in(&agents, "omar-agent-missing"));
+    }
 
     #[test]
     fn parse_spawn_agent_request_accepts_plain_text_body() {
