@@ -33,6 +33,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/projects", get(handlers::list_projects))
         .route("/api/projects", post(handlers::add_project))
         .route("/api/projects/:id", delete(handlers::complete_project))
+        .route("/api/logs", post(handlers::log_justification))
         .route("/api/events", post(handlers::schedule_event))
         .route("/api/events", get(handlers::list_events))
         .route("/api/events/:id", delete(handlers::cancel_event))
