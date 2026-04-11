@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::ea::{self, EaId, EaInfo};
@@ -116,6 +117,7 @@ pub struct App {
     pub focus_child_indices: Vec<usize>,
     agent_parents: HashMap<String, String>,
     worker_tasks: HashMap<String, String>,
+    agent_statuses: HashMap<String, String>,
     /// Whether the left sidebar is focused (vs the right agent panels)
     pub sidebar_focused: bool,
     /// Which sidebar panel is active
@@ -216,6 +218,7 @@ impl App {
             focus_child_indices: Vec::new(),
             agent_parents: HashMap::new(),
             worker_tasks: HashMap::new(),
+            agent_statuses: HashMap::new(),
             sidebar_focused: false,
             sidebar_panel: SidebarPanel::Projects,
             sidebar_selected: 0,
@@ -477,6 +480,16 @@ impl App {
         self.manager.as_ref()
     }
 
+    /// Get an agent's self-reported status
+    pub fn agent_status(&self, session: &str) -> Option<&String> {
+        self.agent_statuses.get(session)
+    }
+
+    /// Update an agent's self-reported status
+    pub fn set_agent_status(&mut self, session: String, status: String) {
+        self.agent_statuses.insert(session, status);
+    }
+
     /// Group agents into PM → worker hierarchies for grid display
     pub fn agent_groups(&self) -> Vec<AgentGroup<'_>> {
         build_agent_groups(
@@ -488,7 +501,7 @@ impl App {
 
     /// Get default command
     pub fn default_command(&self) -> &str {
-        &self.config.agent.default_command
+        &self.default_command
     }
 
     /// Get the agent_parents map (for API/display)
@@ -1186,12 +1199,13 @@ impl App {
 pub(crate) fn filter_sessions(
     sessions: Vec<Session>,
     prefix: &str,
+    manager_session_name: &str,
 ) -> (Option<Session>, Vec<Session>) {
     let mut manager_session = None;
     let mut other_sessions = Vec::new();
 
     for session in sessions {
-        if session.name == MANAGER_SESSION {
+        if session.name == manager_session_name {
             manager_session = Some(session);
         } else if session.name == DASHBOARD_SESSION
             || (!prefix.is_empty() && !session.name.starts_with(prefix))
@@ -1857,9 +1871,9 @@ mod tests {
         let agents = vec![attached];
         let ea = make_agent("omar-agent-ea", HealthState::Running);
         let mut parents = HashMap::new();
-        parents.insert("omar-agent-api".to_string(), MANAGER_SESSION.to_string());
+        parents.insert("omar-agent-api".to_string(), TEST_MANAGER.to_string());
 
-        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-");
+        let tree = build_tree(&agents, Some(&ea), &parents, "omar-agent-", TEST_MANAGER);
 
         assert_eq!(tree.len(), 2);
         assert_eq!(tree[1].name, "api");
@@ -1880,17 +1894,17 @@ mod tests {
     #[test]
     fn test_filter_sessions_basic() {
         let sessions = vec![
-            make_session(MANAGER_SESSION, false),
+            make_session(TEST_MANAGER, false),
             make_session(DASHBOARD_SESSION, false),
             make_session("omar-agent-api", false),
             make_session("omar-agent-auth", false),
             make_session("unrelated-session", false),
         ];
 
-        let (manager, agents) = filter_sessions(sessions, "omar-agent-");
+        let (manager, agents) = filter_sessions(sessions, "omar-agent-", TEST_MANAGER);
 
         assert!(manager.is_some());
-        assert_eq!(manager.unwrap().name, MANAGER_SESSION);
+        assert_eq!(manager.unwrap().name, TEST_MANAGER);
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0].name, "omar-agent-api");
         assert_eq!(agents[1].name, "omar-agent-auth");
@@ -1899,12 +1913,12 @@ mod tests {
     #[test]
     fn test_filter_sessions_includes_attached() {
         let sessions = vec![
-            make_session(MANAGER_SESSION, false),
+            make_session(TEST_MANAGER, false),
             make_session("omar-agent-api", false),
             make_session("omar-agent-auth", true), // attached (user has popup open)
         ];
 
-        let (_, agents) = filter_sessions(sessions, "omar-agent-");
+        let (_, agents) = filter_sessions(sessions, "omar-agent-", TEST_MANAGER);
 
         // Attached sessions must NOT be filtered out
         assert_eq!(agents.len(), 2);
@@ -1917,7 +1931,7 @@ mod tests {
     fn test_filter_sessions_no_manager() {
         let sessions = vec![make_session("omar-agent-worker", false)];
 
-        let (manager, agents) = filter_sessions(sessions, "omar-agent-");
+        let (manager, agents) = filter_sessions(sessions, "omar-agent-", TEST_MANAGER);
 
         assert!(manager.is_none());
         assert_eq!(agents.len(), 1);

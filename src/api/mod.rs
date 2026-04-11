@@ -4,7 +4,7 @@ pub mod handlers;
 pub mod models;
 
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::net::SocketAddr;
@@ -24,6 +24,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
     Router::new()
         // Global
         .route("/api/health", get(handlers::health))
+        .route("/api/backends", get(handlers::list_backends))
         // EA management (global)
         .route("/api/eas", get(handlers::list_eas))
         .route("/api/eas", post(handlers::create_ea))

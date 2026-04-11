@@ -83,6 +83,12 @@ enum Commands {
         all_eas: bool,
     },
 
+    /// Kill an agent session
+    Kill {
+        /// Name of the session to kill
+        name: String,
+    },
+
     /// Configure tmux for optimal omar experience
     SetupTmux,
 

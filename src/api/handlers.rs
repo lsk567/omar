@@ -1,9 +1,8 @@
 //! API endpoint handlers — all EA-scoped via path parameter
 
 use axum::{
-    body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -100,6 +99,36 @@ pub async fn health() -> Json<HealthResponse> {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+/// GET /api/backends
+/// Returns which agent backends are installed and available on the system.
+pub async fn list_backends() -> Json<BackendsResponse> {
+    let infos = tokio::task::spawn_blocking(|| {
+        use std::process::Command;
+
+        let backends = ["claude", "codex", "cursor", "opencode"];
+        backends
+            .iter()
+            .filter_map(|&name| {
+                let resolved = crate::config::resolve_backend(name).ok()?;
+                let executable = resolved.split_whitespace().next().unwrap_or(name);
+                let available = Command::new(executable)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success());
+                Some(BackendInfo {
+                    name: name.to_string(),
+                    available,
+                    command: resolved,
+                })
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(BackendsResponse { backends: infos })
 }
 
 /// GET /api/eas
@@ -568,12 +597,44 @@ pub async fn spawn_agent(
         display_name(&prefix, &parent_session).to_string()
     };
 
+    if req.backend.is_some() && req.command.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Cannot specify both 'backend' and 'command'. Use one or the other."
+                    .to_string(),
+            }),
+        ));
+    }
+
     // Read default_command from App (brief lock, released before blocking I/O).
-    let base_command = {
+    let default_command = {
         let app = state.app.lock().await;
-        req.command
-            .unwrap_or_else(|| app.default_command().to_string())
+        app.default_command().to_string()
     };
+
+    let mut base_command = if let Some(ref backend) = req.backend {
+        crate::config::resolve_backend(backend)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?
+    } else {
+        req.command.clone().unwrap_or(default_command)
+    };
+
+    if let Some(ref model) = req.model {
+        if !model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid model name. Only alphanumeric, '-', '_', '.', '/' allowed."
+                        .to_string(),
+                }),
+            ));
+        }
+        base_command = format!("{} --model {}", base_command, model);
+    }
 
     // Get workdir
     let workdir = req.workdir.unwrap_or_else(|| {

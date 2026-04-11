@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn test_build_agent_command_claude() {
-        let cmd = build_agent_command("claude --some-flag", Path::new("/tmp/prompts/ea.md"));
+        let cmd = build_agent_command("claude --some-flag", Path::new("/tmp/prompts/ea.md"), &[]);
         assert_eq!(
             cmd,
             "claude --some-flag --system-prompt \"$(cat '/tmp/prompts/ea.md')\""
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_build_agent_command_opencode() {
-        let cmd = build_agent_command("opencode", Path::new("/tmp/prompts/pm.md"));
+        let cmd = build_agent_command("opencode", Path::new("/tmp/prompts/pm.md"), &[]);
         assert_eq!(cmd, "opencode --prompt \"$(cat '/tmp/prompts/pm.md')\"");
     }
 
@@ -639,12 +639,13 @@ mod tests {
     #[test]
     fn test_build_agent_command_with_substitutions() {
         let cmd = build_agent_command(
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
-            Path::new("/tmp/prompts/ea.md"),
+            "claude",
+            Path::new("/prompts/worker.md"),
+            &[("{{PARENT_NAME}}", "pm-api"), ("{{TASK}}", "build it")],
         );
         assert_eq!(
             cmd,
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
+            "claude --system-prompt \"$(sed 's|{{PARENT_NAME}}|pm-api|g; s|{{TASK}}|build it|g' '/prompts/worker.md')\""
         );
     }
 

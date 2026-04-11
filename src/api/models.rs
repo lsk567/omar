@@ -67,36 +67,6 @@ pub struct SpawnAgentRequest {
     pub parent: Option<String>,
 }
 
-impl SpawnAgentRequest {
-    pub fn with_fallbacks(mut self, fallback: Self) -> Self {
-        if self.name.is_none() {
-            self.name = fallback.name;
-        }
-        if self.task.is_none() {
-            self.task = fallback.task;
-        }
-        if self.workdir.is_none() {
-            self.workdir = fallback.workdir;
-        }
-        if self.command.is_none() {
-            self.command = fallback.command;
-        }
-        if self.backend.is_none() {
-            self.backend = fallback.backend;
-        }
-        if self.model.is_none() {
-            self.model = fallback.model;
-        }
-        if self.role.is_none() {
-            self.role = fallback.role;
-        }
-        if self.parent.is_none() {
-            self.parent = fallback.parent;
-        }
-        self
-    }
-}
-
 /// Response after spawning an agent
 #[derive(Debug, Serialize)]
 pub struct SpawnAgentResponse {
@@ -193,6 +163,12 @@ pub struct ProjectResponse {
 #[derive(Debug, Serialize)]
 pub struct ListProjectsResponse {
     pub projects: Vec<ProjectResponse>,
+}
+
+/// Request to update an agent's status
+#[derive(Debug, Deserialize)]
+pub struct UpdateStatusRequest {
+    pub status: String,
 }
 
 /// Agent summary response (lightweight card info)
