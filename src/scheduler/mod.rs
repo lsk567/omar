@@ -3,7 +3,6 @@ pub mod event;
 pub use event::ScheduledEvent;
 
 use std::collections::{BinaryHeap, VecDeque};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -162,29 +161,13 @@ impl Scheduler {
 }
 
 pub(crate) fn deliver_to_tmux(receiver: &str, message: &str, ticker: &TickerBuffer) {
+    // Use the reliable delivery path so scheduled events / inter-agent messages
+    // land deterministically regardless of backend startup / input buffering.
     let target = format!("omar-agent-{}", receiver);
-    let result = Command::new("tmux")
-        .args(["send-keys", "-t", &target, "-l", message])
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            // Small delay so tmux finishes processing bracketed paste
-            // before we send the Enter key to submit it.
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            // Send Enter to submit the message
-            let _ = Command::new("tmux")
-                .args(["send-keys", "-t", &target, "Enter"])
-                .output();
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            ticker.push(format!("tmux send-keys failed for {}: {}", target, stderr));
-        }
-        Err(e) => {
-            ticker.push(format!("failed to run tmux for {}: {}", target, e));
-        }
+    let client = crate::tmux::TmuxClient::new("omar-agent-");
+    let opts = crate::tmux::DeliveryOptions::default();
+    if let Err(e) = client.deliver_prompt(&target, message, &opts) {
+        ticker.push(format!("event delivery failed for {}: {}", target, e));
     }
 }
 
@@ -300,7 +283,14 @@ pub async fn run_event_loop(
                         continue;
                     }
                     let message = format_delivery(&batch, earliest_ts);
-                    deliver_to_tmux(receiver, &message, &ticker);
+                    // Run blocking delivery off the async runtime so the loop
+                    // stays responsive for other scheduled events.
+                    let receiver_owned = receiver.clone();
+                    let message_owned = message.clone();
+                    let ticker_clone = ticker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        deliver_to_tmux(&receiver_owned, &message_owned, &ticker_clone);
+                    });
 
                     // Re-insert recurring events with a fresh timestamp and ID
                     for ev in &batch {
@@ -335,6 +325,7 @@ pub async fn run_event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn make_event(receiver: &str, sender: &str, timestamp: u64, payload: &str) -> ScheduledEvent {
         ScheduledEvent {
