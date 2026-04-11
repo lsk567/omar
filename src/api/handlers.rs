@@ -495,12 +495,25 @@ pub async fn send_input(
 
     // When enter is requested, use the reliable delivery path so text lands
     // and Enter is actually processed. Otherwise just type literally.
+    //
+    // This path is synchronous (HTTP caller blocks until delivery completes),
+    // so use tighter timeouts than the default spawn-agent path: the session
+    // already exists, so no long startup wait is needed. Worst-case total:
+    // ~2s × max_retries ≈ 6s.
     if req.enter {
         let client = app.client().clone();
         let session = session_name.clone();
         let text = req.text.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let opts = crate::tmux::DeliveryOptions::default();
+            let opts = crate::tmux::DeliveryOptions {
+                startup_timeout: std::time::Duration::from_secs(2),
+                stable_quiet: std::time::Duration::from_millis(200),
+                text_verify_timeout: std::time::Duration::from_millis(800),
+                enter_verify_timeout: std::time::Duration::from_millis(800),
+                max_retries: 3,
+                poll_interval: std::time::Duration::from_millis(50),
+                retry_delay: std::time::Duration::from_millis(150),
+            };
             client.deliver_prompt(&session, &text, &opts)
         })
         .await;

@@ -22,6 +22,8 @@ pub struct DeliveryOptions {
     pub max_retries: u32,
     /// Polling interval for pane capture / activity checks.
     pub poll_interval: Duration,
+    /// Delay between retry attempts (after clearing input with C-u).
+    pub retry_delay: Duration,
 }
 
 impl Default for DeliveryOptions {
@@ -33,6 +35,7 @@ impl Default for DeliveryOptions {
             enter_verify_timeout: Duration::from_secs(2),
             max_retries: 3,
             poll_interval: Duration::from_millis(100),
+            retry_delay: Duration::from_millis(200),
         }
     }
 }
@@ -175,7 +178,12 @@ impl TmuxClient {
     /// times if any step fails.
     pub fn deliver_prompt(&self, session: &str, text: &str, opts: &DeliveryOptions) -> Result<()> {
         // Phase 1: wait for the backend to finish drawing its UI / be ready.
-        self.wait_for_stable(session, opts.stable_quiet, opts.startup_timeout)?;
+        self.wait_for_stable(
+            session,
+            opts.stable_quiet,
+            opts.startup_timeout,
+            opts.poll_interval,
+        )?;
 
         // Choose a verification needle: first non-empty line, trimmed.
         // Limit to a reasonable length so wrapping/truncation doesn't break us.
@@ -193,11 +201,16 @@ impl TmuxClient {
             self.send_keys_literal(session, text)?;
 
             if !needle.is_empty()
-                && !self.wait_for_text_in_pane(session, &needle, opts.text_verify_timeout)
+                && !self.wait_for_text_in_pane(
+                    session,
+                    &needle,
+                    opts.text_verify_timeout,
+                    opts.poll_interval,
+                )
             {
                 // Text never showed up — clear input and retry
                 let _ = self.send_keys(session, "C-u");
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(opts.retry_delay);
                 continue;
             }
 
@@ -205,14 +218,19 @@ impl TmuxClient {
             let before = self.get_pane_activity(session).unwrap_or(0);
             self.send_keys(session, "Enter")?;
 
-            if self.wait_for_activity_advance(session, before, opts.enter_verify_timeout) {
+            if self.wait_for_activity_advance(
+                session,
+                before,
+                opts.enter_verify_timeout,
+                opts.poll_interval,
+            ) {
                 return Ok(());
             }
 
             // Enter didn't register — try once more
             if attempt < opts.max_retries {
                 let _ = self.send_keys(session, "C-u");
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(opts.retry_delay);
             }
         }
 
@@ -226,13 +244,19 @@ impl TmuxClient {
     /// Wait for pane activity to be quiet for `quiet` duration, or until `timeout`.
     /// Returns Ok(()) as soon as the pane becomes stable; returns Ok(()) anyway
     /// after timeout (best-effort — caller should proceed regardless).
-    pub fn wait_for_stable(&self, session: &str, quiet: Duration, timeout: Duration) -> Result<()> {
+    pub fn wait_for_stable(
+        &self,
+        session: &str,
+        quiet: Duration,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<()> {
         let start = Instant::now();
         let mut last_activity = self.get_pane_activity(session).unwrap_or(0);
         let mut last_change = Instant::now();
 
         while start.elapsed() < timeout {
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(poll_interval);
             let current = self.get_pane_activity(session).unwrap_or(last_activity);
             if current != last_activity {
                 last_activity = current;
@@ -246,7 +270,13 @@ impl TmuxClient {
     }
 
     /// Poll the pane until `needle` appears in the captured content, or timeout.
-    fn wait_for_text_in_pane(&self, session: &str, needle: &str, timeout: Duration) -> bool {
+    fn wait_for_text_in_pane(
+        &self,
+        session: &str,
+        needle: &str,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {
             if let Ok(content) = self.capture_pane(session, 50) {
@@ -254,13 +284,19 @@ impl TmuxClient {
                     return true;
                 }
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(poll_interval);
         }
         false
     }
 
     /// Poll the pane activity until it exceeds `before`, or timeout.
-    fn wait_for_activity_advance(&self, session: &str, before: i64, timeout: Duration) -> bool {
+    fn wait_for_activity_advance(
+        &self,
+        session: &str,
+        before: i64,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {
             if let Ok(current) = self.get_pane_activity(session) {
@@ -268,7 +304,7 @@ impl TmuxClient {
                     return true;
                 }
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(poll_interval);
         }
         false
     }
@@ -405,6 +441,7 @@ mod tests {
             enter_verify_timeout: Duration::from_millis(800),
             max_retries: 3,
             poll_interval: Duration::from_millis(50),
+            retry_delay: Duration::from_millis(100),
         };
 
         let result = client.deliver_prompt(session, "echo OMAR_DELIVERED", &opts);
@@ -456,7 +493,12 @@ mod tests {
         let client = TmuxClient::new("omar-test-");
         let start = Instant::now();
         client
-            .wait_for_stable(session, Duration::from_millis(200), Duration::from_secs(3))
+            .wait_for_stable(
+                session,
+                Duration::from_millis(200),
+                Duration::from_secs(3),
+                Duration::from_millis(50),
+            )
             .unwrap();
         // Should return within a couple hundred ms on a fully idle pane.
         assert!(
@@ -496,12 +538,14 @@ mod tests {
             enter_verify_timeout: Duration::from_millis(800),
             max_retries: 3,
             poll_interval: Duration::from_millis(50),
+            retry_delay: Duration::from_millis(100),
         };
 
-        // Multi-line: only the first line is the verification needle.
-        // In a shell, subsequent lines will look like continuations — just
-        // verify delivery doesn't error out.
-        let text = "echo FIRST_LINE_OMAR";
+        // Multi-line input: bash will run both commands. Verification needle
+        // is the first non-empty line ("echo FIRST_LINE_OMAR"); we also
+        // assert the SECOND_LINE actually executed to prove the full payload
+        // was delivered, not just truncated at the first newline.
+        let text = "echo FIRST_LINE_OMAR\necho SECOND_LINE_OMAR";
         let result = client.deliver_prompt(session, text, &opts);
         if let Err(e) = &result {
             eprintln!("Skipping test: deliver_prompt failed: {}", e);
@@ -513,6 +557,11 @@ mod tests {
         assert!(
             content.contains("FIRST_LINE_OMAR"),
             "Expected FIRST_LINE_OMAR in pane: {:?}",
+            content
+        );
+        assert!(
+            content.contains("SECOND_LINE_OMAR"),
+            "Expected SECOND_LINE_OMAR in pane (multi-line delivery): {:?}",
             content
         );
     }

@@ -160,14 +160,40 @@ impl Scheduler {
     }
 }
 
-pub(crate) fn deliver_to_tmux(receiver: &str, message: &str, ticker: &TickerBuffer) {
+pub(crate) fn deliver_to_tmux(
+    receiver: &str,
+    message: &str,
+    event_count: usize,
+    scheduled_ts: u64,
+    ticker: &TickerBuffer,
+) {
     // Use the reliable delivery path so scheduled events / inter-agent messages
     // land deterministically regardless of backend startup / input buffering.
+    //
+    // Scheduler targets are already-running agents (not fresh spawns), so use
+    // tighter timeouts than the spawn-agent defaults.
     let target = format!("omar-agent-{}", receiver);
     let client = crate::tmux::TmuxClient::new("omar-agent-");
-    let opts = crate::tmux::DeliveryOptions::default();
-    if let Err(e) = client.deliver_prompt(&target, message, &opts) {
-        ticker.push(format!("event delivery failed for {}: {}", target, e));
+    let opts = crate::tmux::DeliveryOptions {
+        startup_timeout: std::time::Duration::from_secs(3),
+        stable_quiet: std::time::Duration::from_millis(200),
+        text_verify_timeout: std::time::Duration::from_millis(800),
+        enter_verify_timeout: std::time::Duration::from_millis(800),
+        max_retries: 3,
+        poll_interval: std::time::Duration::from_millis(50),
+        retry_delay: std::time::Duration::from_millis(150),
+    };
+    match client.deliver_prompt(&target, message, &opts) {
+        Ok(()) => {
+            let lag_ms = now_ns().saturating_sub(scheduled_ts) as f64 / 1_000_000.0;
+            ticker.push(format!(
+                "delivered {} event(s) to {}, lag={:.2}ms",
+                event_count, receiver, lag_ms
+            ));
+        }
+        Err(e) => {
+            ticker.push(format!("event delivery failed for {}: {}", target, e));
+        }
     }
 }
 
@@ -283,16 +309,11 @@ pub async fn run_event_loop(
                         continue;
                     }
                     let message = format_delivery(&batch, earliest_ts);
-                    // Run blocking delivery off the async runtime so the loop
-                    // stays responsive for other scheduled events.
-                    let receiver_owned = receiver.clone();
-                    let message_owned = message.clone();
-                    let ticker_clone = ticker.clone();
-                    tokio::task::spawn_blocking(move || {
-                        deliver_to_tmux(&receiver_owned, &message_owned, &ticker_clone);
-                    });
+                    let batch_len = batch.len();
 
                     // Re-insert recurring events with a fresh timestamp and ID
+                    // BEFORE spawning delivery, so the queue stays consistent
+                    // regardless of whether delivery succeeds.
                     for ev in &batch {
                         if let Some(interval) = ev.recurring_ns {
                             let next = ScheduledEvent {
@@ -308,14 +329,23 @@ pub async fn run_event_loop(
                         }
                     }
 
-                    let lag_ns = now_ns().saturating_sub(earliest_ts);
-                    let lag_ms = lag_ns as f64 / 1_000_000.0;
-                    ticker.push(format!(
-                        "delivered {} event(s) to {}, lag={:.2}ms",
-                        batch.len(),
-                        receiver,
-                        lag_ms
-                    ));
+                    // Run blocking delivery off the async runtime so the loop
+                    // stays responsive for other scheduled events. Success /
+                    // failure telemetry is logged from inside the blocking
+                    // task (see deliver_to_tmux) so the ticker reflects
+                    // actual delivery, not queuing.
+                    let receiver_owned = receiver.clone();
+                    let message_owned = message.clone();
+                    let ticker_clone = ticker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        deliver_to_tmux(
+                            &receiver_owned,
+                            &message_owned,
+                            batch_len,
+                            earliest_ts,
+                            &ticker_clone,
+                        );
+                    });
                 }
             }
         }
@@ -514,7 +544,7 @@ mod tests {
 
         // deliver_to_tmux prepends "omar-agent-" to the receiver name
         let ticker = TickerBuffer::new();
-        deliver_to_tmux("test-deliver", "hello-from-scheduler", &ticker);
+        deliver_to_tmux("test-deliver", "hello-from-scheduler", 1, now_ns(), &ticker);
 
         // Give tmux a moment to process the send-keys
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
