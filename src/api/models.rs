@@ -377,6 +377,8 @@ pub struct ComputerAvailabilityResponse {
     pub available: bool,
     pub xdotool: bool,
     pub screenshot: bool,
+    pub display: bool,
+    pub screenshot_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_size: Option<ScreenSizeResponse>,
 }

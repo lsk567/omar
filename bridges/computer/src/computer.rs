@@ -2,15 +2,60 @@
 //! Adapted from the main omar crate's computer module for standalone use.
 
 use anyhow::{Context, Result};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 // ── X11 environment detection ─────────────────────────────────────────────────
+
+const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+fn command_output_with_timeout(mut cmd: Command) -> Option<Output> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if start.elapsed() < PROBE_TIMEOUT => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
 
 /// Return the path of the Xauthority file to use, checking env then ~/.Xauthority.
 fn find_xauthority_file() -> String {
     if let Ok(x) = std::env::var("XAUTHORITY") {
         if !x.is_empty() && std::path::Path::new(&x).exists() {
             return x;
+        }
+    }
+    let uid = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u32>().ok())
+        })
+        .unwrap_or(1000);
+    for candidate in [
+        format!("/run/user/{}/gdm/Xauthority", uid),
+        format!("/run/user/{}/.mutter-Xwaylandauth", uid),
+    ] {
+        if std::path::Path::new(&candidate).exists() {
+            return candidate;
         }
     }
     if let Ok(home) = std::env::var("HOME") {
@@ -24,10 +69,9 @@ fn find_xauthority_file() -> String {
 
 /// Ask tmux for the DISPLAY value it holds in the session environment.
 fn tmux_get_display() -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["show-environment", "DISPLAY"])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("tmux");
+    cmd.args(["show-environment", "DISPLAY"]);
+    let output = command_output_with_timeout(cmd)?;
     if output.status.success() {
         let s = String::from_utf8_lossy(&output.stdout);
         for line in s.lines() {
@@ -51,9 +95,9 @@ fn xauth_list_displays(xauth_file: &str) -> Vec<String> {
         cmd.args(["-f", xauth_file]);
     }
     cmd.arg("list");
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
+    let output = match command_output_with_timeout(cmd) {
+        Some(o) => o,
+        None => return Vec::new(),
     };
     let s = String::from_utf8_lossy(&output.stdout);
     let mut displays = Vec::new();
@@ -91,8 +135,8 @@ fn probe_display(display: &str, xauth_file: &str) -> bool {
         cmd.env("XAUTHORITY", xauth_file);
     }
     cmd.arg("version");
-    match cmd.output() {
-        Ok(o) => {
+    match command_output_with_timeout(cmd) {
+        Some(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             // Definite failure messages
             if stderr.contains("Can't open display")
@@ -104,7 +148,7 @@ fn probe_display(display: &str, xauth_file: &str) -> bool {
             // Success: got version output (even if exit code != 0 due to XTEST warning)
             !o.stdout.is_empty() || o.status.success()
         }
-        Err(_) => false,
+        None => false,
     }
 }
 
@@ -121,22 +165,22 @@ fn probe_display(display: &str, xauth_file: &str) -> bool {
 fn detect_x11_env() -> Option<(String, String)> {
     let xauth = find_xauthority_file();
 
-    let mut candidates: Vec<String> = Vec::new();
-
     // 1. Current environment
     if let Ok(d) = std::env::var("DISPLAY") {
-        if !d.is_empty() {
-            candidates.push(d);
+        if !d.is_empty() && probe_display(&d, &xauth) {
+            return Some((d, xauth.clone()));
         }
     }
 
     // 2. tmux session environment (SSH -X sets DISPLAY here even when the
     //    bridge process itself does not inherit it)
     if let Some(d) = tmux_get_display() {
-        if !candidates.contains(&d) {
-            candidates.push(d);
+        if probe_display(&d, &xauth) {
+            return Some((d, xauth.clone()));
         }
     }
+
+    let mut candidates = Vec::new();
 
     // 3. xauth list – generates :N and localhost:N.0 for each known cookie
     for d in xauth_list_displays(&xauth) {

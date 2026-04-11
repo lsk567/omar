@@ -56,6 +56,10 @@ pub fn ea_state_dir(ea_id: EaId, base_dir: &Path) -> PathBuf {
     base_dir.join("ea").join(ea_id.to_string())
 }
 
+fn active_ea_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("active_ea")
+}
+
 /// Load all registered EAs from ~/.omar/eas.json.
 pub fn load_registry(base_dir: &Path) -> Vec<EaInfo> {
     let path = base_dir.join("eas.json");
@@ -74,6 +78,52 @@ pub fn load_registry(base_dir: &Path) -> Vec<EaInfo> {
     }
 }
 
+/// Load the last active EA id persisted on disk.
+pub fn load_active_ea(base_dir: &Path) -> Option<EaId> {
+    let path = active_ea_path(base_dir);
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<EaId>().ok())
+}
+
+/// Persist the active EA id on disk for CLI/dashboard/API defaults.
+pub fn save_active_ea(base_dir: &Path, ea_id: EaId) -> anyhow::Result<()> {
+    let path = active_ea_path(base_dir);
+    fs::create_dir_all(base_dir)?;
+    fs::write(&path, ea_id.to_string())?;
+    Ok(())
+}
+
+/// Resolve the active EA, falling back to the lowest registered EA when needed.
+pub fn resolve_active_ea(base_dir: &Path, eas: &[EaInfo]) -> EaId {
+    let fallback = eas.iter().map(|ea| ea.id).min().unwrap_or(0);
+    let active = load_active_ea(base_dir)
+        .filter(|id| eas.iter().any(|ea| ea.id == *id))
+        .unwrap_or(fallback);
+    let _ = save_active_ea(base_dir, active);
+    active
+}
+
+/// Resolve an EA selector from either an explicit `id`/`name` or the persisted active EA.
+pub fn resolve_ea_selector(base_dir: &Path, selector: Option<&str>) -> anyhow::Result<EaInfo> {
+    let eas = ensure_default_ea(base_dir)?;
+    let ea = match selector {
+        Some(raw) => {
+            if let Ok(id) = raw.parse::<EaId>() {
+                eas.iter().find(|ea| ea.id == id).cloned()
+            } else {
+                eas.iter().find(|ea| ea.name == raw).cloned()
+            }
+        }
+        None => {
+            let active = resolve_active_ea(base_dir, &eas);
+            eas.iter().find(|ea| ea.id == active).cloned()
+        }
+    };
+
+    ea.ok_or_else(|| anyhow::anyhow!("EA '{}' not found", selector.unwrap_or("<active>")))
+}
+
 /// Ensure at least one default EA exists on disk.
 pub fn ensure_default_ea(base_dir: &Path) -> anyhow::Result<Vec<EaInfo>> {
     let mut eas = load_registry(base_dir);
@@ -84,6 +134,7 @@ pub fn ensure_default_ea(base_dir: &Path) -> anyhow::Result<Vec<EaInfo>> {
             save_next_id_counter(base_dir, 0)?;
         }
         fs::create_dir_all(ea_state_dir(0, base_dir).join("status"))?;
+        let _ = save_active_ea(base_dir, 0);
     }
     Ok(eas)
 }
@@ -330,6 +381,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let eas = load_registry(dir.path());
         assert_eq!(eas.len(), 0);
+    }
+
+    #[test]
+    fn test_resolve_active_ea_prefers_persisted_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+        let id1 = register_ea(dir.path(), "Research", None).unwrap();
+        let eas = load_registry(dir.path());
+
+        save_active_ea(dir.path(), id1).unwrap();
+
+        assert_eq!(resolve_active_ea(dir.path(), &eas), id1);
+    }
+
+    #[test]
+    fn test_resolve_active_ea_falls_back_when_persisted_value_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+        let _ = register_ea(dir.path(), "Research", None).unwrap();
+        let eas = load_registry(dir.path());
+
+        save_active_ea(dir.path(), 99).unwrap();
+
+        assert_eq!(resolve_active_ea(dir.path(), &eas), 0);
+        assert_eq!(load_active_ea(dir.path()), Some(0));
+    }
+
+    #[test]
+    fn test_resolve_ea_selector_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+        let id = register_ea(dir.path(), "Research", None).unwrap();
+
+        let ea = resolve_ea_selector(dir.path(), Some("Research")).unwrap();
+
+        assert_eq!(ea.id, id);
+        assert_eq!(ea.name, "Research");
     }
 
     #[test]

@@ -9,8 +9,7 @@ use crate::config::Config;
 use crate::ea::{self, EaId, EaInfo};
 use crate::memory;
 use crate::projects::{self, Project};
-use crate::scheduler::{ScheduledEvent, Scheduler, TickerBuffer};
-use crate::settings::DashboardSettings;
+use crate::scheduler::{PendingEaEvents, ScheduledEvent, Scheduler, TickerBuffer};
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -108,7 +107,7 @@ pub struct App {
     pub show_debug_console: bool,
     pub show_settings: bool,
     pub settings_selected: usize,
-    pub settings: DashboardSettings,
+    pub config: Config,
     /// Session name of the agent shown in the bottom panel (the EA's manager session)
     pub focus_parent: String,
     /// Stack for Esc navigation (drill-up restores previous parent)
@@ -130,10 +129,16 @@ pub struct App {
     default_workdir: String,
     session_prefix: String,
     pub scheduler: Arc<Scheduler>,
+    pending_ea_events: PendingEaEvents,
 }
 
 impl App {
-    pub fn new(config: &Config, ticker: TickerBuffer, scheduler: Arc<Scheduler>) -> Self {
+    pub fn new(
+        config: &Config,
+        ticker: TickerBuffer,
+        scheduler: Arc<Scheduler>,
+        pending_ea_events: PendingEaEvents,
+    ) -> Self {
         let base_prefix = config.dashboard.session_prefix.clone();
         let omar_dir = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -147,9 +152,7 @@ impl App {
             eprintln!("warn: ensure default EA: {}", e);
             ea::load_registry(&omar_dir)
         });
-        // Use the lowest registered EA id as the initial active EA.
-        // Hardcoding 0 would break if EA 0 was deleted and all remaining IDs are ≥ 1.
-        let active_ea: EaId = registered_eas.iter().map(|e| e.id).min().unwrap_or(0);
+        let active_ea = ea::resolve_active_ea(&omar_dir, &registered_eas);
 
         // EA-scoped prefix and manager session
         let session_prefix = ea::ea_prefix(active_ea, &base_prefix);
@@ -207,7 +210,7 @@ impl App {
             show_debug_console: false,
             show_settings: false,
             settings_selected: 0,
-            settings: DashboardSettings::load(),
+            config: config.clone(),
             focus_parent: manager_session,
             focus_stack: Vec::new(),
             focus_child_indices: Vec::new(),
@@ -223,6 +226,7 @@ impl App {
             default_workdir: config.agent.default_workdir.clone(),
             session_prefix,
             scheduler,
+            pending_ea_events,
         }
     }
 
@@ -1006,6 +1010,7 @@ impl App {
         }
 
         self.active_ea = ea_id;
+        ea::save_active_ea(&self.omar_dir, ea_id)?;
 
         // Reconstruct tmux client with new EA's prefix
         let new_prefix = ea::ea_prefix(ea_id, &self.base_prefix);
@@ -1113,45 +1118,37 @@ impl App {
         let manager_session = ea::ea_manager_session(ea_id, &self.base_prefix);
         let ea_client = TmuxClient::new(&ea_prefix);
 
-        // Kill worker sessions
-        if let Ok(sessions) = ea_client.list_sessions() {
-            for session in sessions {
-                if session.name != manager_session {
-                    if let Err(e) = ea_client.kill_session(&session.name) {
-                        self.ticker
-                            .push(format!("warn: kill session '{}': {}", session.name, e));
-                    }
-                }
+        let sessions = ea_client.list_sessions()?;
+        let mut worker_sessions = Vec::new();
+        for session in sessions {
+            if session.name != manager_session {
+                worker_sessions.push(session.name);
             }
         }
 
+        // Transactional delete: cleanup must succeed before registry mutation.
+        for session_name in &worker_sessions {
+            ea_client.kill_session(session_name)?;
+        }
+
         // Kill manager session
-        if ea_client.has_session(&manager_session).unwrap_or(false) {
-            if let Err(e) = ea_client.kill_session(&manager_session) {
-                self.ticker
-                    .push(format!("warn: kill manager '{}': {}", manager_session, e));
-            }
+        if ea_client.has_session(&manager_session)? {
+            ea_client.kill_session(&manager_session)?;
         }
 
         // Remove state directory
         let state_dir = ea::ea_state_dir(ea_id, &self.omar_dir);
         if state_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&state_dir) {
-                self.ticker
-                    .push(format!("warn: remove state dir {:?}: {}", state_dir, e));
-            }
+            std::fs::remove_dir_all(&state_dir)?;
         }
 
         let notes_path = memory::manager_notes_path(&self.omar_dir, ea_id);
         if notes_path.exists() {
-            if let Err(e) = std::fs::remove_file(&notes_path) {
-                self.ticker
-                    .push(format!("warn: remove notes {:?}: {}", notes_path, e));
-            }
+            std::fs::remove_file(&notes_path)?;
         }
 
-        // Cancel all scheduler events for this EA
-        self.scheduler.cancel_by_ea(ea_id);
+        let events_cancelled = self.scheduler.cancel_by_ea(ea_id);
+        self.pending_ea_events.lock().unwrap().remove(&ea_id);
 
         // Unregister EA
         ea::unregister_ea(&self.omar_dir, ea_id)?;
@@ -1169,7 +1166,12 @@ impl App {
             self.switch_ea(next_id)?;
         }
 
-        self.set_status(format!("Deleted EA {}", ea_id));
+        self.set_status(format!(
+            "Deleted EA {} ({} workers, {} events)",
+            ea_id,
+            worker_sessions.len(),
+            events_cancelled
+        ));
         self.pending_confirm = None;
         Ok(())
     }

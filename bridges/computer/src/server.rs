@@ -243,13 +243,17 @@ async fn handle_screen_size() -> impl IntoResponse {
 async fn handle_health() -> impl IntoResponse {
     let xdotool = computer::is_xdotool_available();
     let screenshot = computer::is_screenshot_available();
+    let display = computer::get_screen_size().is_ok();
+    let screenshot_ready = display && screenshot;
 
     Json(serde_json::json!({
         "ok": true,
-        "available": xdotool && screenshot,
+        "available": xdotool && screenshot_ready,
         "service": "omar-computer-bridge",
         "xdotool": xdotool,
+        "display": display,
         "screenshot": screenshot,
+        "screenshot_ready": screenshot_ready,
         "imagemagick": screenshot,
     }))
 }

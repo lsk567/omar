@@ -1292,7 +1292,7 @@ fn render_help_popup(frame: &mut Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  q           Quit"),
+        Line::from("  Q           Quit"),
         Line::from("  ←/→, h/l   Switch panel (sidebar ↔ main)"),
         Line::from("  ↑/↓, j/k   Move selection up/down"),
         Line::from("  Tab         Drill into selected agent"),

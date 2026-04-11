@@ -30,8 +30,14 @@ Other features include messaging systems integration (e.g., Slack), computer use
 
 ### Prerequisites
 
-- **tmux 3.0+** — `brew install tmux` (macOS) or `apt install tmux` (Debian/Ubuntu)
-- At least one agent backend: [Claude](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex](https://developers.openai.com/codex/cli), [Opencode](https://github.com/anomalyco/opencode), or [Cursor](https://cursor.com/cli).
+- tmux 3.0+
+- Rust 1.70+
+- GNU Make
+- One supported agent backend:
+- [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview)
+- [Codex CLI](https://developers.openai.com/codex/cli)
+- [Cursor CLI](https://cursor.com/cli)
+- [Opencode](https://github.com/anomalyco/opencode)
 
 ### One-liner (recommended)
 
@@ -96,10 +102,27 @@ https://github.com/user-attachments/assets/94b9a78f-5eb2-4557-9932-f17fed536ba5
 
 | Backend | How to launch |
 |---------|---------------|
-| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar` or `omar --agent claude` |
+| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar` (default) |
 | [Codex CLI](https://developers.openai.com/codex/cli) | `omar --agent codex` |
+| [Cursor CLI](https://cursor.com/cli) | `omar --agent cursor` |
 | [Opencode](https://github.com/anomalyco/opencode) | `omar --agent opencode` |
 | [Cursor CLI](https://cursor.com/cli) | `omar --agent cursor` |
+
+## Multi-EA CLI
+
+By default, CLI commands target the active EA stored on disk.
+
+```bash
+# List sessions for the active EA
+omar list
+
+# Switch CLI targeting to a specific EA by id or name
+omar --ea 2 list
+omar --ea Research manager start
+
+# Inspect sessions across every EA
+omar list --all-eas
+```
 
 ## License
 

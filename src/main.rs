@@ -46,19 +46,42 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Path to config file [default: ~/.omar/config.toml]
+    /// Path to config file
     #[arg(short, long)]
     config: Option<String>,
 
     /// Agent backend to use: claude, codex, cursor, opencode
     #[arg(short, long)]
     agent: Option<String>,
+
+    /// EA to target by id or name [default: active EA]
+    #[arg(long, global = true)]
+    ea: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List all agent sessions
-    List,
+    /// Spawn a new agent session
+    Spawn {
+        /// Name for the agent session
+        #[arg(short, long)]
+        name: String,
+
+        /// Command to run in the session (defaults to configured default_command)
+        #[arg(short, long)]
+        command: Option<String>,
+
+        /// Working directory
+        #[arg(short, long)]
+        workdir: Option<String>,
+    },
+
+    /// List agent sessions in the target EA
+    List {
+        /// List sessions across all EAs
+        #[arg(long)]
+        all_eas: bool,
+    },
 
     /// Configure tmux for optimal omar experience
     SetupTmux,
@@ -87,29 +110,58 @@ async fn main() -> Result<()> {
         config.agent.default_command =
             config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
     }
-    let (default_ea_id, default_ea_name, client) = default_cli_ea(&config)?;
+    let omar_dir = omar_dir();
+
+    if let Some(ref selector) = cli.ea {
+        let ea_info = ea::resolve_ea_selector(&omar_dir, Some(selector))?;
+        ea::save_active_ea(&omar_dir, ea_info.id)?;
+    }
 
     match cli.command {
-        Some(Commands::List) => list_agents(&client),
+        Some(Commands::Spawn {
+            name,
+            command,
+            workdir,
+        }) => {
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let client =
+                TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
+            let cmd = command.unwrap_or_else(|| config.agent.default_command.clone());
+            spawn_agent(&client, &name, &cmd, workdir.as_deref())
+        }
+        Some(Commands::List { all_eas }) => {
+            if all_eas {
+                list_agents_all(&omar_dir, &config.dashboard.session_prefix)
+            } else {
+                let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+                list_agents_for_ea(&config.dashboard.session_prefix, &target)
+            }
+        }
+        Some(Commands::Kill { name }) => {
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let client =
+                TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
+            kill_agent(&client, &name)
+        }
         Some(Commands::SetupTmux) => setup_tmux(),
         Some(Commands::Manager { action }) => {
-            let omar_dir = dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".omar");
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let client =
+                TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
             match action {
                 Some(ManagerAction::Start) | None => manager::start_manager(
                     &client,
                     &config.agent.default_command,
-                    default_ea_id,
-                    &default_ea_name,
+                    target.id,
+                    &target.name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
                 ),
                 Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(
                     &client,
                     &config.agent.default_command,
-                    default_ea_id,
-                    &default_ea_name,
+                    target.id,
+                    &target.name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
                 ),
@@ -125,17 +177,92 @@ async fn main() -> Result<()> {
     }
 }
 
-fn default_cli_ea(config: &Config) -> Result<(ea::EaId, String, TmuxClient)> {
-    let omar_dir = dirs::home_dir()
+fn omar_dir() -> PathBuf {
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar");
-    let eas = ea::ensure_default_ea(&omar_dir)?;
-    let active = eas
-        .iter()
-        .min_by_key(|ea_info| ea_info.id)
-        .ok_or_else(|| anyhow::anyhow!("EA registry is empty"))?;
-    let client = TmuxClient::new(ea::ea_prefix(active.id, &config.dashboard.session_prefix));
-    Ok((active.id, active.name.clone(), client))
+        .join(".omar")
+}
+
+fn resolve_cli_ea(omar_dir: &std::path::Path, selector: Option<&str>) -> Result<ea::EaInfo> {
+    ea::resolve_ea_selector(omar_dir, selector)
+}
+
+fn list_agents_for_ea(base_prefix: &str, ea_info: &ea::EaInfo) -> Result<()> {
+    let prefix = ea::ea_prefix(ea_info.id, base_prefix);
+    let manager_session = ea::ea_manager_session(ea_info.id, base_prefix);
+    let sessions = sessions_for_ea(base_prefix, ea_info.id)?;
+
+    if sessions.is_empty() {
+        println!(
+            "No agent sessions found for EA {} ({})",
+            ea_info.id, ea_info.name
+        );
+        return Ok(());
+    }
+
+    println!("EA {}: {}", ea_info.id, ea_info.name);
+    println!("{:<20} {:<12} {:<10}", "NAME", "ATTACHED", "PID");
+    println!("{}", "-".repeat(44));
+
+    for session in sessions {
+        let name = display_cli_session_name(&session.name, &prefix, &manager_session);
+        let attached = if session.attached { "yes" } else { "no" };
+        println!("{:<20} {:<12} {:<10}", name, attached, session.pane_pid);
+    }
+
+    Ok(())
+}
+
+fn list_agents_all(omar_dir: &std::path::Path, base_prefix: &str) -> Result<()> {
+    let eas = ea::ensure_default_ea(omar_dir)?;
+    let mut printed = false;
+
+    println!(
+        "{:<6} {:<20} {:<20} {:<12} {:<10}",
+        "EA", "EA_NAME", "NAME", "ATTACHED", "PID"
+    );
+    println!("{}", "-".repeat(74));
+
+    for ea_info in eas {
+        let prefix = ea::ea_prefix(ea_info.id, base_prefix);
+        let manager_session = ea::ea_manager_session(ea_info.id, base_prefix);
+        for session in sessions_for_ea(base_prefix, ea_info.id)? {
+            let name = display_cli_session_name(&session.name, &prefix, &manager_session);
+            let attached = if session.attached { "yes" } else { "no" };
+            println!(
+                "{:<6} {:<20} {:<20} {:<12} {:<10}",
+                ea_info.id, ea_info.name, name, attached, session.pane_pid
+            );
+            printed = true;
+        }
+    }
+
+    if !printed {
+        println!("No agent sessions found");
+    }
+
+    Ok(())
+}
+
+fn sessions_for_ea(base_prefix: &str, ea_id: ea::EaId) -> Result<Vec<tmux::Session>> {
+    let prefix = ea::ea_prefix(ea_id, base_prefix);
+    let manager_session = ea::ea_manager_session(ea_id, base_prefix);
+    let client = TmuxClient::new("");
+    let mut sessions = client.list_all_sessions()?;
+    sessions.retain(|session| session.name == manager_session || session.name.starts_with(&prefix));
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(sessions)
+}
+
+fn display_cli_session_name(session_name: &str, prefix: &str, manager_session: &str) -> String {
+    if session_name == manager_session {
+        "ea".to_string()
+    } else {
+        session_name
+            .strip_prefix(prefix)
+            .unwrap_or(session_name)
+            .to_string()
+    }
 }
 
 fn spawn_agent(
@@ -155,26 +282,15 @@ fn spawn_agent(
     Ok(())
 }
 
-fn list_agents(client: &TmuxClient) -> Result<()> {
-    let sessions = client.list_sessions()?;
+fn kill_agent(client: &TmuxClient, name: &str) -> Result<()> {
+    let full_name = format!("{}{}", client.prefix(), name);
 
-    if sessions.is_empty() {
-        println!("No agent sessions found");
-        return Ok(());
+    if !client.has_session(&full_name)? {
+        anyhow::bail!("Session '{}' not found", name);
     }
 
-    println!("{:<20} {:<12} {:<10}", "NAME", "ATTACHED", "PID");
-    println!("{}", "-".repeat(44));
-
-    for session in sessions {
-        let name = session
-            .name
-            .strip_prefix(client.prefix())
-            .unwrap_or(&session.name);
-        let attached = if session.attached { "yes" } else { "no" };
-        println!("{:<20} {:<12} {:<10}", name, attached, session.pane_pid);
-    }
-
+    client.kill_session(&full_name)?;
+    println!("Killed agent: {}", name);
     Ok(())
 }
 
@@ -191,7 +307,8 @@ fn relaunch_in_tmux() -> Result<()> {
 
     let client = TmuxClient::new("");
 
-    // If the dashboard session exists, try to attach to it.
+    // Preserve a live dashboard across detach/reattach cycles.
+    // Only kill the session if attach fails, which indicates a stale tmux session.
     if client.has_session(DASHBOARD_SESSION)? {
         let status = std::process::Command::new("tmux")
             .args(["attach-session", "-t", DASHBOARD_SESSION])
@@ -200,7 +317,6 @@ fn relaunch_in_tmux() -> Result<()> {
         match status {
             Ok(s) if s.success() => return Ok(()),
             _ => {
-                // Attach failed — stale session. Kill it and create a new one.
                 let _ = client.kill_session(DASHBOARD_SESSION);
             }
         }
@@ -489,6 +605,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
         &config,
         ticker.clone(),
         scheduler.clone(),
+        pending_ea_events.clone(),
     )));
 
     // Start API server if enabled
@@ -716,7 +833,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                             KeyCode::Enter => {
                                 let idx = app.settings_selected;
-                                app.settings.toggle(idx);
+                                app.config.toggle_setting(idx);
                                 // If event queue was just hidden, move sidebar off Events panel
                                 if !app.config.dashboard.show_event_queue
                                     && app.sidebar_panel == app::SidebarPanel::Events
@@ -762,7 +879,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         KeyCode::Right => {
                             if key.modifiers.contains(KeyModifiers::ALT) {
                                 app.cycle_next_ea();
-                            } else if app.settings.sidebar_right {
+                            } else if app.config.dashboard.sidebar_right {
                                 // Sidebar is on the right: try grid right first, then sidebar
                                 if !app.grid_right() {
                                     app.sidebar_focused = true;
@@ -778,7 +895,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         KeyCode::Left => {
                             if key.modifiers.contains(KeyModifiers::ALT) {
                                 app.cycle_previous_ea();
-                            } else if app.settings.sidebar_right {
+                            } else if app.config.dashboard.sidebar_right {
                                 // Sidebar is on the right: try grid left (no fallback)
                                 if !app.grid_left() && app.sidebar_focused {
                                     app.sidebar_focused = false;

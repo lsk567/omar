@@ -208,7 +208,7 @@ pub(crate) fn deliver_to_tmux(
 
         {
             let mut map = pending_ea_events.lock().unwrap();
-            map.entry(ea_id).or_insert_with(VecDeque::new).push_back(message.to_string());
+            map.entry(ea_id).or_default().push_back(message.to_string());
         }
 
         // Flash a status-bar notification so the human sees it immediately.
@@ -217,13 +217,18 @@ pub(crate) fn deliver_to_tmux(
         let _ = Command::new("tmux")
             .args([
                 "display-message",
-                "-t", &ea_pane_target,
-                "-d", "4000",
+                "-t",
+                &ea_pane_target,
+                "-d",
+                "4000",
                 &flash_msg,
             ])
             .output();
 
-        ticker.push(format!("queued event for EA {} manager ({})", ea_id, ea_pane_target));
+        ticker.push(format!(
+            "queued event for EA {} manager ({})",
+            ea_id, ea_pane_target
+        ));
     } else {
         let prefix = ea::ea_prefix(ea_id, base_prefix);
         let target = format!("{}{}", prefix, receiver);
@@ -274,6 +279,19 @@ fn format_delivery(events: &[ScheduledEvent], timestamp: u64) -> String {
         }
         msg
     }
+}
+
+fn split_batch_for_quota(
+    mut batch: Vec<ScheduledEvent>,
+    remaining_quota: usize,
+) -> (Vec<ScheduledEvent>, Vec<ScheduledEvent>) {
+    if batch.is_empty() || remaining_quota >= batch.len() {
+        return (batch, Vec::new());
+    }
+
+    batch.sort_by_key(|ev| ev.created_at);
+    let deferred = batch.split_off(remaining_quota);
+    (batch, deferred)
 }
 
 /// Shared state: the (short name, ea_id) of the agent whose popup is currently open, if any.
@@ -384,10 +402,25 @@ pub async fn run_event_loop(
                     if batch.is_empty() {
                         continue;
                     }
+                    let remaining_quota = MAX_EVENTS_PER_EA_PER_TICK - delivered_so_far;
+                    let (batch, deferred_batch) = split_batch_for_quota(batch, remaining_quota);
+                    for ev in deferred_batch {
+                        scheduler.insert(ev);
+                    }
+                    if batch.is_empty() {
+                        continue;
+                    }
                     // Track events delivered for this EA this tick.
                     *ea_delivery_count.entry(*ea_id).or_insert(0) += batch.len();
                     let message = format_delivery(&batch, earliest_ts);
-                    deliver_to_tmux(*ea_id, receiver, &message, &base_prefix, &ticker, &pending_ea_events);
+                    deliver_to_tmux(
+                        *ea_id,
+                        receiver,
+                        &message,
+                        &base_prefix,
+                        &ticker,
+                        &pending_ea_events,
+                    );
 
                     // Re-insert recurring events with a fresh timestamp and ID
                     for ev in &batch {
@@ -705,6 +738,24 @@ mod tests {
         let msg = format_delivery(&[e1, e2], 1000);
         assert!(msg.contains("[EVENT] From alice: one-time"));
         assert!(msg.contains("[CRON] From carol: recurring"));
+    }
+
+    #[test]
+    fn test_split_batch_for_quota_defers_excess_events() {
+        let mut e1 = make_event("bob", "alice", 1000, "first");
+        e1.created_at = 1;
+        let mut e2 = make_event("bob", "alice", 1000, "second");
+        e2.created_at = 2;
+        let mut e3 = make_event("bob", "alice", 1000, "third");
+        e3.created_at = 3;
+
+        let (deliver_now, deferred) = split_batch_for_quota(vec![e3, e1, e2], 2);
+
+        assert_eq!(deliver_now.len(), 2);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deliver_now[0].payload, "first");
+        assert_eq!(deliver_now[1].payload, "second");
+        assert_eq!(deferred[0].payload, "third");
     }
 
     // ── TickerBuffer tests ──

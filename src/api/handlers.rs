@@ -88,6 +88,10 @@ fn health_from_activity(activity: i64, idle_warning: i64) -> String {
     }
 }
 
+fn timestamp_is_too_old(timestamp: u64, now: u64) -> bool {
+    timestamp < now.saturating_sub(1_000_000_000)
+}
+
 // ── Global handlers ──
 
 /// GET /api/health
@@ -188,8 +192,85 @@ pub async fn delete_ea(
         }
     }
 
-    // Step 1: Validate EA exists, then IMMEDIATELY unregister it.
+    // Step 1: Validate EA exists and inspect current state before mutating registry.
     let (prefix, manager_session, state_dir) = resolve_ea(ea_id, &state)?;
+    let client = TmuxClient::new(&prefix);
+    let sessions = client.list_sessions().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to inspect EA sessions: {}", e),
+            }),
+        )
+    })?;
+
+    // Step 2: Transactional cleanup. Do not unregister until cleanup succeeds.
+    let mut agents_killed = 0;
+    for session in &sessions {
+        if session.name != manager_session {
+            client.kill_session(&session.name).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to kill worker session '{}': {}", session.name, e),
+                    }),
+                )
+            })?;
+            agents_killed += 1;
+        }
+    }
+
+    if client.has_session(&manager_session).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!(
+                    "Failed to check manager session '{}': {}",
+                    manager_session, e
+                ),
+            }),
+        )
+    })? {
+        client.kill_session(&manager_session).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Failed to kill manager session '{}': {}",
+                        manager_session, e
+                    ),
+                }),
+            )
+        })?;
+        agents_killed += 1;
+    }
+
+    if state_dir.exists() {
+        std::fs::remove_dir_all(&state_dir).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to remove state dir {:?}: {}", state_dir, e),
+                }),
+            )
+        })?;
+    }
+
+    let notes_path = memory::manager_notes_path(&state.omar_dir, ea_id);
+    if notes_path.exists() {
+        std::fs::remove_file(&notes_path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to remove notes {:?}: {}", notes_path, e),
+                }),
+            )
+        })?;
+    }
+
+    // Step 3: Commit registry/scheduler changes after cleanup succeeds.
+    let events_cancelled = state.scheduler.cancel_by_ea(ea_id);
+    state.pending_ea_events.lock().unwrap().remove(&ea_id);
     ea::unregister_ea(&state.omar_dir, ea_id).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -199,46 +280,6 @@ pub async fn delete_ea(
         )
     })?;
 
-    // Step 2: Cancel all events for this EA
-    let events_cancelled = state.scheduler.cancel_by_ea(ea_id);
-
-    // Step 3: Kill all worker agents (tmux sessions matching prefix)
-    let client = TmuxClient::new(&prefix);
-    let sessions = client.list_sessions().unwrap_or_default();
-    let mut agents_killed = 0;
-    for session in &sessions {
-        if session.name != manager_session {
-            if let Err(e) = client.kill_session(&session.name) {
-                eprintln!("warn: kill session '{}': {}", session.name, e);
-            }
-            agents_killed += 1;
-        }
-    }
-
-    // Step 4: Kill the EA's manager session
-    if client.has_session(&manager_session).unwrap_or(false) {
-        if let Err(e) = client.kill_session(&manager_session) {
-            eprintln!("warn: kill manager '{}': {}", manager_session, e);
-        }
-        agents_killed += 1;
-    }
-
-    // Step 5: Remove state directory
-    if state_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&state_dir) {
-            eprintln!("warn: remove state dir {:?}: {}", state_dir, e);
-        }
-    }
-
-    // Step 5b: Remove manager notes file (ignore not-found errors; file may not exist)
-    let notes_path = memory::manager_notes_path(&state.omar_dir, ea_id);
-    if notes_path.exists() {
-        if let Err(e) = std::fs::remove_file(&notes_path) {
-            eprintln!("warn: remove notes {:?}: {}", notes_path, e);
-        }
-    }
-
-    // Step 6: If active EA was deleted, switch dashboard to lowest remaining EA
     app.registered_eas = ea::load_registry(&state.omar_dir);
     if app.active_ea == ea_id {
         let next_id = app
@@ -827,7 +868,7 @@ pub async fn schedule_event(
         .as_nanos() as u64;
 
     // Reject timestamps more than 1 second in the past to prevent event spam.
-    if req.timestamp + 1_000_000_000 < now {
+    if timestamp_is_too_old(req.timestamp, now) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1008,11 +1049,15 @@ pub async fn computer_status(
             width: s.width,
             height: s.height,
         });
+    let display = screen_size.is_some();
+    let screenshot_ready = display && screenshot;
 
     Json(ComputerAvailabilityResponse {
-        available: xdotool && screenshot,
+        available: xdotool && screenshot_ready,
         xdotool,
         screenshot,
+        display,
+        screenshot_ready,
         screen_size,
     })
 }
@@ -1273,4 +1318,27 @@ fn generate_agent_name_in_ea(prefix: &str) -> String {
     }
     // Fallback: use UUID suffix
     format!("{}{}", prefix, &uuid::Uuid::new_v4().to_string()[..8])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timestamp_is_too_old;
+
+    #[test]
+    fn timestamp_guard_accepts_exact_one_second_boundary() {
+        let now = 5_000_000_000;
+        assert!(!timestamp_is_too_old(4_000_000_000, now));
+    }
+
+    #[test]
+    fn timestamp_guard_rejects_values_more_than_one_second_old() {
+        let now = 5_000_000_000;
+        assert!(timestamp_is_too_old(3_999_999_999, now));
+    }
+
+    #[test]
+    fn timestamp_guard_handles_large_timestamps_without_overflow() {
+        let now = 5_000_000_000;
+        assert!(!timestamp_is_too_old(u64::MAX, now));
+    }
 }

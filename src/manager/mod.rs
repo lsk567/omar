@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+use uuid::Uuid;
 
 use crate::ea::{self, EaId};
 use crate::memory;
@@ -53,6 +54,14 @@ fn sed_escape(s: &str) -> String {
         .replace('\'', "'\\''")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Claude,
+    Codex,
+    Cursor,
+    Opencode,
+}
+
 fn detect_backend_token(token: &str) -> Option<BackendKind> {
     let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')'));
     let executable = Path::new(token)
@@ -75,7 +84,40 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
         .find_map(detect_backend_token)
 }
 
-/// Build a CLI command with the system prompt injected via backend-specific mechanisms.
+fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -> PathBuf {
+    if substitutions.is_empty() {
+        return prompt_file.to_path_buf();
+    }
+
+    let mut content = std::fs::read_to_string(prompt_file).unwrap_or_default();
+    for (pattern, replacement) in substitutions {
+        content = content.replace(pattern, replacement);
+    }
+
+    let dir = std::env::temp_dir().join("omar-prompts");
+    std::fs::create_dir_all(&dir).ok();
+
+    let stem = prompt_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("prompt");
+    let ext = prompt_file
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("md");
+    let rendered = dir.join(format!("{}-{}.{}", stem, Uuid::new_v4(), ext));
+
+    if std::fs::write(&rendered, content).is_ok() {
+        rendered
+    } else {
+        prompt_file.to_path_buf()
+    }
+}
+
+/// Build a CLI command with system prompt loaded from a file via native flag.
+///
+/// - `prompt_file`: absolute path to the prompt .md file
+/// - `substitutions`: `(pattern, replacement)` pairs for sed; empty = use `cat`
 ///
 /// Detects backend from `base_command`:
 ///   - claude  → `--system-prompt "$(cat '<path>')"`
@@ -83,8 +125,22 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
 ///   - cursor  → positional arg `"Load the <path> file and follow the instructions."`
 ///   - opencode → `--prompt "$(cat '<path>')"`
 ///   - unknown → returns `base_command` unchanged
-pub fn build_agent_command(base_command: &str, prompt_file: &Path) -> String {
-    let shell_expr = format!("$(cat '{}')", prompt_file.display());
+pub fn build_agent_command(
+    base_command: &str,
+    prompt_file: &Path,
+    substitutions: &[(&str, &str)],
+) -> String {
+    let path_str = prompt_file.display();
+    let shell_expr = if substitutions.is_empty() {
+        format!("$(cat '{}')", path_str)
+    } else {
+        let sed_script: String = substitutions
+            .iter()
+            .map(|(pat, repl)| format!("s|{}|{}|g", pat, sed_escape(repl)))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("$(sed '{}' '{}')", sed_script, path_str)
+    };
 
     match detect_backend(base_command) {
         Some(BackendKind::Claude) => {
@@ -95,10 +151,11 @@ pub fn build_agent_command(base_command: &str, prompt_file: &Path) -> String {
             base_command, shell_expr
         ),
         Some(BackendKind::Cursor) => {
+            let rendered = materialize_prompt_file(prompt_file, substitutions);
             format!(
                 "{} \"Load the '{}' file and follow the instructions.\"",
                 base_command,
-                prompt_file.display()
+                rendered.display()
             )
         }
         Some(BackendKind::Opencode) => format!("{} --prompt \"{}\"", base_command, shell_expr),
@@ -501,6 +558,86 @@ mod tests {
 
     #[test]
     fn test_build_agent_command_codex() {
+        let cmd = build_agent_command(
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_claude() {
+        let cmd = build_agent_command(
+            "env ANTHROPIC_API_KEY=test claude --some-flag",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "env ANTHROPIC_API_KEY=test claude --some-flag --system-prompt \"$(cat '/tmp/prompts/ea.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_opencode() {
+        let cmd = build_agent_command(
+            "npx opencode --model local",
+            Path::new("/tmp/prompts/pm.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "npx opencode --model local --prompt \"$(cat '/tmp/prompts/pm.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_codex() {
+        let cmd = build_agent_command(
+            "env OPENAI_API_KEY=test codex --no-alt-screen",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "env OPENAI_API_KEY=test codex --no-alt-screen -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_cursor() {
+        let cmd = build_agent_command("cursor agent --yolo", Path::new("/tmp/prompts/ea.md"), &[]);
+        assert_eq!(
+            cmd,
+            "cursor agent --yolo \"Load the '/tmp/prompts/ea.md' file and follow the instructions.\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_cursor() {
+        let cmd = build_agent_command(
+            "env FOO=bar cursor agent --yolo",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "env FOO=bar cursor agent --yolo \"Load the '/tmp/prompts/ea.md' file and follow the instructions.\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_unknown_backend() {
+        let cmd = build_agent_command("vim", Path::new("/tmp/prompts/ea.md"), &[]);
+        assert_eq!(cmd, "vim");
+    }
+
+    #[test]
+    fn test_build_agent_command_with_substitutions() {
         let cmd = build_agent_command(
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
             Path::new("/tmp/prompts/ea.md"),
