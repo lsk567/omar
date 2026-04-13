@@ -40,14 +40,39 @@ impl TickerBuffer {
 
     /// Return the joined ticker content, filtering entries older than `ttl`.
     /// Does NOT prune the buffer — old entries remain for `latest()` / debug console.
+    ///
+    /// When there are many recent messages, collapses them into a summary
+    /// (e.g. "3 errors, 2 info — press D for details") to avoid spilling
+    /// across the dashboard.
     pub fn render(&self, ttl: std::time::Duration) -> String {
         let buf = self.entries.lock().unwrap();
         let now = Instant::now();
-        buf.iter()
+        let recent: Vec<&str> = buf
+            .iter()
             .filter(|e| now.duration_since(e.created_at) < ttl)
             .map(|e| e.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" +++ ")
+            .collect();
+
+        if recent.len() <= 2 {
+            return recent.join(" +++ ");
+        }
+
+        // Collapse into a summary when there are many messages.
+        let errors = recent
+            .iter()
+            .filter(|t| t.contains("failed") || t.contains("error") || t.contains("Error"))
+            .count();
+        let other = recent.len() - errors;
+
+        let mut parts = Vec::new();
+        if errors > 0 {
+            parts.push(format!("{} error(s)", errors));
+        }
+        if other > 0 {
+            parts.push(format!("{} info", other));
+        }
+        parts.push("press D for details".to_string());
+        parts.join(", ")
     }
 
     /// Return the last `n` messages regardless of age (for debug console).
@@ -642,6 +667,27 @@ mod tests {
         // Render with zero TTL — everything expires immediately
         let out = ticker.render(std::time::Duration::ZERO);
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn test_ticker_collapse_many_messages() {
+        let ticker = TickerBuffer::new();
+        ticker.push("delivered 1 event(s) to worker-1");
+        ticker.push("event delivery failed for worker-2: timeout");
+        ticker.push("event delivery failed for worker-3: timeout");
+        ticker.push("delivered 1 event(s) to worker-4");
+        let out = ticker.render(std::time::Duration::from_secs(30));
+        assert!(
+            out.contains("2 error(s)"),
+            "expected error count, got: {}",
+            out
+        );
+        assert!(out.contains("2 info"), "expected info count, got: {}", out);
+        assert!(
+            out.contains("press D for details"),
+            "expected D hint, got: {}",
+            out
+        );
     }
 
     #[test]
