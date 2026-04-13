@@ -219,16 +219,19 @@ impl TmuxClient {
             let content_before = self.capture_pane(session, 50).unwrap_or_default();
             let activity_before = self.get_pane_activity(session).unwrap_or(0);
 
-            // Deliver text + Enter atomically via load-buffer + paste-buffer.
-            // This uses tmux's bracketed paste so the backend receives the
-            // entire payload (including the trailing newline) as a single
-            // paste event — no gap between text and Enter where input can
-            // be lost.
-            let text_with_newline = format!("{}\n", text);
-            self.paste_text(session, &text_with_newline)?;
+            // Paste text via bracketed paste (no trailing newline — Enter
+            // is sent separately below).
+            self.paste_text(session, text)?;
 
-            // Verify the backend processed the input: either pane content
-            // changed or activity timestamp advanced.
+            // Send Enter 3 times with small gaps. Some backends need time
+            // to process the pasted text before accepting Enter, and a
+            // single Enter can be lost. Redundant Enters are harmless.
+            for _ in 0..3 {
+                thread::sleep(Duration::from_millis(150));
+                let _ = self.send_keys(session, "Enter");
+            }
+
+            // Verify the backend processed the input.
             if self.wait_for_change(
                 session,
                 activity_before,
