@@ -197,21 +197,19 @@ impl TmuxClient {
         let needle = needle.trim().to_string();
 
         for attempt in 1..=opts.max_retries {
-            // Phase 2: send text, verify it appears in the pane
+            // Phase 2: send text
             self.send_keys_literal(session, text)?;
 
-            if !needle.is_empty()
-                && !self.wait_for_text_in_pane(
+            // Best-effort verification: check if text appeared in the pane.
+            // Some backends (e.g. Codex) don't echo typed input to the pane
+            // buffer, so we don't gate on this — proceed to Enter regardless.
+            if !needle.is_empty() {
+                self.wait_for_text_in_pane(
                     session,
                     &needle,
                     opts.text_verify_timeout,
                     opts.poll_interval,
-                )
-            {
-                // Text never showed up — clear input and retry
-                let _ = self.send_keys(session, "C-u");
-                thread::sleep(opts.retry_delay);
-                continue;
+                );
             }
 
             // Phase 3: send Enter, verify activity advances
@@ -227,7 +225,7 @@ impl TmuxClient {
                 return Ok(());
             }
 
-            // Enter didn't register — try once more
+            // Enter didn't register — clear input and retry
             if attempt < opts.max_retries {
                 let _ = self.send_keys(session, "C-u");
                 thread::sleep(opts.retry_delay);
