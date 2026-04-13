@@ -404,13 +404,12 @@ pub async fn spawn_agent(
 
         let client = app.client().clone();
         let session = name.clone();
-        tokio::spawn(async move {
-            // Wait for the agent process to start
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let _ = client.send_keys_literal(&session, &user_msg);
-            // Delay so tmux finishes processing bracketed paste before Enter
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let _ = client.send_keys(&session, "Enter");
+        // Deliver reliably in a blocking task so HTTP response returns immediately.
+        tokio::task::spawn_blocking(move || {
+            let opts = crate::tmux::DeliveryOptions::default();
+            if let Err(e) = client.deliver_prompt(&session, &user_msg, &opts) {
+                eprintln!("[omar] prompt delivery failed for {}: {}", session, e);
+            }
         });
     }
 
@@ -494,27 +493,55 @@ pub async fn send_input(
         ));
     }
 
-    // Send text
-    if let Err(e) = app.client().send_keys_literal(&session_name, &req.text) {
+    // When enter is requested, use the reliable delivery path so text lands
+    // and Enter is actually processed. Otherwise just type literally.
+    //
+    // This path is synchronous (HTTP caller blocks until delivery completes),
+    // so use tighter timeouts than the default spawn-agent path: the session
+    // already exists, so no long startup wait is needed. Worst-case total:
+    // ~2s × max_retries ≈ 6s.
+    if req.enter {
+        let client = app.client().clone();
+        let session = session_name.clone();
+        let text = req.text.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let opts = crate::tmux::DeliveryOptions {
+                startup_timeout: std::time::Duration::from_secs(2),
+                stable_quiet: std::time::Duration::from_millis(200),
+                verify_timeout: std::time::Duration::from_secs(2),
+                max_retries: 3,
+                poll_interval: std::time::Duration::from_millis(50),
+                retry_delay: std::time::Duration::from_millis(150),
+            };
+            client.deliver_prompt(&session, &text, &opts)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to deliver input: {}", e),
+                    }),
+                ));
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Delivery task panicked: {}", e),
+                    }),
+                ));
+            }
+        }
+    } else if let Err(e) = app.client().send_keys_literal(&session_name, &req.text) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: format!("Failed to send input: {}", e),
             }),
         ));
-    }
-
-    // Send enter if requested (small delay so tmux finishes buffering the text)
-    if req.enter {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Err(e) = app.client().send_keys(&session_name, "Enter") {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to send Enter: {}", e),
-                }),
-            ));
-        }
     }
 
     Ok(Json(StatusResponse {
