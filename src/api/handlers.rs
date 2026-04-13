@@ -508,8 +508,7 @@ pub async fn send_input(
             let opts = crate::tmux::DeliveryOptions {
                 startup_timeout: std::time::Duration::from_secs(2),
                 stable_quiet: std::time::Duration::from_millis(200),
-                text_verify_timeout: std::time::Duration::from_millis(800),
-                enter_verify_timeout: std::time::Duration::from_millis(800),
+                verify_timeout: std::time::Duration::from_secs(2),
                 max_retries: 3,
                 poll_interval: std::time::Duration::from_millis(50),
                 retry_delay: std::time::Duration::from_millis(150),

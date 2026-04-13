@@ -14,11 +14,9 @@ pub struct DeliveryOptions {
     pub startup_timeout: Duration,
     /// How long the pane must be quiet to be considered "stable".
     pub stable_quiet: Duration,
-    /// How long to wait for typed text to appear in the pane after send-keys.
-    pub text_verify_timeout: Duration,
-    /// How long to wait for pane activity to advance after Enter.
-    pub enter_verify_timeout: Duration,
-    /// How many full delivery attempts (text + Enter) to try before giving up.
+    /// How long to wait for pane change after paste (activity or content).
+    pub verify_timeout: Duration,
+    /// How many full delivery attempts to try before giving up.
     pub max_retries: u32,
     /// Polling interval for pane capture / activity checks.
     pub poll_interval: Duration,
@@ -31,8 +29,7 @@ impl Default for DeliveryOptions {
         Self {
             startup_timeout: Duration::from_secs(15),
             stable_quiet: Duration::from_millis(500),
-            text_verify_timeout: Duration::from_secs(1),
-            enter_verify_timeout: Duration::from_secs(2),
+            verify_timeout: Duration::from_secs(3),
             max_retries: 3,
             poll_interval: Duration::from_millis(100),
             retry_delay: Duration::from_millis(200),
@@ -169,13 +166,45 @@ impl TmuxClient {
         Ok(())
     }
 
+    /// Paste text into a pane via load-buffer + paste-buffer.
+    /// Uses bracketed paste (-p) so the backend receives the entire payload
+    /// as a single paste event. This is more reliable than send-keys for
+    /// multi-line text and backends with custom TUI input widgets.
+    pub fn paste_text(&self, target: &str, text: &str) -> Result<()> {
+        // Load text into a tmux buffer via stdin.
+        let child = Command::new("tmux")
+            .args(["load-buffer", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("Failed to spawn tmux load-buffer")?;
+        use std::io::Write;
+        child
+            .stdin
+            .as_ref()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .context("Failed to write to tmux load-buffer stdin")?;
+        let output = child
+            .wait_with_output()
+            .context("Failed to wait for tmux load-buffer")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux load-buffer failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // Paste using bracketed paste mode so the target pane treats it as
+        // a single paste operation. -d deletes the buffer after pasting.
+        self.run(&["paste-buffer", "-t", target, "-d", "-p"])?;
+        Ok(())
+    }
+
     /// Reliably deliver a prompt to a tmux session.
     ///
     /// Backend-agnostic: works for claude, codex, cursor, opencode, or any
-    /// command that echoes typed input to its pane. Waits for the backend
-    /// to become idle, sends the text, verifies it appeared, sends Enter,
-    /// and verifies pane activity advanced. Retries up to `opts.max_retries`
-    /// times if any step fails.
+    /// TUI. Uses tmux's bracketed paste (load-buffer + paste-buffer -p) to
+    /// deliver text + Enter as a single atomic paste event, then verifies
+    /// that the pane changed. Retries up to `opts.max_retries` times.
     pub fn deliver_prompt(&self, session: &str, text: &str, opts: &DeliveryOptions) -> Result<()> {
         // Phase 1: wait for the backend to finish drawing its UI / be ready.
         self.wait_for_stable(
@@ -185,54 +214,32 @@ impl TmuxClient {
             opts.poll_interval,
         )?;
 
-        // Choose a verification needle: first non-empty line, trimmed.
-        // Limit to a reasonable length so wrapping/truncation doesn't break us.
-        let needle: String = text
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or(text)
-            .chars()
-            .take(40)
-            .collect();
-        let needle = needle.trim().to_string();
-
         for attempt in 1..=opts.max_retries {
-            // Phase 2: send text
-            self.send_keys_literal(session, text)?;
-
-            // Best-effort: check if text appeared in the pane. Some backends
-            // (e.g. Codex) don't echo typed input, so we don't gate on this.
-            if !needle.is_empty() {
-                self.wait_for_text_in_pane(
-                    session,
-                    &needle,
-                    opts.text_verify_timeout,
-                    opts.poll_interval,
-                );
-            }
-
-            // Phase 3: send Enter. Snapshot pane content before so we can
-            // detect any change (not just activity timestamp — some backends
-            // update content without bumping activity).
+            // Snapshot pane state before delivery so we can detect changes.
             let content_before = self.capture_pane(session, 50).unwrap_or_default();
             let activity_before = self.get_pane_activity(session).unwrap_or(0);
 
-            self.send_keys(session, "Enter")?;
+            // Deliver text + Enter atomically via load-buffer + paste-buffer.
+            // This uses tmux's bracketed paste so the backend receives the
+            // entire payload (including the trailing newline) as a single
+            // paste event — no gap between text and Enter where input can
+            // be lost.
+            let text_with_newline = format!("{}\n", text);
+            self.paste_text(session, &text_with_newline)?;
 
-            // Verify Enter was processed: either activity advances or pane
-            // content changes (covers backends that update content without
-            // bumping the activity counter).
+            // Verify the backend processed the input: either pane content
+            // changed or activity timestamp advanced.
             if self.wait_for_change(
                 session,
                 activity_before,
                 &content_before,
-                opts.enter_verify_timeout,
+                opts.verify_timeout,
                 opts.poll_interval,
             ) {
                 return Ok(());
             }
 
-            // Enter didn't register — clear input and retry
+            // Didn't register — clear input and retry
             if attempt < opts.max_retries {
                 let _ = self.send_keys(session, "C-u");
                 thread::sleep(opts.retry_delay);
@@ -240,8 +247,7 @@ impl TmuxClient {
         }
 
         // Best-effort: even if verification failed, the prompt may have been
-        // delivered (some backends are slow to reflect changes). Log but don't
-        // treat as a hard error.
+        // delivered (some backends are slow to reflect changes).
         Ok(())
     }
 
@@ -271,26 +277,6 @@ impl TmuxClient {
         }
         // Timed out waiting for stability — proceed anyway
         Ok(())
-    }
-
-    /// Poll the pane until `needle` appears in the captured content, or timeout.
-    fn wait_for_text_in_pane(
-        &self,
-        session: &str,
-        needle: &str,
-        timeout: Duration,
-        poll_interval: Duration,
-    ) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < timeout {
-            if let Ok(content) = self.capture_pane(session, 50) {
-                if content.contains(needle) {
-                    return true;
-                }
-            }
-            thread::sleep(poll_interval);
-        }
-        false
     }
 
     /// Poll until either pane activity advances OR pane content changes.
@@ -449,8 +435,7 @@ mod tests {
         let opts = DeliveryOptions {
             startup_timeout: Duration::from_secs(3),
             stable_quiet: Duration::from_millis(200),
-            text_verify_timeout: Duration::from_millis(800),
-            enter_verify_timeout: Duration::from_millis(800),
+            verify_timeout: Duration::from_secs(2),
             max_retries: 3,
             poll_interval: Duration::from_millis(50),
             retry_delay: Duration::from_millis(100),
@@ -546,8 +531,7 @@ mod tests {
         let opts = DeliveryOptions {
             startup_timeout: Duration::from_secs(3),
             stable_quiet: Duration::from_millis(200),
-            text_verify_timeout: Duration::from_millis(800),
-            enter_verify_timeout: Duration::from_millis(800),
+            verify_timeout: Duration::from_secs(2),
             max_retries: 3,
             poll_interval: Duration::from_millis(50),
             retry_delay: Duration::from_millis(100),
