@@ -328,28 +328,26 @@ pub fn render(frame: &mut Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),             // EA switcher bar
             Constraint::Length(status_height), // Status bar
             Constraint::Min(8),                // Main content area
             Constraint::Length(1),             // Help bar
         ])
         .split(frame.area());
 
-    render_ea_bar(frame, app, outer[0]);
-    render_status_bar(frame, app, outer[1]);
+    render_status_bar(frame, app, outer[0]);
 
     // Two-column layout: sidebar + main content (sidebar can be left or right)
     let columns = if app.config.dashboard.sidebar_right {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(40)])
-            .split(outer[2]);
+            .split(outer[1]);
         (cols[1], cols[0]) // (sidebar, main)
     } else {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(40), Constraint::Min(0)])
-            .split(outer[2]);
+            .split(outer[1]);
         (cols[0], cols[1]) // (sidebar, main)
     };
     let (sidebar_area, main_area) = columns;
@@ -387,7 +385,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_agent_grid(frame, app, main_col[0]);
     render_focus_parent(frame, app, main_col[1]);
 
-    render_help_bar(frame, app, outer[3]);
+    render_help_bar(frame, app, outer[2]);
 
     // Render overlays
     if app.show_help {
@@ -524,41 +522,6 @@ fn render_status_row(frame: &mut Frame, app: &App, status_spans: &[Span], area: 
         )));
         frame.render_widget(quote_paragraph, h_chunks[1]);
     }
-}
-
-fn render_ea_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let mut spans: Vec<Span> = vec![Span::styled("EA: ", Style::default().fg(Color::Gray))];
-    for ea in &app.registered_eas {
-        let is_active = ea.id == app.active_ea;
-        let label = format!("{}:{}", ea.id, ea.name);
-        if is_active {
-            spans.push(Span::styled(
-                format!("[{}]", label),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            spans.push(Span::styled(label, Style::default().fg(Color::Gray)));
-        }
-        spans.push(Span::raw(" | "));
-    }
-    if !app.registered_eas.is_empty() {
-        spans.pop(); // Remove trailing " | "
-    }
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        "Alt+Left",
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::raw("/[/,:Prev "));
-    spans.push(Span::styled(
-        "Alt+Right",
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::raw("/]/.:Next"));
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_projects_panel(frame: &mut Frame, app: &App, area: Rect) {
@@ -1301,8 +1264,8 @@ fn render_help_popup(frame: &mut Frame) {
         Line::from("  N           Spawn new EA (prompts for name)"),
         Line::from("  D           Delete current EA (not the only one)"),
         Line::from("  p           Add a project"),
-        Line::from("  Alt+Left/[/,  Previous EA"),
-        Line::from("  Alt+Right/]/. Next EA"),
+        Line::from("  [           Previous EA"),
+        Line::from("  ]           Next EA"),
         Line::from("  e           Show scheduled events"),
         Line::from("  G           Debug console"),
         Line::from("  S           Settings"),

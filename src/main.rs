@@ -666,8 +666,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    // Enable keyboard enhancement so Alt+arrow arrives as a single event with ALT modifier
-    // rather than two separate events (Esc, then arrow) which would break Alt+Left/Right EA switching.
+    // Enable keyboard enhancement where supported (improves key reporting).
     let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
     if keyboard_enhanced {
         let _ = execute!(
@@ -901,9 +900,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             app.drill_up();
                         }
                         KeyCode::Right => {
-                            if key.modifiers.contains(KeyModifiers::ALT) {
-                                app.cycle_next_ea();
-                            } else if app.config.dashboard.sidebar_right {
+                            if app.config.dashboard.sidebar_right {
                                 // Sidebar is on the right: try grid right first, then sidebar
                                 if !app.grid_right() {
                                     app.sidebar_focused = true;
@@ -917,9 +914,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Left => {
-                            if key.modifiers.contains(KeyModifiers::ALT) {
-                                app.cycle_previous_ea();
-                            } else if app.config.dashboard.sidebar_right {
+                            if app.config.dashboard.sidebar_right {
                                 // Sidebar is on the right: try grid left (no fallback)
                                 if !app.grid_left() && app.sidebar_focused {
                                     app.sidebar_focused = false;
@@ -932,19 +927,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Char(']') => {
-                            // Fallback for terminals that don't emit Alt+Right.
-                            app.cycle_next_ea();
-                        }
-                        KeyCode::Char('.') => {
-                            // Additional fallback for layouts where [ ] are awkward.
                             app.cycle_next_ea();
                         }
                         KeyCode::Char('[') => {
-                            // Fallback for terminals that don't emit Alt+Left.
-                            app.cycle_previous_ea();
-                        }
-                        KeyCode::Char(',') => {
-                            // Additional fallback for layouts where [ ] are awkward.
                             app.cycle_previous_ea();
                         }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
