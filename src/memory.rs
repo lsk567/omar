@@ -231,6 +231,16 @@ pub fn write_memory_to(
     fs::write(&path, &out).ok();
 }
 
+/// Clear runtime/transient EA state that should not leak across dashboard sessions.
+/// Keeps durable artifacts such as projects and manager notes intact.
+pub fn clear_runtime_state_in(state_dir: &Path) {
+    let _ = fs::remove_file(state_dir.join("agent_parents.json"));
+    let _ = fs::remove_file(state_dir.join("worker_tasks.json"));
+    let _ = fs::remove_file(state_dir.join("memory.md"));
+    let _ = fs::remove_dir_all(state_dir.join("status"));
+    let _ = fs::create_dir_all(state_dir.join("status"));
+}
+
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]

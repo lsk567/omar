@@ -154,6 +154,11 @@ impl App {
             eprintln!("warn: ensure default EA: {}", e);
             ea::load_registry(&omar_dir)
         });
+        // Reset per-run transient EA data so stale hierarchy/status/task state
+        // does not leak from previous dashboard sessions.
+        for ea_info in &registered_eas {
+            memory::clear_runtime_state_in(&ea::ea_state_dir(ea_info.id, &omar_dir));
+        }
         let active_ea = ea::resolve_active_ea(&omar_dir, &registered_eas);
 
         // EA-scoped prefix and manager session
@@ -1053,7 +1058,13 @@ impl App {
 
         // Refresh discovers agents via the new prefix and reloads all EA state
         self.refresh()?;
-        self.set_status(format!("Switched to EA {}", ea_id));
+        let ea_label = self
+            .registered_eas
+            .iter()
+            .find(|ea| ea.id == ea_id)
+            .map(|ea| ea.name.clone())
+            .unwrap_or_else(|| format!("EA {}", ea_id));
+        self.set_status(format!("Switched to {}", ea_label));
         self.ea_input_mode = false;
         self.ea_input.clear();
         self.project_input_mode = false;
