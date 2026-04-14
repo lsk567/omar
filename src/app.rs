@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::ea::{self, EaId, EaInfo};
 use crate::memory;
 use crate::projects::{self, Project};
-use crate::scheduler::{PendingEaEvents, ScheduledEvent, Scheduler, TickerBuffer};
+use crate::scheduler::{ScheduledEvent, Scheduler, TickerBuffer};
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -131,16 +131,10 @@ pub struct App {
     default_workdir: String,
     session_prefix: String,
     pub scheduler: Arc<Scheduler>,
-    pending_ea_events: PendingEaEvents,
 }
 
 impl App {
-    pub fn new(
-        config: &Config,
-        ticker: TickerBuffer,
-        scheduler: Arc<Scheduler>,
-        pending_ea_events: PendingEaEvents,
-    ) -> Self {
+    pub fn new(config: &Config, ticker: TickerBuffer, scheduler: Arc<Scheduler>) -> Self {
         let base_prefix = config.dashboard.session_prefix.clone();
         let omar_dir = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -237,7 +231,6 @@ impl App {
             default_workdir: config.agent.default_workdir.clone(),
             session_prefix,
             scheduler,
-            pending_ea_events,
         }
     }
 
@@ -1185,7 +1178,6 @@ impl App {
         }
 
         let events_cancelled = self.scheduler.cancel_by_ea(ea_id);
-        self.pending_ea_events.lock().unwrap().remove(&ea_id);
 
         // Unregister EA
         ea::unregister_ea(&self.omar_dir, ea_id)?;

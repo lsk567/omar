@@ -2,22 +2,12 @@ pub mod event;
 
 pub use event::ScheduledEvent;
 
-use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::process::Command;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 use crate::ea;
-
-/// Per-EA queue of event messages pending delivery to the EA manager.
-/// The EA polls GET /api/ea/:ea_id/events/pending to drain this queue.
-pub type PendingEaEvents = Arc<Mutex<HashMap<u32, VecDeque<String>>>>;
-
-/// Create a new, empty pending-EA-events queue.
-pub fn new_pending_ea_events() -> PendingEaEvents {
-    Arc::new(Mutex::new(HashMap::new()))
-}
 
 /// A ticker message with its creation time.
 struct TickerEntry {
@@ -199,60 +189,24 @@ pub(crate) fn deliver_to_tmux(
     message: &str,
     base_prefix: &str,
     ticker: &TickerBuffer,
-    pending_ea_events: &PendingEaEvents,
 ) {
-    if receiver == "ea" || receiver == "omar" {
-        // Queue the event for the EA manager to poll instead of injecting
-        // it into the readline buffer (which corrupts mid-typing input).
-        let ea_pane_target = ea::ea_manager_session(ea_id, base_prefix);
-
-        {
-            let mut map = pending_ea_events.lock().unwrap();
-            map.entry(ea_id).or_default().push_back(message.to_string());
-        }
-
-        // Flash a status-bar notification so the human sees it immediately.
-        let flash_text: String = message.chars().take(80).collect();
-        let flash_msg = format!("⚡ [EVENT] {}", flash_text);
-        let _ = Command::new("tmux")
-            .args([
-                "display-message",
-                "-t",
-                &ea_pane_target,
-                "-d",
-                "4000",
-                &flash_msg,
-            ])
-            .output();
-
-        ticker.push(format!(
-            "queued event for EA {} manager ({})",
-            ea_id, ea_pane_target
-        ));
+    // Keep one consistent delivery method for all agents, including EA.
+    let target = if receiver == "ea" || receiver == "omar" {
+        ea::ea_manager_session(ea_id, base_prefix)
     } else {
         let prefix = ea::ea_prefix(ea_id, base_prefix);
-        let target = format!("{}{}", prefix, receiver);
-
-        let result = Command::new("tmux")
-            .args(["send-keys", "-t", &target, "-l", message])
-            .output();
-
-        match result {
-            Ok(output) if output.status.success() => {
-                // Send Enter to submit the message
-                let _ = Command::new("tmux")
-                    .args(["send-keys", "-t", &target, "Enter"])
-                    .output();
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                ticker.push(format!("tmux send-keys failed for {}: {}", target, stderr));
-            }
-            Err(e) => {
-                ticker.push(format!("failed to run tmux for {}: {}", target, e));
-            }
-        }
+        format!("{}{}", prefix, receiver)
+    };
+    let client = crate::tmux::TmuxClient::new("");
+    if let Err(e) = client.send_keys_literal(&target, message) {
+        ticker.push(format!("tmux send-keys failed for {}: {}", target, e));
+        return;
     }
+    if let Err(e) = client.send_keys(&target, "Enter") {
+        ticker.push(format!("tmux send-keys failed for {}: {}", target, e));
+        return;
+    }
+    ticker.push(format!("delivered event(s) to {}", receiver));
 }
 
 fn format_delivery(events: &[ScheduledEvent], timestamp: u64) -> String {
@@ -308,7 +262,6 @@ pub async fn run_event_loop(
     ticker: TickerBuffer,
     popup_receiver: PopupReceiver,
     base_prefix: String,
-    pending_ea_events: PendingEaEvents,
 ) {
     loop {
         let next_ts = {
@@ -413,14 +366,7 @@ pub async fn run_event_loop(
                     // Track events delivered for this EA this tick.
                     *ea_delivery_count.entry(*ea_id).or_insert(0) += batch.len();
                     let message = format_delivery(&batch, earliest_ts);
-                    deliver_to_tmux(
-                        *ea_id,
-                        receiver,
-                        &message,
-                        &base_prefix,
-                        &ticker,
-                        &pending_ea_events,
-                    );
+                    deliver_to_tmux(*ea_id, receiver, &message, &base_prefix, &ticker);
 
                     // Re-insert recurring events with a fresh timestamp and ID
                     for ev in &batch {
