@@ -33,6 +33,7 @@ tracing = "0.1.44"
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
+tower = { version = "0.5.3", features = ["util"] }
 
 [[bin]]
 name = "omar"

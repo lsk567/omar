@@ -42,6 +42,19 @@ fn display_name<'a>(prefix: &str, session_name: &'a str) -> &'a str {
     session_name.strip_prefix(prefix).unwrap_or(session_name)
 }
 
+/// Check if a session is currently attached (user has a tmux client connected).
+/// Caller must call `app.refresh()` first to ensure agent state is current.
+fn is_session_attached(app: &SharedApp, session_name: &str) -> bool {
+    is_attached_in(app.agents(), session_name)
+}
+
+/// Pure helper: returns true if the named session appears in `agents` and is attached.
+fn is_attached_in(agents: &[crate::app::AgentInfo], session_name: &str) -> bool {
+    agents
+        .iter()
+        .any(|a| a.session.name == session_name && a.session.attached)
+}
+
 fn parse_spawn_agent_request(
     query: SpawnAgentRequest,
     headers: &HeaderMap,
@@ -426,7 +439,7 @@ pub async fn kill_agent(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = state.app.lock().await;
+    let mut app = state.app.lock().await;
 
     let prefix = app.client().prefix().to_string();
     let session_name = resolve_session_name(&prefix, &id);
@@ -447,6 +460,26 @@ pub async fn kill_agent(
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: format!("Agent '{}' not found", id),
+            }),
+        ));
+    }
+
+    // Don't kill sessions the user is currently attached to (e.g., popup view).
+    // Fail closed: if refresh fails we cannot confirm attachment state.
+    if let Err(e) = app.refresh() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to refresh before kill: {}", e),
+            }),
+        ));
+    }
+    let is_attached = is_session_attached(&app, &session_name);
+    if is_attached {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: format!("Cannot kill attached session '{}'", id),
             }),
         ));
     }
@@ -1057,9 +1090,48 @@ pub async fn computer_mouse_position(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_spawn_agent_request;
+    use super::{is_attached_in, parse_spawn_agent_request};
     use crate::api::models::SpawnAgentRequest;
+    use crate::app::AgentInfo;
+    use crate::tmux::{HealthInfo, HealthState, Session};
     use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    fn make_agent(name: &str, attached: bool) -> AgentInfo {
+        AgentInfo {
+            session: Session {
+                name: name.to_string(),
+                activity: 0,
+                attached,
+                pane_pid: 0,
+            },
+            health: HealthState::Running,
+            health_info: HealthInfo {
+                state: HealthState::Running,
+                last_output: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn is_attached_in_returns_true_for_attached_session() {
+        let agents = vec![
+            make_agent("omar-agent-foo", false),
+            make_agent("omar-agent-bar", true),
+        ];
+        assert!(is_attached_in(&agents, "omar-agent-bar"));
+    }
+
+    #[test]
+    fn is_attached_in_returns_false_for_detached_session() {
+        let agents = vec![make_agent("omar-agent-foo", false)];
+        assert!(!is_attached_in(&agents, "omar-agent-foo"));
+    }
+
+    #[test]
+    fn is_attached_in_returns_false_for_unknown_session() {
+        let agents = vec![make_agent("omar-agent-foo", true)];
+        assert!(!is_attached_in(&agents, "omar-agent-missing"));
+    }
 
     #[test]
     fn parse_spawn_agent_request_accepts_plain_text_body() {
@@ -1151,5 +1223,161 @@ mod tests {
         .unwrap();
 
         assert_eq!(req.backend.as_deref(), Some("codex"));
+    }
+
+    /// Integration test: DELETE /api/agents/:id returns 403 for the manager.
+    #[tokio::test]
+    async fn kill_agent_returns_403_for_manager() {
+        use crate::api;
+        use crate::computer::ComputerLock;
+        use crate::config::Config;
+        use crate::scheduler::{Scheduler, TickerBuffer};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tower::ServiceExt;
+
+        let config = Config::default();
+        let ticker = TickerBuffer::new();
+        let app = crate::app::App::new(config, ticker);
+
+        let state = Arc::new(super::ApiState {
+            app: Arc::new(Mutex::new(app)),
+            scheduler: Arc::new(Scheduler::new()),
+            computer_lock: ComputerLock::default(),
+        });
+
+        let router = api::create_router(state);
+
+        // Try to kill the EA — should be forbidden.
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/agents/omar-agent-ea")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "Expected 403 when trying to kill the manager"
+        );
+    }
+
+    /// Integration test: DELETE /api/agents/:id returns 404 for unknown agent.
+    #[tokio::test]
+    async fn kill_agent_returns_404_for_unknown() {
+        use crate::api;
+        use crate::computer::ComputerLock;
+        use crate::config::Config;
+        use crate::scheduler::{Scheduler, TickerBuffer};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tower::ServiceExt;
+
+        let config = Config::default();
+        let ticker = TickerBuffer::new();
+        let app = crate::app::App::new(config, ticker);
+
+        let state = Arc::new(super::ApiState {
+            app: Arc::new(Mutex::new(app)),
+            scheduler: Arc::new(Scheduler::new()),
+            computer_lock: ComputerLock::default(),
+        });
+
+        let router = api::create_router(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/agents/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "Expected 404 for nonexistent agent"
+        );
+    }
+
+    /// Integration test: DELETE /api/agents/:id succeeds for detached sessions.
+    #[tokio::test]
+    async fn kill_agent_succeeds_for_detached_session() {
+        use crate::api;
+        use crate::computer::ComputerLock;
+        use crate::config::Config;
+        use crate::scheduler::{Scheduler, TickerBuffer};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tower::ServiceExt;
+
+        // Need a real tmux session so has_session() returns true and
+        // kill_session() actually works.
+        let session = "omar-agent-killable";
+        let tmux_ok = std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !tmux_ok {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let created = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", session, "sleep", "60"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !created {
+            eprintln!("Skipping test: could not create tmux session");
+            return;
+        }
+
+        // Cleanup guard
+        struct Guard(&'static str);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", self.0])
+                    .output();
+            }
+        }
+        let _guard = Guard(session);
+
+        let config = Config::default();
+        let ticker = TickerBuffer::new();
+        let mut app = crate::app::App::new(config, ticker);
+        // Inject as detached
+        app.agents.push(make_agent(session, false));
+
+        let state = Arc::new(super::ApiState {
+            app: Arc::new(Mutex::new(app)),
+            scheduler: Arc::new(Scheduler::new()),
+            computer_lock: ComputerLock::default(),
+        });
+
+        let router = api::create_router(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/agents/killable")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Expected 200 for detached session kill"
+        );
     }
 }
