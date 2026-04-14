@@ -3,7 +3,6 @@ pub mod event;
 pub use event::ScheduledEvent;
 
 use std::collections::{BinaryHeap, VecDeque};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -41,14 +40,39 @@ impl TickerBuffer {
 
     /// Return the joined ticker content, filtering entries older than `ttl`.
     /// Does NOT prune the buffer — old entries remain for `latest()` / debug console.
+    ///
+    /// When there are many recent messages, collapses them into a summary
+    /// (e.g. "3 errors, 2 info — press D for details") to avoid spilling
+    /// across the dashboard.
     pub fn render(&self, ttl: std::time::Duration) -> String {
         let buf = self.entries.lock().unwrap();
         let now = Instant::now();
-        buf.iter()
+        let recent: Vec<&str> = buf
+            .iter()
             .filter(|e| now.duration_since(e.created_at) < ttl)
             .map(|e| e.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" +++ ")
+            .collect();
+
+        if recent.len() <= 2 {
+            return recent.join(" +++ ");
+        }
+
+        // Collapse into a summary when there are many messages.
+        let errors = recent
+            .iter()
+            .filter(|t| t.contains("failed") || t.contains("error") || t.contains("Error"))
+            .count();
+        let other = recent.len() - errors;
+
+        let mut parts = Vec::new();
+        if errors > 0 {
+            parts.push(format!("{} error(s)", errors));
+        }
+        if other > 0 {
+            parts.push(format!("{} info", other));
+        }
+        parts.push("press D for details".to_string());
+        parts.join(", ")
     }
 
     /// Return the last `n` messages regardless of age (for debug console).
@@ -161,29 +185,38 @@ impl Scheduler {
     }
 }
 
-pub(crate) fn deliver_to_tmux(receiver: &str, message: &str, ticker: &TickerBuffer) {
+pub(crate) fn deliver_to_tmux(
+    receiver: &str,
+    message: &str,
+    event_count: usize,
+    scheduled_ts: u64,
+    ticker: &TickerBuffer,
+) {
+    // Use the reliable delivery path so scheduled events / inter-agent messages
+    // land deterministically regardless of backend startup / input buffering.
+    //
+    // Scheduler targets are already-running agents (not fresh spawns), so use
+    // tighter timeouts than the spawn-agent defaults.
     let target = format!("omar-agent-{}", receiver);
-    let result = Command::new("tmux")
-        .args(["send-keys", "-t", &target, "-l", message])
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            // Small delay so tmux finishes processing bracketed paste
-            // before we send the Enter key to submit it.
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            // Send Enter to submit the message
-            let _ = Command::new("tmux")
-                .args(["send-keys", "-t", &target, "Enter"])
-                .output();
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            ticker.push(format!("tmux send-keys failed for {}: {}", target, stderr));
+    let client = crate::tmux::TmuxClient::new("omar-agent-");
+    let opts = crate::tmux::DeliveryOptions {
+        startup_timeout: std::time::Duration::from_secs(3),
+        stable_quiet: std::time::Duration::from_millis(200),
+        verify_timeout: std::time::Duration::from_secs(2),
+        max_retries: 3,
+        poll_interval: std::time::Duration::from_millis(50),
+        retry_delay: std::time::Duration::from_millis(150),
+    };
+    match client.deliver_prompt(&target, message, &opts) {
+        Ok(()) => {
+            let lag_ms = now_ns().saturating_sub(scheduled_ts) as f64 / 1_000_000.0;
+            ticker.push(format!(
+                "delivered {} event(s) to {}, lag={:.2}ms",
+                event_count, receiver, lag_ms
+            ));
         }
         Err(e) => {
-            ticker.push(format!("failed to run tmux for {}: {}", target, e));
+            ticker.push(format!("event delivery failed for {}: {}", target, e));
         }
     }
 }
@@ -300,9 +333,11 @@ pub async fn run_event_loop(
                         continue;
                     }
                     let message = format_delivery(&batch, earliest_ts);
-                    deliver_to_tmux(receiver, &message, &ticker);
+                    let batch_len = batch.len();
 
                     // Re-insert recurring events with a fresh timestamp and ID
+                    // BEFORE spawning delivery, so the queue stays consistent
+                    // regardless of whether delivery succeeds.
                     for ev in &batch {
                         if let Some(interval) = ev.recurring_ns {
                             let next = ScheduledEvent {
@@ -318,14 +353,23 @@ pub async fn run_event_loop(
                         }
                     }
 
-                    let lag_ns = now_ns().saturating_sub(earliest_ts);
-                    let lag_ms = lag_ns as f64 / 1_000_000.0;
-                    ticker.push(format!(
-                        "delivered {} event(s) to {}, lag={:.2}ms",
-                        batch.len(),
-                        receiver,
-                        lag_ms
-                    ));
+                    // Run blocking delivery off the async runtime so the loop
+                    // stays responsive for other scheduled events. Success /
+                    // failure telemetry is logged from inside the blocking
+                    // task (see deliver_to_tmux) so the ticker reflects
+                    // actual delivery, not queuing.
+                    let receiver_owned = receiver.clone();
+                    let message_owned = message.clone();
+                    let ticker_clone = ticker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        deliver_to_tmux(
+                            &receiver_owned,
+                            &message_owned,
+                            batch_len,
+                            earliest_ts,
+                            &ticker_clone,
+                        );
+                    });
                 }
             }
         }
@@ -335,6 +379,7 @@ pub async fn run_event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn make_event(receiver: &str, sender: &str, timestamp: u64, payload: &str) -> ScheduledEvent {
         ScheduledEvent {
@@ -523,7 +568,7 @@ mod tests {
 
         // deliver_to_tmux prepends "omar-agent-" to the receiver name
         let ticker = TickerBuffer::new();
-        deliver_to_tmux("test-deliver", "hello-from-scheduler", &ticker);
+        deliver_to_tmux("test-deliver", "hello-from-scheduler", 1, now_ns(), &ticker);
 
         // Give tmux a moment to process the send-keys
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -621,6 +666,27 @@ mod tests {
         // Render with zero TTL — everything expires immediately
         let out = ticker.render(std::time::Duration::ZERO);
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn test_ticker_collapse_many_messages() {
+        let ticker = TickerBuffer::new();
+        ticker.push("delivered 1 event(s) to worker-1");
+        ticker.push("event delivery failed for worker-2: timeout");
+        ticker.push("event delivery failed for worker-3: timeout");
+        ticker.push("delivered 1 event(s) to worker-4");
+        let out = ticker.render(std::time::Duration::from_secs(30));
+        assert!(
+            out.contains("2 error(s)"),
+            "expected error count, got: {}",
+            out
+        );
+        assert!(out.contains("2 info"), "expected info count, got: {}", out);
+        assert!(
+            out.contains("press D for details"),
+            "expected D hint, got: {}",
+            out
+        );
     }
 
     #[test]

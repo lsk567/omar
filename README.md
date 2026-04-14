@@ -1,10 +1,8 @@
 <div align="center">
 
-# one-man army
+# Open Multi-Agent Runtime
 
-<img src="docs/img/thermopylae.png" alt="thermopylae" width="450" />
-
-Lead an army of 300 agents to solve humanity's biggest problems.
+Lead a team of 100 agents to solve humanity's biggest problems.
 
 **`omar` is a TUI for creating powerful agentic organizations.**
 
@@ -20,21 +18,22 @@ Lead an army of 300 agents to solve humanity's biggest problems.
 
 ## Features
 
-- Professional TUI dashboard for all your agents in one place
-- Deep hierarchy of parallel agents, just like a company
-- Talk to any agent - you are in control
-- Messaging systems integration (e.g., Slack, etc.)
-- Computer use (Linux)
-- Highly customizable, supporting all `tmux` commands
+- **Deep hierarchies**: Agents managing agents, just like a company.
+- **Heterogeneity**: Let `claude`, `codex`, and more collaborate as a team.
+- **Full control**: Talk to and control any subagent you want.
+- **Life span**: Long-running or ephemeral agents, your choice.
+- **Customization**: Support all `tmux` commands you love.
+
+Other features include messaging systems integration (e.g., Slack), computer use, and more.
 
 ## Installation
 
-#### Prerequisites
+### Prerequisites
 
 - **tmux 3.0+** — `brew install tmux` (macOS) or `apt install tmux` (Debian/Ubuntu)
-- [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex CLI](https://developers.openai.com/codex/cli), or [Opencode](https://github.com/anomalyco/opencode)
+- At least one agent backend: [Claude](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex](https://developers.openai.com/codex/cli), [Opencode](https://github.com/anomalyco/opencode), or [Cursor](https://cursor.com/cli).
 
-#### One-liner (recommended)
+### One-liner (recommended)
 
 ```bash
 curl -fsSL https://omarmy.ai/install.sh | sh
@@ -42,13 +41,13 @@ curl -fsSL https://omarmy.ai/install.sh | sh
 
 Installs all binaries to `/usr/local/bin`.
 
-#### Homebrew
+### Homebrew
 
 ```bash
 brew install lsk567/omar/omar
 ```
 
-#### Build from source
+### Build from source
 
 Requires Rust 1.70+ and GNU Make.
 
@@ -69,11 +68,11 @@ https://github.com/user-attachments/assets/b720eb41-1d97-4331-9c2c-10a0e4580286
 
 Go [here](#supported-agent-backends) to see how to launch with other agent backends.
 
-#### Step 2: Tell your executive assistent (EA) to run a test prompt.
+#### Step 2: Tell your Executive Assistant (EA) to run a test prompt.
 
 Copy the following into your EA window:
 ```
-Load and run <omar-root>/prompts/tests/project-factory.md
+Load and run https://github.com/lsk567/omar/blob/main/prompts/tests/project-factory.md
 ```
 
 https://github.com/user-attachments/assets/3dfe5bd3-9b9f-474c-a036-a1058413935d
@@ -88,20 +87,19 @@ https://github.com/user-attachments/assets/dc94edb4-24ea-4e7e-aa8c-f0bc31d09d3f
 
 Go back to the EA and type in:
 ```
-Shutdown the test project and its agents. Delete <omar-root>/junk/ folder.
+Shutdown the test project and its agents.
 ```
 
 https://github.com/user-attachments/assets/94b9a78f-5eb2-4557-9932-f17fed536ba5
 
 ## Supported Agent Backends
 
-Omar auto-detects which agent backend is available on your system:
-
 | Backend | How to launch |
 |---------|---------------|
-| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar` (default) |
+| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar` or `omar --agent claude` |
 | [Codex CLI](https://developers.openai.com/codex/cli) | `omar --agent codex` |
 | [Opencode](https://github.com/anomalyco/opencode) | `omar --agent opencode` |
+| [Cursor CLI](https://cursor.com/cli) | `omar --agent cursor` |
 
 ## License
 
