@@ -642,7 +642,9 @@ pub async fn log_justification(
         .join(&session_id);
     let _ = std::fs::create_dir_all(&log_dir);
 
-    let log_file_path = log_dir.join("justifications.jsonl");
+    let full_name = resolve_session_name(&prefix, &req.agent_name);
+    let short_name = display_name(&prefix, &full_name);
+    let log_file_path = log_dir.join(format!("{}.jsonl", short_name));
 
     if let Ok(json_line) = serde_json::to_string(&entry) {
         use tokio::io::AsyncWriteExt;
