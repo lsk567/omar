@@ -267,8 +267,9 @@ impl App {
         // Ensure manager exists
         self.ensure_manager()?;
 
-        // Get all sessions
-        let sessions = self.client.list_all_sessions()?;
+        // Get all sessions (used for both active EA state and multi-EA CoC sidebar)
+        let all_sessions = self.client.list_all_sessions()?;
+        let sessions = all_sessions.clone();
 
         // Separate manager from other agents, filtering out non-EA sessions
         let mut manager_session_found = None;
@@ -359,46 +360,55 @@ impl App {
             }
             self.agent_statuses = new_statuses;
         }
-        let active_tree = build_tree(
-            &self.agents,
-            self.manager.as_ref(),
-            &self.agent_parents,
-            &self.session_prefix,
-            &manager_session,
-        );
-
-        // Build multi-EA CoC: all EAs sorted by ID, active one expanded, others collapsed.
-        let active_ea_name = self
-            .registered_eas
-            .iter()
-            .find(|e| e.id == self.active_ea)
-            .map(|e| e.name.clone())
-            .unwrap_or_else(|| format!("EA {}", self.active_ea));
+        // Build multi-EA CoC: all EAs sorted by ID, each with its real subtree and health.
 
         let mut sorted_eas = self.registered_eas.clone();
         sorted_eas.sort_by_key(|e| e.id);
 
         let mut all_nodes: Vec<CommandTreeNode> = Vec::new();
         for ea_info in &sorted_eas {
-            if ea_info.id == self.active_ea {
-                // Expanded: full subtree, root label = EA name
-                let mut nodes = active_tree.clone();
-                if let Some(root) = nodes.first_mut() {
-                    root.name = active_ea_name.clone();
+            let ea_prefix = ea::ea_prefix(ea_info.id, &self.base_prefix);
+            let ea_manager = ea::ea_manager_session(ea_info.id, &self.base_prefix);
+            let ea_state_dir = ea::ea_state_dir(ea_info.id, &self.omar_dir);
+            let ea_parents = memory::load_agent_parents_from(&ea_state_dir);
+
+            let mut manager_info = None;
+            let mut ea_agents = Vec::new();
+
+            for session in &all_sessions {
+                if session.name == DASHBOARD_SESSION {
+                    continue;
                 }
-                all_nodes.extend(nodes);
-            } else {
-                // Collapsed: single row, no children
-                let other_manager = ea::ea_manager_session(ea_info.id, &self.base_prefix);
-                all_nodes.push(CommandTreeNode {
-                    name: ea_info.name.clone(),
-                    session_name: other_manager,
-                    health: HealthState::Idle,
-                    depth: 0,
-                    is_last_sibling: true,
-                    ancestor_is_last: vec![],
-                });
+                if session.name == ea_manager {
+                    let health_info = self.health_checker.check_detailed(&session.name);
+                    let health = health_info.state;
+                    manager_info = Some(AgentInfo {
+                        session: session.clone(),
+                        health,
+                        health_info,
+                    });
+                } else if !ea_prefix.is_empty() && session.name.starts_with(&ea_prefix) {
+                    let health_info = self.health_checker.check_detailed(&session.name);
+                    let health = health_info.state;
+                    ea_agents.push(AgentInfo {
+                        session: session.clone(),
+                        health,
+                        health_info,
+                    });
+                }
             }
+
+            let mut nodes = build_tree(
+                &ea_agents,
+                manager_info.as_ref(),
+                &ea_parents,
+                &ea_prefix,
+                &ea_manager,
+            );
+            if let Some(root) = nodes.first_mut() {
+                root.name = ea_info.name.clone();
+            }
+            all_nodes.extend(nodes);
         }
         self.command_tree = all_nodes;
 
