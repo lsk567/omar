@@ -1183,20 +1183,18 @@ async fn run_dashboard(config: Config) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // Fix V3: Kill ALL EAs' managers and workers on quit (not just active EA)
+    // Kill ALL OMAR EA sessions on quit (managers + workers), even if
+    // registry and tmux are temporarily out of sync.
     {
         let app = shared_app.lock().await;
-        for ea_info in &app.registered_eas {
-            let prefix = ea::ea_prefix(ea_info.id, &app.base_prefix);
-            let manager = ea::ea_manager_session(ea_info.id, &app.base_prefix);
-            let client = TmuxClient::new(&prefix);
-            // Kill all worker sessions for this EA
-            for session in client.list_sessions().unwrap_or_default() {
-                let _ = client.kill_session(&session.name);
-            }
-            // Kill the manager session
-            if client.has_session(&manager).unwrap_or(false) {
-                let _ = client.kill_session(&manager);
+        let client = TmuxClient::new("");
+        let base_prefix = app.base_prefix.clone();
+
+        if let Ok(sessions) = client.list_all_sessions() {
+            for session in sessions {
+                if session.name.starts_with(&base_prefix) {
+                    let _ = client.kill_session(&session.name);
+                }
             }
         }
     }
