@@ -372,11 +372,14 @@ fn test_omar_spawn_and_kill() {
 
     cleanup_test_sessions();
 
-    // CLI commands now target the default EA namespace.
-    let full_session = "omar-agent-0-test-spawn";
-
-    // Clean up from previous test runs
-    let _ = tmux(&["kill-session", "-t", full_session]);
+    // Clean up from previous test runs across EA namespaces
+    if let Ok(output) = tmux(&["list-sessions", "-F", "#{session_name}"]) {
+        for line in output.lines() {
+            if line == "test-spawn" || line.ends_with("-test-spawn") {
+                let _ = tmux(&["kill-session", "-t", line]);
+            }
+        }
+    }
 
     // Spawn a new agent
     let output = Command::new("cargo")
@@ -392,10 +395,18 @@ fn test_omar_spawn_and_kill() {
         stdout
     );
 
-    // Verify session exists with the prefixed name
+    // Resolve the full spawned session name dynamically, since active EA id can vary.
     thread::sleep(Duration::from_millis(200));
+    let all_sessions = tmux(&["list-sessions", "-F", "#{session_name}"]).unwrap_or_default();
+    let full_session = all_sessions
+        .lines()
+        .find(|line| *line == "test-spawn" || line.ends_with("-test-spawn"))
+        .map(ToString::to_string)
+        .expect("Expected a spawned session ending with '-test-spawn'");
+
+    // Verify session exists
     let result = Command::new("tmux")
-        .args(["has-session", "-t", full_session])
+        .args(["has-session", "-t", &full_session])
         .output()
         .unwrap();
     assert!(result.status.success(), "Session should exist after spawn");
@@ -431,7 +442,7 @@ fn test_omar_spawn_and_kill() {
     // Verify session is gone
     thread::sleep(Duration::from_millis(100));
     let result = Command::new("tmux")
-        .args(["has-session", "-t", full_session])
+        .args(["has-session", "-t", &full_session])
         .output()
         .unwrap();
     assert!(

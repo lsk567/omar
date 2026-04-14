@@ -362,6 +362,7 @@ pub struct ComputerAvailabilityResponse {
 // ── Logging models ──
 
 /// Request to log a justification
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct LogRequest {
     pub agent_name: String,
@@ -370,6 +371,7 @@ pub struct LogRequest {
 }
 
 /// JSONL log entry format
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct LogEntry {
     pub timestamp: String,
