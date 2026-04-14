@@ -36,6 +36,25 @@ fn coalesce_alt_arrow(first: KeyEvent, next: Option<Event>) -> (AppEvent, Option
                 );
             }
 
+            // Some terminals send Option/Alt+Arrow as Esc+b / Esc+f.
+            if next_key.modifiers.is_empty() {
+                match next_key.code {
+                    KeyCode::Char('b') => {
+                        return (
+                            AppEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+                            None,
+                        );
+                    }
+                    KeyCode::Char('f') => {
+                        return (
+                            AppEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+                            None,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
             return (AppEvent::Key(first), Some(AppEvent::Key(next_key)));
         }
 
@@ -196,5 +215,45 @@ mod tests {
             }
             _ => panic!("expected pending key event"),
         }
+    }
+
+    #[test]
+    fn coalesces_escape_b_into_alt_left() {
+        let (event, pending) = coalesce_alt_arrow(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::empty(),
+            ))),
+        );
+
+        match event {
+            AppEvent::Key(key) => {
+                assert_eq!(key.code, KeyCode::Left);
+                assert!(key.modifiers.contains(KeyModifiers::ALT));
+            }
+            _ => panic!("expected key event"),
+        }
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn coalesces_escape_f_into_alt_right() {
+        let (event, pending) = coalesce_alt_arrow(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::empty(),
+            ))),
+        );
+
+        match event {
+            AppEvent::Key(key) => {
+                assert_eq!(key.code, KeyCode::Right);
+                assert!(key.modifiers.contains(KeyModifiers::ALT));
+            }
+            _ => panic!("expected key event"),
+        }
+        assert!(pending.is_none());
     }
 }

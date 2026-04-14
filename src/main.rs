@@ -925,6 +925,14 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 }
                             }
                         }
+                        KeyCode::Char(']') => {
+                            // Fallback for terminals that don't emit Alt+Right.
+                            app.cycle_next_ea();
+                        }
+                        KeyCode::Char('[') => {
+                            // Fallback for terminals that don't emit Alt+Left.
+                            app.cycle_previous_ea();
+                        }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.pending_confirm = Some(app::ConfirmAction::Quit);
                         }
