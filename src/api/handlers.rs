@@ -639,12 +639,16 @@ pub async fn log_justification(
         .unwrap_or_else(|| "ea".to_string());
 
     let session_id = app.session_id.clone();
-    let filename = format!("justifications_{}_{}.jsonl", ea_name, session_id);
 
-    let log_file_path = dirs::home_dir()
+    let log_dir = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".omar")
-        .join(filename);
+        .join("logs")
+        .join(&session_id);
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let filename = format!("justifications_{}.jsonl", ea_name);
+    let log_file_path = log_dir.join(filename);
 
     if let Ok(json_line) = serde_json::to_string(&entry) {
         use tokio::io::AsyncWriteExt;
