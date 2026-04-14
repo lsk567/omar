@@ -150,6 +150,9 @@ impl App {
         ea::migrate_legacy_state(&omar_dir);
         ea::migrate_legacy_sessions(&base_prefix);
 
+        // Start each dashboard session with a fresh EA registry/state.
+        ea::clear_registry_and_state(&omar_dir);
+
         let registered_eas = ea::ensure_default_ea(&omar_dir).unwrap_or_else(|e| {
             eprintln!("warn: ensure default EA: {}", e);
             ea::load_registry(&omar_dir)

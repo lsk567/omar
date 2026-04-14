@@ -245,6 +245,32 @@ fn save_registry(base_dir: &Path, eas: &[EaInfo]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Clear persisted EA registry/state so each dashboard run starts fresh.
+/// This removes:
+/// - eas.json (EA registry)
+/// - active_ea
+/// - ea_next_id
+/// - ea/ (per-EA state directories)
+/// - manager_notes_ea*.md
+pub fn clear_registry_and_state(base_dir: &Path) {
+    let _ = fs::remove_file(base_dir.join("eas.json"));
+    let _ = fs::remove_file(base_dir.join("active_ea"));
+    let _ = fs::remove_file(base_dir.join("ea_next_id"));
+    let _ = fs::remove_dir_all(base_dir.join("ea"));
+
+    if let Ok(entries) = fs::read_dir(base_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if name.starts_with("manager_notes_ea") && name.ends_with(".md") {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// Migrate legacy state files from ~/.omar/ to ~/.omar/ea/0/
 pub fn migrate_legacy_state(omar_dir: &Path) {
     let ea0_dir = ea_state_dir(0, omar_dir);
