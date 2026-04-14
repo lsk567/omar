@@ -315,6 +315,9 @@ const QUOTES: &[&str] = &[
     "\"Pain and suffering are always inevitable for a large intelligence and a deep heart.\" — Fyodor Dostoevsky",
     // Leo Tolstoy
     "\"Everyone thinks of changing the world, but no one thinks of changing himself.\" — Leo Tolstoy",
+    // Prophetic Tradition
+    "\"The leader of a people is their servant.\" — Prophetic Tradition",
+    "\"All of you are shepherds and each of you is responsible for his flock.\" — Prophetic Tradition",
 ];
 
 pub const QUOTE_COUNT: usize = QUOTES.len();

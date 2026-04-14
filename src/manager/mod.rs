@@ -59,6 +59,7 @@ enum BackendKind {
     Claude,
     Codex,
     Cursor,
+    Gemini,
     Opencode,
 }
 
@@ -73,6 +74,7 @@ fn detect_backend_token(token: &str) -> Option<BackendKind> {
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
         "cursor" => Some(BackendKind::Cursor),
+        "gemini" => Some(BackendKind::Gemini),
         "opencode" => Some(BackendKind::Opencode),
         _ => None,
     }
@@ -123,6 +125,7 @@ fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -
 ///   - claude  → `--system-prompt "$(cat '<path>')"`
 ///   - codex   → `-c "developer_instructions='''$(cat '<path>')'''"`
 ///   - cursor  → positional arg `"Load the <path> file and follow the instructions."`
+///   - gemini  → `-i "$(cat '<path>')"`
 ///   - opencode → `--prompt "$(cat '<path>')"`
 ///   - unknown → returns `base_command` unchanged
 pub fn build_agent_command(
@@ -157,6 +160,9 @@ pub fn build_agent_command(
                 base_command,
                 rendered.display()
             )
+        }
+        Some(BackendKind::Gemini) => {
+            format!("TERM=xterm-256color {} -i \"{}\"", base_command, shell_expr)
         }
         Some(BackendKind::Opencode) => format!("{} --prompt \"{}\"", base_command, shell_expr),
         None => base_command.to_string(),
@@ -614,6 +620,28 @@ mod tests {
         assert_eq!(
             cmd,
             "cursor agent --yolo \"Load the '/tmp/prompts/ea.md' file and follow the instructions.\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_gemini() {
+        let cmd = build_agent_command("gemini --yolo", Path::new("/tmp/prompts/ea.md"), &[]);
+        assert_eq!(
+            cmd,
+            "TERM=xterm-256color gemini --yolo -i \"$(cat '/tmp/prompts/ea.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_gemini() {
+        let cmd = build_agent_command(
+            "env FOO=bar gemini --yolo",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "TERM=xterm-256color env FOO=bar gemini --yolo -i \"$(cat '/tmp/prompts/ea.md')\""
         );
     }
 

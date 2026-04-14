@@ -124,7 +124,11 @@ fn detect_agent_command() -> String {
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
         ),
         ("cursor", "cursor agent --yolo"),
-        ("opencode", "opencode"),
+        ("gemini", "gemini --yolo"),
+        (
+            "opencode",
+            "OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode",
+        ),
     ] {
         if Command::new(binary)
             .arg("--version")
@@ -148,7 +152,8 @@ fn default_command() -> String {
 /// - `"claude"` → `"claude --dangerously-skip-permissions"`
 /// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
 /// - `"cursor"` → `"cursor agent --yolo"`
-/// - `"opencode"` → `"opencode"`
+/// - `"gemini"` → `"gemini --yolo"`
+/// - `"opencode"` → `"opencode --dangerously-skip-permissions"`
 /// - anything else → error
 pub fn resolve_backend(name: &str) -> Result<String, String> {
     match name {
@@ -157,9 +162,10 @@ pub fn resolve_backend(name: &str) -> Result<String, String> {
             Ok("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string())
         }
         "cursor" => Ok("cursor agent --yolo".to_string()),
-        "opencode" => Ok("opencode".to_string()),
+        "gemini" => Ok("gemini --yolo".to_string()),
+        "opencode" => Ok("OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode".to_string()),
         other => Err(format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode",
+            "Unknown backend '{}'. Supported: claude, codex, cursor, gemini, opencode",
             other
         )),
     }
@@ -395,7 +401,11 @@ default_command = "bash"
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
         );
         assert_eq!(resolve_backend("cursor").unwrap(), "cursor agent --yolo");
-        assert_eq!(resolve_backend("opencode").unwrap(), "opencode");
+        assert_eq!(resolve_backend("gemini").unwrap(), "gemini --yolo");
+        assert_eq!(
+            resolve_backend("opencode").unwrap(),
+            "OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode"
+        );
     }
 
     #[test]
