@@ -1311,8 +1311,8 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
                 .registered_eas
                 .iter()
                 .find(|ea| ea.id == app.active_ea)
-                .map(|ea| format!("EA {}: {}", ea.id, ea.name))
-                .unwrap_or_else(|| format!("EA {}", app.active_ea));
+                .map(|ea| ea.name.clone())
+                .unwrap_or_else(|| "Unknown EA".to_string());
             (
                 " Confirm Delete EA ",
                 "Delete this EA?",
