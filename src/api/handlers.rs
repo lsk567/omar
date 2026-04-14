@@ -1108,4 +1108,160 @@ mod tests {
 
         assert_eq!(req.backend.as_deref(), Some("codex"));
     }
+
+    /// Integration test: DELETE /api/agents/:id returns 403 for the manager.
+    #[tokio::test]
+    async fn kill_agent_returns_403_for_manager() {
+        use crate::api;
+        use crate::computer::ComputerLock;
+        use crate::config::Config;
+        use crate::scheduler::{Scheduler, TickerBuffer};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tower::ServiceExt;
+
+        let config = Config::default();
+        let ticker = TickerBuffer::new();
+        let app = crate::app::App::new(config, ticker);
+
+        let state = Arc::new(super::ApiState {
+            app: Arc::new(Mutex::new(app)),
+            scheduler: Arc::new(Scheduler::new()),
+            computer_lock: ComputerLock::default(),
+        });
+
+        let router = api::create_router(state);
+
+        // Try to kill the EA — should be forbidden.
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/agents/omar-agent-ea")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "Expected 403 when trying to kill the manager"
+        );
+    }
+
+    /// Integration test: DELETE /api/agents/:id returns 404 for unknown agent.
+    #[tokio::test]
+    async fn kill_agent_returns_404_for_unknown() {
+        use crate::api;
+        use crate::computer::ComputerLock;
+        use crate::config::Config;
+        use crate::scheduler::{Scheduler, TickerBuffer};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tower::ServiceExt;
+
+        let config = Config::default();
+        let ticker = TickerBuffer::new();
+        let app = crate::app::App::new(config, ticker);
+
+        let state = Arc::new(super::ApiState {
+            app: Arc::new(Mutex::new(app)),
+            scheduler: Arc::new(Scheduler::new()),
+            computer_lock: ComputerLock::default(),
+        });
+
+        let router = api::create_router(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/agents/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "Expected 404 for nonexistent agent"
+        );
+    }
+
+    /// Integration test: DELETE /api/agents/:id succeeds for detached sessions.
+    #[tokio::test]
+    async fn kill_agent_succeeds_for_detached_session() {
+        use crate::api;
+        use crate::computer::ComputerLock;
+        use crate::config::Config;
+        use crate::scheduler::{Scheduler, TickerBuffer};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tower::ServiceExt;
+
+        // Need a real tmux session so has_session() returns true and
+        // kill_session() actually works.
+        let session = "omar-agent-killable";
+        let tmux_ok = std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !tmux_ok {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let created = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", session, "sleep", "60"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !created {
+            eprintln!("Skipping test: could not create tmux session");
+            return;
+        }
+
+        // Cleanup guard
+        struct Guard(&'static str);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", self.0])
+                    .output();
+            }
+        }
+        let _guard = Guard(session);
+
+        let config = Config::default();
+        let ticker = TickerBuffer::new();
+        let mut app = crate::app::App::new(config, ticker);
+        // Inject as detached
+        app.agents.push(make_agent(session, false));
+
+        let state = Arc::new(super::ApiState {
+            app: Arc::new(Mutex::new(app)),
+            scheduler: Arc::new(Scheduler::new()),
+            computer_lock: ComputerLock::default(),
+        });
+
+        let router = api::create_router(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/agents/killable")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Expected 200 for detached session kill"
+        );
+    }
 }
