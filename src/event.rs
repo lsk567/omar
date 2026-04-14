@@ -108,7 +108,7 @@ impl EventHandler {
                         if event::poll(Duration::from_millis(0)).unwrap_or(false) {
                             match event::read() {
                                 Ok(Event::Key(key)) if key.code == KeyCode::Esc && key.modifiers.is_empty() => {
-                                    let next = if event::poll(Duration::from_millis(10)).unwrap_or(false) {
+                                    let next = if event::poll(Duration::from_millis(30)).unwrap_or(false) {
                                         event::read().ok()
                                     } else {
                                         None

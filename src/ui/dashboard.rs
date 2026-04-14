@@ -551,12 +551,12 @@ fn render_ea_bar(frame: &mut Frame, app: &App, area: Rect) {
         "Alt+Left",
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::raw("/[:Prev "));
+    spans.push(Span::raw("/[/,:Prev "));
     spans.push(Span::styled(
         "Alt+Right",
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::raw("/]:Next"));
+    spans.push(Span::raw("/]/.:Next"));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1301,8 +1301,8 @@ fn render_help_popup(frame: &mut Frame) {
         Line::from("  N           Spawn new EA (prompts for name)"),
         Line::from("  D           Delete current EA (not the only one)"),
         Line::from("  p           Add a project"),
-        Line::from("  Alt+Left/[  Previous EA"),
-        Line::from("  Alt+Right/] Next EA"),
+        Line::from("  Alt+Left/[/,  Previous EA"),
+        Line::from("  Alt+Right/]/. Next EA"),
         Line::from("  e           Show scheduled events"),
         Line::from("  G           Debug console"),
         Line::from("  S           Settings"),

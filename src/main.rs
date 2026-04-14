@@ -603,6 +603,12 @@ fn kill_child_gracefully(child: &mut std::process::Child, timeout: Duration) {
 }
 
 async fn run_dashboard(config: Config) -> Result<()> {
+    // Some shells/dev tools export NO_COLOR globally. That disables all ANSI
+    // styling and makes the TUI monochrome. The dashboard is explicitly color-coded.
+    if std::env::var_os("NO_COLOR").is_some() {
+        std::env::remove_var("NO_COLOR");
+    }
+
     // Create the ticker buffer and scheduler, then spawn the event loop
     let ticker = scheduler::TickerBuffer::new();
     let scheduler = Arc::new(scheduler::Scheduler::new());
@@ -929,8 +935,16 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             // Fallback for terminals that don't emit Alt+Right.
                             app.cycle_next_ea();
                         }
+                        KeyCode::Char('.') => {
+                            // Additional fallback for layouts where [ ] are awkward.
+                            app.cycle_next_ea();
+                        }
                         KeyCode::Char('[') => {
                             // Fallback for terminals that don't emit Alt+Left.
+                            app.cycle_previous_ea();
+                        }
+                        KeyCode::Char(',') => {
+                            // Additional fallback for layouts where [ ] are awkward.
                             app.cycle_previous_ea();
                         }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
