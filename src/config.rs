@@ -36,6 +36,10 @@ pub struct DashboardConfig {
     /// Sidebar on right side
     #[serde(default = "default_true")]
     pub sidebar_right: bool,
+
+    /// Show inspirational quotes in the status bar
+    #[serde(default)]
+    pub show_quotes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +188,7 @@ impl Default for DashboardConfig {
             session_prefix: default_session_prefix(),
             show_event_queue: true,
             sidebar_right: true,
+            show_quotes: false,
         }
     }
 }
@@ -258,7 +263,7 @@ impl Config {
 
     /// Number of toggleable settings
     pub fn settings_count(&self) -> usize {
-        2
+        3
     }
 
     /// Get label and current value for a setting by index
@@ -269,6 +274,7 @@ impl Config {
                 self.dashboard.show_event_queue,
             )),
             1 => Some(("Sidebar on right side", self.dashboard.sidebar_right)),
+            2 => Some(("Show inspirational quotes", self.dashboard.show_quotes)),
             _ => None,
         }
     }
@@ -278,6 +284,7 @@ impl Config {
         match index {
             0 => self.dashboard.show_event_queue = !self.dashboard.show_event_queue,
             1 => self.dashboard.sidebar_right = !self.dashboard.sidebar_right,
+            2 => self.dashboard.show_quotes = !self.dashboard.show_quotes,
             _ => {}
         }
         self.save();
@@ -312,7 +319,8 @@ mod tests {
     fn test_settings_toggle() {
         let mut config = Config::default();
         assert!(config.dashboard.show_event_queue);
-        assert_eq!(config.settings_count(), 2);
+        assert!(!config.dashboard.show_quotes);
+        assert_eq!(config.settings_count(), 3);
         assert_eq!(
             config.settings_item(0),
             Some(("Show event queue in sidebar", true))

@@ -358,3 +358,23 @@ pub struct ComputerAvailabilityResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_size: Option<ScreenSizeResponse>,
 }
+
+// ── Logging models ──
+
+/// Request to log a justification
+#[derive(Debug, Deserialize)]
+pub struct LogRequest {
+    pub agent_name: String,
+    pub action: String,
+    pub justification: String,
+}
+
+/// JSONL log entry format
+#[derive(Debug, Serialize)]
+pub struct LogEntry {
+    pub timestamp: String,
+    pub agent_name: String,
+    pub hierarchy_path: Vec<String>,
+    pub action: String,
+    pub justification: String,
+}

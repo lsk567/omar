@@ -430,10 +430,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         .as_nanos() as u64;
 
     let mut status_spans = vec![
-        Span::styled(
-            "One-Man Army ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("OMAR ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("| Agents: "),
         Span::styled(format!("{}", total), Style::default().fg(Color::White)),
         Span::raw(" | "),
@@ -495,9 +492,9 @@ fn render_status_row(frame: &mut Frame, app: &App, status_spans: &[Span], area: 
     let stats = Paragraph::new(Line::from(status_spans.to_vec()));
     frame.render_widget(stats, h_chunks[0]);
 
-    // Right: scrolling quote
+    // Right: scrolling quote (if enabled in settings)
     let quote_width = h_chunks[1].width as usize;
-    if quote_width > 5 {
+    if app.config.dashboard.show_quotes && quote_width > 5 {
         let qi = app.quote_order[app.quote_index % app.quote_order.len()];
         let quote = QUOTES[qi];
         let quote_len = quote.chars().count();
