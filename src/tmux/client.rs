@@ -137,6 +137,7 @@ impl TmuxClient {
     pub fn capture_pane(&self, target: &str, lines: i32) -> Result<String> {
         self.run(&[
             "capture-pane",
+            "-e",
             "-t",
             target,
             "-p",
