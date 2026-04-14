@@ -28,6 +28,7 @@ chrono = { version = "0.4", features = ["serde"] }
 ansi-to-tui = "7"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+tracing = "0.1.44"
 
 [dev-dependencies]
 pretty_assertions = "1"

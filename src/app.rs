@@ -71,6 +71,8 @@ pub struct AgentGroup<'a> {
 
 /// Application state
 pub struct App {
+    /// Unique session identifier (timestamp) for logs
+    pub session_id: String,
     pub agents: Vec<AgentInfo>,
     pub manager: Option<AgentInfo>,
     pub command_tree: Vec<CommandTreeNode>,
@@ -163,6 +165,7 @@ impl App {
             show_settings: false,
             settings_selected: 0,
             config,
+            session_id: chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string(),
             focus_parent: MANAGER_SESSION.to_string(),
             focus_stack: Vec::new(),
             focus_child_indices: Vec::new(),

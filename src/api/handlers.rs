@@ -602,6 +602,95 @@ pub async fn complete_project(
     }
 }
 
+// ── Logging handlers ──
+
+/// POST /api/logs
+pub async fn log_justification(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<LogRequest>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let app = state.app.lock().await;
+    let prefix = app.client().prefix().to_string();
+
+    let mut hierarchy_path = Vec::new();
+    let parents = memory::load_agent_parents();
+
+    let mut current_session = resolve_session_name(&prefix, &req.agent_name);
+    // Build path backwards
+    hierarchy_path.push(display_name(&prefix, &current_session).to_string());
+
+    while let Some(parent) = parents.get(&current_session) {
+        if parent == crate::app::MANAGER_SESSION_NAME {
+            hierarchy_path.push("ea".to_string());
+            break;
+        } else {
+            let short_parent = display_name(&prefix, parent).to_string();
+            hierarchy_path.push(short_parent.clone());
+            current_session = parent.clone();
+        }
+    }
+
+    // Reverse to get root -> leaf
+    hierarchy_path.reverse();
+
+    // Ensure ea is the root if not present (e.g. for EA itself)
+    if (hierarchy_path.is_empty() || hierarchy_path[0] != "ea")
+        && (req.agent_name == "ea" || req.agent_name == crate::app::MANAGER_SESSION_NAME)
+    {
+        hierarchy_path.insert(0, "ea".to_string());
+        if hierarchy_path.len() > 1 && hierarchy_path[1] == "ea" {
+            hierarchy_path.remove(1);
+        }
+    }
+
+    // Print human-readable
+    tracing::info!(
+        "Justification [{}] Action: {} | Reason: {}",
+        hierarchy_path.join(" > "),
+        req.action,
+        req.justification
+    );
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = LogEntry {
+        timestamp: now,
+        agent_name: req.agent_name.clone(),
+        hierarchy_path,
+        action: req.action.clone(),
+        justification: req.justification.clone(),
+    };
+
+    let session_id = app.session_id.clone();
+
+    let log_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".omar")
+        .join("logs")
+        .join(&session_id);
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let full_name = resolve_session_name(&prefix, &req.agent_name);
+    let short_name = display_name(&prefix, &full_name);
+    let log_file_path = log_dir.join(format!("{}.jsonl", short_name));
+
+    if let Ok(json_line) = serde_json::to_string(&entry) {
+        use tokio::io::AsyncWriteExt;
+        let file_result: Result<tokio::fs::File, std::io::Error> = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file_path)
+            .await;
+        if let Ok(mut f) = file_result {
+            let _ = f.write_all(format!("{}\n", json_line).as_bytes()).await;
+        }
+    }
+
+    Ok(Json(StatusResponse {
+        status: "logged".to_string(),
+        message: None,
+    }))
+}
+
 // ── Event Scheduler handlers ──
 
 /// POST /api/events
