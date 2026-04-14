@@ -1111,6 +1111,7 @@ mod tests {
             health_info: HealthInfo {
                 state: HealthState::Running,
                 last_output: String::new(),
+                auth_failure: false,
             },
         }
     }
