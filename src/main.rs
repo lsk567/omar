@@ -317,7 +317,7 @@ fn relaunch_in_tmux() -> Result<()> {
     // Only kill the session if attach fails, which indicates a stale tmux session.
     if client.has_session(DASHBOARD_SESSION)? {
         let status = std::process::Command::new("tmux")
-            .args(["attach-session", "-t", DASHBOARD_SESSION])
+            .args(["-2", "attach-session", "-t", DASHBOARD_SESSION])
             .status();
 
         match status {
@@ -332,6 +332,8 @@ fn relaunch_in_tmux() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let mut cmd = std::process::Command::new("tmux");
+    // Force 256-color mode when launching the dashboard session.
+    cmd.arg("-2");
     cmd.args(["new-session", "-s", DASHBOARD_SESSION]);
     cmd.arg(&exe);
     cmd.args(&args);
@@ -343,6 +345,11 @@ fn relaunch_in_tmux() -> Result<()> {
 
 /// Recommended tmux settings for omar, keyed by option name.
 const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
+    (
+        "default-terminal",
+        "set -g default-terminal tmux-256color",
+        "256-color terminal support",
+    ),
     ("mouse", "set -g mouse on", "mouse scrolling and selection"),
     (
         "extended-keys",
@@ -358,6 +365,11 @@ const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
 
 /// Additional raw lines that need to appear in tmux.conf (checked by substring).
 const TMUX_EXTRA_LINES: &[(&str, &str, &str)] = &[
+    (
+        "terminal-features',*:RGB'",
+        "set -as terminal-features ',*:RGB'",
+        "truecolor support",
+    ),
     (
         "terminal-features',*:extkeys'",
         "set -as terminal-features ',*:extkeys'",
