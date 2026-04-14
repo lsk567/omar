@@ -633,11 +633,6 @@ pub async fn log_justification(
         justification: req.justification.clone(),
     };
 
-    let ea_name = app
-        .manager()
-        .map(|m| m.session.name.clone())
-        .unwrap_or_else(|| "ea".to_string());
-
     let session_id = app.session_id.clone();
 
     let log_dir = dirs::home_dir()
@@ -647,8 +642,7 @@ pub async fn log_justification(
         .join(&session_id);
     let _ = std::fs::create_dir_all(&log_dir);
 
-    let filename = format!("justifications_{}.jsonl", ea_name);
-    let log_file_path = log_dir.join(filename);
+    let log_file_path = log_dir.join("justifications.jsonl");
 
     if let Ok(json_line) = serde_json::to_string(&entry) {
         use tokio::io::AsyncWriteExt;
