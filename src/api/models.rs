@@ -2,6 +2,48 @@
 
 use serde::{Deserialize, Serialize};
 
+// ── EA management models ──
+
+/// Request to create a new EA
+#[derive(Debug, Deserialize)]
+pub struct CreateEaRequest {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// EA info in responses
+#[derive(Debug, Serialize)]
+pub struct EaResponse {
+    pub id: u32,
+    pub name: String,
+    pub description: Option<String>,
+    pub agent_count: usize,
+    pub is_active: bool,
+}
+
+/// Response for listing EAs
+#[derive(Debug, Serialize)]
+pub struct ListEasResponse {
+    pub eas: Vec<EaResponse>,
+    pub active: u32,
+}
+
+/// Request to switch active EA
+#[derive(Debug, Deserialize)]
+pub struct SwitchEaRequest {
+    pub id: u32,
+}
+
+/// Response for EA deletion
+#[derive(Debug, Serialize)]
+pub struct DeleteEaResponse {
+    pub deleted_ea: u32,
+    pub agents_killed: usize,
+    pub events_cancelled: usize,
+}
+
+// ── Agent models ──
+
 /// Request to spawn a new agent
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SpawnAgentRequest {
@@ -23,36 +65,6 @@ pub struct SpawnAgentRequest {
     pub role: Option<String>,
     /// Optional parent agent name (e.g. "pm-rest-api") for chain-of-command tracking
     pub parent: Option<String>,
-}
-
-impl SpawnAgentRequest {
-    pub fn with_fallbacks(mut self, fallback: Self) -> Self {
-        if self.name.is_none() {
-            self.name = fallback.name;
-        }
-        if self.task.is_none() {
-            self.task = fallback.task;
-        }
-        if self.workdir.is_none() {
-            self.workdir = fallback.workdir;
-        }
-        if self.command.is_none() {
-            self.command = fallback.command;
-        }
-        if self.backend.is_none() {
-            self.backend = fallback.backend;
-        }
-        if self.model.is_none() {
-            self.model = fallback.model;
-        }
-        if self.role.is_none() {
-            self.role = fallback.role;
-        }
-        if self.parent.is_none() {
-            self.parent = fallback.parent;
-        }
-        self
-    }
 }
 
 /// Response after spawning an agent
@@ -155,19 +167,27 @@ pub struct ListProjectsResponse {
     pub projects: Vec<ProjectResponse>,
 }
 
+/// Request to update an agent's status
+#[derive(Debug, Deserialize)]
+pub struct UpdateStatusRequest {
+    pub status: String,
+}
+
 /// Agent summary response (lightweight card info)
 #[derive(Debug, Serialize)]
 pub struct AgentSummaryResponse {
     pub id: String,
     pub health: String,
     pub task: Option<String>,
+    /// Self-reported status
+    pub status: Option<String>,
     /// Direct child agent names
     pub children: Vec<String>,
 }
 
 // ── Event Scheduler models ──
 
-/// Request to schedule a new event
+/// Request to schedule a new event — ea_id comes from URL path, not body
 #[derive(Debug, Deserialize)]
 pub struct ScheduleEventRequest {
     pub sender: String,
@@ -177,6 +197,7 @@ pub struct ScheduleEventRequest {
     pub payload: String,
     /// If set, the event re-schedules itself at `now + recurring_ns` after each delivery.
     pub recurring_ns: Option<u64>,
+    // NO ea_id field — it comes from the URL path
 }
 
 /// Response after scheduling an event
@@ -184,6 +205,7 @@ pub struct ScheduleEventRequest {
 pub struct ScheduleEventResponse {
     pub id: String,
     pub timestamp: u64,
+    pub ea_id: u32,
 }
 
 /// Event info in list response
@@ -216,10 +238,14 @@ pub struct EventCancelResponse {
 // ── Computer Use models ──
 
 /// Request to acquire the computer use lock
+/// Fix V6: Optional ea_id prevents cross-EA identity collision.
+/// When provided, lock owner is stored as "{ea_id}:{agent}".
 #[derive(Debug, Deserialize)]
 pub struct ComputerLockRequest {
     /// Agent requesting the lock
     pub agent: String,
+    /// Optional EA ID for namespaced lock identity
+    pub ea_id: Option<u32>,
 }
 
 /// Response for lock operations
@@ -236,6 +262,8 @@ pub struct ComputerLockResponse {
 pub struct ScreenshotRequest {
     /// Agent requesting the screenshot (must hold the lock)
     pub agent: String,
+    /// EA ID for scoped lock identity (must match acquire-time ea_id)
+    pub ea_id: Option<u32>,
     /// Max width for resizing (optional)
     pub max_width: Option<u32>,
     /// Max height for resizing (optional)
@@ -256,6 +284,8 @@ pub struct ScreenshotResponse {
 pub struct MouseRequest {
     /// Agent performing the action (must hold the lock)
     pub agent: String,
+    /// EA ID for scoped lock identity (must match acquire-time ea_id)
+    pub ea_id: Option<u32>,
     /// Action: "move", "click", "double_click", "drag", "scroll"
     pub action: String,
     /// X coordinate
@@ -289,6 +319,8 @@ fn default_scroll_amount() -> u32 {
 pub struct KeyboardRequest {
     /// Agent performing the action (must hold the lock)
     pub agent: String,
+    /// EA ID for scoped lock identity (must match acquire-time ea_id)
+    pub ea_id: Option<u32>,
     /// Action: "type" or "key"
     pub action: String,
     /// For "type": text to type. For "key": key combo (e.g. "ctrl+s", "Return")
@@ -323,6 +355,8 @@ pub struct ComputerAvailabilityResponse {
     pub available: bool,
     pub xdotool: bool,
     pub screenshot: bool,
+    pub display: bool,
+    pub screenshot_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_size: Option<ScreenSizeResponse>,
 }
@@ -330,6 +364,7 @@ pub struct ComputerAvailabilityResponse {
 // ── Logging models ──
 
 /// Request to log a justification
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct LogRequest {
     pub agent_name: String,
@@ -338,6 +373,7 @@ pub struct LogRequest {
 }
 
 /// JSONL log entry format
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct LogEntry {
     pub timestamp: String,

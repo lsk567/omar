@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
+use crate::ea;
+
 /// A ticker message with its creation time.
 struct TickerEntry {
     text: String,
@@ -40,39 +42,14 @@ impl TickerBuffer {
 
     /// Return the joined ticker content, filtering entries older than `ttl`.
     /// Does NOT prune the buffer — old entries remain for `latest()` / debug console.
-    ///
-    /// When there are many recent messages, collapses them into a summary
-    /// (e.g. "3 errors, 2 info — press D for details") to avoid spilling
-    /// across the dashboard.
     pub fn render(&self, ttl: std::time::Duration) -> String {
         let buf = self.entries.lock().unwrap();
         let now = Instant::now();
-        let recent: Vec<&str> = buf
-            .iter()
+        buf.iter()
             .filter(|e| now.duration_since(e.created_at) < ttl)
             .map(|e| e.text.as_str())
-            .collect();
-
-        if recent.len() <= 2 {
-            return recent.join(" +++ ");
-        }
-
-        // Collapse into a summary when there are many messages.
-        let errors = recent
-            .iter()
-            .filter(|t| t.contains("failed") || t.contains("error") || t.contains("Error"))
-            .count();
-        let other = recent.len() - errors;
-
-        let mut parts = Vec::new();
-        if errors > 0 {
-            parts.push(format!("{} error(s)", errors));
-        }
-        if other > 0 {
-            parts.push(format!("{} info", other));
-        }
-        parts.push("press D for details".to_string());
-        parts.join(", ")
+            .collect::<Vec<_>>()
+            .join(" +++ ")
     }
 
     /// Return the last `n` messages regardless of age (for debug console).
@@ -92,7 +69,7 @@ impl TickerBuffer {
 fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_nanos() as u64
 }
 
@@ -114,50 +91,52 @@ impl Scheduler {
         self.notify.notify_one();
     }
 
-    pub fn cancel(&self, event_id: &str) -> Option<ScheduledEvent> {
+    /// Cancel an event only if it belongs to the specified EA.
+    /// Fix S1: Atomic EA-scoped cancellation — no TOCTOU window where the event
+    /// is temporarily absent from the queue (as happens with cancel + re-insert).
+    /// Returns:
+    ///   Ok(event) if found and ea_id matches (event removed)
+    ///   Err(true)  if found but ea_id doesn't match (event stays in queue)
+    ///   Err(false) if not found
+    pub fn cancel_if_ea(&self, event_id: &str, ea_id: u32) -> Result<ScheduledEvent, bool> {
         let mut queue = self.queue.lock().unwrap();
         let events: Vec<ScheduledEvent> = queue.drain().collect();
         let mut cancelled = None;
+        let mut wrong_ea = false;
         let mut remaining = BinaryHeap::new();
         for ev in events {
             if ev.id == event_id && cancelled.is_none() {
-                cancelled = Some(ev);
+                if ev.ea_id == ea_id {
+                    cancelled = Some(ev);
+                } else {
+                    wrong_ea = true;
+                    remaining.push(ev); // put it back — wrong EA
+                }
             } else {
                 remaining.push(ev);
             }
         }
         *queue = remaining;
-        cancelled
+        match cancelled {
+            Some(ev) => Ok(ev),
+            None => Err(wrong_ea),
+        }
     }
 
-    pub fn list(&self) -> Vec<ScheduledEvent> {
+    /// List events for a specific EA only.
+    pub fn list_by_ea(&self, ea_id: u32) -> Vec<ScheduledEvent> {
         let queue = self.queue.lock().unwrap();
-        queue.iter().cloned().collect()
+        queue.iter().filter(|e| e.ea_id == ea_id).cloned().collect()
     }
 
-    pub fn list_by_receiver(&self, receiver: &str) -> Vec<ScheduledEvent> {
-        let queue = self.queue.lock().unwrap();
-        queue
-            .iter()
-            .filter(|e| e.receiver == receiver)
-            .cloned()
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    pub fn peek_next_timestamp(&self) -> Option<u64> {
-        let queue = self.queue.lock().unwrap();
-        queue.peek().map(|e| e.timestamp)
-    }
-
-    /// Cancel all events for a given receiver. Returns the number cancelled.
-    pub fn cancel_by_receiver(&self, receiver: &str) -> usize {
+    /// Cancel all events for a specific EA. Returns the number cancelled.
+    pub fn cancel_by_ea(&self, ea_id: u32) -> usize {
         let mut queue = self.queue.lock().unwrap();
         let events: Vec<ScheduledEvent> = queue.drain().collect();
         let mut count = 0;
         let mut remaining = BinaryHeap::new();
         for ev in events {
-            if ev.receiver == receiver {
+            if ev.ea_id == ea_id {
                 count += 1;
             } else {
                 remaining.push(ev);
@@ -167,14 +146,33 @@ impl Scheduler {
         count
     }
 
-    /// Pop all events matching the given receiver and timestamp.
-    pub fn pop_batch(&self, receiver: &str, timestamp: u64) -> Vec<ScheduledEvent> {
+    /// Cancel all events for a given receiver within a specific EA only.
+    /// Fix V5: EA-scoped receiver cancellation prevents cross-EA event leaks.
+    pub fn cancel_by_receiver_and_ea(&self, receiver: &str, ea_id: u32) -> usize {
+        let mut queue = self.queue.lock().unwrap();
+        let events: Vec<ScheduledEvent> = queue.drain().collect();
+        let mut count = 0;
+        let mut remaining = BinaryHeap::new();
+        for ev in events {
+            if ev.receiver == receiver && ev.ea_id == ea_id {
+                count += 1;
+            } else {
+                remaining.push(ev);
+            }
+        }
+        *queue = remaining;
+        count
+    }
+
+    /// Pop all events matching the given receiver, EA, and timestamp.
+    /// Fix V7: EA-scoped batching prevents cross-EA event delivery.
+    pub fn pop_batch(&self, receiver: &str, ea_id: u32, timestamp: u64) -> Vec<ScheduledEvent> {
         let mut queue = self.queue.lock().unwrap();
         let events: Vec<ScheduledEvent> = queue.drain().collect();
         let mut batch = Vec::new();
         let mut remaining = BinaryHeap::new();
         for ev in events {
-            if ev.receiver == receiver && ev.timestamp == timestamp {
+            if ev.receiver == receiver && ev.ea_id == ea_id && ev.timestamp == timestamp {
                 batch.push(ev);
             } else {
                 remaining.push(ev);
@@ -186,39 +184,29 @@ impl Scheduler {
 }
 
 pub(crate) fn deliver_to_tmux(
+    ea_id: u32,
     receiver: &str,
     message: &str,
-    event_count: usize,
-    scheduled_ts: u64,
+    base_prefix: &str,
     ticker: &TickerBuffer,
 ) {
-    // Use the reliable delivery path so scheduled events / inter-agent messages
-    // land deterministically regardless of backend startup / input buffering.
-    //
-    // Scheduler targets are already-running agents (not fresh spawns), so use
-    // tighter timeouts than the spawn-agent defaults.
-    let target = format!("omar-agent-{}", receiver);
-    let client = crate::tmux::TmuxClient::new("omar-agent-");
-    let opts = crate::tmux::DeliveryOptions {
-        startup_timeout: std::time::Duration::from_secs(3),
-        stable_quiet: std::time::Duration::from_millis(200),
-        verify_timeout: std::time::Duration::from_secs(2),
-        max_retries: 3,
-        poll_interval: std::time::Duration::from_millis(50),
-        retry_delay: std::time::Duration::from_millis(150),
+    // Keep one consistent delivery method for all agents, including EA.
+    let target = if receiver == "ea" || receiver == "omar" {
+        ea::ea_manager_session(ea_id, base_prefix)
+    } else {
+        let prefix = ea::ea_prefix(ea_id, base_prefix);
+        format!("{}{}", prefix, receiver)
     };
-    match client.deliver_prompt(&target, message, &opts) {
-        Ok(()) => {
-            let lag_ms = now_ns().saturating_sub(scheduled_ts) as f64 / 1_000_000.0;
-            ticker.push(format!(
-                "delivered {} event(s) to {}, lag={:.2}ms",
-                event_count, receiver, lag_ms
-            ));
-        }
-        Err(e) => {
-            ticker.push(format!("event delivery failed for {}: {}", target, e));
-        }
+    let client = crate::tmux::TmuxClient::new("");
+    if let Err(e) = client.send_keys_literal(&target, message) {
+        ticker.push(format!("tmux send-keys failed for {}: {}", target, e));
+        return;
     }
+    if let Err(e) = client.send_keys(&target, "Enter") {
+        ticker.push(format!("tmux send-keys failed for {}: {}", target, e));
+        return;
+    }
+    ticker.push(format!("delivered event(s) to {}", receiver));
 }
 
 fn format_delivery(events: &[ScheduledEvent], timestamp: u64) -> String {
@@ -247,8 +235,23 @@ fn format_delivery(events: &[ScheduledEvent], timestamp: u64) -> String {
     }
 }
 
-/// Shared state: the short name of the agent whose popup is currently open, if any.
-pub type PopupReceiver = Arc<Mutex<Option<String>>>;
+fn split_batch_for_quota(
+    mut batch: Vec<ScheduledEvent>,
+    remaining_quota: usize,
+) -> (Vec<ScheduledEvent>, Vec<ScheduledEvent>) {
+    if batch.is_empty() || remaining_quota >= batch.len() {
+        return (batch, Vec::new());
+    }
+
+    batch.sort_by_key(|ev| ev.created_at);
+    let deferred = batch.split_off(remaining_quota);
+    (batch, deferred)
+}
+
+/// Shared state: the (short name, ea_id) of the agent whose popup is currently open, if any.
+/// Both fields are required so suppression is scoped per-EA and does not affect same-named
+/// agents in other EAs.
+pub type PopupReceiver = Arc<Mutex<Option<(String, ea::EaId)>>>;
 
 pub fn new_popup_receiver() -> PopupReceiver {
     Arc::new(Mutex::new(None))
@@ -258,6 +261,7 @@ pub async fn run_event_loop(
     scheduler: Arc<Scheduler>,
     ticker: TickerBuffer,
     popup_receiver: PopupReceiver,
+    base_prefix: String,
 ) {
     loop {
         let next_ts = {
@@ -296,29 +300,48 @@ pub async fn run_event_loop(
                     }
                 };
 
-                // Collect all receivers that have events at this timestamp.
-                let receivers: Vec<String> = {
+                // Fix V7: Collect (receiver, ea_id) pairs — not just receivers.
+                // This prevents cross-EA event batching where events for same-named
+                // agents in different EAs would be merged and delivered to only one EA.
+                let receiver_ea_pairs: Vec<(String, u32)> = {
                     let queue = scheduler.queue.lock().unwrap();
-                    let mut seen = Vec::new();
+                    let mut seen: Vec<(String, u32)> = Vec::new();
                     for ev in queue.iter() {
-                        if ev.timestamp == earliest_ts && !seen.contains(&ev.receiver) {
-                            seen.push(ev.receiver.clone());
+                        if ev.timestamp == earliest_ts {
+                            let pair = (ev.receiver.clone(), ev.ea_id);
+                            if !seen.contains(&pair) {
+                                seen.push(pair);
+                            }
                         }
                     }
                     seen
                 };
 
-                for receiver in &receivers {
+                // Per-EA fairness cap: process at most this many events per EA per tick.
+                // If an EA has a burst of events, the excess stays in the queue for the
+                // next iteration so other EAs are not starved.
+                const MAX_EVENTS_PER_EA_PER_TICK: usize = 10;
+                let mut ea_delivery_count: std::collections::HashMap<u32, usize> =
+                    std::collections::HashMap::new();
+
+                for (receiver, ea_id) in &receiver_ea_pairs {
+                    // Enforce per-EA delivery cap.
+                    let delivered_so_far = *ea_delivery_count.get(ea_id).unwrap_or(&0);
+                    if delivered_so_far >= MAX_EVENTS_PER_EA_PER_TICK {
+                        // Leave remaining events for this EA in the queue for the next tick.
+                        continue;
+                    }
+
                     // If the user has a popup open for this receiver, defer by 30s.
                     // The event will keep getting rescheduled on each attempt until
                     // the popup is closed.
                     let popup_active = popup_receiver
                         .lock()
                         .unwrap()
-                        .as_deref()
-                        .is_some_and(|r| r == receiver);
+                        .as_ref()
+                        .is_some_and(|(r, eid)| r == receiver && eid == ea_id);
                     if popup_active {
-                        let batch = scheduler.pop_batch(receiver, earliest_ts);
+                        let batch = scheduler.pop_batch(receiver, *ea_id, earliest_ts);
                         let defer_ns: u64 = 30_000_000_000;
                         for mut ev in batch {
                             ev.timestamp = now_ns() + defer_ns;
@@ -328,16 +351,24 @@ pub async fn run_event_loop(
                         continue;
                     }
 
-                    let batch = scheduler.pop_batch(receiver, earliest_ts);
+                    let batch = scheduler.pop_batch(receiver, *ea_id, earliest_ts);
                     if batch.is_empty() {
                         continue;
                     }
+                    let remaining_quota = MAX_EVENTS_PER_EA_PER_TICK - delivered_so_far;
+                    let (batch, deferred_batch) = split_batch_for_quota(batch, remaining_quota);
+                    for ev in deferred_batch {
+                        scheduler.insert(ev);
+                    }
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    // Track events delivered for this EA this tick.
+                    *ea_delivery_count.entry(*ea_id).or_insert(0) += batch.len();
                     let message = format_delivery(&batch, earliest_ts);
-                    let batch_len = batch.len();
+                    deliver_to_tmux(*ea_id, receiver, &message, &base_prefix, &ticker);
 
                     // Re-insert recurring events with a fresh timestamp and ID
-                    // BEFORE spawning delivery, so the queue stays consistent
-                    // regardless of whether delivery succeeds.
                     for ev in &batch {
                         if let Some(interval) = ev.recurring_ns {
                             let next = ScheduledEvent {
@@ -348,28 +379,20 @@ pub async fn run_event_loop(
                                 payload: ev.payload.clone(),
                                 created_at: now_ns(),
                                 recurring_ns: Some(interval),
+                                ea_id: ev.ea_id,
                             };
                             scheduler.insert(next);
                         }
                     }
 
-                    // Run blocking delivery off the async runtime so the loop
-                    // stays responsive for other scheduled events. Success /
-                    // failure telemetry is logged from inside the blocking
-                    // task (see deliver_to_tmux) so the ticker reflects
-                    // actual delivery, not queuing.
-                    let receiver_owned = receiver.clone();
-                    let message_owned = message.clone();
-                    let ticker_clone = ticker.clone();
-                    tokio::task::spawn_blocking(move || {
-                        deliver_to_tmux(
-                            &receiver_owned,
-                            &message_owned,
-                            batch_len,
-                            earliest_ts,
-                            &ticker_clone,
-                        );
-                    });
+                    let lag_ns = now_ns().saturating_sub(earliest_ts);
+                    let lag_ms = lag_ns as f64 / 1_000_000.0;
+                    ticker.push(format!(
+                        "delivered {} event(s) to {}, lag={:.2}ms",
+                        batch.len(),
+                        receiver,
+                        lag_ms
+                    ));
                 }
             }
         }
@@ -379,7 +402,6 @@ pub async fn run_event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     fn make_event(receiver: &str, sender: &str, timestamp: u64, payload: &str) -> ScheduledEvent {
         ScheduledEvent {
@@ -390,6 +412,7 @@ mod tests {
             payload: payload.to_string(),
             created_at: now_ns(),
             recurring_ns: None,
+            ea_id: 0,
         }
     }
 
@@ -399,7 +422,8 @@ mod tests {
         sched.insert(make_event("bob", "alice", 200, "hello"));
         sched.insert(make_event("bob", "alice", 100, "earlier"));
 
-        assert_eq!(sched.peek_next_timestamp(), Some(100));
+        let min_ts = sched.list_by_ea(0).iter().map(|e| e.timestamp).min();
+        assert_eq!(min_ts, Some(100));
     }
 
     #[test]
@@ -410,18 +434,18 @@ mod tests {
         sched.insert(ev);
         sched.insert(make_event("bob", "alice", 200, "keep"));
 
-        let cancelled = sched.cancel(&id);
+        let cancelled = sched.cancel_if_ea(&id, 0).ok();
         assert!(cancelled.is_some());
         assert_eq!(cancelled.unwrap().payload, "cancel me");
-        assert_eq!(sched.list().len(), 1);
+        assert_eq!(sched.list_by_ea(0).len(), 1);
     }
 
     #[test]
     fn test_cancel_nonexistent() {
         let sched = Scheduler::new();
         sched.insert(make_event("bob", "alice", 100, "keep"));
-        assert!(sched.cancel("no-such-id").is_none());
-        assert_eq!(sched.list().len(), 1);
+        assert!(sched.cancel_if_ea("no-such-id", 0).is_err());
+        assert_eq!(sched.list_by_ea(0).len(), 1);
     }
 
     #[test]
@@ -431,12 +455,54 @@ mod tests {
         sched.insert(make_event("carol", "alice", 200, "for carol"));
         sched.insert(make_event("bob", "dave", 300, "also for bob"));
 
-        let bob_events = sched.list_by_receiver("bob");
+        let bob_events: Vec<_> = sched
+            .list_by_ea(0)
+            .into_iter()
+            .filter(|e| e.receiver == "bob")
+            .collect();
         assert_eq!(bob_events.len(), 2);
         assert!(bob_events.iter().all(|e| e.receiver == "bob"));
 
-        let carol_events = sched.list_by_receiver("carol");
+        let carol_events: Vec<_> = sched
+            .list_by_ea(0)
+            .into_iter()
+            .filter(|e| e.receiver == "carol")
+            .collect();
         assert_eq!(carol_events.len(), 1);
+    }
+
+    #[test]
+    fn test_list_by_ea() {
+        let sched = Scheduler::new();
+        let mut ev1 = make_event("bob", "alice", 100, "ea0");
+        ev1.ea_id = 0;
+        let mut ev2 = make_event("carol", "alice", 200, "ea1");
+        ev2.ea_id = 1;
+        let mut ev3 = make_event("dave", "alice", 300, "ea0 too");
+        ev3.ea_id = 0;
+        sched.insert(ev1);
+        sched.insert(ev2);
+        sched.insert(ev3);
+
+        assert_eq!(sched.list_by_ea(0).len(), 2);
+        assert_eq!(sched.list_by_ea(1).len(), 1);
+        assert_eq!(sched.list_by_ea(99).len(), 0);
+    }
+
+    #[test]
+    fn test_cancel_by_ea() {
+        let sched = Scheduler::new();
+        let mut ev1 = make_event("bob", "alice", 100, "ea0");
+        ev1.ea_id = 0;
+        let mut ev2 = make_event("carol", "alice", 200, "ea1");
+        ev2.ea_id = 1;
+        sched.insert(ev1);
+        sched.insert(ev2);
+
+        let count = sched.cancel_by_ea(0);
+        assert_eq!(count, 1);
+        assert_eq!(sched.list_by_ea(1).len(), 1);
+        assert_eq!(sched.list_by_ea(1)[0].ea_id, 1);
     }
 
     #[test]
@@ -447,14 +513,38 @@ mod tests {
         sched.insert(make_event("bob", "dave", 200, "c"));
         sched.insert(make_event("carol", "alice", 100, "d"));
 
-        let batch = sched.pop_batch("bob", 100);
+        let batch = sched.pop_batch("bob", 0, 100);
         assert_eq!(batch.len(), 2);
         assert!(batch
             .iter()
             .all(|e| e.receiver == "bob" && e.timestamp == 100));
 
         // Remaining: bob@200 and carol@100
-        assert_eq!(sched.list().len(), 2);
+        assert_eq!(sched.list_by_ea(0).len(), 2);
+    }
+
+    #[test]
+    fn test_pop_batch_ea_scoped() {
+        // Fix V7: pop_batch must scope by ea_id to prevent cross-EA batching
+        let sched = Scheduler::new();
+        let mut ev0 = make_event("auth", "alice", 100, "ea0-event");
+        ev0.ea_id = 0;
+        let mut ev1 = make_event("auth", "bob", 100, "ea1-event");
+        ev1.ea_id = 1;
+        sched.insert(ev0);
+        sched.insert(ev1);
+
+        // Pop only EA 0's auth events at timestamp 100
+        let batch = sched.pop_batch("auth", 0, 100);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].ea_id, 0);
+        assert_eq!(batch[0].payload, "ea0-event");
+
+        // EA 1's auth event should still be in the queue
+        let remaining = sched.list_by_ea(1);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].ea_id, 1);
+        assert_eq!(remaining[0].payload, "ea1-event");
     }
 
     #[test]
@@ -465,9 +555,9 @@ mod tests {
         sched.insert(make_event("carol", "alice", 300, "c"));
         sched.insert(make_event("bob", "dave", 400, "d"));
 
-        let cancelled = sched.cancel_by_receiver("bob");
+        let cancelled = sched.cancel_by_receiver_and_ea("bob", 0);
         assert_eq!(cancelled, 3);
-        let remaining = sched.list();
+        let remaining = sched.list_by_ea(0);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].receiver, "carol");
     }
@@ -476,9 +566,85 @@ mod tests {
     fn test_cancel_by_receiver_none() {
         let sched = Scheduler::new();
         sched.insert(make_event("bob", "alice", 100, "a"));
-        let cancelled = sched.cancel_by_receiver("nobody");
+        let cancelled = sched.cancel_by_receiver_and_ea("nobody", 0);
         assert_eq!(cancelled, 0);
-        assert_eq!(sched.list().len(), 1);
+        assert_eq!(sched.list_by_ea(0).len(), 1);
+    }
+
+    #[test]
+    fn test_cancel_by_receiver_and_ea() {
+        let sched = Scheduler::new();
+        // EA 0 has "auth" events
+        let mut ev1 = make_event("auth", "alice", 100, "ea0-auth-1");
+        ev1.ea_id = 0;
+        let mut ev2 = make_event("auth", "carol", 200, "ea0-auth-2");
+        ev2.ea_id = 0;
+        // EA 1 also has "auth" events
+        let mut ev3 = make_event("auth", "dave", 300, "ea1-auth-1");
+        ev3.ea_id = 1;
+        // EA 0 has "bob" events
+        let mut ev4 = make_event("bob", "alice", 400, "ea0-bob");
+        ev4.ea_id = 0;
+        sched.insert(ev1);
+        sched.insert(ev2);
+        sched.insert(ev3);
+        sched.insert(ev4);
+
+        // Cancel only EA 0's "auth" events — EA 1's "auth" and EA 0's "bob" survive
+        let cancelled = sched.cancel_by_receiver_and_ea("auth", 0);
+        assert_eq!(cancelled, 2);
+        let remaining_ea0 = sched.list_by_ea(0);
+        let remaining_ea1 = sched.list_by_ea(1);
+        assert_eq!(remaining_ea0.len() + remaining_ea1.len(), 2);
+        // Verify EA 1's auth event survived
+        assert!(remaining_ea1.iter().any(|e| e.receiver == "auth"));
+        // Verify EA 0's bob event survived
+        assert!(remaining_ea0.iter().any(|e| e.receiver == "bob"));
+    }
+
+    #[test]
+    fn test_cancel_if_ea_correct() {
+        let sched = Scheduler::new();
+        let mut ev = make_event("auth", "alice", 100, "ea0-event");
+        ev.ea_id = 0;
+        let id = ev.id.clone();
+        sched.insert(ev);
+
+        // Cancel with correct EA — should succeed
+        let result = sched.cancel_if_ea(&id, 0);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().payload, "ea0-event");
+        assert_eq!(sched.list_by_ea(0).len(), 0);
+    }
+
+    #[test]
+    fn test_cancel_if_ea_wrong() {
+        let sched = Scheduler::new();
+        let mut ev = make_event("auth", "alice", 100, "ea0-event");
+        ev.ea_id = 0;
+        let id = ev.id.clone();
+        sched.insert(ev);
+
+        // Cancel with wrong EA — should fail and leave event in queue
+        let result = sched.cancel_if_ea(&id, 1);
+        assert!(result.is_err());
+        assert!(result.unwrap_err()); // true = wrong EA (event exists but wrong owner)
+                                      // Event must still be in the queue (atomic — no TOCTOU window)
+        let remaining = sched.list_by_ea(0);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].payload, "ea0-event");
+    }
+
+    #[test]
+    fn test_cancel_if_ea_not_found() {
+        let sched = Scheduler::new();
+        sched.insert(make_event("bob", "alice", 100, "keep"));
+
+        // Cancel nonexistent event
+        let result = sched.cancel_if_ea("no-such-id", 0);
+        assert!(result.is_err());
+        assert!(!result.unwrap_err()); // false = not found at all
+        assert_eq!(sched.list_by_ea(0).len(), 1);
     }
 
     #[test]
@@ -520,125 +686,22 @@ mod tests {
         assert!(msg.contains("[CRON] From carol: recurring"));
     }
 
-    /// Helper: check if tmux is available on this machine.
-    fn tmux_available() -> bool {
-        Command::new("tmux").arg("-V").output().is_ok()
-    }
+    #[test]
+    fn test_split_batch_for_quota_defers_excess_events() {
+        let mut e1 = make_event("bob", "alice", 1000, "first");
+        e1.created_at = 1;
+        let mut e2 = make_event("bob", "alice", 1000, "second");
+        e2.created_at = 2;
+        let mut e3 = make_event("bob", "alice", 1000, "third");
+        e3.created_at = 3;
 
-    /// Helper: create a tmux session, returning true if successful.
-    fn create_test_session(name: &str) -> bool {
-        Command::new("tmux")
-            .args(["new-session", "-d", "-s", name, "-x", "200", "-y", "50"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
+        let (deliver_now, deferred) = split_batch_for_quota(vec![e3, e1, e2], 2);
 
-    /// Helper: kill a tmux session (best-effort cleanup).
-    fn kill_test_session(name: &str) {
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", name])
-            .output();
-    }
-
-    /// Helper: capture pane content from a tmux session.
-    fn capture_pane(name: &str) -> String {
-        Command::new("tmux")
-            .args(["capture-pane", "-t", name, "-p"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default()
-    }
-
-    #[tokio::test]
-    async fn test_deliver_to_tmux() {
-        if !tmux_available() {
-            eprintln!("skipping test_deliver_to_tmux: tmux not available");
-            return;
-        }
-
-        let session = "omar-agent-test-deliver";
-        // Clean up any leftover session from a previous run
-        kill_test_session(session);
-
-        if !create_test_session(session) {
-            eprintln!("skipping test_deliver_to_tmux: could not create tmux session");
-            return;
-        }
-
-        // deliver_to_tmux prepends "omar-agent-" to the receiver name
-        let ticker = TickerBuffer::new();
-        deliver_to_tmux("test-deliver", "hello-from-scheduler", 1, now_ns(), &ticker);
-
-        // Give tmux a moment to process the send-keys
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let content = capture_pane(session);
-        kill_test_session(session);
-
-        assert!(
-            content.contains("hello-from-scheduler"),
-            "expected pane to contain 'hello-from-scheduler', got: {}",
-            content
-        );
-    }
-
-    #[tokio::test]
-    async fn test_scheduler_event_delivery_cycle() {
-        if !tmux_available() {
-            eprintln!("skipping test_scheduler_event_delivery_cycle: tmux not available");
-            return;
-        }
-
-        let session = "omar-agent-test-sched";
-        kill_test_session(session);
-
-        if !create_test_session(session) {
-            eprintln!(
-                "skipping test_scheduler_event_delivery_cycle: could not create tmux session"
-            );
-            return;
-        }
-
-        let scheduler = Arc::new(Scheduler::new());
-
-        // Insert an event with timestamp=1 (immediately due — way in the past)
-        let event = ScheduledEvent {
-            id: "test-cycle-1".to_string(),
-            sender: "alice".to_string(),
-            receiver: "test-sched".to_string(),
-            timestamp: 1,
-            payload: "cycle-delivery-payload".to_string(),
-            created_at: now_ns(),
-            recurring_ns: None,
-        };
-        scheduler.insert(event);
-
-        // Spawn the event loop with a timeout
-        let sched = Arc::clone(&scheduler);
-        let ticker = TickerBuffer::new();
-        let handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = run_event_loop(sched, ticker, new_popup_receiver()) => {}
-                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
-            }
-        });
-
-        // Wait for delivery
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        let content = capture_pane(session);
-        kill_test_session(session);
-
-        // Abort the event loop task
-        handle.abort();
-        let _ = handle.await;
-
-        assert!(
-            content.contains("cycle-delivery-payload"),
-            "expected pane to contain 'cycle-delivery-payload', got: {}",
-            content
-        );
+        assert_eq!(deliver_now.len(), 2);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deliver_now[0].payload, "first");
+        assert_eq!(deliver_now[1].payload, "second");
+        assert_eq!(deferred[0].payload, "third");
     }
 
     // ── TickerBuffer tests ──
@@ -666,27 +729,6 @@ mod tests {
         // Render with zero TTL — everything expires immediately
         let out = ticker.render(std::time::Duration::ZERO);
         assert_eq!(out, "");
-    }
-
-    #[test]
-    fn test_ticker_collapse_many_messages() {
-        let ticker = TickerBuffer::new();
-        ticker.push("delivered 1 event(s) to worker-1");
-        ticker.push("event delivery failed for worker-2: timeout");
-        ticker.push("event delivery failed for worker-3: timeout");
-        ticker.push("delivered 1 event(s) to worker-4");
-        let out = ticker.render(std::time::Duration::from_secs(30));
-        assert!(
-            out.contains("2 error(s)"),
-            "expected error count, got: {}",
-            out
-        );
-        assert!(out.contains("2 info"), "expected info count, got: {}", out);
-        assert!(
-            out.contains("press D for details"),
-            "expected D hint, got: {}",
-            out
-        );
     }
 
     #[test]

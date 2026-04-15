@@ -133,48 +133,30 @@ fn default_error_patterns() -> Vec<String> {
 }
 
 /// Detect which agent command is available on the system.
-/// Checks PATH for `claude` first, then `codex`, then `cursor`, then `gemini`, then `opencode`, falling back to `claude`.
+/// Checks PATH for the supported first-class backends, falling back to `claude`.
 fn detect_agent_command() -> String {
     use std::process::Command;
 
-    if Command::new("claude")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        return "claude --dangerously-skip-permissions".to_string();
-    }
-
-    if Command::new("codex")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        return "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string();
-    }
-
-    if Command::new("gemini")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        return "gemini --yolo".to_string();
-    }
-
-    if Command::new("opencode")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        return "OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode".to_string();
-    }
-
-    if Command::new("cursor")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        return "cursor agent --yolo".to_string();
+    for (binary, command) in [
+        ("claude", "claude --dangerously-skip-permissions"),
+        (
+            "codex",
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
+        ),
+        ("cursor", "cursor agent --yolo"),
+        ("gemini", "gemini --yolo"),
+        (
+            "opencode",
+            "OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode",
+        ),
+    ] {
+        if Command::new(binary)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return command.to_string();
+        }
     }
 
     // Fallback to claude even if not found (user may install it later)
@@ -414,7 +396,10 @@ sidebar_right = false
         assert!(!cmd.is_empty());
         // Should be one of the known agent commands
         assert!(
-            cmd.contains("claude") || cmd.contains("opencode"),
+            cmd.contains("claude")
+                || cmd.contains("codex")
+                || cmd.contains("cursor")
+                || cmd.contains("opencode"),
             "Unexpected default command: {}",
             cmd
         );
@@ -426,6 +411,8 @@ sidebar_right = false
 [dashboard]
 refresh_interval = 5
 session_prefix = "test-"
+show_event_queue = false
+sidebar_right = false
 
 [health]
 idle_warning = 30
@@ -438,6 +425,8 @@ default_command = "bash"
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.dashboard.refresh_interval, 5);
         assert_eq!(config.dashboard.session_prefix, "test-");
+        assert!(!config.dashboard.show_event_queue);
+        assert!(!config.dashboard.sidebar_right);
         assert_eq!(config.health.idle_warning, 30);
         assert_eq!(config.health.error_patterns, vec!["error", "panic"]);
     }
@@ -462,8 +451,8 @@ default_command = "bash"
 
     #[test]
     fn test_resolve_backend_unknown_errors() {
-        assert!(resolve_backend("aider").is_err());
-        assert!(resolve_backend("agent").is_err());
+        assert!(resolve_backend("aider --yes").is_err());
+        assert!(resolve_backend("custom-agent").is_err());
     }
 
     #[test]

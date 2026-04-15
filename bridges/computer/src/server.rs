@@ -210,30 +210,7 @@ async fn handle_scroll(Json(req): Json<ScrollRequest>) -> impl IntoResponse {
     );
 
     let result = tokio::task::spawn_blocking(move || {
-        // Move to position first
-        computer::mouse_move(req.x, req.y)?;
-
-        let button = match req.direction.as_str() {
-            "up" => "4",
-            "down" => "5",
-            "left" => "6",
-            "right" => "7",
-            other => anyhow::bail!("Invalid scroll direction: {}", other),
-        };
-
-        for _ in 0..req.amount {
-            let output = std::process::Command::new("xdotool")
-                .args(["click", button])
-                .output()
-                .map_err(|e| anyhow::anyhow!("xdotool scroll failed: {}", e))?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "xdotool scroll failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-        Ok(())
+        computer::mouse_scroll(req.x, req.y, &req.direction, req.amount)
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("task join error: {}", e)));
@@ -265,13 +242,19 @@ async fn handle_screen_size() -> impl IntoResponse {
 /// GET /health — health check.
 async fn handle_health() -> impl IntoResponse {
     let xdotool = computer::is_xdotool_available();
-    let imagemagick = computer::is_import_available();
+    let screenshot = computer::is_screenshot_available();
+    let display = computer::get_screen_size().is_ok();
+    let screenshot_ready = display && screenshot;
 
     Json(serde_json::json!({
         "ok": true,
+        "available": xdotool && screenshot_ready,
         "service": "omar-computer-bridge",
         "xdotool": xdotool,
-        "imagemagick": imagemagick,
+        "display": display,
+        "screenshot": screenshot,
+        "screenshot_ready": screenshot_ready,
+        "imagemagick": screenshot,
     }))
 }
 

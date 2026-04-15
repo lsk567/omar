@@ -1,40 +1,58 @@
-//! API endpoint handlers
+//! API endpoint handlers — all EA-scoped via path parameter
 
 use axum::{
-    body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use super::models::*;
-use crate::app::{SharedApp, MANAGER_SESSION_NAME};
+use crate::app::App;
 use crate::computer::{self, ComputerLock};
+use crate::ea;
 use crate::manager::{build_agent_command, prompts_dir};
 use crate::memory;
 use crate::projects;
 use crate::scheduler::{event::ScheduledEvent, Scheduler};
+use crate::tmux::TmuxClient;
 
 /// Shared state for all API handlers
 pub struct ApiState {
-    pub app: Arc<Mutex<SharedApp>>,
+    pub app: Arc<Mutex<App>>,
     pub scheduler: Arc<Scheduler>,
     pub computer_lock: ComputerLock,
+    pub base_prefix: String,
+    pub omar_dir: PathBuf,
+    pub health_idle_warning: i64,
+    /// Serializes the has_session → new_session sequence to prevent concurrent
+    /// spawns from racing past the collision check (TOCTOU race condition fix).
+    pub spawn_lock: Arc<Mutex<()>>,
 }
 
-/// Resolve a user-facing agent name to a full tmux session name.
-/// Accepts both short names ("auth") and full names ("omar-agent-auth").
-fn resolve_session_name(prefix: &str, id: &str) -> String {
-    if prefix.is_empty() || id.starts_with(prefix) {
-        id.to_string()
-    } else {
-        format!("{}{}", prefix, id)
+/// Validate EA exists, returning prefix, manager session, and state_dir.
+fn resolve_ea(
+    ea_id: u32,
+    state: &ApiState,
+) -> Result<(String, String, PathBuf), (StatusCode, Json<ErrorResponse>)> {
+    let registry = ea::load_registry(&state.omar_dir);
+    if !registry.iter().any(|e| e.id == ea_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("EA {} not found", ea_id),
+            }),
+        ));
     }
+    let prefix = ea::ea_prefix(ea_id, &state.base_prefix);
+    let manager = ea::ea_manager_session(ea_id, &state.base_prefix);
+    let state_dir = ea::ea_state_dir(ea_id, &state.omar_dir);
+    Ok((prefix, manager, state_dir))
 }
 
 /// Strip the session prefix to get the user-facing short name.
@@ -42,56 +60,35 @@ fn display_name<'a>(prefix: &str, session_name: &'a str) -> &'a str {
     session_name.strip_prefix(prefix).unwrap_or(session_name)
 }
 
-/// Check if a session is currently attached (user has a tmux client connected).
-/// Caller must call `app.refresh()` first to ensure agent state is current.
-fn is_session_attached(app: &SharedApp, session_name: &str) -> bool {
-    is_attached_in(app.agents(), session_name)
+fn last_output_line(output: &str) -> String {
+    output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(80)
+        .collect()
 }
 
-/// Pure helper: returns true if the named session appears in `agents` and is attached.
-fn is_attached_in(agents: &[crate::app::AgentInfo], session_name: &str) -> bool {
-    agents
-        .iter()
-        .any(|a| a.session.name == session_name && a.session.attached)
-}
-
-fn parse_spawn_agent_request(
-    query: SpawnAgentRequest,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Result<SpawnAgentRequest, String> {
-    let trimmed = body
-        .iter()
-        .skip_while(|b| b.is_ascii_whitespace())
-        .copied()
-        .collect::<Vec<_>>();
-    let looks_like_json = matches!(trimmed.first(), Some(b'{'));
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let wants_json = content_type.starts_with("application/json")
-        || (looks_like_json && !content_type.starts_with("text/plain"));
-
-    if body.is_empty() {
-        return Ok(query);
+fn health_from_activity(activity: i64, idle_warning: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_secs() as i64;
+    if now.saturating_sub(activity) <= idle_warning {
+        "running".to_string()
+    } else {
+        "idle".to_string()
     }
-
-    if wants_json {
-        let req: SpawnAgentRequest =
-            serde_json::from_slice(body).map_err(|e| format!("Invalid JSON spawn request: {e}"))?;
-        return Ok(req.with_fallbacks(query));
-    }
-
-    let task = std::str::from_utf8(body)
-        .map_err(|e| format!("Spawn request body must be valid UTF-8: {e}"))?
-        .to_string();
-
-    Ok(SpawnAgentRequest {
-        task: Some(task),
-        ..query
-    })
 }
+
+fn timestamp_is_too_old(timestamp: u64, now: u64) -> bool {
+    timestamp < now.saturating_sub(1_000_000_000)
+}
+
+// ── Global handlers ──
 
 /// GET /api/health
 pub async fn health() -> Json<HealthResponse> {
@@ -111,15 +108,12 @@ pub async fn list_backends() -> Json<BackendsResponse> {
         backends
             .iter()
             .filter_map(|&name| {
-                let resolved = match crate::config::resolve_backend(name) {
-                    Ok(cmd) => cmd,
-                    Err(_) => return None,
-                };
+                let resolved = crate::config::resolve_backend(name).ok()?;
                 let executable = resolved.split_whitespace().next().unwrap_or(name);
                 let available = Command::new(executable)
                     .arg("--version")
                     .output()
-                    .is_ok_and(|o| o.status.success());
+                    .is_ok_and(|output| output.status.success());
                 Some(BackendInfo {
                     name: name.to_string(),
                     available,
@@ -134,208 +128,474 @@ pub async fn list_backends() -> Json<BackendsResponse> {
     Json(BackendsResponse { backends: infos })
 }
 
-/// GET /api/agents
-pub async fn list_agents(
+/// GET /api/eas
+pub async fn list_eas(State(state): State<Arc<ApiState>>) -> Json<ListEasResponse> {
+    let app = state.app.lock().await;
+    let active = app.active_ea;
+    let registry = ea::ensure_default_ea(&state.omar_dir)
+        .unwrap_or_else(|_| ea::load_registry(&state.omar_dir));
+
+    let eas = registry
+        .iter()
+        .map(|ea_info| {
+            let prefix = ea::ea_prefix(ea_info.id, &state.base_prefix);
+            let client = TmuxClient::new(&prefix);
+            let agent_count = client.list_sessions().unwrap_or_default().len();
+            EaResponse {
+                id: ea_info.id,
+                name: ea_info.name.clone(),
+                description: ea_info.description.clone(),
+                agent_count,
+                is_active: ea_info.id == active,
+            }
+        })
+        .collect();
+
+    Json(ListEasResponse { eas, active })
+}
+
+/// POST /api/eas
+/// Fix S2: Hold App lock across register_ea to serialize concurrent EA creation.
+/// Without this, two concurrent create_ea calls could read-modify-write eas.json
+/// simultaneously, producing duplicate EA IDs or losing one EA's registration.
+pub async fn create_ea(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<ListAgentsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    Json(req): Json<CreateEaRequest>,
+) -> Result<Json<EaResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Validate name before acquiring the lock to fail fast on bad input
+    ea::validate_ea_name(&req.name).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                error: format!("Invalid EA name: {}", e),
+            }),
+        )
+    })?;
+
+    // Acquire lock BEFORE register_ea to serialize concurrent creation
     let mut app = state.app.lock().await;
 
-    // Refresh to get latest state
-    if let Err(e) = app.refresh() {
+    let ea_id =
+        ea::register_ea(&state.omar_dir, &req.name, req.description.as_deref()).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Failed to create EA: {}", e),
+                }),
+            )
+        })?;
+
+    // Update app's registry (still under lock)
+    app.registered_eas = ea::load_registry(&state.omar_dir);
+
+    Ok(Json(EaResponse {
+        id: ea_id,
+        name: req.name,
+        description: req.description,
+        agent_count: 0,
+        is_active: false,
+    }))
+}
+
+/// DELETE /api/eas/:ea_id
+pub async fn delete_ea(
+    Path(ea_id): Path<u32>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<DeleteEaResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Acquire App lock before any mutation to prevent races with the dashboard.
+    let mut app = state.app.lock().await;
+
+    // Step 0: Cannot delete the last EA
+    {
+        let registry = ea::load_registry(&state.omar_dir);
+        if registry.len() <= 1 {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: "Cannot delete the only EA".to_string(),
+                }),
+            ));
+        }
+    }
+
+    // Step 1: Validate EA exists and inspect current state before mutating registry.
+    let (prefix, manager_session, state_dir) = resolve_ea(ea_id, &state)?;
+    let client = TmuxClient::new(&prefix);
+    let sessions = client.list_sessions().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to inspect EA sessions: {}", e),
+            }),
+        )
+    })?;
+
+    // Step 2: Transactional cleanup. Do not unregister until cleanup succeeds.
+    let mut agents_killed = 0;
+    for session in &sessions {
+        if session.name != manager_session {
+            client.kill_session(&session.name).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to kill worker session '{}': {}", session.name, e),
+                    }),
+                )
+            })?;
+            agents_killed += 1;
+        }
+    }
+
+    if client.has_session(&manager_session).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!(
+                    "Failed to check manager session '{}': {}",
+                    manager_session, e
+                ),
+            }),
+        )
+    })? {
+        client.kill_session(&manager_session).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Failed to kill manager session '{}': {}",
+                        manager_session, e
+                    ),
+                }),
+            )
+        })?;
+        agents_killed += 1;
+    }
+
+    if state_dir.exists() {
+        std::fs::remove_dir_all(&state_dir).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to remove state dir {:?}: {}", state_dir, e),
+                }),
+            )
+        })?;
+    }
+
+    let notes_path = memory::manager_notes_path(&state.omar_dir, ea_id);
+    if notes_path.exists() {
+        std::fs::remove_file(&notes_path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to remove notes {:?}: {}", notes_path, e),
+                }),
+            )
+        })?;
+    }
+
+    // Step 3: Commit registry/scheduler changes after cleanup succeeds.
+    let events_cancelled = state.scheduler.cancel_by_ea(ea_id);
+    ea::unregister_ea(&state.omar_dir, ea_id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to unregister EA: {}", e),
+            }),
+        )
+    })?;
+
+    app.registered_eas = ea::load_registry(&state.omar_dir);
+    if app.active_ea == ea_id {
+        let next_id = app
+            .registered_eas
+            .iter()
+            .map(|e| e.id)
+            .filter(|id| *id != ea_id)
+            .min()
+            .unwrap_or(0);
+        let _ = app.switch_ea(next_id);
+    }
+
+    Ok(Json(DeleteEaResponse {
+        deleted_ea: ea_id,
+        agents_killed,
+        events_cancelled,
+    }))
+}
+
+/// GET /api/eas/active
+pub async fn get_active_ea(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    let app = state.app.lock().await;
+    Json(serde_json::json!({ "active": app.active_ea }))
+}
+
+/// PUT /api/eas/active
+pub async fn switch_ea(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<SwitchEaRequest>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut app = state.app.lock().await;
+    let registry = ea::load_registry(&state.omar_dir);
+    if !registry.iter().any(|e| e.id == req.id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("EA {} not found", req.id),
+            }),
+        ));
+    }
+    if let Err(e) = app.switch_ea(req.id) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: format!("Failed to refresh: {}", e),
+                error: format!("Failed to switch EA: {}", e),
             }),
         ));
     }
 
-    let prefix = app.client().prefix();
-    let agents: Vec<AgentInfo> = app
-        .agents()
+    Ok(Json(StatusResponse {
+        status: "switched".to_string(),
+        message: Some(format!("Switched to EA {}", req.id)),
+    }))
+}
+
+// ── EA-scoped agent handlers ──
+
+/// GET /api/ea/:ea_id/agents
+pub async fn list_agents(
+    Path(ea_id): Path<u32>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ListAgentsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (prefix, manager_session, _state_dir) = resolve_ea(ea_id, &state)?;
+    let client = TmuxClient::new(&prefix);
+
+    let sessions = client.list_sessions().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to list sessions: {}", e),
+            }),
+        )
+    })?;
+
+    let agents: Vec<AgentInfo> = sessions
         .iter()
-        .map(|a| AgentInfo {
-            id: display_name(prefix, &a.session.name).to_string(),
+        .filter(|s| s.name != manager_session)
+        .map(|s| AgentInfo {
+            id: display_name(&prefix, &s.name).to_string(),
             status: "running".to_string(),
-            health: a.health.as_str().to_string(),
-            last_output: a.health_info.last_output.clone(),
-            auth_failure: a.health_info.auth_failure,
+            health: health_from_activity(s.activity, state.health_idle_warning),
+            last_output: last_output_line(&client.capture_pane(&s.name, 50).unwrap_or_default()),
+            auth_failure: false,
         })
         .collect();
 
-    let manager = app.manager().map(|m| AgentInfo {
-        id: m.session.name.clone(),
-        status: "running".to_string(),
-        health: m.health.as_str().to_string(),
-        last_output: m.health_info.last_output.clone(),
-        auth_failure: m.health_info.auth_failure,
-    });
+    let manager = if client.has_session(&manager_session).unwrap_or(false) {
+        let output_tail = client
+            .capture_pane(&manager_session, 50)
+            .unwrap_or_default();
+        let activity = client
+            .get_pane_activity(&manager_session)
+            .unwrap_or_default();
+        Some(AgentInfo {
+            id: manager_session.clone(),
+            status: "running".to_string(),
+            health: health_from_activity(activity, state.health_idle_warning),
+            last_output: last_output_line(&output_tail),
+            auth_failure: false,
+        })
+    } else {
+        None
+    };
 
     Ok(Json(ListAgentsResponse { agents, manager }))
 }
 
-/// GET /api/agents/:id
+/// GET /api/ea/:ea_id/agents/:name
 pub async fn get_agent(
+    Path((ea_id, name)): Path<(u32, String)>,
     State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
 ) -> Result<Json<AgentDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut app = state.app.lock().await;
+    let (prefix, manager_session, _state_dir) = resolve_ea(ea_id, &state)?;
 
-    // Refresh to pick up newly spawned sessions from tmux
-    if let Err(e) = app.refresh() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to refresh: {}", e),
-            }),
-        ));
-    }
-
-    let prefix = app.client().prefix().to_string();
-    let full_id = resolve_session_name(&prefix, &id);
-
-    // Find agent by resolved session name, or manager by resolved/raw name
-    let agent = app
-        .agents()
-        .iter()
-        .find(|a| a.session.name == full_id)
-        .or_else(|| {
-            app.manager()
-                .filter(|m| m.session.name == full_id || m.session.name == id)
-        });
-
-    match agent {
-        Some(a) => {
-            let output_tail = app
-                .client()
-                .capture_pane(&a.session.name, 50)
-                .unwrap_or_default();
-
-            Ok(Json(AgentDetailResponse {
-                id: display_name(&prefix, &a.session.name).to_string(),
-                status: "running".to_string(),
-                health: a.health.as_str().to_string(),
-                last_output: a.health_info.last_output.clone(),
-                output_tail,
-                auth_failure: a.health_info.auth_failure,
-            }))
-        }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Agent '{}' not found", id),
-            }),
-        )),
-    }
-}
-
-/// GET /api/agents/:id/summary
-pub async fn get_agent_summary(
-    State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
-) -> Result<Json<AgentSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut app = state.app.lock().await;
-
-    if let Err(e) = app.refresh() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to refresh: {}", e),
-            }),
-        ));
-    }
-
-    let prefix = app.client().prefix().to_string();
-    let full_id = resolve_session_name(&prefix, &id);
-
-    // Find agent
-    let agent = app
-        .agents()
-        .iter()
-        .find(|a| a.session.name == full_id)
-        .or_else(|| {
-            app.manager()
-                .filter(|m| m.session.name == full_id || m.session.name == id)
-        });
-
-    match agent {
-        Some(a) => {
-            let session = a.session.name.clone();
-            let health = a.health.as_str().to_string();
-
-            let tasks = memory::load_worker_tasks();
-            let task = tasks.get(&session).cloned();
-
-            let parents = memory::load_agent_parents();
-            let children: Vec<String> = parents
-                .iter()
-                .filter(|(_, parent)| **parent == session)
-                .map(|(child, _)| display_name(&prefix, child).to_string())
-                .collect();
-
-            Ok(Json(AgentSummaryResponse {
-                id: display_name(&prefix, &session).to_string(),
-                health,
-                task,
-                children,
-            }))
-        }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Agent '{}' not found", id),
-            }),
-        )),
-    }
-}
-
-/// POST /api/agents
-pub async fn spawn_agent(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<SpawnAgentRequest>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Json<SpawnAgentResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let req = parse_spawn_agent_request(query, &headers, &body).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!(
-                    "{}. Use JSON or send the task as text/plain with query params like /api/agents?name=worker&parent=ea",
-                    error
-                ),
-            }),
-        )
-    })?;
-    let app = state.app.lock().await;
-
-    let prefix = app.client().prefix().to_string();
-
-    // Generate full session name: prepend prefix to user-provided names,
-    // or auto-generate (which already includes the prefix)
-    let name = match req.name {
-        Some(n) => resolve_session_name(&prefix, &n),
-        None => app.generate_agent_name(),
+    let session_name = if name == manager_session || name.starts_with(&prefix) {
+        name.clone()
+    } else {
+        format!("{}{}", prefix, name)
     };
 
-    // Check if already exists
-    if app.client().has_session(&name).unwrap_or(false) {
+    let client = TmuxClient::new(&prefix);
+    let output_tail = match client.capture_pane(&session_name, 200) {
+        Ok(s) => s,
+        Err(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Agent '{}' not found", name),
+                }),
+            ))
+        }
+    };
+
+    Ok(Json(AgentDetailResponse {
+        id: display_name(&prefix, &session_name).to_string(),
+        status: "running".to_string(),
+        health: health_from_activity(
+            client.get_pane_activity(&session_name).unwrap_or_default(),
+            state.health_idle_warning,
+        ),
+        last_output: last_output_line(&output_tail),
+        output_tail,
+        auth_failure: false,
+    }))
+}
+
+/// GET /api/ea/:ea_id/agents/:name/summary
+pub async fn get_agent_summary(
+    Path((ea_id, name)): Path<(u32, String)>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<AgentSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (prefix, manager_session, state_dir) = resolve_ea(ea_id, &state)?;
+
+    let session_name = if name == manager_session || name.starts_with(&prefix) {
+        name.clone()
+    } else {
+        format!("{}{}", prefix, name)
+    };
+
+    let client = TmuxClient::new(&prefix);
+    if !client.has_session(&session_name).unwrap_or(false) {
         return Err((
-            StatusCode::CONFLICT,
+            StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: format!("Agent '{}' already exists", display_name(&prefix, &name)),
+                error: format!("Agent '{}' not found", name),
             }),
         ));
     }
 
-    // Get workdir
-    let workdir = req.workdir.unwrap_or_else(|| {
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string())
-    });
+    let tasks = memory::load_worker_tasks_from(&state_dir);
+    let task = tasks.get(&session_name).cloned();
 
-    // Reject if both backend and command are set
+    // Read status from the in-memory cache (populated by refresh()) when the
+    // requested EA is the active dashboard EA; fall back to disk for other EAs.
+    let status = {
+        let app = state.app.lock().await;
+        if app.active_ea == ea_id {
+            app.agent_status(&session_name).cloned()
+        } else {
+            memory::load_agent_status_in(&state_dir, &session_name)
+        }
+    };
+
+    let parents = memory::load_agent_parents_from(&state_dir);
+    let children: Vec<String> = parents
+        .iter()
+        .filter(|(_, parent)| **parent == session_name)
+        .map(|(child, _)| display_name(&prefix, child).to_string())
+        .collect();
+
+    Ok(Json(AgentSummaryResponse {
+        id: display_name(&prefix, &session_name).to_string(),
+        health: health_from_activity(
+            client.get_pane_activity(&session_name).unwrap_or_default(),
+            state.health_idle_warning,
+        ),
+        task,
+        status,
+        children,
+    }))
+}
+
+/// PUT /api/ea/:ea_id/agents/:name/status
+pub async fn update_agent_status(
+    Path((ea_id, name)): Path<(u32, String)>,
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<UpdateStatusRequest>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (prefix, _manager_session, state_dir) = resolve_ea(ea_id, &state)?;
+
+    let session_name = if name.starts_with(&prefix) {
+        name.clone()
+    } else {
+        format!("{}{}", prefix, name)
+    };
+
+    let client = TmuxClient::new(&prefix);
+    if !client.has_session(&session_name).unwrap_or(false) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Agent '{}' not found", name),
+            }),
+        ));
+    }
+
+    memory::save_agent_status_in(&state_dir, &session_name, &req.status);
+
+    // Write through to the in-memory cache so the dashboard reads the latest
+    // status without waiting for the next refresh() cycle.
+    {
+        let mut app = state.app.lock().await;
+        if app.active_ea == ea_id {
+            app.set_agent_status(session_name.clone(), req.status.clone());
+        }
+    }
+
+    Ok(Json(StatusResponse {
+        status: "updated".to_string(),
+        message: Some(format!("Status updated for '{}'", name)),
+    }))
+}
+
+/// POST /api/ea/:ea_id/agents
+pub async fn spawn_agent(
+    Path(ea_id): Path<u32>,
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<SpawnAgentRequest>,
+) -> Result<Json<SpawnAgentResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Note: resolve_ea validates the EA at request time. A concurrent delete_ea
+    // could remove the EA between here and the tmux calls, but any resulting
+    // filesystem/tmux errors are caught and returned as 500 responses downstream.
+    let (prefix, manager_session, state_dir) = resolve_ea(ea_id, &state)?;
+
+    // Generate full session name.
+    // If the request contains a non-empty `name`, that name is used as the
+    // agent ID (with the EA prefix prepended once).  An absent or empty name
+    // falls back to auto-generation.
+    let session_name = match req.name.as_deref() {
+        Some(n) if !n.trim().is_empty() => {
+            let stripped = n.strip_prefix(&prefix).unwrap_or(n);
+            format!("{}{}", prefix, stripped)
+        }
+        _ => generate_agent_name_in_ea(&prefix),
+    };
+
+    // Short name (for prompts and events)
+    let short_name = session_name
+        .strip_prefix(&prefix)
+        .unwrap_or(&session_name)
+        .to_string();
+
+    // Parent resolution within this EA's namespace
+    let parent_session = if let Some(ref parent) = req.parent {
+        if parent == "ea" {
+            manager_session.clone()
+        } else {
+            let stripped = parent.strip_prefix(&prefix).unwrap_or(parent);
+            format!("{}{}", prefix, stripped)
+        }
+    } else {
+        manager_session.clone()
+    };
+
+    let client = TmuxClient::new(&prefix);
+    let prompt_parent_name = if parent_session == manager_session {
+        "ea".to_string()
+    } else {
+        display_name(&prefix, &parent_session).to_string()
+    };
+
     if req.backend.is_some() && req.command.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -346,24 +606,23 @@ pub async fn spawn_agent(
         ));
     }
 
-    // Resolve base command: backend shorthand > explicit command > config default
-    let base_command = if let Some(ref backend) = req.backend {
-        match crate::config::resolve_backend(backend) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })));
-            }
-        }
-    } else {
-        req.command
-            .unwrap_or_else(|| app.default_command().to_string())
+    // Read default_command from App (brief lock, released before blocking I/O).
+    let default_command = {
+        let app = state.app.lock().await;
+        app.default_command().to_string()
     };
 
-    // Validate and append --model flag if specified
+    let mut base_command = if let Some(ref backend) = req.backend {
+        crate::config::resolve_backend(backend)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?
+    } else {
+        req.command.clone().unwrap_or(default_command)
+    };
+
     if let Some(ref model) = req.model {
         if !model
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
         {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -373,25 +632,55 @@ pub async fn spawn_agent(
                 }),
             ));
         }
+        base_command = format!("{} --model {}", base_command, model);
     }
-    let base_command = match req.model {
-        Some(ref model) => format!("{} --model {}", base_command, model),
-        None => base_command,
-    };
 
-    // Unified agent role: "project-manager" and "agent" both use agent.md prompt.
-    // Legacy "project-manager" role is treated as an alias for "agent".
+    // Get workdir
+    let workdir = req.workdir.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
+
+    // Build the agent command (App lock is no longer held)
     let has_agent_prompt = matches!(req.role.as_deref(), Some("project-manager") | Some("agent"))
         || req.task.is_some();
     let cmd = if has_agent_prompt {
-        let prompt_file = prompts_dir().join("agent.md");
-        build_agent_command(&base_command, &prompt_file)
+        let task = req.task.as_deref().unwrap_or("");
+        let prompt_file = prompts_dir(&state.omar_dir).join("agent.md");
+        build_agent_command(
+            &base_command,
+            &prompt_file,
+            &[
+                ("{{PARENT_NAME}}", &prompt_parent_name),
+                ("{{TASK}}", task),
+                ("{{EA_ID}}", &ea_id.to_string()),
+            ],
+        )
     } else {
         base_command.clone()
     };
 
-    // Spawn the agent — system prompt set at process start
-    if let Err(e) = app.client().new_session(&name, &cmd, Some(&workdir)) {
+    // Ensure state directory exists
+    std::fs::create_dir_all(&state_dir).ok();
+
+    // Acquire the spawn lock to make the has_session → new_session sequence
+    // atomic, preventing parallel spawns from racing past the collision check
+    // (TOCTOU fix for BUG C).
+    let _spawn_guard = state.spawn_lock.lock().await;
+
+    // Collision check under spawn lock
+    if client.has_session(&session_name).unwrap_or(false) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("Agent '{}' already exists", short_name),
+            }),
+        ));
+    }
+
+    // Spawn the agent (blocking tmux call — spawn lock IS held, App lock is NOT)
+    if let Err(e) = client.new_session(&session_name, &cmd, Some(&workdir)) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -400,55 +689,72 @@ pub async fn spawn_agent(
         ));
     }
 
-    // Save parent mapping if explicitly provided
-    if let Some(ref parent) = req.parent {
-        let resolved_parent = resolve_session_name(&prefix, parent);
-        memory::save_agent_parent(&name, &resolved_parent);
-    }
+    // Release spawn lock — session now exists; subsequent requests will see it.
+    drop(_spawn_guard);
+
+    // Save parent mapping only after spawn succeeds to avoid orphaned entries
+    memory::save_agent_parent_in(&state_dir, &session_name, &parent_session);
 
     // Send first user message after a delay
-    if let Some(task) = req.task {
-        // Always persist the original (short) task for dashboard display
-        memory::save_worker_task(&name, &task);
+    if let Some(ref task) = req.task {
+        memory::save_worker_task_in(&state_dir, &session_name, task);
 
-        let short = display_name(&prefix, &name);
-        let parent = req.parent.as_deref().unwrap_or("ea");
-        let user_msg = format!(
-            "YOUR NAME: {}.\nYOUR PARENT: {}.\nYOUR TASK: {}",
-            short, parent, task
-        );
-
-        let client = app.client().clone();
-        let session = name.clone();
-        // Deliver reliably in a blocking task so HTTP response returns immediately.
-        tokio::task::spawn_blocking(move || {
-            let opts = crate::tmux::DeliveryOptions::default();
-            if let Err(e) = client.deliver_prompt(&session, &user_msg, &opts) {
-                eprintln!("[omar] prompt delivery failed for {}: {}", session, e);
-            }
+        let user_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", short_name, task);
+        let client2 = client.clone();
+        let session2 = session_name.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let _ = client2.send_keys_literal(&session2, &user_msg);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = client2.send_keys(&session2, "Enter");
         });
     }
 
-    let short = display_name(&prefix, &name).to_string();
+    // Schedule a recurring status check — ea_id is structural
+    if has_agent_prompt {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let interval: u64 = 60_000_000_000; // 60 seconds
+        let event = ScheduledEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            sender: "omar".to_string(),
+            receiver: short_name.clone(),
+            timestamp: now + interval,
+            payload: format!(
+                "[STATUS CHECK] Update your status via the API: curl -X PUT http://localhost:9876/api/ea/{}/agents/<YOUR NAME>/status -H 'Content-Type: application/json' -d '{{\"status\": \"<1-line status>\"}}'",
+                ea_id
+            ),
+            created_at: now,
+            recurring_ns: Some(interval),
+            ea_id,
+        };
+        state.scheduler.insert(event);
+    }
+
     Ok(Json(SpawnAgentResponse {
-        id: short,
+        id: short_name,
         status: "running".to_string(),
-        session: name,
+        session: session_name,
     }))
 }
 
-/// DELETE /api/agents/:id
+/// DELETE /api/ea/:ea_id/agents/:name
 pub async fn kill_agent(
+    Path((ea_id, name)): Path<(u32, String)>,
     State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut app = state.app.lock().await;
+    let (prefix, manager_session, state_dir) = resolve_ea(ea_id, &state)?;
 
-    let prefix = app.client().prefix().to_string();
-    let session_name = resolve_session_name(&prefix, &id);
+    let session_name = if name.starts_with(&prefix) {
+        name.clone()
+    } else {
+        format!("{}{}", prefix, name)
+    };
 
     // Don't allow killing manager via API
-    if session_name == MANAGER_SESSION_NAME || id == MANAGER_SESSION_NAME {
+    if session_name == manager_session {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -457,38 +763,17 @@ pub async fn kill_agent(
         ));
     }
 
-    // Check if exists
-    if !app.client().has_session(&session_name).unwrap_or(false) {
+    let client = TmuxClient::new(&prefix);
+    if !client.has_session(&session_name).unwrap_or(false) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: format!("Agent '{}' not found", id),
+                error: format!("Agent '{}' not found", name),
             }),
         ));
     }
 
-    // Don't kill sessions the user is currently attached to (e.g., popup view).
-    // Fail closed: if refresh fails we cannot confirm attachment state.
-    if let Err(e) = app.refresh() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to refresh before kill: {}", e),
-            }),
-        ));
-    }
-    let is_attached = is_session_attached(&app, &session_name);
-    if is_attached {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: format!("Cannot kill attached session '{}'", id),
-            }),
-        ));
-    }
-
-    // Kill it
-    if let Err(e) = app.client().kill_session(&session_name) {
+    if let Err(e) = client.kill_session(&session_name) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -497,81 +782,44 @@ pub async fn kill_agent(
         ));
     }
 
-    // Clean up parent mapping and cancel pending events for the killed agent
-    memory::remove_agent_parent(&session_name);
+    // Clean up parent mapping and cancel pending events (EA-scoped, fix V5)
+    memory::remove_agent_parent_in(&state_dir, &session_name);
     let short_name = display_name(&prefix, &session_name).to_string();
-    state.scheduler.cancel_by_receiver(&short_name);
+    state
+        .scheduler
+        .cancel_by_receiver_and_ea(&short_name, ea_id);
 
     Ok(Json(StatusResponse {
         status: "killed".to_string(),
-        message: Some(format!("Agent '{}' killed", id)),
+        message: Some(format!("Agent '{}' killed", name)),
     }))
 }
 
-/// POST /api/agents/:id/send
+/// POST /api/ea/:ea_id/agents/:name/send
 pub async fn send_input(
+    Path((ea_id, name)): Path<(u32, String)>,
     State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
     Json(req): Json<SendInputRequest>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = state.app.lock().await;
+    let (prefix, _manager_session, _state_dir) = resolve_ea(ea_id, &state)?;
 
-    let prefix = app.client().prefix().to_string();
-    let session_name = resolve_session_name(&prefix, &id);
+    let session_name = if name.starts_with(&prefix) {
+        name.clone()
+    } else {
+        format!("{}{}", prefix, name)
+    };
 
-    // Check if exists
-    if !app.client().has_session(&session_name).unwrap_or(false) {
+    let client = TmuxClient::new(&prefix);
+    if !client.has_session(&session_name).unwrap_or(false) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: format!("Agent '{}' not found", id),
+                error: format!("Agent '{}' not found", name),
             }),
         ));
     }
 
-    // When enter is requested, use the reliable delivery path so text lands
-    // and Enter is actually processed. Otherwise just type literally.
-    //
-    // This path is synchronous (HTTP caller blocks until delivery completes),
-    // so use tighter timeouts than the default spawn-agent path: the session
-    // already exists, so no long startup wait is needed. Worst-case total:
-    // ~2s × max_retries ≈ 6s.
-    if req.enter {
-        let client = app.client().clone();
-        let session = session_name.clone();
-        let text = req.text.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let opts = crate::tmux::DeliveryOptions {
-                startup_timeout: std::time::Duration::from_secs(2),
-                stable_quiet: std::time::Duration::from_millis(200),
-                verify_timeout: std::time::Duration::from_secs(2),
-                max_retries: 3,
-                poll_interval: std::time::Duration::from_millis(50),
-                retry_delay: std::time::Duration::from_millis(150),
-            };
-            client.deliver_prompt(&session, &text, &opts)
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to deliver input: {}", e),
-                    }),
-                ));
-            }
-            Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Delivery task panicked: {}", e),
-                    }),
-                ));
-            }
-        }
-    } else if let Err(e) = app.client().send_keys_literal(&session_name, &req.text) {
+    if let Err(e) = client.send_keys_literal(&session_name, &req.text) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -580,30 +828,53 @@ pub async fn send_input(
         ));
     }
 
+    if req.enter {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Err(e) = client.send_keys(&session_name, "Enter") {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to send Enter: {}", e),
+                }),
+            ));
+        }
+    }
+
     Ok(Json(StatusResponse {
         status: "sent".to_string(),
         message: None,
     }))
 }
 
-/// GET /api/projects
-pub async fn list_projects() -> Json<ListProjectsResponse> {
-    let projects = projects::load_projects();
-    let list: Vec<ProjectResponse> = projects
+// ── EA-scoped project handlers ──
+
+/// GET /api/ea/:ea_id/projects
+pub async fn list_projects(
+    Path(ea_id): Path<u32>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ListProjectsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (_prefix, _manager_session, state_dir) = resolve_ea(ea_id, &state)?;
+
+    let project_list = projects::load_projects_from(&state_dir);
+    let list: Vec<ProjectResponse> = project_list
         .iter()
         .map(|p| ProjectResponse {
             id: p.id,
             name: p.name.clone(),
         })
         .collect();
-    Json(ListProjectsResponse { projects: list })
+    Ok(Json(ListProjectsResponse { projects: list }))
 }
 
-/// POST /api/projects
+/// POST /api/ea/:ea_id/projects
 pub async fn add_project(
+    Path(ea_id): Path<u32>,
+    State(state): State<Arc<ApiState>>,
     Json(req): Json<AddProjectRequest>,
 ) -> Result<Json<ProjectResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match projects::add_project(&req.name) {
+    let (_prefix, _manager_session, state_dir) = resolve_ea(ea_id, &state)?;
+
+    match projects::add_project_in(&state_dir, &req.name) {
         Ok(id) => Ok(Json(ProjectResponse { id, name: req.name })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -614,11 +885,14 @@ pub async fn add_project(
     }
 }
 
-/// DELETE /api/projects/:id
+/// DELETE /api/ea/:ea_id/projects/:id
 pub async fn complete_project(
-    Path(id): Path<usize>,
+    Path((ea_id, id)): Path<(u32, usize)>,
+    State(state): State<Arc<ApiState>>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match projects::remove_project(id) {
+    let (_prefix, _manager_session, state_dir) = resolve_ea(ea_id, &state)?;
+
+    match projects::remove_project_in(&state_dir, id) {
         Ok(true) => Ok(Json(StatusResponse {
             status: "completed".to_string(),
             message: Some(format!("Project {} removed", id)),
@@ -638,135 +912,81 @@ pub async fn complete_project(
     }
 }
 
-// ── Logging handlers ──
+// ── EA-scoped event handlers ──
 
-/// POST /api/logs
-pub async fn log_justification(
-    State(state): State<Arc<ApiState>>,
-    Json(req): Json<LogRequest>,
-) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let app = state.app.lock().await;
-    let prefix = app.client().prefix().to_string();
-
-    let mut hierarchy_path = Vec::new();
-    let parents = memory::load_agent_parents();
-
-    let mut current_session = resolve_session_name(&prefix, &req.agent_name);
-    // Build path backwards
-    hierarchy_path.push(display_name(&prefix, &current_session).to_string());
-
-    while let Some(parent) = parents.get(&current_session) {
-        if parent == crate::app::MANAGER_SESSION_NAME {
-            hierarchy_path.push("ea".to_string());
-            break;
-        } else {
-            let short_parent = display_name(&prefix, parent).to_string();
-            hierarchy_path.push(short_parent.clone());
-            current_session = parent.clone();
-        }
-    }
-
-    // Reverse to get root -> leaf
-    hierarchy_path.reverse();
-
-    // Ensure ea is the root if not present (e.g. for EA itself)
-    if (hierarchy_path.is_empty() || hierarchy_path[0] != "ea")
-        && (req.agent_name == "ea" || req.agent_name == crate::app::MANAGER_SESSION_NAME)
-    {
-        hierarchy_path.insert(0, "ea".to_string());
-        if hierarchy_path.len() > 1 && hierarchy_path[1] == "ea" {
-            hierarchy_path.remove(1);
-        }
-    }
-
-    // Print human-readable
-    tracing::info!(
-        "Justification [{}] Action: {} | Reason: {}",
-        hierarchy_path.join(" > "),
-        req.action,
-        req.justification
-    );
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let entry = LogEntry {
-        timestamp: now,
-        agent_name: req.agent_name.clone(),
-        hierarchy_path,
-        action: req.action.clone(),
-        justification: req.justification.clone(),
-    };
-
-    let session_id = app.session_id.clone();
-
-    let log_dir = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".omar")
-        .join("logs")
-        .join(&session_id);
-    let _ = std::fs::create_dir_all(&log_dir);
-
-    let full_name = resolve_session_name(&prefix, &req.agent_name);
-    let short_name = display_name(&prefix, &full_name);
-    let log_file_path = log_dir.join(format!("{}.jsonl", short_name));
-
-    if let Ok(json_line) = serde_json::to_string(&entry) {
-        use tokio::io::AsyncWriteExt;
-        let file_result: Result<tokio::fs::File, std::io::Error> = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file_path)
-            .await;
-        if let Ok(mut f) = file_result {
-            let _ = f.write_all(format!("{}\n", json_line).as_bytes()).await;
-        }
-    }
-
-    Ok(Json(StatusResponse {
-        status: "logged".to_string(),
-        message: None,
-    }))
-}
-
-// ── Event Scheduler handlers ──
-
-/// POST /api/events
+/// POST /api/ea/:ea_id/events
 pub async fn schedule_event(
+    Path(ea_id): Path<u32>,
     State(state): State<Arc<ApiState>>,
     Json(req): Json<ScheduleEventRequest>,
-) -> impl IntoResponse {
-    let id = uuid::Uuid::new_v4().to_string();
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let _ = resolve_ea(ea_id, &state)?;
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_nanos() as u64;
 
+    // Reject timestamps more than 1 second in the past to prevent event spam.
+    if timestamp_is_too_old(req.timestamp, now) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "timestamp is more than 1 second in the past".to_string(),
+            }),
+        ));
+    }
+
+    // Reject recurring_ns < 1 second to prevent CPU DoS from tight infinite loops.
+    if let Some(recurring_ns) = req.recurring_ns {
+        if recurring_ns < 1_000_000_000 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "recurring_ns must be at least 1_000_000_000 (1 second)".to_string(),
+                }),
+            ));
+        }
+    }
+
     let event = ScheduledEvent {
-        id: id.clone(),
+        id: uuid::Uuid::new_v4().to_string(),
         sender: req.sender,
         receiver: req.receiver,
         timestamp: req.timestamp,
         payload: req.payload,
         created_at: now,
         recurring_ns: req.recurring_ns,
+        ea_id,
     };
 
-    state.scheduler.insert(event);
+    state.scheduler.insert(event.clone());
 
-    Json(ScheduleEventResponse {
-        id,
+    Ok(Json(ScheduleEventResponse {
+        id: event.id,
         timestamp: req.timestamp,
-    })
+        ea_id,
+    }))
 }
 
-/// GET /api/events
+/// GET /api/ea/:ea_id/events
 pub async fn list_events(
+    Path(ea_id): Path<u32>,
     State(state): State<Arc<ApiState>>,
     Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let _ = resolve_ea(ea_id, &state)?;
+
     let events = if let Some(receiver) = params.get("receiver") {
-        state.scheduler.list_by_receiver(receiver)
+        // Filter by both EA and receiver
+        state
+            .scheduler
+            .list_by_ea(ea_id)
+            .into_iter()
+            .filter(|e| e.receiver == *receiver)
+            .collect()
     } else {
-        state.scheduler.list()
+        state.scheduler.list_by_ea(ea_id)
     };
 
     let events: Vec<EventInfo> = events
@@ -782,41 +1002,63 @@ pub async fn list_events(
         })
         .collect();
 
-    Json(EventListResponse { events })
+    Ok(Json(EventListResponse { events }))
 }
 
-/// DELETE /api/events/:id
+/// DELETE /api/ea/:ea_id/events/:id
+/// Fix V4 + Fix S1: Atomic EA-scoped event cancellation.
+/// Uses cancel_if_ea to avoid TOCTOU window where cancel + re-insert
+/// briefly removes the event from the queue.
 pub async fn cancel_event(
+    Path((ea_id, id)): Path<(u32, String)>,
     State(state): State<Arc<ApiState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    match state.scheduler.cancel(&id) {
-        Some(_) => (
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let _ = resolve_ea(ea_id, &state)?;
+
+    match state.scheduler.cancel_if_ea(&id, ea_id) {
+        Ok(_event) => Ok((
             StatusCode::OK,
             Json(serde_json::json!(EventCancelResponse {
                 status: "cancelled".to_string(),
                 id,
             })),
-        ),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!(ErrorResponse {
-                error: format!("Event '{}' not found", id),
-            })),
-        ),
+        )),
+        Err(true) => {
+            // Event exists but belongs to a different EA
+            Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Event '{}' not found in EA {}", id, ea_id),
+                }),
+            ))
+        }
+        Err(false) => {
+            // Event not found at all
+            Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Event '{}' not found", id),
+                }),
+            ))
+        }
     }
 }
 
-// ── Computer Use handlers ──
+// ── Computer Use handlers (global — not EA-scoped) ──
 
 /// Helper: verify the agent holds the computer lock.
 async fn verify_computer_lock(
     lock: &ComputerLock,
     agent: &str,
+    ea_id: Option<u32>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let expected = match ea_id {
+        Some(ea) => format!("{}:{}", ea, agent),
+        None => agent.to_string(),
+    };
     let guard = lock.lock().await;
     match guard.as_deref() {
-        Some(holder) if holder == agent => Ok(()),
+        Some(holder) if holder == expected => Ok(()),
         Some(holder) => Err((
             StatusCode::CONFLICT,
             Json(ErrorResponse {
@@ -837,7 +1079,6 @@ async fn verify_computer_lock(
 }
 
 /// GET /api/computer/status
-/// Check computer use availability and current lock status.
 pub async fn computer_status(
     State(_state): State<Arc<ApiState>>,
 ) -> Json<ComputerAvailabilityResponse> {
@@ -849,29 +1090,39 @@ pub async fn computer_status(
             width: s.width,
             height: s.height,
         });
+    let display = screen_size.is_some();
+    let screenshot_ready = display && screenshot;
 
     Json(ComputerAvailabilityResponse {
-        available: xdotool && screenshot,
+        available: xdotool && screenshot_ready,
         xdotool,
         screenshot,
+        display,
+        screenshot_ready,
         screen_size,
     })
 }
 
 /// POST /api/computer/lock
-/// Acquire exclusive access to the computer.
+/// Fix V6: Lock owner uses "{ea_id}:{agent}" when ea_id is provided,
+/// preventing cross-EA identity collisions.
 pub async fn computer_lock_acquire(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<ComputerLockRequest>,
 ) -> Result<Json<ComputerLockResponse>, (StatusCode, Json<ErrorResponse>)> {
     let mut guard = state.computer_lock.lock().await;
 
+    // Build qualified owner name
+    let owner = match req.ea_id {
+        Some(ea) => format!("{}:{}", ea, req.agent),
+        None => req.agent.clone(), // backward compat
+    };
+
     if let Some(ref holder) = *guard {
-        if holder == &req.agent {
-            // Already holds the lock — idempotent
+        if *holder == owner {
             return Ok(Json(ComputerLockResponse {
                 status: "already_held".to_string(),
-                held_by: Some(req.agent),
+                held_by: Some(owner),
             }));
         }
         return Err((
@@ -882,23 +1133,29 @@ pub async fn computer_lock_acquire(
         ));
     }
 
-    *guard = Some(req.agent.clone());
+    *guard = Some(owner.clone());
     Ok(Json(ComputerLockResponse {
         status: "acquired".to_string(),
-        held_by: Some(req.agent),
+        held_by: Some(owner),
     }))
 }
 
 /// DELETE /api/computer/lock
-/// Release the computer lock.
+/// Fix V6: Uses EA-qualified owner name for release comparison.
 pub async fn computer_lock_release(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<ComputerLockRequest>,
 ) -> Result<Json<ComputerLockResponse>, (StatusCode, Json<ErrorResponse>)> {
     let mut guard = state.computer_lock.lock().await;
 
+    // Build qualified owner name (must match acquire format)
+    let owner = match req.ea_id {
+        Some(ea) => format!("{}:{}", ea, req.agent),
+        None => req.agent.clone(),
+    };
+
     match guard.as_deref() {
-        Some(holder) if holder == req.agent => {
+        Some(holder) if holder == owner => {
             *guard = None;
             Ok(Json(ComputerLockResponse {
                 status: "released".to_string(),
@@ -908,7 +1165,7 @@ pub async fn computer_lock_release(
         Some(holder) => Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
-                error: format!("Lock held by '{}', not '{}'", holder, req.agent),
+                error: format!("Lock held by '{}', not '{}'", holder, owner),
             }),
         )),
         None => Ok(Json(ComputerLockResponse {
@@ -919,12 +1176,11 @@ pub async fn computer_lock_release(
 }
 
 /// POST /api/computer/screenshot
-/// Take a screenshot (must hold the lock).
 pub async fn computer_screenshot(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<ScreenshotRequest>,
 ) -> Result<Json<ScreenshotResponse>, (StatusCode, Json<ErrorResponse>)> {
-    verify_computer_lock(&state.computer_lock, &req.agent).await?;
+    verify_computer_lock(&state.computer_lock, &req.agent, req.ea_id).await?;
 
     let result = if let (Some(w), Some(h)) = (req.max_width, req.max_height) {
         computer::take_screenshot_resized(w, h)
@@ -955,12 +1211,11 @@ pub async fn computer_screenshot(
 }
 
 /// POST /api/computer/mouse
-/// Perform a mouse action (must hold the lock).
 pub async fn computer_mouse(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<MouseRequest>,
 ) -> Result<Json<ComputerActionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    verify_computer_lock(&state.computer_lock, &req.agent).await?;
+    verify_computer_lock(&state.computer_lock, &req.agent, req.ea_id).await?;
 
     let result = match req.action.as_str() {
         "move" => computer::mouse_move(req.x, req.y),
@@ -1024,12 +1279,11 @@ pub async fn computer_mouse(
 }
 
 /// POST /api/computer/keyboard
-/// Perform a keyboard action (must hold the lock).
 pub async fn computer_keyboard(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<KeyboardRequest>,
 ) -> Result<Json<ComputerActionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    verify_computer_lock(&state.computer_lock, &req.agent).await?;
+    verify_computer_lock(&state.computer_lock, &req.agent, req.ea_id).await?;
 
     let result = match req.action.as_str() {
         "type" => computer::type_text(&req.text),
@@ -1059,7 +1313,6 @@ pub async fn computer_keyboard(
 }
 
 /// GET /api/computer/screen-size
-/// Get screen dimensions (no lock required).
 pub async fn computer_screen_size(
 ) -> Result<Json<ScreenSizeResponse>, (StatusCode, Json<ErrorResponse>)> {
     match computer::get_screen_size() {
@@ -1077,7 +1330,6 @@ pub async fn computer_screen_size(
 }
 
 /// GET /api/computer/mouse-position
-/// Get current mouse position (no lock required).
 pub async fn computer_mouse_position(
 ) -> Result<Json<MousePositionResponse>, (StatusCode, Json<ErrorResponse>)> {
     match computer::get_mouse_position() {
@@ -1091,297 +1343,43 @@ pub async fn computer_mouse_position(
     }
 }
 
+// ── Helpers ──
+
+/// Generate a unique agent name within an EA, using tmux has-session for checking.
+fn generate_agent_name_in_ea(prefix: &str) -> String {
+    for i in 1..1000 {
+        let name = format!("{}{}", prefix, i);
+        let result = std::process::Command::new("tmux")
+            .args(["has-session", "-t", &name])
+            .output();
+        match result {
+            Ok(output) if !output.status.success() => return name,
+            _ => continue,
+        }
+    }
+    // Fallback: use UUID suffix
+    format!("{}{}", prefix, &uuid::Uuid::new_v4().to_string()[..8])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_attached_in, parse_spawn_agent_request};
-    use crate::api::models::SpawnAgentRequest;
-    use crate::app::AgentInfo;
-    use crate::tmux::{HealthInfo, HealthState, Session};
-    use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
+    use super::timestamp_is_too_old;
 
-    fn make_agent(name: &str, attached: bool) -> AgentInfo {
-        AgentInfo {
-            session: Session {
-                name: name.to_string(),
-                activity: 0,
-                attached,
-                pane_pid: 0,
-            },
-            health: HealthState::Running,
-            health_info: HealthInfo {
-                state: HealthState::Running,
-                last_output: String::new(),
-                auth_failure: false,
-            },
-        }
+    #[test]
+    fn timestamp_guard_accepts_exact_one_second_boundary() {
+        let now = 5_000_000_000;
+        assert!(!timestamp_is_too_old(4_000_000_000, now));
     }
 
     #[test]
-    fn is_attached_in_returns_true_for_attached_session() {
-        let agents = vec![
-            make_agent("omar-agent-foo", false),
-            make_agent("omar-agent-bar", true),
-        ];
-        assert!(is_attached_in(&agents, "omar-agent-bar"));
+    fn timestamp_guard_rejects_values_more_than_one_second_old() {
+        let now = 5_000_000_000;
+        assert!(timestamp_is_too_old(3_999_999_999, now));
     }
 
     #[test]
-    fn is_attached_in_returns_false_for_detached_session() {
-        let agents = vec![make_agent("omar-agent-foo", false)];
-        assert!(!is_attached_in(&agents, "omar-agent-foo"));
-    }
-
-    #[test]
-    fn is_attached_in_returns_false_for_unknown_session() {
-        let agents = vec![make_agent("omar-agent-foo", true)];
-        assert!(!is_attached_in(&agents, "omar-agent-missing"));
-    }
-
-    #[test]
-    fn parse_spawn_agent_request_accepts_plain_text_body() {
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-
-        let req = parse_spawn_agent_request(
-            SpawnAgentRequest {
-                name: Some("worker-1".to_string()),
-                parent: Some("ea".to_string()),
-                ..SpawnAgentRequest::default()
-            },
-            &headers,
-            b"Fix user's issue\nPreserve \"quotes\".",
-        )
-        .unwrap();
-
-        assert_eq!(req.name.as_deref(), Some("worker-1"));
-        assert_eq!(req.parent.as_deref(), Some("ea"));
-        assert_eq!(
-            req.task.as_deref(),
-            Some("Fix user's issue\nPreserve \"quotes\".")
-        );
-    }
-
-    #[test]
-    fn parse_spawn_agent_request_accepts_headerless_json() {
-        let req = parse_spawn_agent_request(
-            SpawnAgentRequest {
-                parent: Some("ea".to_string()),
-                ..SpawnAgentRequest::default()
-            },
-            &HeaderMap::new(),
-            br#"{"name":"worker-2","task":"Implement feature","command":"bash"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(req.name.as_deref(), Some("worker-2"));
-        assert_eq!(req.parent.as_deref(), Some("ea"));
-        assert_eq!(req.task.as_deref(), Some("Implement feature"));
-        assert_eq!(req.command.as_deref(), Some("bash"));
-    }
-
-    #[test]
-    fn parse_spawn_agent_request_respects_explicit_text_plain() {
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-
-        let req = parse_spawn_agent_request(
-            SpawnAgentRequest::default(),
-            &headers,
-            br#"{"not":"json for OMAR, just literal task text"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            req.task.as_deref(),
-            Some(r#"{"not":"json for OMAR, just literal task text"}"#)
-        );
-    }
-
-    #[test]
-    fn parse_spawn_agent_request_with_backend_and_model() {
-        let req = parse_spawn_agent_request(
-            SpawnAgentRequest::default(),
-            &HeaderMap::new(),
-            br#"{"name":"worker","task":"Build API","backend":"opencode","model":"anthropic/claude-sonnet-4-5-20250514"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(req.name.as_deref(), Some("worker"));
-        assert_eq!(req.backend.as_deref(), Some("opencode"));
-        assert_eq!(
-            req.model.as_deref(),
-            Some("anthropic/claude-sonnet-4-5-20250514")
-        );
-    }
-
-    #[test]
-    fn parse_spawn_agent_request_backend_fallback() {
-        let req = parse_spawn_agent_request(
-            SpawnAgentRequest {
-                backend: Some("codex".to_string()),
-                ..SpawnAgentRequest::default()
-            },
-            &HeaderMap::new(),
-            br#"{"name":"worker","task":"Build API"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(req.backend.as_deref(), Some("codex"));
-    }
-
-    /// Integration test: DELETE /api/agents/:id returns 403 for the manager.
-    #[tokio::test]
-    async fn kill_agent_returns_403_for_manager() {
-        use crate::api;
-        use crate::computer::ComputerLock;
-        use crate::config::Config;
-        use crate::scheduler::{Scheduler, TickerBuffer};
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
-        use tower::ServiceExt;
-
-        let config = Config::default();
-        let ticker = TickerBuffer::new();
-        let app = crate::app::App::new(config, ticker);
-
-        let state = Arc::new(super::ApiState {
-            app: Arc::new(Mutex::new(app)),
-            scheduler: Arc::new(Scheduler::new()),
-            computer_lock: ComputerLock::default(),
-        });
-
-        let router = api::create_router(state);
-
-        // Try to kill the EA — should be forbidden.
-        let req = Request::builder()
-            .method("DELETE")
-            .uri("/api/agents/omar-agent-ea")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::FORBIDDEN,
-            "Expected 403 when trying to kill the manager"
-        );
-    }
-
-    /// Integration test: DELETE /api/agents/:id returns 404 for unknown agent.
-    #[tokio::test]
-    async fn kill_agent_returns_404_for_unknown() {
-        use crate::api;
-        use crate::computer::ComputerLock;
-        use crate::config::Config;
-        use crate::scheduler::{Scheduler, TickerBuffer};
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
-        use tower::ServiceExt;
-
-        let config = Config::default();
-        let ticker = TickerBuffer::new();
-        let app = crate::app::App::new(config, ticker);
-
-        let state = Arc::new(super::ApiState {
-            app: Arc::new(Mutex::new(app)),
-            scheduler: Arc::new(Scheduler::new()),
-            computer_lock: ComputerLock::default(),
-        });
-
-        let router = api::create_router(state);
-
-        let req = Request::builder()
-            .method("DELETE")
-            .uri("/api/agents/nonexistent")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_FOUND,
-            "Expected 404 for nonexistent agent"
-        );
-    }
-
-    /// Integration test: DELETE /api/agents/:id succeeds for detached sessions.
-    #[tokio::test]
-    async fn kill_agent_succeeds_for_detached_session() {
-        use crate::api;
-        use crate::computer::ComputerLock;
-        use crate::config::Config;
-        use crate::scheduler::{Scheduler, TickerBuffer};
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
-        use tower::ServiceExt;
-
-        // Need a real tmux session so has_session() returns true and
-        // kill_session() actually works.
-        let session = "omar-agent-killable";
-        let tmux_ok = std::process::Command::new("tmux")
-            .arg("-V")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !tmux_ok {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", session])
-            .output();
-        let created = std::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", session, "sleep", "60"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !created {
-            eprintln!("Skipping test: could not create tmux session");
-            return;
-        }
-
-        // Cleanup guard
-        struct Guard(&'static str);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                let _ = std::process::Command::new("tmux")
-                    .args(["kill-session", "-t", self.0])
-                    .output();
-            }
-        }
-        let _guard = Guard(session);
-
-        let config = Config::default();
-        let ticker = TickerBuffer::new();
-        let mut app = crate::app::App::new(config, ticker);
-        // Inject as detached
-        app.agents.push(make_agent(session, false));
-
-        let state = Arc::new(super::ApiState {
-            app: Arc::new(Mutex::new(app)),
-            scheduler: Arc::new(Scheduler::new()),
-            computer_lock: ComputerLock::default(),
-        });
-
-        let router = api::create_router(state);
-
-        let req = Request::builder()
-            .method("DELETE")
-            .uri("/api/agents/killable")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "Expected 200 for detached session kill"
-        );
+    fn timestamp_guard_handles_large_timestamps_without_overflow() {
+        let now = 5_000_000_000;
+        assert!(!timestamp_is_too_old(u64::MAX, now));
     }
 }

@@ -1,154 +1,164 @@
-//! Persistent memory — split into two files under ~/.omar/
+//! Persistent memory — state snapshots in per-EA state directories
 //!
-//! - `system_state.md`  — written exclusively by the Rust backend (authoritative
-//!   system state: projects, agents, scheduled events, manager status).
-//! - `manager_notes.md` — written exclusively by the manager agent (semantic
-//!   context: task summaries, user preferences, completed work notes).
-//!
-//! `load_memory()` combines both files so the manager gets the full picture on
-//! restart without either side clobbering the other.
+//! Writes a human-readable markdown snapshot of the current OMAR state
+//! so a newly created manager session can resume seamlessly.
+//! All functions take a `state_dir` parameter for EA-scoped isolation.
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::app::AgentInfo;
+use crate::ea::EaId;
 use crate::projects;
 use crate::scheduler::ScheduledEvent;
 use crate::tmux::TmuxClient;
 
-/// Ensure ~/.omar/ exists and return it
-fn omar_dir() -> PathBuf {
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar");
-    fs::create_dir_all(&dir).ok();
-    dir
+/// Per-file-type mutexes to serialize concurrent read-modify-write operations.
+/// These are process-global (not per-EA) which is sufficient since all EAs
+/// run in the same process and operate on separate state_dir paths.
+static WORKER_TASKS_LOCK: Mutex<()> = Mutex::new(());
+static AGENT_PARENTS_LOCK: Mutex<()> = Mutex::new(());
+
+/// Generic JSON helpers
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
 }
 
-/// Path to the system state file (Rust-owned)
-fn system_state_path() -> PathBuf {
-    omar_dir().join("system_state.md")
-}
-
-/// Path to the manager notes file (manager-agent-owned)
-fn manager_notes_path() -> PathBuf {
-    omar_dir().join("manager_notes.md")
-}
-
-/// Path to worker task descriptions
-fn worker_tasks_path() -> PathBuf {
-    omar_dir().join("worker_tasks.json")
-}
-
-/// Path to agent parent mappings (child → parent)
-fn agent_parents_path() -> PathBuf {
-    omar_dir().join("agent_parents.json")
+/// Write JSON atomically: write to a sibling `.tmp` file then rename into place.
+/// This prevents partial writes from being visible to concurrent readers.
+fn write_json<T: serde::Serialize>(path: &Path, data: &T) {
+    if let Ok(json) = serde_json::to_string_pretty(data) {
+        let tmp = path.with_extension("tmp");
+        if fs::write(&tmp, &json).is_ok() {
+            if fs::rename(&tmp, path).is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
+        } else {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
 }
 
 /// Save a worker's task description (upsert)
-pub fn save_worker_task(session: &str, task: &str) {
-    let mut tasks = load_worker_tasks();
+pub fn save_worker_task_in(state_dir: &Path, session: &str, task: &str) {
+    let path = state_dir.join("worker_tasks.json");
+    let _guard = WORKER_TASKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tasks = load_worker_tasks_inner(state_dir);
     tasks.insert(session.to_string(), task.to_string());
-    write_worker_tasks(&tasks);
+    write_json(&path, &tasks);
 }
 
-/// Load all worker task mappings
-pub fn load_worker_tasks() -> HashMap<String, String> {
-    let path = worker_tasks_path();
-    match fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
+/// Load all worker task mappings for an EA
+pub fn load_worker_tasks_from(state_dir: &Path) -> HashMap<String, String> {
+    let _guard = WORKER_TASKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    load_worker_tasks_inner(state_dir)
 }
 
-/// Write worker tasks to disk
-fn write_worker_tasks(tasks: &HashMap<String, String>) {
-    let path = worker_tasks_path();
-    if let Ok(json) = serde_json::to_string_pretty(tasks) {
-        fs::write(&path, json).ok();
-    }
+/// Inner (lock-free) loader — only call while holding `WORKER_TASKS_LOCK`.
+fn load_worker_tasks_inner(state_dir: &Path) -> HashMap<String, String> {
+    let path = state_dir.join("worker_tasks.json");
+    read_json(&path).unwrap_or_default()
 }
 
-/// Save a child→parent mapping (upsert)
-pub fn save_agent_parent(child: &str, parent: &str) {
-    let mut parents = load_agent_parents();
+/// Save a child->parent mapping (upsert)
+pub fn save_agent_parent_in(state_dir: &Path, child: &str, parent: &str) {
+    let path = state_dir.join("agent_parents.json");
+    let _guard = AGENT_PARENTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut parents = load_agent_parents_inner(state_dir);
     parents.insert(child.to_string(), parent.to_string());
-    write_agent_parents(&parents);
+    write_json(&path, &parents);
 }
 
-/// Load all child→parent mappings
-pub fn load_agent_parents() -> HashMap<String, String> {
-    let path = agent_parents_path();
-    match fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
+/// Load all child->parent mappings for an EA
+pub fn load_agent_parents_from(state_dir: &Path) -> HashMap<String, String> {
+    let _guard = AGENT_PARENTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    load_agent_parents_inner(state_dir)
 }
 
-/// Write agent parents to disk
-fn write_agent_parents(parents: &HashMap<String, String>) {
-    let path = agent_parents_path();
-    if let Ok(json) = serde_json::to_string_pretty(parents) {
-        fs::write(&path, json).ok();
-    }
+/// Inner (lock-free) loader — only call while holding `AGENT_PARENTS_LOCK`.
+fn load_agent_parents_inner(state_dir: &Path) -> HashMap<String, String> {
+    let path = state_dir.join("agent_parents.json");
+    read_json(&path).unwrap_or_default()
 }
 
-/// Remove a child→parent mapping
-pub fn remove_agent_parent(child: &str) {
-    let mut parents = load_agent_parents();
+/// Remove a child->parent mapping
+pub fn remove_agent_parent_in(state_dir: &Path, child: &str) {
+    let path = state_dir.join("agent_parents.json");
+    let _guard = AGENT_PARENTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut parents = load_agent_parents_inner(state_dir);
     parents.remove(child);
-    write_agent_parents(&parents);
+    write_json(&path, &parents);
 }
 
-/// Combine system state and manager notes into a single memory string.
-fn combine_memory(system: &str, notes: &str) -> String {
-    match (system.is_empty(), notes.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => system.to_string(),
-        (true, false) => notes.to_string(),
-        (false, false) => format!("{}\n---\n\n{}", system, notes),
-    }
+/// Load an agent's self-reported status
+pub fn load_agent_status_in(state_dir: &Path, session_name: &str) -> Option<String> {
+    let path = state_dir
+        .join("status")
+        .join(format!("{}.md", session_name));
+    fs::read_to_string(&path)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
-/// Load combined memory: system_state.md + manager_notes.md
-pub fn load_memory() -> String {
-    let system = fs::read_to_string(system_state_path()).unwrap_or_default();
-    let notes = fs::read_to_string(manager_notes_path()).unwrap_or_default();
-    combine_memory(&system, &notes)
+/// Save an agent's status
+pub fn save_agent_status_in(state_dir: &Path, session_name: &str, status: &str) {
+    let dir = state_dir.join("status");
+    fs::create_dir_all(&dir).ok();
+    let path = dir.join(format!("{}.md", session_name));
+    fs::write(&path, status).ok();
 }
 
-/// Write system state snapshot to ~/.omar/system_state.md
-///
-/// Captures: active projects, worker states + tasks, scheduled events
-/// (with exact periods and payloads for recovery), manager status,
-/// and the manager's recent conversation context.
-pub fn write_memory(
+/// Load the memory file contents (empty string if missing)
+pub fn load_memory_from(state_dir: &Path) -> String {
+    let path = state_dir.join("memory.md");
+    fs::read_to_string(&path).unwrap_or_default()
+}
+
+/// Returns the EA-specific manager notes file path.
+/// Each EA uses its own file: ~/.omar/manager_notes_ea<ID>.md
+/// (e.g. ~/.omar/manager_notes_ea0.md for EA 0)
+pub fn manager_notes_path(omar_dir: &Path, ea_id: EaId) -> PathBuf {
+    omar_dir.join(format!("manager_notes_ea{}.md", ea_id))
+}
+
+/// Load manager notes for an EA (empty string if file is missing).
+pub fn load_manager_notes(omar_dir: &Path, ea_id: EaId) -> String {
+    let path = manager_notes_path(omar_dir, ea_id);
+    fs::read_to_string(&path).unwrap_or_default()
+}
+
+/// Write a full state snapshot — SCOPED to one EA
+pub fn write_memory_to(
+    state_dir: &Path,
     agents: &[AgentInfo],
     manager: Option<&AgentInfo>,
+    manager_session: &str,
     client: &TmuxClient,
     events: &[ScheduledEvent],
 ) {
-    let projects = projects::load_projects();
-    let mut worker_tasks = load_worker_tasks();
+    let project_list = projects::load_projects_from(state_dir);
 
-    // Clean up stale entries from worker_tasks (sessions that no longer exist)
-    let active_sessions: Vec<String> = agents.iter().map(|a| a.session.name.clone()).collect();
-    worker_tasks.retain(|k, _| active_sessions.contains(k));
-    write_worker_tasks(&worker_tasks);
-
-    // Note: agent_parents cleanup is intentionally NOT done here.
-    // write_memory() can be called with a stale agents list (e.g., from
-    // add_project/complete_project) which would incorrectly delete parent
-    // entries for recently API-spawned workers. Parent entries are cleaned
-    // up explicitly via remove_agent_parent() when agents are killed.
+    // Hold the lock across read-modify-write of worker_tasks.json.
+    let worker_tasks = {
+        let _guard = WORKER_TASKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tasks = load_worker_tasks_inner(state_dir);
+        // Clean up stale entries (sessions that no longer exist for this EA)
+        let active_sessions: Vec<String> = agents.iter().map(|a| a.session.name.clone()).collect();
+        tasks.retain(|k, _| active_sessions.contains(k));
+        write_json(&state_dir.join("worker_tasks.json"), &tasks);
+        tasks
+    };
 
     let mut out = String::from("# OMAR State\n\n");
 
     // Active projects
-    if !projects.is_empty() {
+    if !project_list.is_empty() {
         out.push_str("## Active Projects\n");
-        for p in &projects {
+        for p in &project_list {
             out.push_str(&format!("{}. {}\n", p.id, p.name));
         }
         out.push('\n');
@@ -200,7 +210,7 @@ pub fn write_memory(
 
     // Manager's recent context (last ~20 lines of pane output)
     if manager.is_some() {
-        if let Ok(output) = client.capture_pane(crate::manager::MANAGER_SESSION, 20) {
+        if let Ok(output) = client.capture_pane(manager_session, 20) {
             let trimmed: Vec<&str> = output
                 .lines()
                 .map(|l| l.trim_end())
@@ -216,43 +226,60 @@ pub fn write_memory(
         }
     }
 
-    let path = system_state_path();
+    let path = state_dir.join("memory.md");
+    fs::create_dir_all(state_dir).ok();
     fs::write(&path, &out).ok();
+}
+
+/// Clear runtime/transient EA state that should not leak across dashboard sessions.
+/// Keeps durable artifacts such as projects and manager notes intact.
+pub fn clear_runtime_state_in(state_dir: &Path) {
+    let _ = fs::remove_file(state_dir.join("agent_parents.json"));
+    let _ = fs::remove_file(state_dir.join("worker_tasks.json"));
+    let _ = fs::remove_file(state_dir.join("memory.md"));
+    let _ = fs::remove_dir_all(state_dir.join("status"));
+    let _ = fs::create_dir_all(state_dir.join("status"));
 }
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]
-    fn combine_both_empty() {
-        assert_eq!(combine_memory("", ""), "");
+    fn manager_notes_path_is_ea_scoped() {
+        let base = std::path::PathBuf::from("/home/user/.omar");
+        assert_eq!(
+            manager_notes_path(&base, 0),
+            std::path::PathBuf::from("/home/user/.omar/manager_notes_ea0.md")
+        );
+        assert_eq!(
+            manager_notes_path(&base, 1),
+            std::path::PathBuf::from("/home/user/.omar/manager_notes_ea1.md")
+        );
+        assert_eq!(
+            manager_notes_path(&base, 42),
+            std::path::PathBuf::from("/home/user/.omar/manager_notes_ea42.md")
+        );
     }
 
     #[test]
-    fn combine_system_only() {
-        let result = combine_memory("# OMAR State\n", "");
-        assert_eq!(result, "# OMAR State\n");
+    fn load_manager_notes_returns_empty_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = load_manager_notes(dir.path(), 0);
+        assert!(notes.is_empty());
     }
 
     #[test]
-    fn combine_notes_only() {
-        let result = combine_memory("", "# Manager Notes\n");
-        assert_eq!(result, "# Manager Notes\n");
-    }
+    fn load_manager_notes_reads_ea_specific_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = manager_notes_path(dir.path(), 3);
+        std::fs::write(&path, "EA 3 notes").unwrap();
 
-    #[test]
-    fn combine_both_present() {
-        let result = combine_memory("# OMAR State\n", "# Manager Notes\n");
-        assert!(result.contains("# OMAR State\n"));
-        assert!(result.contains("---"));
-        assert!(result.contains("# Manager Notes\n"));
-        // System state comes first, then separator, then notes
-        let sep_pos = result.find("---").unwrap();
-        let state_pos = result.find("# OMAR State").unwrap();
-        let notes_pos = result.find("# Manager Notes").unwrap();
-        assert!(state_pos < sep_pos);
-        assert!(sep_pos < notes_pos);
+        // EA 3 gets its notes
+        assert_eq!(load_manager_notes(dir.path(), 3), "EA 3 notes");
+        // EA 0 does NOT see EA 3's notes
+        assert!(load_manager_notes(dir.path(), 0).is_empty());
     }
 
     #[test]

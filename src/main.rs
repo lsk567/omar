@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod computer;
 mod config;
+mod ea;
 mod event;
 mod manager;
 mod memory;
@@ -18,9 +19,15 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{KeyCode, KeyModifiers},
+    event::{
+        KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::Mutex;
@@ -39,22 +46,66 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Path to config file [default: ~/.omar/config.toml]
+    /// Path to config file
     #[arg(short, long)]
     config: Option<String>,
 
     /// Agent backend to use: claude, codex, cursor, gemini, opencode
     #[arg(short, long)]
     agent: Option<String>,
+
+    /// EA to target by id or name [default: active EA]
+    #[arg(long, global = true)]
+    ea: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List all agent sessions
-    List,
+    /// Spawn a new agent session
+    Spawn {
+        /// Name for the agent session
+        #[arg(short, long)]
+        name: String,
+
+        /// Command to run in the session (defaults to configured default_command)
+        #[arg(short, long)]
+        command: Option<String>,
+
+        /// Working directory
+        #[arg(short, long)]
+        workdir: Option<String>,
+    },
+
+    /// List agent sessions in the target EA
+    List {
+        /// List sessions across all EAs
+        #[arg(long)]
+        all_eas: bool,
+    },
+
+    /// Kill an agent session
+    Kill {
+        /// Name of the session to kill
+        name: String,
+    },
 
     /// Configure tmux for optimal omar experience
     SetupTmux,
+
+    /// Start or interact with the manager agent
+    Manager {
+        /// Manager action (start, orchestrate)
+        #[command(subcommand)]
+        action: Option<ManagerAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManagerAction {
+    /// Start the manager session
+    Start,
+    /// Run in orchestration mode (interactive)
+    Orchestrate,
 }
 
 #[tokio::main]
@@ -65,11 +116,63 @@ async fn main() -> Result<()> {
         config.agent.default_command =
             config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
     }
-    let client = TmuxClient::new(&config.dashboard.session_prefix);
+    let omar_dir = omar_dir();
+
+    if let Some(ref selector) = cli.ea {
+        let ea_info = ea::resolve_ea_selector(&omar_dir, Some(selector))?;
+        ea::save_active_ea(&omar_dir, ea_info.id)?;
+    }
 
     match cli.command {
-        Some(Commands::List) => list_agents(&client),
+        Some(Commands::Spawn {
+            name,
+            command,
+            workdir,
+        }) => {
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let client =
+                TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
+            let cmd = command.unwrap_or_else(|| config.agent.default_command.clone());
+            spawn_agent(&client, &name, &cmd, workdir.as_deref())
+        }
+        Some(Commands::List { all_eas }) => {
+            if all_eas {
+                list_agents_all(&omar_dir, &config.dashboard.session_prefix)
+            } else {
+                let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+                list_agents_for_ea(&config.dashboard.session_prefix, &target)
+            }
+        }
+        Some(Commands::Kill { name }) => {
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let client =
+                TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
+            kill_agent(&client, &name)
+        }
         Some(Commands::SetupTmux) => setup_tmux(),
+        Some(Commands::Manager { action }) => {
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let client =
+                TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
+            match action {
+                Some(ManagerAction::Start) | None => manager::start_manager(
+                    &client,
+                    &config.agent.default_command,
+                    target.id,
+                    &target.name,
+                    &omar_dir,
+                    &config.dashboard.session_prefix,
+                ),
+                Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(
+                    &client,
+                    &config.agent.default_command,
+                    target.id,
+                    &target.name,
+                    &omar_dir,
+                    &config.dashboard.session_prefix,
+                ),
+            }
+        }
         None => {
             if std::env::var("TMUX").is_err() {
                 relaunch_in_tmux()
@@ -80,26 +183,120 @@ async fn main() -> Result<()> {
     }
 }
 
-fn list_agents(client: &TmuxClient) -> Result<()> {
-    let sessions = client.list_sessions()?;
+fn omar_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".omar")
+}
+
+fn resolve_cli_ea(omar_dir: &std::path::Path, selector: Option<&str>) -> Result<ea::EaInfo> {
+    ea::resolve_ea_selector(omar_dir, selector)
+}
+
+fn list_agents_for_ea(base_prefix: &str, ea_info: &ea::EaInfo) -> Result<()> {
+    let prefix = ea::ea_prefix(ea_info.id, base_prefix);
+    let manager_session = ea::ea_manager_session(ea_info.id, base_prefix);
+    let sessions = sessions_for_ea(base_prefix, ea_info.id)?;
 
     if sessions.is_empty() {
-        println!("No agent sessions found");
+        println!(
+            "No agent sessions found for EA {} ({})",
+            ea_info.id, ea_info.name
+        );
         return Ok(());
     }
 
+    println!("EA {}: {}", ea_info.id, ea_info.name);
     println!("{:<20} {:<12} {:<10}", "NAME", "ATTACHED", "PID");
     println!("{}", "-".repeat(44));
 
     for session in sessions {
-        let name = session
-            .name
-            .strip_prefix(client.prefix())
-            .unwrap_or(&session.name);
+        let name = display_cli_session_name(&session.name, &prefix, &manager_session);
         let attached = if session.attached { "yes" } else { "no" };
         println!("{:<20} {:<12} {:<10}", name, attached, session.pane_pid);
     }
 
+    Ok(())
+}
+
+fn list_agents_all(omar_dir: &std::path::Path, base_prefix: &str) -> Result<()> {
+    let eas = ea::ensure_default_ea(omar_dir)?;
+    let mut printed = false;
+
+    println!(
+        "{:<6} {:<20} {:<20} {:<12} {:<10}",
+        "EA", "EA_NAME", "NAME", "ATTACHED", "PID"
+    );
+    println!("{}", "-".repeat(74));
+
+    for ea_info in eas {
+        let prefix = ea::ea_prefix(ea_info.id, base_prefix);
+        let manager_session = ea::ea_manager_session(ea_info.id, base_prefix);
+        for session in sessions_for_ea(base_prefix, ea_info.id)? {
+            let name = display_cli_session_name(&session.name, &prefix, &manager_session);
+            let attached = if session.attached { "yes" } else { "no" };
+            println!(
+                "{:<6} {:<20} {:<20} {:<12} {:<10}",
+                ea_info.id, ea_info.name, name, attached, session.pane_pid
+            );
+            printed = true;
+        }
+    }
+
+    if !printed {
+        println!("No agent sessions found");
+    }
+
+    Ok(())
+}
+
+fn sessions_for_ea(base_prefix: &str, ea_id: ea::EaId) -> Result<Vec<tmux::Session>> {
+    let prefix = ea::ea_prefix(ea_id, base_prefix);
+    let manager_session = ea::ea_manager_session(ea_id, base_prefix);
+    let client = TmuxClient::new("");
+    let mut sessions = client.list_all_sessions()?;
+    sessions.retain(|session| session.name == manager_session || session.name.starts_with(&prefix));
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(sessions)
+}
+
+fn display_cli_session_name(session_name: &str, prefix: &str, manager_session: &str) -> String {
+    if session_name == manager_session {
+        "ea".to_string()
+    } else {
+        session_name
+            .strip_prefix(prefix)
+            .unwrap_or(session_name)
+            .to_string()
+    }
+}
+
+fn spawn_agent(
+    client: &TmuxClient,
+    name: &str,
+    command: &str,
+    workdir: Option<&str>,
+) -> Result<()> {
+    let full_name = format!("{}{}", client.prefix(), name);
+
+    if client.has_session(&full_name)? {
+        anyhow::bail!("Session '{}' already exists", name);
+    }
+
+    client.new_session(&full_name, command, workdir)?;
+    println!("Spawned agent: {}", name);
+    Ok(())
+}
+
+fn kill_agent(client: &TmuxClient, name: &str) -> Result<()> {
+    let full_name = format!("{}{}", client.prefix(), name);
+
+    if !client.has_session(&full_name)? {
+        anyhow::bail!("Session '{}' not found", name);
+    }
+
+    client.kill_session(&full_name)?;
+    println!("Killed agent: {}", name);
     Ok(())
 }
 
@@ -116,16 +313,16 @@ fn relaunch_in_tmux() -> Result<()> {
 
     let client = TmuxClient::new("");
 
-    // If the dashboard session exists, try to attach to it.
+    // Preserve a live dashboard across detach/reattach cycles.
+    // Only kill the session if attach fails, which indicates a stale tmux session.
     if client.has_session(DASHBOARD_SESSION)? {
         let status = std::process::Command::new("tmux")
-            .args(["attach-session", "-t", DASHBOARD_SESSION])
+            .args(["-2", "attach-session", "-t", DASHBOARD_SESSION])
             .status();
 
         match status {
             Ok(s) if s.success() => return Ok(()),
             _ => {
-                // Attach failed — stale session. Kill it and create a new one.
                 let _ = client.kill_session(DASHBOARD_SESSION);
             }
         }
@@ -135,6 +332,8 @@ fn relaunch_in_tmux() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let mut cmd = std::process::Command::new("tmux");
+    // Force 256-color mode when launching the dashboard session.
+    cmd.arg("-2");
     cmd.args(["new-session", "-s", DASHBOARD_SESSION]);
     cmd.arg(&exe);
     cmd.args(&args);
@@ -146,6 +345,11 @@ fn relaunch_in_tmux() -> Result<()> {
 
 /// Recommended tmux settings for omar, keyed by option name.
 const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
+    (
+        "default-terminal",
+        "set -g default-terminal tmux-256color",
+        "256-color terminal support",
+    ),
     ("mouse", "set -g mouse on", "mouse scrolling and selection"),
     (
         "history-limit",
@@ -166,6 +370,11 @@ const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
 
 /// Additional raw lines that need to appear in tmux.conf (checked by substring).
 const TMUX_EXTRA_LINES: &[(&str, &str, &str)] = &[
+    (
+        "terminal-features',*:RGB'",
+        "set -as terminal-features ',*:RGB'",
+        "truecolor support",
+    ),
     (
         "terminal-features',*:extkeys'",
         "set -as terminal-features ',*:extkeys'",
@@ -399,23 +608,48 @@ fn kill_child_gracefully(child: &mut std::process::Child, timeout: Duration) {
 }
 
 async fn run_dashboard(config: Config) -> Result<()> {
+    // Some shells/dev tools export NO_COLOR globally. That disables all ANSI
+    // styling and makes the TUI monochrome. The dashboard is explicitly color-coded.
+    if std::env::var_os("NO_COLOR").is_some() {
+        std::env::remove_var("NO_COLOR");
+    }
+
     // Create the ticker buffer and scheduler, then spawn the event loop
     let ticker = scheduler::TickerBuffer::new();
+    let app_ticker = ticker.clone();
     let scheduler = Arc::new(scheduler::Scheduler::new());
     let popup_receiver = scheduler::new_popup_receiver();
+    let base_prefix = config.dashboard.session_prefix.clone();
     tokio::spawn(scheduler::run_event_loop(
         scheduler.clone(),
         ticker.clone(),
         popup_receiver.clone(),
+        base_prefix,
     ));
+
+    // Create SINGLE shared App instance (fixes V1: Two-App Problem / BUG-C2).
+    // Both the API server and dashboard operate on the same App via Arc<Mutex<App>>.
+    let shared_app = Arc::new(Mutex::new(App::new(
+        &config,
+        ticker.clone(),
+        scheduler.clone(),
+    )));
 
     // Start API server if enabled
     if config.api.enabled {
         let api_config = config.api.clone();
+        let (base_prefix, omar_dir) = {
+            let app_guard = shared_app.lock().await;
+            (app_guard.base_prefix.clone(), app_guard.omar_dir.clone())
+        };
         let api_state = Arc::new(api::handlers::ApiState {
-            app: Arc::new(Mutex::new(App::new(config.clone(), ticker.clone()))),
+            app: shared_app.clone(), // Same Arc — single source of truth
             scheduler: scheduler.clone(),
             computer_lock: computer::new_lock(),
+            base_prefix,
+            omar_dir,
+            health_idle_warning: config.health.idle_warning,
+            spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
         tokio::spawn(async move {
             if let Err(e) = api::start_server(api_state, &api_config).await {
@@ -434,44 +668,66 @@ async fn run_dashboard(config: Config) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    // Enable keyboard enhancement where supported (improves key reporting).
+    let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app for dashboard (separate instance)
-    let tick_rate = Duration::from_secs(config.dashboard.refresh_interval);
-    let app_ticker = ticker.clone();
-    let mut app = App::new(config, ticker);
-
     // Show bridge status
-    match (slack_bridge.is_some(), computer_bridge.is_some()) {
-        (true, true) => app.set_status("Slack & computer bridges started"),
-        (true, false) => app.set_status("Slack bridge started"),
-        (false, true) => app.set_status("Computer bridge started"),
-        _ => {}
+    {
+        let mut app = shared_app.lock().await;
+        match (slack_bridge.is_some(), computer_bridge.is_some()) {
+            (true, true) => app.set_status("Slack & computer bridges started"),
+            (true, false) => app.set_status("Slack bridge started"),
+            (false, true) => app.set_status("Computer bridge started"),
+            _ => {}
+        }
     }
 
     // Warn if tmux config is missing recommended settings
     if tmux_setup_needed() {
-        app.set_persistent_warning("⚠ tmux not configured for omar — run 'omar setup-tmux' to fix");
+        shared_app.lock().await.set_persistent_warning(
+            "⚠ tmux not configured for omar — run 'omar setup-tmux' to fix",
+        );
     }
 
     // Initial refresh
-    if let Err(e) = app.refresh() {
-        app.set_status(format!("Error: {}", e));
+    {
+        let mut app = shared_app.lock().await;
+        if let Err(e) = app.refresh() {
+            app.set_status(format!("Error: {}", e));
+        }
     }
 
-    // Event loop
+    // Event loop — locks shared_app per-phase (render, then handle).
+    // The lock is NOT held across events.next().await so API calls proceed.
+    let tick_rate = Duration::from_secs(config.dashboard.refresh_interval);
     let mut events = EventHandler::new(tick_rate);
     let mut tick_count: u64 = 0;
 
     loop {
-        // Draw UI
-        terminal.draw(|f| ui::render(f, &app))?;
+        // Phase 1: Render (brief lock — read-only access to App)
+        {
+            let app = shared_app.lock().await;
+            terminal.draw(|f| ui::render(f, &app))?;
+        }
+        // Lock released — API calls can proceed during event wait
 
-        // Handle events
-        if let Some(event) = events.next().await {
+        // Phase 2: Wait for event (no lock held)
+        let event = events.next().await;
+
+        // Phase 3: Handle event (lock for mutation)
+        if let Some(event) = event {
             match event {
                 AppEvent::Key(key) => {
+                    let mut app = shared_app.lock().await;
+
                     // Handle project input mode
                     if app.project_input_mode {
                         match key.code {
@@ -499,17 +755,54 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
-                    // Handle confirmation dialog (kill or quit)
+                    // Handle EA name input mode (for spawning a new EA)
+                    if app.ea_input_mode {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.ea_input_mode = false;
+                                app.ea_input.clear();
+                            }
+                            KeyCode::Enter => {
+                                let name = app.ea_input.clone();
+                                if !name.trim().is_empty() {
+                                    if let Err(e) = app.create_ea(name.trim().to_string(), None) {
+                                        app.set_status(format!("Error: {}", e));
+                                    }
+                                }
+                                app.ea_input_mode = false;
+                                app.ea_input.clear();
+                            }
+                            KeyCode::Backspace => {
+                                app.ea_input.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                app.ea_input.push(c);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Handle confirmation dialog (kill, quit, or delete EA)
                     if let Some(action) = app.pending_confirm {
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') => match action {
                                 app::ConfirmAction::Kill => {
+                                    let short_name = app.selected_agent_short_name();
                                     if let Err(e) = app.kill_selected() {
                                         app.set_status(format!("Error: {}", e));
+                                    } else if let Some(name) = short_name {
+                                        scheduler.cancel_by_receiver_and_ea(&name, app.active_ea);
                                     }
                                 }
                                 app::ConfirmAction::Quit => {
                                     app.should_quit = true;
+                                }
+                                app::ConfirmAction::DeleteEa => {
+                                    let ea_id = app.active_ea;
+                                    if let Err(e) = app.delete_ea(ea_id) {
+                                        app.set_status(format!("Error: {}", e));
+                                    }
                                 }
                             },
                             _ => {
@@ -539,7 +832,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     // Handle debug console popup
                     if app.show_debug_console {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Char('D') => {
+                            KeyCode::Esc | KeyCode::Char('G') => {
                                 app.show_debug_console = false;
                             }
                             _ => {}
@@ -564,7 +857,8 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 }
                             }
                             KeyCode::Enter => {
-                                app.config.toggle_setting(app.settings_selected);
+                                let idx = app.settings_selected;
+                                app.config.toggle_setting(idx);
                                 // If event queue was just hidden, move sidebar off Events panel
                                 if !app.config.dashboard.show_event_queue
                                     && app.sidebar_panel == app::SidebarPanel::Events
@@ -634,6 +928,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 }
                             }
                         }
+                        KeyCode::Char(']') => {
+                            app.cycle_next_ea();
+                        }
+                        KeyCode::Char('[') => {
+                            app.cycle_previous_ea();
+                        }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.pending_confirm = Some(app::ConfirmAction::Quit);
                         }
@@ -682,7 +982,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         KeyCode::Enter => {
                             if app.sidebar_focused {
                                 if app.sidebar_panel == app::SidebarPanel::Events {
-                                    app.scheduled_events = scheduler.list();
+                                    app.scheduled_events = scheduler.list_by_ea(app.active_ea);
                                     app.scheduled_events.sort_by_key(|e| e.timestamp);
                                     app.show_events = true;
                                 } else {
@@ -692,32 +992,66 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                             // Tell the scheduler which agent popup is open so it
                             // defers events for that receiver until the popup closes.
-                            *popup_receiver.lock().unwrap() = app.selected_agent_short_name();
+                            // Include ea_id so suppression is scoped per-EA.
+                            *popup_receiver.lock().unwrap() = app
+                                .selected_agent_short_name()
+                                .map(|name| (name, app.active_ea));
+
+                            // Release App lock before blocking popup call
+                            drop(app);
 
                             if std::env::var("TMUX").is_ok() {
-                                // Inside tmux: use display-popup overlay (stays on top of dashboard)
-                                if let Err(e) = app.attach_selected() {
-                                    app.set_status(format!("Error: {}", e));
+                                // Inside tmux: use display-popup overlay.
+                                // IMPORTANT: extract session info while holding the lock,
+                                // then release the lock BEFORE the blocking attach_popup call.
+                                // Holding the lock across attach_popup blocks all API handlers
+                                // that need app.lock() for the entire popup lifetime.
+                                let popup_info = {
+                                    let app = shared_app.lock().await;
+                                    app.selected_agent()
+                                        .map(|a| (a.session.name.clone(), app.client().clone()))
+                                }; // Lock released here
+                                if let Some((session_name, client)) = popup_info {
+                                    if let Err(e) = client.attach_popup(&session_name, "90%", "90%")
+                                    {
+                                        let mut app = shared_app.lock().await;
+                                        app.set_status(format!("Error: {}", e));
+                                    }
                                 }
                                 // Discard ticks that accumulated while popup was open
                                 events.drain();
-                                // Force redraw after popup closes
                                 terminal.clear()?;
                             } else {
                                 // Outside tmux: temporarily exit alternate screen
+                                if keyboard_enhanced {
+                                    let _ = execute!(
+                                        terminal.backend_mut(),
+                                        PopKeyboardEnhancementFlags
+                                    );
+                                }
                                 disable_raw_mode()?;
                                 execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
+                                let app = shared_app.lock().await;
                                 let result = app.attach_selected();
+                                drop(app);
 
                                 // Restore terminal
                                 execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                                 enable_raw_mode()?;
-                                // Discard ticks that accumulated while popup was open
+                                if keyboard_enhanced {
+                                    let _ = execute!(
+                                        terminal.backend_mut(),
+                                        PushKeyboardEnhancementFlags(
+                                            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                                        )
+                                    );
+                                }
                                 events.drain();
                                 terminal.clear()?;
 
                                 if let Err(e) = result {
+                                    let mut app = shared_app.lock().await;
                                     app.set_status(format!("Error: {}", e));
                                 }
                             }
@@ -735,6 +1069,18 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 app.pending_confirm = Some(app::ConfirmAction::Kill);
                             }
                         }
+                        KeyCode::Char('N') => {
+                            // Open EA name prompt to spawn a new EA
+                            app.ea_input_mode = true;
+                        }
+                        KeyCode::Char('D') => {
+                            // Delete the currently active EA (last EA is protected)
+                            if app.registered_eas.len() > 1 {
+                                app.pending_confirm = Some(app::ConfirmAction::DeleteEa);
+                            } else {
+                                app.set_status("Cannot delete the only EA");
+                            }
+                        }
                         KeyCode::Char('p') => {
                             app.project_input_mode = true;
                         }
@@ -746,11 +1092,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Char('e') => {
-                            app.scheduled_events = scheduler.list();
+                            // Fix V2: EA-scoped events instead of global list
+                            app.scheduled_events = scheduler.list_by_ea(app.active_ea);
                             app.scheduled_events.sort_by_key(|e| e.timestamp);
                             app.show_events = true;
                         }
-                        KeyCode::Char('D') => {
+                        KeyCode::Char('G') => {
                             app.show_debug_console = true;
                         }
                         KeyCode::Char('z') => {
@@ -771,14 +1118,15 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     }
                 }
                 AppEvent::Tick => {
+                    let mut app = shared_app.lock().await;
                     // Rotate quotes every ~30 ticks
                     tick_count += 1;
                     if tick_count.is_multiple_of(30) {
                         app.quote_index = app.quote_index.wrapping_add(1);
                     }
 
-                    // Keep event snapshots fresh for status-bar countdowns and events popup.
-                    app.scheduled_events = scheduler.list();
+                    // Fix V2: EA-scoped events instead of global list
+                    app.scheduled_events = scheduler.list_by_ea(app.active_ea);
                     app.scheduled_events.sort_by_key(|e| e.timestamp);
 
                     // Skip refresh while a popup/input overlay is active
@@ -793,15 +1141,20 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         app.check_auth_failures(&app_ticker);
                     }
 
-                    // Keep system_state.md in sync with live state
-                    memory::write_memory(
+                    // Keep system_state.md in sync with live state (EA-scoped)
+                    let state_dir = app.state_dir();
+                    let manager_session = app.manager_session_name();
+                    memory::write_memory_to(
+                        &state_dir,
                         &app.agents,
                         app.manager.as_ref(),
+                        &manager_session,
                         app.client(),
                         &app.scheduled_events,
                     );
                 }
                 AppEvent::TickerScroll => {
+                    let mut app = shared_app.lock().await;
                     app.ticker_offset = app.ticker_offset.wrapping_add(1);
                 }
                 AppEvent::Resize(_, _) => {
@@ -810,22 +1163,45 @@ async fn run_dashboard(config: Config) -> Result<()> {
             }
         }
 
-        if app.should_quit {
+        // Check quit flag
+        let should_quit = {
+            let app = shared_app.lock().await;
+            if app.should_quit {
+                Some(app.omar_dir.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(omar_dir) = should_quit {
+            // Compact EA ID counter on clean quit so next session starts from a compact point
+            if let Err(e) = ea::compact_id_counter(&omar_dir) {
+                eprintln!("compact_id_counter failed: {}", e);
+            }
             break;
         }
     }
 
     // Restore terminal
+    if keyboard_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // Kill the EA session on exit
-    if app
-        .client()
-        .has_session(crate::manager::MANAGER_SESSION)
-        .unwrap_or(false)
+    // Kill ALL OMAR EA sessions on quit (managers + workers), even if
+    // registry and tmux are temporarily out of sync.
     {
-        let _ = app.client().kill_session(crate::manager::MANAGER_SESSION);
+        let app = shared_app.lock().await;
+        let client = TmuxClient::new("");
+        let base_prefix = app.base_prefix.clone();
+
+        if let Ok(sessions) = client.list_all_sessions() {
+            for session in sessions {
+                if session.name.starts_with(&base_prefix) {
+                    let _ = client.kill_session(&session.name);
+                }
+            }
+        }
     }
 
     // Kill Slack bridge on exit
