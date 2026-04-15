@@ -37,6 +37,7 @@ Other features include messaging systems integration (e.g., Slack), computer use
 - [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview)
 - [Codex CLI](https://developers.openai.com/codex/cli)
 - [Cursor CLI](https://cursor.com/cli)
+- [Gemini CLI](https://geminicli.com)
 - [Opencode](https://github.com/anomalyco/opencode)
 
 ### One-liner (recommended)
@@ -105,8 +106,8 @@ https://github.com/user-attachments/assets/94b9a78f-5eb2-4557-9932-f17fed536ba5
 | [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar` (default) |
 | [Codex CLI](https://developers.openai.com/codex/cli) | `omar --agent codex` |
 | [Cursor CLI](https://cursor.com/cli) | `omar --agent cursor` |
+| [Gemini CLI](https://geminicli.com) | `omar --agent gemini` |
 | [Opencode](https://github.com/anomalyco/opencode) | `omar --agent opencode` |
-| [Cursor CLI](https://cursor.com/cli) | `omar --agent cursor` |
 
 ## Multi-EA CLI
 
