@@ -387,6 +387,7 @@ pub async fn list_agents(
             status: "running".to_string(),
             health: health_from_activity(s.activity, state.health_idle_warning),
             last_output: last_output_line(&client.capture_pane(&s.name, 50).unwrap_or_default()),
+            auth_failure: false,
         })
         .collect();
 
@@ -402,6 +403,7 @@ pub async fn list_agents(
             status: "running".to_string(),
             health: health_from_activity(activity, state.health_idle_warning),
             last_output: last_output_line(&output_tail),
+            auth_failure: false,
         })
     } else {
         None
@@ -445,6 +447,7 @@ pub async fn get_agent(
         ),
         last_output: last_output_line(&output_tail),
         output_tail,
+        auth_failure: false,
     }))
 }
 

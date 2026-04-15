@@ -352,6 +352,11 @@ const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
     ),
     ("mouse", "set -g mouse on", "mouse scrolling and selection"),
     (
+        "history-limit",
+        "set -g history-limit 9999",
+        "larger scrollback history",
+    ),
+    (
         "extended-keys",
         "set -g extended-keys always",
         "Shift+Enter in agents",
@@ -611,6 +616,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
 
     // Create the ticker buffer and scheduler, then spawn the event loop
     let ticker = scheduler::TickerBuffer::new();
+    let app_ticker = ticker.clone();
     let scheduler = Arc::new(scheduler::Scheduler::new());
     let popup_receiver = scheduler::new_popup_receiver();
     let base_prefix = config.dashboard.session_prefix.clone();
@@ -1130,6 +1136,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         if let Err(e) = app.refresh() {
                             app.set_status(format!("Error: {}", e));
                         }
+
+                        // Check for auth failures and spawn watchdog if configured
+                        app.check_auth_failures(&app_ticker);
                     }
 
                     // Keep system_state.md in sync with live state (EA-scoped)

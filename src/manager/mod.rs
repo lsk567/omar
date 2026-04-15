@@ -17,11 +17,13 @@ use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 // Embed prompt files at compile time so they work regardless of CWD.
 const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
 const PROMPT_AGENT: &str = include_str!("../../prompts/agent.md");
+const PROMPT_WATCHDOG: &str = include_str!("../../prompts/watchdog.md");
 
 /// Embedded prompt files, keyed by filename.
 const EMBEDDED_PROMPTS: &[(&str, &str)] = &[
     ("executive-assistant.md", PROMPT_EA),
     ("agent.md", PROMPT_AGENT),
+    ("watchdog.md", PROMPT_WATCHDOG),
 ];
 
 /// Return the `{omar_dir}/prompts/` directory, writing embedded prompts into it.

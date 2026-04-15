@@ -82,6 +82,7 @@ pub struct AgentInfo {
     pub status: String,
     pub health: String,
     pub last_output: String,
+    pub auth_failure: bool,
 }
 
 /// Response for listing agents
@@ -99,6 +100,7 @@ pub struct AgentDetailResponse {
     pub health: String,
     pub last_output: String,
     pub output_tail: String,
+    pub auth_failure: bool,
 }
 
 /// Request to send input to an agent

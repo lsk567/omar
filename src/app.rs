@@ -131,6 +131,8 @@ pub struct App {
     default_workdir: String,
     session_prefix: String,
     pub scheduler: Arc<Scheduler>,
+    /// Whether the watchdog agent has been spawned
+    watchdog_spawned: bool,
 }
 
 impl App {
@@ -163,7 +165,8 @@ impl App {
         let manager_session = ea::ea_manager_session(active_ea, &base_prefix);
 
         let client = TmuxClient::new(&session_prefix);
-        let health_checker = HealthChecker::new(client.clone(), config.health.idle_warning);
+        let health_checker = HealthChecker::new(client.clone(), config.health.idle_warning)
+            .with_auth_failure_patterns(config.watchdog.auth_failure_patterns.clone());
 
         let state_dir = ea::ea_state_dir(active_ea, &omar_dir);
         std::fs::create_dir_all(state_dir.join("status")).ok();
@@ -231,6 +234,7 @@ impl App {
             default_workdir: config.agent.default_workdir.clone(),
             session_prefix,
             scheduler,
+            watchdog_spawned: false,
         }
     }
 
@@ -924,6 +928,110 @@ impl App {
         Ok(())
     }
 
+    /// Check all agents for auth failures and spawn a single watchdog agent
+    /// to monitor errors and notify the user via Slack. Returns true if the
+    /// watchdog was spawned.
+    pub fn check_auth_failures(&mut self, ticker: &TickerBuffer) -> bool {
+        if self.config.watchdog.command.is_empty() || self.watchdog_spawned {
+            return false;
+        }
+
+        // Collect names of agents with auth failures
+        let prefix = &self.config.dashboard.session_prefix;
+        let mut failed_agents: Vec<String> = Vec::new();
+
+        if let Some(ref mgr) = self.manager {
+            if mgr.health_info.auth_failure {
+                let short = mgr
+                    .session
+                    .name
+                    .strip_prefix(prefix)
+                    .unwrap_or(&mgr.session.name);
+                failed_agents.push(short.to_string());
+            }
+        }
+
+        for agent in &self.agents {
+            if agent.health_info.auth_failure {
+                let short = agent
+                    .session
+                    .name
+                    .strip_prefix(prefix)
+                    .unwrap_or(&agent.session.name);
+                failed_agents.push(short.to_string());
+            }
+        }
+
+        if failed_agents.is_empty() {
+            return false;
+        }
+
+        let watchdog_session = format!("{}watchdog", prefix);
+
+        // Skip if watchdog already exists
+        if self.client.has_session(&watchdog_session).unwrap_or(false) {
+            self.watchdog_spawned = true;
+            return false;
+        }
+
+        ticker.push(format!(
+            "AUTH FAILURE in {} agent(s) — spawning watchdog",
+            failed_agents.len()
+        ));
+
+        let watchdog_cmd = &self.config.watchdog.command;
+        let prompt_file = crate::manager::prompts_dir(&self.omar_dir).join("watchdog.md");
+        let cmd = crate::manager::build_agent_command(watchdog_cmd, &prompt_file, &[]);
+
+        let workdir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        if let Err(e) = self
+            .client
+            .new_session(&watchdog_session, &cmd, Some(&workdir))
+        {
+            ticker.push(format!("Failed to spawn watchdog: {}", e));
+            return false;
+        }
+
+        // Build the initial task message for the watchdog.
+        // No secrets — only localhost URLs and the Slack channel ID.
+        let slack_channel = &self.config.watchdog.slack_channel;
+        let failed_list = failed_agents.join(", ");
+        let slack_display = if slack_channel.is_empty() {
+            "(not configured)"
+        } else {
+            slack_channel
+        };
+        let task_msg = format!(
+            "AUTH FAILURE DETECTED.\n\
+Failed agents: {}\n\
+Slack channel: {}\n\
+Omar API: http://localhost:{}\n\
+Slack bridge: http://localhost:9877",
+            failed_list, slack_display, self.config.api.port,
+        );
+
+        let client = self.client.clone();
+        let session = watchdog_session;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = client.send_keys_literal(&session, &task_msg);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = client.send_keys(&session, "Enter");
+        });
+
+        self.watchdog_spawned = true;
+
+        self.set_persistent_warning(format!(
+            "⚠ Auth failure in {} agent(s) — watchdog monitoring",
+            failed_agents.len()
+        ));
+
+        true
+    }
+
     /// Set status message (persists for 3 seconds before auto-clearing)
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
@@ -1040,7 +1148,8 @@ impl App {
         let new_prefix = ea::ea_prefix(ea_id, &self.base_prefix);
         self.session_prefix = new_prefix.clone();
         self.client = TmuxClient::new(&new_prefix);
-        self.health_checker = HealthChecker::new(self.client.clone(), self.health_threshold);
+        self.health_checker = HealthChecker::new(self.client.clone(), self.health_threshold)
+            .with_auth_failure_patterns(self.config.watchdog.auth_failure_patterns.clone());
 
         // Reset all view state
         self.focus_parent = ea::ea_manager_session(ea_id, &self.base_prefix);
@@ -1483,6 +1592,7 @@ mod tests {
             health_info: HealthInfo {
                 state: health,
                 last_output: String::new(),
+                auth_failure: false,
             },
         }
     }
