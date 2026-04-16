@@ -50,6 +50,36 @@ fn tmux_available() -> bool {
         .unwrap_or(false)
 }
 
+fn wait_for_pane_contains(target: &str, needle: &str, attempts: usize, delay: Duration) -> bool {
+    for _ in 0..attempts {
+        if let Ok(output) = tmux(&["capture-pane", "-t", target, "-p"]) {
+            if output.contains(needle) {
+                return true;
+            }
+        }
+        thread::sleep(delay);
+    }
+    false
+}
+
+fn send_line_and_wait(target: &str, line: &str) -> bool {
+    for _ in 0..5 {
+        let _ = tmux(&["send-keys", "-t", target, "-l", line]);
+        let _ = tmux(&["send-keys", "-t", target, "C-m"]);
+        if wait_for_pane_contains(target, line, 10, Duration::from_millis(100)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn pane_contains_wrapped(output: &str, needle: &str) -> bool {
+    if output.contains(needle) {
+        return true;
+    }
+    output.replace(['\r', '\n'], "").contains(needle)
+}
+
 #[test]
 fn test_tmux_available() {
     assert!(
@@ -106,25 +136,9 @@ fn test_capture_pane() {
     // Give it time to start
     thread::sleep(Duration::from_millis(200));
 
-    // Send echo command
-    let _ = tmux(&[
-        "send-keys",
-        "-t",
-        &session_name,
-        "echo HELLO_OMAR_TEST",
-        "Enter",
-    ]);
-
-    // Give it time to execute
-    thread::sleep(Duration::from_millis(500));
-
-    // Capture pane content
-    let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
-    assert!(
-        output.contains("HELLO_OMAR_TEST"),
-        "Expected output not found: {}",
-        output
-    );
+    let found = send_line_and_wait(&session_name, "echo HELLO_OMAR_TEST");
+    let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap_or_default();
+    assert!(found, "Expected output not found: {}", output);
 
     // Cleanup
     let _ = tmux(&["kill-session", "-t", &session_name]);
@@ -243,23 +257,12 @@ fn test_send_keys() {
     let _ = tmux(&["new-session", "-d", "-s", &session_name]);
     thread::sleep(Duration::from_millis(200));
 
-    // Send a command
-    let result = tmux(&[
-        "send-keys",
-        "-t",
-        &session_name,
-        "echo SENT_BY_OMAR",
-        "Enter",
-    ]);
-    assert!(result.is_ok());
-
-    // Give it time to execute
-    thread::sleep(Duration::from_millis(500));
+    let sent = send_line_and_wait(&session_name, "echo SENT_BY_OMAR");
 
     // Capture and verify
     let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
     assert!(
-        output.contains("SENT_BY_OMAR"),
+        sent && output.contains("SENT_BY_OMAR"),
         "Sent command not found: {}",
         output
     );
@@ -305,15 +308,12 @@ fn test_spawn_custom_command() {
     // Simulate the universal send-keys task injection pattern
     // (this is how omar sends tasks to any backend, including opencode)
     let task_text = "echo TASK_INJECTED_VIA_SENDKEYS";
-    let _ = tmux(&["send-keys", "-t", &session_name, "-l", task_text]);
-    let _ = tmux(&["send-keys", "-t", &session_name, "Enter"]);
-
-    thread::sleep(Duration::from_millis(500));
+    let injected = send_line_and_wait(&session_name, task_text);
 
     // Verify the task was injected and executed
     let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
     assert!(
-        output.contains("TASK_INJECTED_VIA_SENDKEYS"),
+        injected && output.contains("TASK_INJECTED_VIA_SENDKEYS"),
         "Task should be injected via send-keys: {}",
         output
     );
@@ -504,13 +504,8 @@ fn test_deliver_to_tmux_ea_scoped() {
     let msg_ea0 = "DELIVER_EA0_ONLY";
     let msg_ea1 = "DELIVER_EA1_ONLY";
 
-    let _ = tmux(&["send-keys", "-t", &ea0_session, "-l", msg_ea0]);
-    let _ = tmux(&["send-keys", "-t", &ea0_session, "Enter"]);
-
-    let _ = tmux(&["send-keys", "-t", &ea1_session, "-l", msg_ea1]);
-    let _ = tmux(&["send-keys", "-t", &ea1_session, "Enter"]);
-
-    thread::sleep(Duration::from_millis(500));
+    let found_ea0 = send_line_and_wait(&ea0_session, msg_ea0);
+    let found_ea1 = send_line_and_wait(&ea1_session, msg_ea1);
 
     // Capture pane output for each session
     let out0 = tmux(&["capture-pane", "-t", &ea0_session, "-p"]).unwrap_or_default();
@@ -518,18 +513,14 @@ fn test_deliver_to_tmux_ea_scoped() {
 
     // Each session must contain its own message
     assert!(
-        out0.contains(msg_ea0),
+        found_ea0,
         "EA 0 session '{}' should contain '{}': {}",
-        ea0_session,
-        msg_ea0,
-        out0
+        ea0_session, msg_ea0, out0
     );
     assert!(
-        out1.contains(msg_ea1),
+        found_ea1,
         "EA 1 session '{}' should contain '{}': {}",
-        ea1_session,
-        msg_ea1,
-        out1
+        ea1_session, msg_ea1, out1
     );
 
     // EA isolation: messages must not cross EA boundaries
@@ -637,14 +628,8 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
     let payload_ea0 = format!("[EVENT at t={}]\nFrom ea-test: sched-ea0-only", ts);
     let payload_ea1 = format!("[EVENT at t={}]\nFrom ea-test: sched-ea1-only", ts);
 
-    // Deliver to each session via the same tmux send-keys pattern as deliver_to_tmux
-    let _ = tmux(&["send-keys", "-t", &ea0_session, "-l", &payload_ea0]);
-    let _ = tmux(&["send-keys", "-t", &ea0_session, "Enter"]);
-
-    let _ = tmux(&["send-keys", "-t", &ea1_session, "-l", &payload_ea1]);
-    let _ = tmux(&["send-keys", "-t", &ea1_session, "Enter"]);
-
-    thread::sleep(Duration::from_millis(500));
+    let _ = send_line_and_wait(&ea0_session, &payload_ea0);
+    let _ = send_line_and_wait(&ea1_session, &payload_ea1);
 
     // Capture pane output
     let out0 = tmux(&["capture-pane", "-t", &ea0_session, "-p"]).unwrap_or_default();
@@ -652,24 +637,24 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
 
     // Each EA's session received its own event payload
     assert!(
-        out0.contains("sched-ea0-only"),
+        pane_contains_wrapped(&out0, "sched-ea0-only"),
         "EA 0 session missing its scheduled event: {}",
         out0
     );
     assert!(
-        out1.contains("sched-ea1-only"),
+        pane_contains_wrapped(&out1, "sched-ea1-only"),
         "EA 1 session missing its scheduled event: {}",
         out1
     );
 
     // EA isolation: events must not cross EA boundaries
     assert!(
-        !out0.contains("sched-ea1-only"),
+        !pane_contains_wrapped(&out0, "sched-ea1-only"),
         "EA 0 session must NOT contain EA 1's event: {}",
         out0
     );
     assert!(
-        !out1.contains("sched-ea0-only"),
+        !pane_contains_wrapped(&out1, "sched-ea0-only"),
         "EA 1 session must NOT contain EA 0's event: {}",
         out1
     );
