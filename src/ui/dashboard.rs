@@ -1735,7 +1735,6 @@ fn render_meeting_room_popup(frame: &mut Frame, app: &App) {
         lines.push(Line::from(""));
 
         let body_height = area.height.saturating_sub(8) as usize;
-        let msg_width = area.width.saturating_sub(6) as usize;
         let start = room.transcript.len().saturating_sub(body_height);
         let messages = room.transcript[start..].to_vec();
 
@@ -1755,10 +1754,7 @@ fn render_meeting_room_popup(frame: &mut Frame, app: &App) {
                     format!("{}: ", msg.sender),
                     Style::default().fg(Color::Yellow),
                 ),
-                Span::styled(
-                    truncate_str(&msg.payload, msg_width),
-                    Style::default().fg(color),
-                ),
+                Span::styled(msg.payload, Style::default().fg(color)),
             ]));
         }
     } else {
