@@ -144,13 +144,12 @@ When the EA asks you to run a command and report its output, always relay the ou
 
 ## Status Reporting
 
-OMAR sends you a periodic `[STATUS CHECK]` event every 60 seconds. When you receive one, update your status via the API:
+Status checks are not automatically pushed to you. If your parent asks for status, update it via the API:
 ```bash
 curl -X PUT http://localhost:9876/api/ea/{{EA_ID}}/agents/<YOUR NAME>/status \
   -H "Content-Type: application/json" \
   -d '{"status": "Currently: <brief description of what you are doing>"}'
 ```
-Also update proactively after spawning sub-agents or reaching a milestone.
 
 ## Scheduling and Wake-ups
 

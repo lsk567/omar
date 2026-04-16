@@ -741,29 +741,6 @@ pub async fn spawn_agent(
         });
     }
 
-    // Schedule a recurring status check — ea_id is structural
-    if has_agent_prompt {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let interval: u64 = 60_000_000_000; // 60 seconds
-        let event = ScheduledEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            sender: "omar".to_string(),
-            receiver: short_name.clone(),
-            timestamp: now + interval,
-            payload: format!(
-                "[STATUS CHECK] Update your status via the API: curl -X PUT http://localhost:9876/api/ea/{}/agents/<YOUR NAME>/status -H 'Content-Type: application/json' -d '{{\"status\": \"<1-line status>\"}}'",
-                ea_id
-            ),
-            created_at: now,
-            recurring_ns: Some(interval),
-            ea_id,
-        };
-        state.scheduler.insert(event);
-    }
-
     Ok(Json(SpawnAgentResponse {
         id: short_name,
         status: "running".to_string(),
