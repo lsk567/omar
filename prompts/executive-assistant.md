@@ -124,6 +124,55 @@ curl http://localhost:9876/api/ea/{{EA_ID}}/projects
 curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/projects/<id>
 ```
 
+### Meeting Rooms API
+
+Use meeting rooms for multi-agent discussions where one message should fan out to all participants.
+
+#### Create a room
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms \
+  -H "Content-Type: application/json" \
+  -d '{"name":"audit-discussion","created_by":"ea"}'
+```
+
+#### List rooms
+```bash
+curl http://localhost:9876/api/ea/{{EA_ID}}/rooms
+```
+
+#### Invite an agent (any participant can invite any agent)
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms/audit-discussion/invites \
+  -H "Content-Type: application/json" \
+  -d '{"invited_agent":"auditor-2","invited_by":"ea","message":"Join the audit meeting"}'
+```
+
+#### Respond to invite (accept/decline)
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms/audit-discussion/invites/<invite-id>/respond \
+  -H "Content-Type: application/json" \
+  -d '{"agent":"auditor-2","response":"accept"}'
+```
+
+#### Send room message (fan-out)
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms/audit-discussion/messages \
+  -H "Content-Type: application/json" \
+  -d '{"sender":"ea","payload":"Please review pipeline_v2 and propose fixes."}'
+```
+
+#### Read transcript
+```bash
+curl http://localhost:9876/api/ea/{{EA_ID}}/rooms/audit-discussion/transcript
+```
+
+#### Close room
+```bash
+curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/rooms/audit-discussion
+```
+
+When a room closes (manual close or inactivity timeout), meeting minutes are written under `~/.omar/meetings/`.
+
 ## Monitoring Agents
 
 Poll agent output periodically:

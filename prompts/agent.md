@@ -190,6 +190,48 @@ curl http://localhost:9876/api/ea/{{EA_ID}}/events
 curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/events/<event-id>
 ```
 
+### Meeting Rooms API
+
+Use meeting rooms for multi-agent discussion when you want one message to reach all participants.
+
+#### Create room
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms \
+  -H "Content-Type: application/json" \
+  -d '{"name":"design-review","created_by":"<YOUR NAME>"}'
+```
+
+#### Invite another agent
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms/design-review/invites \
+  -H "Content-Type: application/json" \
+  -d '{"invited_agent":"agent-name","invited_by":"<YOUR NAME>","message":"Join this review"}'
+```
+
+#### Accept/decline invite (for invited agent)
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms/design-review/invites/<invite-id>/respond \
+  -H "Content-Type: application/json" \
+  -d '{"agent":"<YOUR NAME>","response":"accept"}'
+```
+
+#### Send message to room (broadcast fan-out)
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms/design-review/messages \
+  -H "Content-Type: application/json" \
+  -d '{"sender":"<YOUR NAME>","payload":"My proposal is ..."}'
+```
+
+#### Read transcript
+```bash
+curl http://localhost:9876/api/ea/{{EA_ID}}/rooms/design-review/transcript
+```
+
+#### Close room
+```bash
+curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/rooms/design-review
+```
+
 ## Skills
 
 If your task requires special capabilities, check the skills folder at `prompts/skills/` for detailed instructions. Read the relevant skill file before proceeding. When spawning sub-agents that need a skill, include the skill contents in the agent's task description.
