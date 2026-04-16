@@ -7,6 +7,7 @@ mod event;
 mod manager;
 mod memory;
 mod projects;
+mod rooms;
 mod scheduler;
 mod tmux;
 mod ui;
@@ -638,13 +639,18 @@ async fn run_dashboard(config: Config) -> Result<()> {
     // Start API server if enabled
     if config.api.enabled {
         let api_config = config.api.clone();
-        let (base_prefix, omar_dir) = {
+        let (base_prefix, omar_dir, rooms) = {
             let app_guard = shared_app.lock().await;
-            (app_guard.base_prefix.clone(), app_guard.omar_dir.clone())
+            (
+                app_guard.base_prefix.clone(),
+                app_guard.omar_dir.clone(),
+                app_guard.rooms_registry(),
+            )
         };
         let api_state = Arc::new(api::handlers::ApiState {
             app: shared_app.clone(), // Same Arc — single source of truth
             scheduler: scheduler.clone(),
+            rooms,
             computer_lock: computer::new_lock(),
             base_prefix,
             omar_dir,
@@ -871,11 +877,38 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
-                    // Handle sidebar enlarged popup
-                    if app.sidebar_popup.is_some() {
+                    // Handle live meeting room popup
+                    if app.active_meeting_room_name.is_some() {
                         match key.code {
                             KeyCode::Esc | KeyCode::Enter => {
+                                app.close_meeting_popup();
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Handle sidebar enlarged popup
+                    if let Some(panel) = app.sidebar_popup {
+                        match key.code {
+                            KeyCode::Esc => {
                                 app.sidebar_popup = None;
+                            }
+                            KeyCode::Enter => {
+                                if panel == app::SidebarPanel::Rooms {
+                                    app.open_selected_meeting_room();
+                                }
+                                app.sidebar_popup = None;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                if panel == app::SidebarPanel::Rooms {
+                                    app.room_selection_next();
+                                }
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                if panel == app::SidebarPanel::Rooms {
+                                    app.room_selection_prev();
+                                }
                             }
                             _ => {}
                         }
@@ -986,6 +1019,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     app.scheduled_events.sort_by_key(|e| e.timestamp);
                                     app.show_events = true;
                                 } else {
+                                    if app.sidebar_panel == app::SidebarPanel::Rooms {
+                                        app.refresh_meeting_rooms();
+                                    }
                                     app.sidebar_popup = Some(app.sidebar_panel);
                                 }
                                 continue;
@@ -1128,6 +1164,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     // Fix V2: EA-scoped events instead of global list
                     app.scheduled_events = scheduler.list_by_ea(app.active_ea);
                     app.scheduled_events.sort_by_key(|e| e.timestamp);
+                    app.refresh_meeting_rooms();
 
                     // Skip refresh while a popup/input overlay is active
                     // to avoid interrupting user input.

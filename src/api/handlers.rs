@@ -19,6 +19,7 @@ use crate::ea;
 use crate::manager::{build_agent_command, prompts_dir};
 use crate::memory;
 use crate::projects;
+use crate::rooms::{InviteDecision, RoomError, RoomRegistry};
 use crate::scheduler::{event::ScheduledEvent, Scheduler};
 use crate::tmux::TmuxClient;
 
@@ -26,6 +27,7 @@ use crate::tmux::TmuxClient;
 pub struct ApiState {
     pub app: Arc<Mutex<App>>,
     pub scheduler: Arc<Scheduler>,
+    pub rooms: Arc<RoomRegistry>,
     pub computer_lock: ComputerLock,
     pub base_prefix: String,
     pub omar_dir: PathBuf,
@@ -86,6 +88,35 @@ fn health_from_activity(activity: i64, idle_warning: i64) -> String {
 
 fn timestamp_is_too_old(timestamp: u64, now: u64) -> bool {
     timestamp < now.saturating_sub(1_000_000_000)
+}
+
+fn room_error_response(err: RoomError) -> (StatusCode, Json<ErrorResponse>) {
+    let status = match err {
+        RoomError::NotFound(_) => StatusCode::NOT_FOUND,
+        RoomError::AlreadyExists(_) => StatusCode::CONFLICT,
+        RoomError::Forbidden(_) => StatusCode::FORBIDDEN,
+        RoomError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error: err.to_string(),
+        }),
+    )
+}
+
+fn normalize_agent_name(prefix: &str, name: &str) -> String {
+    name.strip_prefix(prefix).unwrap_or(name).to_string()
+}
+
+fn ensure_agent_exists(prefix: &str, name: &str) -> bool {
+    let client = TmuxClient::new(prefix);
+    let session = if name.starts_with(prefix) {
+        name.to_string()
+    } else {
+        format!("{}{}", prefix, name)
+    };
+    client.has_session(&session).unwrap_or(false)
 }
 
 // ── Global handlers ──
@@ -1042,6 +1073,295 @@ pub async fn cancel_event(
             ))
         }
     }
+}
+
+// ── EA-scoped meeting room handlers ──
+
+/// POST /api/ea/:ea_id/rooms
+pub async fn create_room(
+    Path(ea_id): Path<u32>,
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CreateRoomRequest>,
+) -> Result<Json<RoomSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (prefix, _manager, _state_dir) = resolve_ea(ea_id, &state)?;
+    let created_by = normalize_agent_name(&prefix, &req.created_by);
+    let room = state
+        .rooms
+        .create_room(ea_id, req.name.trim(), created_by.trim())
+        .map_err(room_error_response)?;
+    Ok(Json(RoomSummaryResponse {
+        name: room.name,
+        created_by: room.created_by,
+        participant_count: room.participant_count,
+        message_count: room.message_count,
+        last_activity_at: room.last_activity_at,
+    }))
+}
+
+/// GET /api/ea/:ea_id/rooms
+pub async fn list_rooms(
+    Path(ea_id): Path<u32>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ListRoomsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (_prefix, _manager, _state_dir) = resolve_ea(ea_id, &state)?;
+    let rooms = state
+        .rooms
+        .list_rooms(ea_id)
+        .into_iter()
+        .map(|r| RoomSummaryResponse {
+            name: r.name,
+            created_by: r.created_by,
+            participant_count: r.participant_count,
+            message_count: r.message_count,
+            last_activity_at: r.last_activity_at,
+        })
+        .collect();
+    Ok(Json(ListRoomsResponse { rooms }))
+}
+
+/// GET /api/ea/:ea_id/rooms/:room
+pub async fn get_room(
+    Path((ea_id, room)): Path<(u32, String)>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<RoomDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (_prefix, _manager, _state_dir) = resolve_ea(ea_id, &state)?;
+    let snapshot = state.rooms.get_room(ea_id, &room).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Room '{}' not found", room),
+            }),
+        )
+    })?;
+    Ok(Json(RoomDetailResponse {
+        name: snapshot.name,
+        created_by: snapshot.created_by,
+        participants: snapshot.participants,
+        created_at: snapshot.created_at,
+        last_activity_at: snapshot.last_activity_at,
+    }))
+}
+
+/// DELETE /api/ea/:ea_id/rooms/:room
+pub async fn close_room(
+    Path((ea_id, room)): Path<(u32, String)>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (_prefix, _manager, _state_dir) = resolve_ea(ea_id, &state)?;
+    state
+        .rooms
+        .close_room(ea_id, &room, "manual close")
+        .map_err(room_error_response)?;
+    Ok(Json(StatusResponse {
+        status: "closed".to_string(),
+        message: Some(format!("Closed room '{}'", room)),
+    }))
+}
+
+/// POST /api/ea/:ea_id/rooms/:room/invites
+pub async fn create_room_invite(
+    Path((ea_id, room)): Path<(u32, String)>,
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CreateInviteRequest>,
+) -> Result<Json<InviteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (prefix, _manager, _state_dir) = resolve_ea(ea_id, &state)?;
+    let invited_agent = normalize_agent_name(&prefix, &req.invited_agent);
+    let invited_by = normalize_agent_name(&prefix, &req.invited_by);
+
+    if !ensure_agent_exists(&prefix, &invited_agent) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                error: format!("Invited agent '{}' does not exist", invited_agent),
+            }),
+        ));
+    }
+
+    let invite = state
+        .rooms
+        .create_invite(
+            ea_id,
+            &room,
+            &invited_by,
+            &invited_agent,
+            req.message,
+            req.expires_at,
+        )
+        .map_err(room_error_response)?;
+
+    Ok(Json(InviteResponse {
+        id: invite.id,
+        invited_agent: invite.invited_agent,
+        invited_by: invite.invited_by,
+        message: invite.message,
+        created_at: invite.created_at,
+        expires_at: invite.expires_at,
+        status: invite.status.as_str().to_string(),
+        responded_at: invite.responded_at,
+        reason: invite.reason,
+    }))
+}
+
+/// GET /api/ea/:ea_id/rooms/:room/invites
+pub async fn list_room_invites(
+    Path((ea_id, room)): Path<(u32, String)>,
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ListInvitesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (_prefix, _manager, _state_dir) = resolve_ea(ea_id, &state)?;
+    let invites = state
+        .rooms
+        .list_invites(ea_id, &room)
+        .map_err(room_error_response)?
+        .into_iter()
+        .map(|i| InviteResponse {
+            id: i.id,
+            invited_agent: i.invited_agent,
+            invited_by: i.invited_by,
+            message: i.message,
+            created_at: i.created_at,
+            expires_at: i.expires_at,
+            status: i.status.as_str().to_string(),
+            responded_at: i.responded_at,
+            reason: i.reason,
+        })
+        .collect();
+    Ok(Json(ListInvitesResponse { invites }))
+}
+
+/// POST /api/ea/:ea_id/rooms/:room/invites/:invite_id/respond
+pub async fn respond_room_invite(
+    Path((ea_id, room, invite_id)): Path<(u32, String, String)>,
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<RespondInviteRequest>,
+) -> Result<Json<InviteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (prefix, _manager, _state_dir) = resolve_ea(ea_id, &state)?;
+    let agent = normalize_agent_name(&prefix, &req.agent);
+    let decision = match req.response.as_str() {
+        "accept" => InviteDecision::Accept,
+        "decline" => InviteDecision::Decline,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid response '{}'. Use 'accept' or 'decline'", other),
+                }),
+            ))
+        }
+    };
+
+    let invite = state
+        .rooms
+        .respond_invite(ea_id, &room, &invite_id, &agent, decision, req.reason)
+        .map_err(room_error_response)?;
+
+    Ok(Json(InviteResponse {
+        id: invite.id,
+        invited_agent: invite.invited_agent,
+        invited_by: invite.invited_by,
+        message: invite.message,
+        created_at: invite.created_at,
+        expires_at: invite.expires_at,
+        status: invite.status.as_str().to_string(),
+        responded_at: invite.responded_at,
+        reason: invite.reason,
+    }))
+}
+
+/// DELETE /api/ea/:ea_id/rooms/:room/invites/:invite_id
+pub async fn cancel_room_invite(
+    Path((ea_id, room, invite_id)): Path<(u32, String, String)>,
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CancelInviteRequest>,
+) -> Result<Json<InviteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (prefix, _manager, _state_dir) = resolve_ea(ea_id, &state)?;
+    let cancelled_by = normalize_agent_name(&prefix, &req.cancelled_by);
+    let invite = state
+        .rooms
+        .cancel_invite(ea_id, &room, &invite_id, &cancelled_by)
+        .map_err(room_error_response)?;
+    Ok(Json(InviteResponse {
+        id: invite.id,
+        invited_agent: invite.invited_agent,
+        invited_by: invite.invited_by,
+        message: invite.message,
+        created_at: invite.created_at,
+        expires_at: invite.expires_at,
+        status: invite.status.as_str().to_string(),
+        responded_at: invite.responded_at,
+        reason: invite.reason,
+    }))
+}
+
+/// POST /api/ea/:ea_id/rooms/:room/messages
+pub async fn send_room_message(
+    Path((ea_id, room)): Path<(u32, String)>,
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<RoomMessageRequest>,
+) -> Result<Json<RoomMessageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (prefix, _manager, _state_dir) = resolve_ea(ea_id, &state)?;
+    let sender = normalize_agent_name(&prefix, &req.sender);
+    let (msg, recipients) = state
+        .rooms
+        .post_message(ea_id, &room, &sender, &req.payload)
+        .map_err(room_error_response)?;
+
+    for receiver in &recipients {
+        let event = ScheduledEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            sender: format!("room:{}:{}", room, sender),
+            receiver: receiver.clone(),
+            timestamp: msg.created_at,
+            payload: msg.payload.clone(),
+            created_at: msg.created_at,
+            recurring_ns: None,
+            ea_id,
+        };
+        state.scheduler.insert(event);
+    }
+
+    Ok(Json(RoomMessageResponse {
+        id: msg.id,
+        sender,
+        payload: msg.payload,
+        created_at: msg.created_at,
+        fanout_count: recipients.len(),
+    }))
+}
+
+/// GET /api/ea/:ea_id/rooms/:room/transcript
+pub async fn get_room_transcript(
+    Path((ea_id, room)): Path<(u32, String)>,
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<TranscriptResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (_prefix, _manager, _state_dir) = resolve_ea(ea_id, &state)?;
+    let snapshot = state.rooms.get_room(ea_id, &room).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Room '{}' not found", room),
+            }),
+        )
+    })?;
+    let mut messages = snapshot.transcript;
+    if let Some(limit) = params.get("limit").and_then(|s| s.parse::<usize>().ok()) {
+        if messages.len() > limit {
+            let start = messages.len() - limit;
+            messages = messages.split_off(start);
+        }
+    }
+    let messages = messages
+        .into_iter()
+        .map(|m| TranscriptMessageResponse {
+            id: m.id,
+            sender: m.sender,
+            payload: m.payload,
+            created_at: m.created_at,
+            delivered_to: m.delivered_to,
+            system: m.system,
+        })
+        .collect();
+    Ok(Json(TranscriptResponse { room, messages }))
 }
 
 // ── Computer Use handlers (global — not EA-scoped) ──

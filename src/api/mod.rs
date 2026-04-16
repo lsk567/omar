@@ -59,6 +59,35 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/ea/:ea_id/events", post(handlers::schedule_event))
         .route("/api/ea/:ea_id/events", get(handlers::list_events))
         .route("/api/ea/:ea_id/events/:id", delete(handlers::cancel_event))
+        // EA-scoped: meeting rooms
+        .route("/api/ea/:ea_id/rooms", post(handlers::create_room))
+        .route("/api/ea/:ea_id/rooms", get(handlers::list_rooms))
+        .route("/api/ea/:ea_id/rooms/:room", get(handlers::get_room))
+        .route("/api/ea/:ea_id/rooms/:room", delete(handlers::close_room))
+        .route(
+            "/api/ea/:ea_id/rooms/:room/invites",
+            post(handlers::create_room_invite),
+        )
+        .route(
+            "/api/ea/:ea_id/rooms/:room/invites",
+            get(handlers::list_room_invites),
+        )
+        .route(
+            "/api/ea/:ea_id/rooms/:room/invites/:invite_id/respond",
+            post(handlers::respond_room_invite),
+        )
+        .route(
+            "/api/ea/:ea_id/rooms/:room/invites/:invite_id",
+            delete(handlers::cancel_room_invite),
+        )
+        .route(
+            "/api/ea/:ea_id/rooms/:room/messages",
+            post(handlers::send_room_message),
+        )
+        .route(
+            "/api/ea/:ea_id/rooms/:room/transcript",
+            get(handlers::get_room_transcript),
+        )
         // Computer use (global — one screen, one mouse)
         .route("/api/computer/status", get(handlers::computer_status))
         .route("/api/computer/lock", post(handlers::computer_lock_acquire))

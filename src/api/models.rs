@@ -235,6 +235,106 @@ pub struct EventCancelResponse {
     pub id: String,
 }
 
+// ── Meeting Room models ──
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRoomRequest {
+    pub name: String,
+    pub created_by: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoomSummaryResponse {
+    pub name: String,
+    pub created_by: String,
+    pub participant_count: usize,
+    pub message_count: usize,
+    pub last_activity_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListRoomsResponse {
+    pub rooms: Vec<RoomSummaryResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoomDetailResponse {
+    pub name: String,
+    pub created_by: String,
+    pub participants: Vec<String>,
+    pub created_at: u64,
+    pub last_activity_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateInviteRequest {
+    pub invited_agent: String,
+    pub invited_by: String,
+    pub message: Option<String>,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InviteResponse {
+    pub id: String,
+    pub invited_agent: String,
+    pub invited_by: String,
+    pub message: Option<String>,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
+    pub status: String,
+    pub responded_at: Option<u64>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListInvitesResponse {
+    pub invites: Vec<InviteResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RespondInviteRequest {
+    pub agent: String,
+    pub response: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelInviteRequest {
+    pub cancelled_by: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RoomMessageRequest {
+    pub sender: String,
+    pub payload: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoomMessageResponse {
+    pub id: String,
+    pub sender: String,
+    pub payload: String,
+    pub created_at: u64,
+    pub fanout_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TranscriptMessageResponse {
+    pub id: String,
+    pub sender: String,
+    pub payload: String,
+    pub created_at: u64,
+    pub delivered_to: Vec<String>,
+    pub system: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TranscriptResponse {
+    pub room: String,
+    pub messages: Vec<TranscriptMessageResponse>,
+}
+
 // ── Computer Use models ──
 
 /// Request to acquire the computer use lock
