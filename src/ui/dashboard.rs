@@ -536,7 +536,12 @@ fn render_status_row(frame: &mut Frame, app: &App, status_spans: &[Span], area: 
 }
 
 fn render_projects_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let border_color = Color::Gray;
+    let panel_active = app.sidebar_focused && app.sidebar_panel == SidebarPanel::Projects;
+    let border_color = if panel_active {
+        Color::Magenta
+    } else {
+        Color::Gray
+    };
     let block = Block::default()
         .title(" Projects ")
         .borders(Borders::ALL)
@@ -664,7 +669,7 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
 
         let (border_color, title_line) = if is_selected {
             (
-                Color::Gray,
+                Color::Magenta,
                 Line::from(vec![
                     Span::styled(" [", Style::default().fg(Color::Magenta)),
                     Span::styled(status_icon, Style::default().fg(Color::Magenta)),
@@ -798,7 +803,12 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
-    let border_color = Color::Gray;
+    let panel_active = app.sidebar_focused && app.sidebar_panel == SidebarPanel::ChainOfCommand;
+    let border_color = if panel_active {
+        Color::Magenta
+    } else {
+        Color::Gray
+    };
     let block = Block::default()
         .title(" Chain of Command ")
         .borders(Borders::ALL)
@@ -891,7 +901,12 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_event_queue(frame: &mut Frame, app: &App, area: Rect) {
-    let border_color = Color::Gray;
+    let panel_active = app.sidebar_focused && app.sidebar_panel == SidebarPanel::Events;
+    let border_color = if panel_active {
+        Color::Magenta
+    } else {
+        Color::Gray
+    };
     let block = Block::default()
         .title(" Event Queue ")
         .borders(Borders::ALL)
@@ -937,7 +952,12 @@ fn render_event_queue(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_meeting_rooms_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let border_color = Color::Gray;
+    let panel_active = app.sidebar_focused && app.sidebar_panel == SidebarPanel::Rooms;
+    let border_color = if panel_active {
+        Color::LightMagenta
+    } else {
+        Color::DarkGray
+    };
     let block = Block::default()
         .title(" Meeting Rooms ")
         .borders(Borders::ALL)
@@ -992,7 +1012,11 @@ fn render_summary_card(
         HealthState::Idle => (Color::Yellow, "○"),
     };
 
-    let border_color = Color::Gray;
+    let border_color = if selected {
+        Color::Magenta
+    } else {
+        Color::Gray
+    };
 
     let border_style = Style::default().fg(border_color).add_modifier(if selected {
         Modifier::BOLD
@@ -1310,7 +1334,7 @@ fn render_help_popup(frame: &mut Frame) {
     let block = Block::default()
         .title(" Help ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(help_content).block(block);
 
@@ -1379,7 +1403,7 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(Color::Red));
 
     let paragraph = Paragraph::new(content)
         .block(block)
@@ -1413,7 +1437,7 @@ fn render_project_input(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" New Project ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(content)
         .block(block)
@@ -1447,7 +1471,7 @@ fn render_ea_input(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" New EA ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(content)
         .block(block)
@@ -1580,7 +1604,7 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" Event Queue ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(lines).block(block);
 
@@ -1624,7 +1648,7 @@ fn render_debug_console(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" Debug Console ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(Color::Yellow));
 
     let paragraph = Paragraph::new(lines).block(block);
 
@@ -1678,7 +1702,7 @@ fn render_settings_popup(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" Settings ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray));
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(lines).block(block);
 
@@ -1752,7 +1776,7 @@ fn render_meeting_room_popup(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" Live Meeting Room ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray))
+        .border_style(Style::default().fg(Color::Cyan))
         .padding(Padding::horizontal(1));
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -1883,7 +1907,7 @@ fn render_sidebar_popup(frame: &mut Frame, app: &App, panel: SidebarPanel) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Gray))
+        .border_style(Style::default().fg(Color::Magenta))
         .padding(Padding::horizontal(1));
 
     let paragraph = Paragraph::new(all_lines).block(block);
