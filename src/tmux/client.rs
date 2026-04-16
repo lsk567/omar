@@ -22,6 +22,11 @@ pub struct DeliveryOptions {
     pub poll_interval: Duration,
     /// Delay between retry attempts (after clearing input with C-u).
     pub retry_delay: Duration,
+    /// When true, readiness wait requires observing at least one pane change
+    /// (activity timestamp or content) before considering the pane stable.
+    /// Useful for freshly spawned sessions where the initial static shell pane
+    /// is not necessarily backend-ready yet.
+    pub require_initial_change: bool,
 }
 
 impl Default for DeliveryOptions {
@@ -33,6 +38,7 @@ impl Default for DeliveryOptions {
             max_retries: 3,
             poll_interval: Duration::from_millis(100),
             retry_delay: Duration::from_millis(200),
+            require_initial_change: false,
         }
     }
 }
@@ -234,6 +240,7 @@ impl TmuxClient {
             opts.stable_quiet,
             opts.startup_timeout,
             opts.poll_interval,
+            opts.require_initial_change,
         )?;
 
         for attempt in 1..=opts.max_retries {
@@ -271,9 +278,11 @@ impl TmuxClient {
             }
         }
 
-        // Best-effort: even if verification failed, the prompt may have been
-        // delivered (some backends are slow to reflect changes).
-        Ok(())
+        anyhow::bail!(
+            "prompt delivery to '{}' was not verified after {} attempt(s)",
+            session,
+            opts.max_retries
+        )
     }
 
     /// Wait for pane activity to be quiet for `quiet` duration, or until `timeout`.
@@ -285,18 +294,26 @@ impl TmuxClient {
         quiet: Duration,
         timeout: Duration,
         poll_interval: Duration,
+        require_initial_change: bool,
     ) -> Result<()> {
         let start = Instant::now();
         let mut last_activity = self.get_pane_activity(session).unwrap_or(0);
+        let mut last_content = self.capture_pane(session, 50).unwrap_or_default();
+        let mut saw_change = false;
         let mut last_change = Instant::now();
 
         while start.elapsed() < timeout {
             thread::sleep(poll_interval);
             let current = self.get_pane_activity(session).unwrap_or(last_activity);
-            if current != last_activity {
+            let content = self
+                .capture_pane(session, 50)
+                .unwrap_or_else(|_| last_content.clone());
+            if current != last_activity || content != last_content {
+                saw_change = true;
                 last_activity = current;
+                last_content = content;
                 last_change = Instant::now();
-            } else if last_change.elapsed() >= quiet {
+            } else if last_change.elapsed() >= quiet && (!require_initial_change || saw_change) {
                 return Ok(());
             }
         }
@@ -324,6 +341,32 @@ impl TmuxClient {
             }
             if let Ok(content) = self.capture_pane(session, 50) {
                 if content != content_before {
+                    return true;
+                }
+            }
+            thread::sleep(poll_interval);
+        }
+        false
+    }
+
+    /// Wait until pane output contains any of the provided markers.
+    /// Matching is case-insensitive; returns false on timeout.
+    pub fn wait_for_markers(
+        &self,
+        session: &str,
+        markers: &[&str],
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> bool {
+        if markers.is_empty() {
+            return true;
+        }
+        let needles: Vec<String> = markers.iter().map(|m| m.to_ascii_lowercase()).collect();
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if let Ok(content) = self.capture_pane(session, 120) {
+                let hay = content.to_ascii_lowercase();
+                if needles.iter().any(|needle| hay.contains(needle)) {
                     return true;
                 }
             }
@@ -465,6 +508,7 @@ mod tests {
             max_retries: 3,
             poll_interval: Duration::from_millis(50),
             retry_delay: Duration::from_millis(100),
+            require_initial_change: false,
         };
 
         let result = client.deliver_prompt(session, "echo OMAR_DELIVERED", &opts);
@@ -521,6 +565,7 @@ mod tests {
                 Duration::from_millis(200),
                 Duration::from_secs(3),
                 Duration::from_millis(50),
+                false,
             )
             .unwrap();
         // Should return within a couple hundred ms on a fully idle pane.
@@ -529,6 +574,40 @@ mod tests {
             "wait_for_stable took too long on idle pane: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn test_wait_for_markers_detects_backend_banner_text() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let session = "omar-test-wait-markers";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let _guard = SessionGuard(session.to_string());
+
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+
+        let client = TmuxClient::new("omar-test-");
+        let _ = client.send_keys_literal(session, "echo OpenAI Codex");
+        let _ = client.send_keys(session, "Enter");
+        let found = client.wait_for_markers(
+            session,
+            &["openai codex"],
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+        );
+        assert!(found, "Expected marker not detected in tmux pane");
     }
 
     #[test]
@@ -561,6 +640,7 @@ mod tests {
             max_retries: 3,
             poll_interval: Duration::from_millis(50),
             retry_delay: Duration::from_millis(100),
+            require_initial_change: false,
         };
 
         // Multi-line input: bash will run both commands. Verification needle

@@ -9,7 +9,7 @@ use axum::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use super::models::*;
@@ -20,7 +20,7 @@ use crate::manager::{build_agent_command, prompts_dir};
 use crate::memory;
 use crate::projects;
 use crate::scheduler::{event::ScheduledEvent, Scheduler};
-use crate::tmux::TmuxClient;
+use crate::tmux::{DeliveryOptions, TmuxClient};
 
 /// Shared state for all API handlers
 pub struct ApiState {
@@ -81,6 +81,40 @@ fn health_from_activity(activity: i64, idle_warning: i64) -> String {
         "running".to_string()
     } else {
         "idle".to_string()
+    }
+}
+
+fn normalize_backend_name(s: &str) -> Option<&'static str> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some("codex"),
+        "cursor" => Some("cursor"),
+        "gemini" => Some("gemini"),
+        "claude" | "claude-code" | "claude_code" => Some("claude"),
+        "opencode" => Some("opencode"),
+        _ => None,
+    }
+}
+
+fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> Option<&'static str> {
+    if let Some(name) = explicit_backend.and_then(normalize_backend_name) {
+        return Some(name);
+    }
+    let token = command.split_whitespace().next().unwrap_or("");
+    let executable = std::path::Path::new(token)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(token);
+    normalize_backend_name(executable)
+}
+
+fn backend_readiness_markers(backend: &str) -> &'static [&'static str] {
+    match backend {
+        "codex" => &["OpenAI Codex"],
+        "cursor" => &["Cursor Agent"],
+        "gemini" => &["Gemini CLI"],
+        "claude" => &["Claude Code"],
+        "opencode" => &["tab agents", "ctrl+p commands"],
+        _ => &[],
     }
 }
 
@@ -695,18 +729,48 @@ pub async fn spawn_agent(
     // Save parent mapping only after spawn succeeds to avoid orphaned entries
     memory::save_agent_parent_in(&state_dir, &session_name, &parent_session);
 
-    // Send first user message after a delay
+    let backend_name = infer_backend_name(req.backend.as_deref(), &base_command);
+
+    // Deliver first user message using readiness-aware prompt delivery.
     if let Some(ref task) = req.task {
         memory::save_worker_task_in(&state_dir, &session_name, task);
 
         let user_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", short_name, task);
         let client2 = client.clone();
         let session2 = session_name.clone();
+        let readiness_markers: Vec<&'static str> = backend_name
+            .map(backend_readiness_markers)
+            .unwrap_or(&[])
+            .to_vec();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let _ = client2.send_keys_literal(&session2, &user_msg);
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let _ = client2.send_keys(&session2, "Enter");
+            let session_label = session2.clone();
+            let opts = DeliveryOptions {
+                startup_timeout: Duration::from_secs(45),
+                stable_quiet: Duration::from_millis(800),
+                verify_timeout: Duration::from_secs(6),
+                max_retries: 4,
+                poll_interval: Duration::from_millis(120),
+                retry_delay: Duration::from_millis(250),
+                require_initial_change: true,
+            };
+
+            match tokio::task::spawn_blocking(move || {
+                if !readiness_markers.is_empty() {
+                    let _ = client2.wait_for_markers(
+                        &session2,
+                        &readiness_markers,
+                        Duration::from_secs(60),
+                        Duration::from_millis(250),
+                    );
+                }
+                client2.deliver_prompt(&session2, &user_msg, &opts)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("prompt delivery failed for {}: {}", session_label, e),
+                Err(e) => eprintln!("prompt delivery task failed for {}: {}", session_label, e),
+            }
         });
     }
 

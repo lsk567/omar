@@ -8,6 +8,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 use crate::ea;
+use crate::tmux::DeliveryOptions;
 
 /// A ticker message with its creation time.
 struct TickerEntry {
@@ -198,12 +199,9 @@ pub(crate) fn deliver_to_tmux(
         format!("{}{}", prefix, receiver)
     };
     let client = crate::tmux::TmuxClient::new("");
-    if let Err(e) = client.send_keys_literal(&target, message) {
-        ticker.push(format!("tmux send-keys failed for {}: {}", target, e));
-        return;
-    }
-    if let Err(e) = client.send_keys(&target, "Enter") {
-        ticker.push(format!("tmux send-keys failed for {}: {}", target, e));
+    let opts = DeliveryOptions::default();
+    if let Err(e) = client.deliver_prompt(&target, message, &opts) {
+        ticker.push(format!("tmux prompt delivery failed for {}: {}", target, e));
         return;
     }
     ticker.push(format!("delivered event(s) to {}", receiver));
