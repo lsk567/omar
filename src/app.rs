@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::ea::{self, EaId, EaInfo};
 use crate::memory;
 use crate::projects::{self, Project};
+use crate::rooms::{RoomRegistry, RoomSnapshot, RoomSummary};
 use crate::scheduler::{ScheduledEvent, Scheduler, TickerBuffer};
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
@@ -33,6 +34,7 @@ pub enum ConfirmAction {
 pub enum SidebarPanel {
     Projects,
     Events,
+    Rooms,
     ChainOfCommand,
 }
 
@@ -100,6 +102,10 @@ pub struct App {
     pub show_events: bool,
     /// Enlarged sidebar popup (None = hidden)
     pub sidebar_popup: Option<SidebarPanel>,
+    pub room_list_selected: usize,
+    pub active_meeting_room_name: Option<String>,
+    pub active_meeting_room: Option<RoomSnapshot>,
+    pub meeting_rooms: Vec<RoomSummary>,
     pub scheduled_events: Vec<ScheduledEvent>,
     pub ticker: TickerBuffer,
     pub ticker_offset: usize,
@@ -131,6 +137,7 @@ pub struct App {
     default_workdir: String,
     session_prefix: String,
     pub scheduler: Arc<Scheduler>,
+    pub rooms: Arc<RoomRegistry>,
     /// Whether the watchdog agent has been spawned
     watchdog_spawned: bool,
 }
@@ -170,6 +177,7 @@ impl App {
 
         let state_dir = ea::ea_state_dir(active_ea, &omar_dir);
         std::fs::create_dir_all(state_dir.join("status")).ok();
+        let rooms = Arc::new(RoomRegistry::new(omar_dir.clone()));
 
         Self {
             active_ea,
@@ -195,6 +203,10 @@ impl App {
             ea_input: String::new(),
             show_events: false,
             sidebar_popup: None,
+            room_list_selected: 0,
+            active_meeting_room_name: None,
+            active_meeting_room: None,
+            meeting_rooms: Vec::new(),
             scheduled_events: Vec::new(),
             ticker,
             ticker_offset: 0,
@@ -234,6 +246,7 @@ impl App {
             default_workdir: config.agent.default_workdir.clone(),
             session_prefix,
             scheduler,
+            rooms,
             watchdog_spawned: false,
         }
     }
@@ -257,7 +270,12 @@ impl App {
             || self.show_events
             || self.show_debug_console
             || self.show_settings
+            || self.active_meeting_room_name.is_some()
             || self.sidebar_popup.is_some()
+    }
+
+    pub fn rooms_registry(&self) -> Arc<RoomRegistry> {
+        self.rooms.clone()
     }
 
     pub fn client(&self) -> &TmuxClient {
@@ -428,7 +446,70 @@ impl App {
             self.selected = self.focus_child_indices.len() - 1;
         }
 
+        self.refresh_meeting_rooms();
+
         Ok(())
+    }
+
+    pub fn refresh_meeting_rooms(&mut self) {
+        let idle_ns = 10 * 60 * 1_000_000_000u64;
+        let closed = self.rooms.close_inactive(self.active_ea, idle_ns);
+        if !closed.is_empty() {
+            self.set_status(format!(
+                "Meeting ended: {}",
+                closed
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        self.meeting_rooms = self.rooms.list_rooms(self.active_ea);
+        if self.room_list_selected >= self.meeting_rooms.len() {
+            self.room_list_selected = self.meeting_rooms.len().saturating_sub(1);
+        }
+
+        if let Some(ref room_name) = self.active_meeting_room_name {
+            self.active_meeting_room = self.rooms.get_room(self.active_ea, room_name);
+            if self.active_meeting_room.is_none() {
+                self.active_meeting_room_name = None;
+            }
+        }
+    }
+
+    pub fn room_selection_next(&mut self) {
+        if self.meeting_rooms.is_empty() {
+            self.room_list_selected = 0;
+            return;
+        }
+        self.room_list_selected = (self.room_list_selected + 1) % self.meeting_rooms.len();
+    }
+
+    pub fn room_selection_prev(&mut self) {
+        if self.meeting_rooms.is_empty() {
+            self.room_list_selected = 0;
+            return;
+        }
+        self.room_list_selected = if self.room_list_selected == 0 {
+            self.meeting_rooms.len() - 1
+        } else {
+            self.room_list_selected - 1
+        };
+    }
+
+    pub fn open_selected_meeting_room(&mut self) {
+        let Some(room) = self.meeting_rooms.get(self.room_list_selected).cloned() else {
+            self.set_status("No active meeting rooms");
+            return;
+        };
+        self.active_meeting_room_name = Some(room.name.clone());
+        self.active_meeting_room = self.rooms.get_room(self.active_ea, &room.name);
+    }
+
+    pub fn close_meeting_popup(&mut self) {
+        self.active_meeting_room_name = None;
+        self.active_meeting_room = None;
     }
 
     /// Ensure manager session exists, start if not
@@ -725,10 +806,11 @@ impl App {
                 if self.config.dashboard.show_event_queue {
                     SidebarPanel::Events
                 } else {
-                    SidebarPanel::ChainOfCommand
+                    SidebarPanel::Rooms
                 }
             }
-            SidebarPanel::Events => SidebarPanel::ChainOfCommand,
+            SidebarPanel::Events => SidebarPanel::Rooms,
+            SidebarPanel::Rooms => SidebarPanel::ChainOfCommand,
             SidebarPanel::ChainOfCommand => SidebarPanel::Projects,
         };
     }
@@ -738,13 +820,14 @@ impl App {
         self.sidebar_panel = match self.sidebar_panel {
             SidebarPanel::Projects => SidebarPanel::ChainOfCommand,
             SidebarPanel::Events => SidebarPanel::Projects,
-            SidebarPanel::ChainOfCommand => {
+            SidebarPanel::Rooms => {
                 if self.config.dashboard.show_event_queue {
                     SidebarPanel::Events
                 } else {
                     SidebarPanel::Projects
                 }
             }
+            SidebarPanel::ChainOfCommand => SidebarPanel::Rooms,
         };
     }
 
@@ -1178,7 +1261,11 @@ Slack bridge: http://localhost:9877",
         self.show_debug_console = false;
         self.show_settings = false;
         self.sidebar_popup = None;
+        self.active_meeting_room_name = None;
+        self.active_meeting_room = None;
+        self.room_list_selected = 0;
         self.pending_confirm = None;
+        self.refresh_meeting_rooms();
         Ok(())
     }
 

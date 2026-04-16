@@ -352,8 +352,23 @@ pub fn render(frame: &mut Frame, app: &App) {
     };
     let (sidebar_area, main_area) = columns;
 
-    // Sidebar: projects, (optional) event queue, chain of command
+    // Sidebar: projects, (optional) event queue, meeting rooms, chain of command
     if app.config.dashboard.show_event_queue {
+        let sidebar = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+            ])
+            .split(sidebar_area);
+
+        render_projects_panel(frame, app, sidebar[0]);
+        render_event_queue(frame, app, sidebar[1]);
+        render_meeting_rooms_panel(frame, app, sidebar[2]);
+        render_command_tree(frame, app, sidebar[3]);
+    } else {
         let sidebar = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -364,16 +379,8 @@ pub fn render(frame: &mut Frame, app: &App) {
             .split(sidebar_area);
 
         render_projects_panel(frame, app, sidebar[0]);
-        render_event_queue(frame, app, sidebar[1]);
+        render_meeting_rooms_panel(frame, app, sidebar[1]);
         render_command_tree(frame, app, sidebar[2]);
-    } else {
-        let sidebar = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
-            .split(sidebar_area);
-
-        render_projects_panel(frame, app, sidebar[0]);
-        render_command_tree(frame, app, sidebar[1]);
     }
 
     // Main area: agent grid on top (~2/3), focus parent on bottom (~1/3)
@@ -414,6 +421,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if app.show_settings {
         render_settings_popup(frame, app);
+    }
+
+    if app.active_meeting_room_name.is_some() {
+        render_meeting_room_popup(frame, app);
     }
 
     if let Some(panel) = app.sidebar_popup {
@@ -940,6 +951,47 @@ fn render_event_queue(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
+fn render_meeting_rooms_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let panel_active = app.sidebar_focused && app.sidebar_panel == SidebarPanel::Rooms;
+    let border_color = if panel_active {
+        Color::LightMagenta
+    } else {
+        Color::DarkGray
+    };
+    let block = Block::default()
+        .title(" Meeting Rooms ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(border_color))
+        .padding(Padding::horizontal(1));
+
+    let mut lines: Vec<Line> = Vec::new();
+    if app.meeting_rooms.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No active meetings",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let visible = area.height.saturating_sub(2) as usize;
+        for room in app.meeting_rooms.iter().take(visible) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    truncate_str(&room.name, 16),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("({})", room.participant_count),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
 /// Strip ANSI escape codes from a string (fallback)
 fn strip_ansi(s: &str) -> String {
     use std::sync::OnceLock;
@@ -1026,22 +1078,6 @@ fn render_summary_card(
             ),
         ]));
     }
-
-    // Status line (from in-memory cache populated by refresh(), fallback to last_output)
-    let status_text = app
-        .agent_status(&agent.session.name)
-        .cloned()
-        .unwrap_or_else(|| {
-            if agent.health_info.last_output.is_empty() {
-                "waiting for the agent to report status".to_string()
-            } else {
-                agent.health_info.last_output.clone()
-            }
-        });
-    lines.push(Line::from(vec![
-        Span::styled("Status: ", Style::default().fg(Color::Reset)),
-        Span::styled(status_text, Style::default().fg(Color::Reset)),
-    ]));
 
     // Task (multi-line word wrap to fill available card space)
     let task = app
@@ -1658,6 +1694,78 @@ fn render_settings_popup(frame: &mut Frame, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+fn render_meeting_room_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(78, 72, frame.area());
+    let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(ref room) = app.active_meeting_room {
+        lines.push(Line::from(Span::styled(
+            format!("Room: {}", room.name),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("Participants: {}", room.participants.join(", ")),
+            Style::default().fg(Color::Cyan),
+        )));
+        let pending = room
+            .invites
+            .iter()
+            .filter(|i| i.status.as_str() == "pending")
+            .count();
+        lines.push(Line::from(Span::styled(
+            format!("Pending invites: {}", pending),
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(""));
+
+        let body_height = area.height.saturating_sub(8) as usize;
+        let start = room.transcript.len().saturating_sub(body_height);
+        let messages = room.transcript[start..].to_vec();
+
+        for msg in messages {
+            let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(msg.created_at as i64)
+                .with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string();
+            let color = if msg.system {
+                Color::DarkGray
+            } else {
+                Color::White
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("[{}] ", ts), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{}: ", msg.sender),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(msg.payload, Style::default().fg(color)),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Meeting ended",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Sliding window: newest messages shown at bottom. Esc/Enter:Close",
+        Style::default().fg(Color::Gray),
+    )));
+
+    let block = Block::default()
+        .title(" Live Meeting Room ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(1));
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
 fn render_sidebar_popup(frame: &mut Frame, app: &App, panel: SidebarPanel) {
     let area = centered_rect(70, 60, frame.area());
 
@@ -1682,6 +1790,35 @@ fn render_sidebar_popup(frame: &mut Frame, app: &App, panel: SidebarPanel) {
         SidebarPanel::Events => {
             // Events popup is handled by the existing show_events popup
             unreachable!()
+        }
+        SidebarPanel::Rooms => {
+            let mut lines: Vec<Line> = Vec::new();
+            if app.meeting_rooms.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "No active meeting rooms.",
+                    Style::default().fg(Color::Gray),
+                )));
+            } else {
+                for (idx, room) in app.meeting_rooms.iter().enumerate() {
+                    let selected = idx == app.room_list_selected;
+                    let marker = if selected { "► " } else { "  " };
+                    let style = if selected {
+                        Style::default().fg(Color::Magenta)
+                    } else {
+                        Style::default().fg(Color::Reset)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, Style::default().fg(Color::Magenta)),
+                        Span::styled(truncate_str(&room.name, 30), style),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("({} participants)", room.participant_count),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]));
+                }
+            }
+            (" Meeting Rooms ", lines)
         }
         SidebarPanel::ChainOfCommand => {
             let mut lines: Vec<Line> = Vec::new();
@@ -1736,10 +1873,17 @@ fn render_sidebar_popup(frame: &mut Frame, app: &App, panel: SidebarPanel) {
 
     let mut all_lines = lines;
     all_lines.push(Line::from(""));
-    all_lines.push(Line::from(Span::styled(
-        "Press Esc or Enter to close",
-        Style::default().fg(Color::Gray),
-    )));
+    if panel == SidebarPanel::Rooms {
+        all_lines.push(Line::from(Span::styled(
+            "↑↓:Select  Enter:Open live room  Esc:Close",
+            Style::default().fg(Color::Gray),
+        )));
+    } else {
+        all_lines.push(Line::from(Span::styled(
+            "Press Esc or Enter to close",
+            Style::default().fg(Color::Gray),
+        )));
+    }
 
     let block = Block::default()
         .title(title)

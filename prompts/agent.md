@@ -144,13 +144,12 @@ When the EA asks you to run a command and report its output, always relay the ou
 
 ## Status Reporting
 
-OMAR sends you a periodic `[STATUS CHECK]` event every 60 seconds. When you receive one, update your status via the API:
+Status checks are not automatically pushed to you. If your parent asks for status, update it via the API:
 ```bash
 curl -X PUT http://localhost:9876/api/ea/{{EA_ID}}/agents/<YOUR NAME>/status \
   -H "Content-Type: application/json" \
   -d '{"status": "Currently: <brief description of what you are doing>"}'
 ```
-Also update proactively after spawning sub-agents or reaching a milestone.
 
 ## Scheduling and Wake-ups
 
@@ -188,6 +187,48 @@ curl http://localhost:9876/api/ea/{{EA_ID}}/events
 
 # Cancel a scheduled event (also stops cron jobs)
 curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/events/<event-id>
+```
+
+### Meeting Rooms API
+
+Use meeting rooms for multi-agent discussion when you want one message to reach all participants.
+
+#### Create room
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms \
+  -H "Content-Type: application/json" \
+  -d '{"name":"design-review","created_by":"<YOUR NAME>"}'
+```
+
+#### Invite another agent
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms/design-review/invites \
+  -H "Content-Type: application/json" \
+  -d '{"invited_agent":"agent-name","invited_by":"<YOUR NAME>","message":"Join this review"}'
+```
+
+#### Accept/decline invite (for invited agent)
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms/design-review/invites/<invite-id>/respond \
+  -H "Content-Type: application/json" \
+  -d '{"agent":"<YOUR NAME>","response":"accept"}'
+```
+
+#### Send message to room (broadcast fan-out)
+```bash
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/rooms/design-review/messages \
+  -H "Content-Type: application/json" \
+  -d '{"sender":"<YOUR NAME>","payload":"My proposal is ..."}'
+```
+
+#### Read transcript
+```bash
+curl http://localhost:9876/api/ea/{{EA_ID}}/rooms/design-review/transcript
+```
+
+#### Close room
+```bash
+curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/rooms/design-review
 ```
 
 ## Skills
