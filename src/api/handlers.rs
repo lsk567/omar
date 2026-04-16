@@ -1288,7 +1288,10 @@ pub async fn send_room_message(
             sender: format!("room:{}:{}", room, sender),
             receiver: receiver.clone(),
             timestamp: msg.created_at,
-            payload: msg.payload.clone(),
+            payload: format!(
+                "[MEETING:{}] {}: {}\nReply in-room via: POST /api/ea/{}/rooms/{}/messages",
+                room, sender, msg.payload, ea_id, room
+            ),
             created_at: msg.created_at,
             recurring_ns: None,
             ea_id,
