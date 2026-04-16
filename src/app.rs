@@ -105,6 +105,7 @@ pub struct App {
     pub room_list_selected: usize,
     pub active_meeting_room_name: Option<String>,
     pub active_meeting_room: Option<RoomSnapshot>,
+    pub meeting_popup_offset_from_end: usize,
     pub meeting_rooms: Vec<RoomSummary>,
     pub scheduled_events: Vec<ScheduledEvent>,
     pub ticker: TickerBuffer,
@@ -206,6 +207,7 @@ impl App {
             room_list_selected: 0,
             active_meeting_room_name: None,
             active_meeting_room: None,
+            meeting_popup_offset_from_end: 0,
             meeting_rooms: Vec::new(),
             scheduled_events: Vec::new(),
             ticker,
@@ -505,11 +507,23 @@ impl App {
         };
         self.active_meeting_room_name = Some(room.name.clone());
         self.active_meeting_room = self.rooms.get_room(self.active_ea, &room.name);
+        self.meeting_popup_offset_from_end = 0;
     }
 
     pub fn close_meeting_popup(&mut self) {
         self.active_meeting_room_name = None;
         self.active_meeting_room = None;
+        self.meeting_popup_offset_from_end = 0;
+    }
+
+    pub fn meeting_scroll_older(&mut self, lines: usize) {
+        self.meeting_popup_offset_from_end =
+            self.meeting_popup_offset_from_end.saturating_add(lines);
+    }
+
+    pub fn meeting_scroll_newer(&mut self, lines: usize) {
+        self.meeting_popup_offset_from_end =
+            self.meeting_popup_offset_from_end.saturating_sub(lines);
     }
 
     /// Ensure manager session exists, start if not
@@ -1263,6 +1277,7 @@ Slack bridge: http://localhost:9877",
         self.sidebar_popup = None;
         self.active_meeting_room_name = None;
         self.active_meeting_room = None;
+        self.meeting_popup_offset_from_end = 0;
         self.room_list_selected = 0;
         self.pending_confirm = None;
         self.refresh_meeting_rooms();

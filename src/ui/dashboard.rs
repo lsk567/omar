@@ -1735,11 +1735,11 @@ fn render_meeting_room_popup(frame: &mut Frame, app: &App) {
         lines.push(Line::from(""));
 
         let body_height = area.height.saturating_sub(8) as usize;
-        let messages = if room.transcript.len() > body_height {
-            room.transcript[room.transcript.len() - body_height..].to_vec()
-        } else {
-            room.transcript.clone()
-        };
+        let max_offset = room.transcript.len().saturating_sub(body_height);
+        let offset = app.meeting_popup_offset_from_end.min(max_offset);
+        let end = room.transcript.len().saturating_sub(offset);
+        let start = end.saturating_sub(body_height);
+        let messages = room.transcript[start..end].to_vec();
 
         for msg in messages {
             let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(msg.created_at as i64)
@@ -1769,7 +1769,7 @@ fn render_meeting_room_popup(frame: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Press Esc or Enter to close",
+        "↑/k:Older  ↓/j:Newer  PgUp/PgDn:Fast  Esc/Enter:Close",
         Style::default().fg(Color::Gray),
     )));
 

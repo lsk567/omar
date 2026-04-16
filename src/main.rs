@@ -883,6 +883,18 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             KeyCode::Esc | KeyCode::Enter => {
                                 app.close_meeting_popup();
                             }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                app.meeting_scroll_older(1);
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                app.meeting_scroll_newer(1);
+                            }
+                            KeyCode::PageUp => {
+                                app.meeting_scroll_older(10);
+                            }
+                            KeyCode::PageDown => {
+                                app.meeting_scroll_newer(10);
+                            }
                             _ => {}
                         }
                         continue;
