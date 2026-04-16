@@ -1735,11 +1735,9 @@ fn render_meeting_room_popup(frame: &mut Frame, app: &App) {
         lines.push(Line::from(""));
 
         let body_height = area.height.saturating_sub(8) as usize;
-        let max_offset = room.transcript.len().saturating_sub(body_height);
-        let offset = app.meeting_popup_offset_from_end.min(max_offset);
-        let end = room.transcript.len().saturating_sub(offset);
-        let start = end.saturating_sub(body_height);
-        let messages = room.transcript[start..end].to_vec();
+        let msg_width = area.width.saturating_sub(6) as usize;
+        let start = room.transcript.len().saturating_sub(body_height);
+        let messages = room.transcript[start..].to_vec();
 
         for msg in messages {
             let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(msg.created_at as i64)
@@ -1757,7 +1755,10 @@ fn render_meeting_room_popup(frame: &mut Frame, app: &App) {
                     format!("{}: ", msg.sender),
                     Style::default().fg(Color::Yellow),
                 ),
-                Span::styled(msg.payload, Style::default().fg(color)),
+                Span::styled(
+                    truncate_str(&msg.payload, msg_width),
+                    Style::default().fg(color),
+                ),
             ]));
         }
     } else {
@@ -1769,7 +1770,7 @@ fn render_meeting_room_popup(frame: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑/k:Older  ↓/j:Newer  PgUp/PgDn:Fast  Esc/Enter:Close",
+        "Sliding window: newest messages shown at bottom. Esc/Enter:Close",
         Style::default().fg(Color::Gray),
     )));
 
