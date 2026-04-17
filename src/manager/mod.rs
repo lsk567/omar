@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::ea::{self, EaId};
 use crate::memory;
-use crate::tmux::TmuxClient;
+use crate::tmux::{DeliveryOptions, TmuxClient};
 use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 
 // Embed prompt files at compile time so they work regardless of CWD.
@@ -86,6 +86,16 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
     base_command
         .split_whitespace()
         .find_map(detect_backend_token)
+}
+
+fn backend_readiness_markers(kind: BackendKind) -> &'static [&'static str] {
+    match kind {
+        BackendKind::Codex => &["OpenAI Codex"],
+        BackendKind::Cursor => &["Cursor Agent"],
+        BackendKind::Gemini => &["Gemini CLI"],
+        BackendKind::Claude => &["Claude Code"],
+        BackendKind::Opencode => &["tab agents", "ctrl+p commands"],
+    }
 }
 
 fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -> PathBuf {
@@ -528,8 +538,38 @@ fn spawn_worker(
         Some(&std::env::current_dir()?.to_string_lossy()),
     )?;
 
-    // Give it time to start
-    thread::sleep(Duration::from_secs(1));
+    // Wait for backend readiness when possible, then deliver an explicit
+    // first task message so workers begin execution deterministically.
+    if let Some(kind) = detect_backend(command) {
+        let markers = backend_readiness_markers(kind);
+        if !markers.is_empty()
+            && !client.wait_for_markers(
+                &session_name,
+                markers,
+                Duration::from_secs(60),
+                Duration::from_millis(250),
+            )
+        {
+            println!(
+                "  {} - readiness markers timed out; attempting delivery anyway",
+                agent.name
+            );
+        }
+    }
+
+    let initial_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", agent.name, agent.task);
+    let opts = DeliveryOptions {
+        startup_timeout: Duration::from_secs(45),
+        stable_quiet: Duration::from_millis(800),
+        verify_timeout: Duration::from_secs(6),
+        max_retries: 4,
+        poll_interval: Duration::from_millis(120),
+        retry_delay: Duration::from_millis(250),
+        require_initial_change: true,
+    };
+    client
+        .deliver_prompt(&session_name, &initial_msg, &opts)
+        .map_err(|e| anyhow::anyhow!("failed to deliver initial task to {}: {}", agent.name, e))?;
 
     // Persist worker task description to EA-scoped state dir
     let state_dir = ea::ea_state_dir(ea_id, omar_dir);
