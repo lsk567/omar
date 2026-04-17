@@ -364,7 +364,26 @@ pub async fn run_event_loop(
                     // Track events delivered for this EA this tick.
                     *ea_delivery_count.entry(*ea_id).or_insert(0) += batch.len();
                     let message = format_delivery(&batch, earliest_ts);
-                    deliver_to_tmux(*ea_id, receiver, &message, &base_prefix, &ticker);
+                    let receiver_name = receiver.clone();
+                    let base_prefix_clone = base_prefix.clone();
+                    let ticker_clone = ticker.clone();
+                    let ea = *ea_id;
+                    let delivery_result = tokio::task::spawn_blocking(move || {
+                        deliver_to_tmux(
+                            ea,
+                            &receiver_name,
+                            &message,
+                            &base_prefix_clone,
+                            &ticker_clone,
+                        );
+                    })
+                    .await;
+                    if let Err(e) = delivery_result {
+                        ticker.push(format!(
+                            "delivery task failed for {} (ea {}): {}",
+                            receiver, ea_id, e
+                        ));
+                    }
 
                     // Re-insert recurring events with a fresh timestamp and ID
                     for ev in &batch {

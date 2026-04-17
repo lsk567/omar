@@ -95,16 +95,33 @@ fn normalize_backend_name(s: &str) -> Option<&'static str> {
     }
 }
 
+fn strip_command_token_wrappers(token: &str) -> &str {
+    token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'))
+}
+
 fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> Option<&'static str> {
     if let Some(name) = explicit_backend.and_then(normalize_backend_name) {
         return Some(name);
     }
-    let token = command.split_whitespace().next().unwrap_or("");
-    let executable = std::path::Path::new(token)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(token);
-    normalize_backend_name(executable)
+
+    for token in command.split_whitespace() {
+        let token = strip_command_token_wrappers(token);
+        if token.is_empty() {
+            continue;
+        }
+
+        let executable = std::path::Path::new(token)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(token);
+        let executable = strip_command_token_wrappers(executable);
+
+        if let Some(name) = normalize_backend_name(executable) {
+            return Some(name);
+        }
+    }
+
+    None
 }
 
 fn backend_readiness_markers(backend: &str) -> &'static [&'static str] {
@@ -756,12 +773,18 @@ pub async fn spawn_agent(
 
             match tokio::task::spawn_blocking(move || {
                 if !readiness_markers.is_empty() {
-                    let _ = client2.wait_for_markers(
+                    let markers_detected = client2.wait_for_markers(
                         &session2,
                         &readiness_markers,
                         Duration::from_secs(60),
                         Duration::from_millis(250),
                     );
+                    if !markers_detected {
+                        eprintln!(
+                            "readiness markers timed out for {}; proceeding with prompt delivery",
+                            session2
+                        );
+                    }
                 }
                 client2.deliver_prompt(&session2, &user_msg, &opts)
             })
@@ -1427,7 +1450,7 @@ fn generate_agent_name_in_ea(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::timestamp_is_too_old;
+    use super::{infer_backend_name, timestamp_is_too_old};
 
     #[test]
     fn timestamp_guard_accepts_exact_one_second_boundary() {
@@ -1445,5 +1468,18 @@ mod tests {
     fn timestamp_guard_handles_large_timestamps_without_overflow() {
         let now = 5_000_000_000;
         assert!(!timestamp_is_too_old(u64::MAX, now));
+    }
+
+    #[test]
+    fn infer_backend_name_scans_wrapped_tokens() {
+        assert_eq!(
+            infer_backend_name(None, "env FOO=bar codex --model o3"),
+            Some("codex")
+        );
+        assert_eq!(
+            infer_backend_name(None, "npx opencode --prompt hi"),
+            Some("opencode")
+        );
+        assert_eq!(infer_backend_name(None, "(cursor) --fast"), Some("cursor"));
     }
 }

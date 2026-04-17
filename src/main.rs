@@ -846,15 +846,13 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             KeyCode::Esc | KeyCode::Char('S') => {
                                 app.show_settings = false;
                             }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                if app.settings_selected > 0 {
-                                    app.settings_selected -= 1;
-                                }
+                            KeyCode::Up | KeyCode::Char('k') if app.settings_selected > 0 => {
+                                app.settings_selected -= 1;
                             }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                if app.settings_selected + 1 < app.config.settings_count() {
-                                    app.settings_selected += 1;
-                                }
+                            KeyCode::Down | KeyCode::Char('j')
+                                if app.settings_selected + 1 < app.config.settings_count() =>
+                            {
+                                app.settings_selected += 1;
                             }
                             KeyCode::Enter => {
                                 let idx = app.settings_selected;
@@ -1064,10 +1062,8 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 app.set_status(format!("Error: {}", e));
                             }
                         }
-                        KeyCode::Char('d') => {
-                            if app.selected_agent().is_some() {
-                                app.pending_confirm = Some(app::ConfirmAction::Kill);
-                            }
+                        KeyCode::Char('d') if app.selected_agent().is_some() => {
+                            app.pending_confirm = Some(app::ConfirmAction::Kill);
                         }
                         KeyCode::Char('N') => {
                             // Open EA name prompt to spawn a new EA
@@ -1100,13 +1096,11 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         KeyCode::Char('G') => {
                             app.show_debug_console = true;
                         }
-                        KeyCode::Char('z') => {
-                            // Detach from tmux — dashboard + agents keep running
-                            if std::env::var("TMUX").is_ok() {
-                                let _ = std::process::Command::new("tmux")
-                                    .args(["detach-client"])
-                                    .status();
-                            }
+                        // Detach from tmux — dashboard + agents keep running
+                        KeyCode::Char('z') if std::env::var("TMUX").is_ok() => {
+                            let _ = std::process::Command::new("tmux")
+                                .args(["detach-client"])
+                                .status();
                         }
                         KeyCode::Char('S') => {
                             app.show_settings = true;
