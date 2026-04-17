@@ -540,22 +540,31 @@ fn spawn_worker(
 
     // Wait for backend readiness when possible, then deliver an explicit
     // first task message so workers begin execution deterministically.
-    if let Some(kind) = detect_backend(command) {
+    // If markers succeed, the TUI is proven ready; skip require_initial_change
+    // (a fresh Claude Code banner stays pixel-stable after drawing, so any
+    // extra "wait for a change" would time out).
+    let markers_proved_ready = if let Some(kind) = detect_backend(command) {
         let markers = backend_readiness_markers(kind);
-        if !markers.is_empty()
-            && !client.wait_for_markers(
+        if markers.is_empty() {
+            false
+        } else {
+            let detected = client.wait_for_markers(
                 &session_name,
                 markers,
                 Duration::from_secs(60),
                 Duration::from_millis(250),
-            )
-        {
-            println!(
-                "  {} - readiness markers timed out; attempting delivery anyway",
-                agent.name
             );
+            if !detected {
+                println!(
+                    "  {} - readiness markers timed out; attempting delivery anyway",
+                    agent.name
+                );
+            }
+            detected
         }
-    }
+    } else {
+        false
+    };
 
     let initial_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", agent.name, agent.task);
     let opts = DeliveryOptions {
@@ -565,7 +574,7 @@ fn spawn_worker(
         max_retries: 4,
         poll_interval: Duration::from_millis(120),
         retry_delay: Duration::from_millis(250),
-        require_initial_change: true,
+        require_initial_change: !markers_proved_ready,
     };
     client
         .deliver_prompt(&session_name, &initial_msg, &opts)

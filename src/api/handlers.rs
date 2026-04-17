@@ -761,31 +761,40 @@ pub async fn spawn_agent(
             .to_vec();
         tokio::spawn(async move {
             let session_label = session2.clone();
-            let opts = DeliveryOptions {
-                startup_timeout: Duration::from_secs(45),
-                stable_quiet: Duration::from_millis(800),
-                verify_timeout: Duration::from_secs(6),
-                max_retries: 4,
-                poll_interval: Duration::from_millis(120),
-                retry_delay: Duration::from_millis(250),
-                require_initial_change: true,
-            };
 
             match tokio::task::spawn_blocking(move || {
-                if !readiness_markers.is_empty() {
-                    let markers_detected = client2.wait_for_markers(
+                // Markers are the authoritative readiness signal when we know
+                // the backend. If they succeed, the TUI has rendered and is
+                // accepting input — no need to also wait for a follow-up
+                // content change in wait_for_stable (Claude Code's TUI is
+                // pixel-stable after its banner draws, so requiring an
+                // *additional* change would time out for no reason).
+                let markers_proved_ready = if !readiness_markers.is_empty() {
+                    let detected = client2.wait_for_markers(
                         &session2,
                         &readiness_markers,
                         Duration::from_secs(60),
                         Duration::from_millis(250),
                     );
-                    if !markers_detected {
+                    if !detected {
                         eprintln!(
                             "readiness markers timed out for {}; proceeding with prompt delivery",
                             session2
                         );
                     }
-                }
+                    detected
+                } else {
+                    false
+                };
+                let opts = DeliveryOptions {
+                    startup_timeout: Duration::from_secs(45),
+                    stable_quiet: Duration::from_millis(800),
+                    verify_timeout: Duration::from_secs(6),
+                    max_retries: 4,
+                    poll_interval: Duration::from_millis(120),
+                    retry_delay: Duration::from_millis(250),
+                    require_initial_change: !markers_proved_ready,
+                };
                 client2.deliver_prompt(&session2, &user_msg, &opts)
             })
             .await
@@ -795,29 +804,6 @@ pub async fn spawn_agent(
                 Err(e) => eprintln!("prompt delivery task failed for {}: {}", session_label, e),
             }
         });
-    }
-
-    // Schedule a recurring status check — ea_id is structural
-    if has_agent_prompt {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let interval: u64 = 60_000_000_000; // 60 seconds
-        let event = ScheduledEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            sender: "omar".to_string(),
-            receiver: short_name.clone(),
-            timestamp: now + interval,
-            payload: format!(
-                "[STATUS CHECK] Update your status via the API: curl -X PUT http://localhost:9876/api/ea/{}/agents/<YOUR NAME>/status -H 'Content-Type: application/json' -d '{{\"status\": \"<1-line status>\"}}'",
-                ea_id
-            ),
-            created_at: now,
-            recurring_ns: Some(interval),
-            ea_id,
-        };
-        state.scheduler.insert(event);
     }
 
     Ok(Json(SpawnAgentResponse {

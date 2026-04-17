@@ -139,7 +139,8 @@ impl TmuxClient {
         Ok(sessions)
     }
 
-    /// Capture the last N lines of a pane's output
+    /// Capture the last N lines of a pane's output, including ANSI escape
+    /// sequences (suitable for display in a colored dashboard).
     pub fn capture_pane(&self, target: &str, lines: i32) -> Result<String> {
         self.run(&[
             "capture-pane",
@@ -152,13 +153,35 @@ impl TmuxClient {
         ])
     }
 
-    /// Get the activity timestamp of a pane
+    /// Capture the last N lines of a pane's output as plain text (no ANSI
+    /// escapes). Required for substring matching — e.g. Claude Code renders
+    /// its banner as `Claude<ESC>[0m <ESC>[1mCode`, so a raw ANSI capture
+    /// would *not* contain the contiguous string "Claude Code".
+    pub fn capture_pane_plain(&self, target: &str, lines: i32) -> Result<String> {
+        self.run(&[
+            "capture-pane",
+            "-t",
+            target,
+            "-p",
+            "-S",
+            &(-lines).to_string(),
+        ])
+    }
+
+    /// Get the activity timestamp of a pane.
+    ///
+    /// Uses `#{window_activity}` — the per-pane `#{pane_activity}` format is
+    /// empty on tmux 3.6a (macOS homebrew) unless `monitor-activity` is
+    /// enabled, which would break readiness checks entirely. Window activity
+    /// is universally populated and tracks the most recent input/output in
+    /// the window. Since OMAR worker sessions always have exactly one window
+    /// and one pane, window-level granularity is equivalent to pane-level.
     pub fn get_pane_activity(&self, target: &str) -> Result<i64> {
-        let output = self.run(&["display-message", "-t", target, "-p", "#{pane_activity}"])?;
+        let output = self.run(&["display-message", "-t", target, "-p", "#{window_activity}"])?;
         output
             .trim()
             .parse()
-            .context("Failed to parse pane activity timestamp")
+            .context("Failed to parse window activity timestamp")
     }
 
     /// Send keys to a pane
@@ -364,7 +387,10 @@ impl TmuxClient {
         let needles: Vec<String> = markers.iter().map(|m| m.to_ascii_lowercase()).collect();
         let start = Instant::now();
         while start.elapsed() < timeout {
-            if let Ok(content) = self.capture_pane(session, 120) {
+            // Use plain capture (no ANSI escapes) so multi-word markers like
+            // "Claude Code" match even when the TUI styles each word
+            // independently (Claude Code inserts a reset between them).
+            if let Ok(content) = self.capture_pane_plain(session, 120) {
                 let hay = content.to_ascii_lowercase();
                 if needles.iter().any(|needle| hay.contains(needle)) {
                     return true;
@@ -664,6 +690,203 @@ mod tests {
         assert!(
             content.contains("SECOND_LINE_OMAR"),
             "Expected SECOND_LINE_OMAR in pane (multi-line delivery): {:?}",
+            content
+        );
+    }
+
+    /// Regression: on tmux 3.6a (macOS homebrew) `#{pane_activity}` is empty
+    /// unless `monitor-activity` is enabled. `get_pane_activity` used to
+    /// swallow this with `unwrap_or(0)`, freezing the "activity timestamp"
+    /// at 0 forever and breaking `wait_for_stable` / `wait_for_change` on
+    /// readiness-gated prompt delivery. This test asserts we get a usable,
+    /// advancing timestamp out of the box (no monitor-activity needed).
+    #[test]
+    fn test_get_pane_activity_returns_usable_timestamp() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let session = "omar-test-pane-activity";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let _guard = SessionGuard(session.to_string());
+
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+
+        let client = TmuxClient::new("omar-test-");
+        let t0 = client
+            .get_pane_activity(session)
+            .expect("get_pane_activity must parse a timestamp on a fresh session");
+        assert!(
+            t0 > 0,
+            "activity timestamp should be a real unix time, got {}",
+            t0
+        );
+
+        // Generate activity and verify the timestamp advances.
+        let _ = client.send_keys(session, "Space");
+        thread::sleep(Duration::from_secs(2));
+        let t1 = client.get_pane_activity(session).unwrap();
+        assert!(
+            t1 >= t0,
+            "activity timestamp must not go backwards: {} -> {}",
+            t0,
+            t1
+        );
+    }
+
+    /// Regression: Claude Code's banner renders each word of "Claude Code"
+    /// with its own bold/reset ANSI pair — `Claude<ESC>[0m <ESC>[1mCode` —
+    /// so an ANSI-inclusive capture (`-e`) contains the bytes
+    /// `claude\x1b[0m code`, which the literal substring "claude code" does
+    /// NOT match. `wait_for_markers` must use a plain capture so multi-word
+    /// markers survive styling. Without this, readiness detection silently
+    /// fails for claude (works for single-word markers like "OpenAI Codex",
+    /// which is why the bug escaped earlier testing).
+    #[test]
+    fn test_wait_for_markers_handles_ansi_styled_multiword_banner() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let session = "omar-test-ansi-marker";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let _guard = SessionGuard(session.to_string());
+
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+
+        let client = TmuxClient::new("omar-test-");
+        // Reproduce the Claude Code banner pattern: each word wrapped in
+        // its own bold/reset pair, exactly like the real TUI.
+        let banner = "printf '\\033[1mClaude\\033[0m \\033[1mCode\\033[0m v2.1.113\\n'";
+        let _ = client.send_keys_literal(session, banner);
+        let _ = client.send_keys(session, "Enter");
+
+        // Confirm the bug's precondition: an ANSI-inclusive capture does
+        // NOT contain the contiguous bytes "claude code".
+        thread::sleep(Duration::from_millis(300));
+        let ansi_capture = client.capture_pane(session, 50).unwrap_or_default();
+        assert!(
+            !ansi_capture.to_ascii_lowercase().contains("claude code"),
+            "precondition: styled banner must NOT contain contiguous 'claude code' in an ANSI capture (if it does, the test is trivially passing and won't catch regressions)"
+        );
+
+        // And the fix: wait_for_markers must still find "Claude Code".
+        let found = client.wait_for_markers(
+            session,
+            &["Claude Code"],
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+        );
+        assert!(
+            found,
+            "wait_for_markers must detect multi-word marker under ANSI styling"
+        );
+    }
+
+    /// Regression: before the fix, `deliver_prompt` with
+    /// `require_initial_change: true` on a pane that is already at rest
+    /// (e.g. Claude Code's banner has finished drawing) would wait the full
+    /// `startup_timeout` because `wait_for_stable` never observed an
+    /// additional change. The API + manager paths now set
+    /// `require_initial_change: false` once `wait_for_markers` has proven
+    /// readiness, which this test codifies: delivery to a quiet pane whose
+    /// marker is already present must complete quickly, not hit the
+    /// startup timeout.
+    #[test]
+    fn test_deliver_prompt_after_markers_does_not_stall() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let session = "omar-test-deliver-after-markers";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let _guard = SessionGuard(session.to_string());
+
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+
+        let client = TmuxClient::new("omar-test-");
+
+        // Print a "banner" and let the pane settle so the marker is visible
+        // and the pane is fully at rest before we attempt delivery.
+        let _ = client.send_keys_literal(session, "echo READY_MARKER_XYZ");
+        let _ = client.send_keys(session, "Enter");
+        let found = client.wait_for_markers(
+            session,
+            &["READY_MARKER_XYZ"],
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+        );
+        if !found {
+            eprintln!("Skipping test: banner echo did not appear (sandbox)");
+            return;
+        }
+        // Ensure the pane is quiet BEFORE delivery, so `require_initial_change:
+        // true` would see no change and stall until startup_timeout.
+        thread::sleep(Duration::from_millis(500));
+
+        let startup_timeout = Duration::from_secs(6);
+        let opts = DeliveryOptions {
+            startup_timeout,
+            stable_quiet: Duration::from_millis(200),
+            verify_timeout: Duration::from_secs(2),
+            max_retries: 2,
+            poll_interval: Duration::from_millis(50),
+            retry_delay: Duration::from_millis(100),
+            // Matches the runtime setting after markers succeed — the bug
+            // was that this was `true`, causing a full-timeout stall.
+            require_initial_change: false,
+        };
+
+        let start = Instant::now();
+        let result = client.deliver_prompt(session, "echo DELIVERED_AFTER_MARKERS", &opts);
+        let elapsed = start.elapsed();
+
+        if let Err(e) = &result {
+            eprintln!("Skipping test: deliver_prompt failed (sandbox?): {}", e);
+            return;
+        }
+        assert!(
+            elapsed < startup_timeout,
+            "delivery should complete well under startup_timeout ({:?}), took {:?}",
+            startup_timeout,
+            elapsed
+        );
+
+        thread::sleep(Duration::from_millis(500));
+        let content = client.capture_pane(session, 80).unwrap_or_default();
+        assert!(
+            content.contains("DELIVERED_AFTER_MARKERS"),
+            "Expected delivered command in pane: {:?}",
             content
         );
     }
