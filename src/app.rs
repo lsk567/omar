@@ -72,6 +72,10 @@ pub struct AgentGroup<'a> {
 
 /// Application state
 pub struct App {
+    /// Unique session identifier (timestamp) used to group log files
+    /// written by the `/api/ea/:ea_id/logs` endpoint for this OMAR run.
+    pub session_id: String,
+
     // EA fields
     pub active_ea: EaId,
     pub registered_eas: Vec<EaInfo>,
@@ -172,6 +176,7 @@ impl App {
         std::fs::create_dir_all(state_dir.join("status")).ok();
 
         Self {
+            session_id: chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string(),
             active_ea,
             registered_eas,
             base_prefix,

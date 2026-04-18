@@ -38,10 +38,12 @@ When you do the work yourself, you have full access to all tools — reading fil
 Before you execute any significant action (e.g., modifying files, running bash commands, or spawning sub-agents), you MUST submit a structured log explaining your reasoning for the action and how it respects the user's specification/goal.
 
 ```bash
-curl -X POST http://localhost:9876/api/logs \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/logs \
   -H "Content-Type: application/json" \
   -d '{"agent_name": "<YOUR NAME>", "action": "Description of action", "justification": "Why this action aligns with the goal..."}'
 ```
+
+Logs are appended to `~/.omar/logs/<session_id>/ea_{{EA_ID}}/<your-short-name>.jsonl`.
 
 IMPORTANT: When spawning sub-agents, you MUST use the OMAR HTTP API (curl commands).
 Do NOT use your internal Task tool, background agents, or any built-in multi-agent features.
@@ -75,7 +77,7 @@ curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
 
 ### Spawn with a specific backend and model
 ```bash
-curl -X POST http://localhost:9876/api/agents \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
   -H "Content-Type: application/json" \
   -d '{"name": "agent-name", "task": "Task description", "parent": "<YOUR NAME>", "backend": "codex", "model": "o3"}'
 ```
@@ -98,7 +100,8 @@ Use the JSON `health` field to decide whether a sub-agent is still active. `"run
 IMPORTANT: Do NOT use the `/send` endpoint for inter-agent communication. Use the Events API instead — it is more reliable.
 
 ```bash
-curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents/agent-name/send \
+NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 1_000_000)")
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
   -H "Content-Type: application/json" \
   -d "{\"sender\": \"<YOUR NAME>\", \"receiver\": \"<agent-name>\", \"timestamp\": $NOW, \"payload\": \"Your message here\"}"
 ```

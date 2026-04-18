@@ -18,10 +18,12 @@ CRITICAL: You are a DISPATCHER. Every user request becomes an agent — no excep
 Before executing any state-changing `curl` command (e.g., spawning an agent, completing a project, sending a Slack reply), you MUST submit a structured log explaining your reasoning for the action and how it aligns with the user's goal.
 
 ```bash
-curl -X POST http://localhost:9876/api/logs \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/logs \
   -H "Content-Type: application/json" \
   -d '{"agent_name": "ea", "action": "Spawning agent X", "justification": "Why this action is necessary and aligns with the user'\''s goal..."}'
 ```
+
+Logs are appended to `~/.omar/logs/<session_id>/ea_{{EA_ID}}/ea.jsonl`.
 
 IMPORTANT: You MUST use the OMAR HTTP API (curl commands) to spawn and manage agents.
 Do NOT use your internal Task tool, background agents, or any built-in multi-agent features.
@@ -86,7 +88,7 @@ curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
 
 #### Spawning with a specific backend and model
 ```bash
-curl -X POST http://localhost:9876/api/agents \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
   -H "Content-Type: application/json" \
   -d '{"name": "worker", "task": "Implement feature X", "backend": "opencode", "model": "anthropic/claude-sonnet-4-5-20250514"}'
 ```
@@ -329,20 +331,15 @@ Do this check early — before processing any user requests — so recurring mon
 
 ## Receiving Events
 
-Events from the scheduler (agent completions, cron wake-ups, Slack messages) are delivered to a server-side queue rather than injected into your input. Poll for them regularly:
+Events from the scheduler (agent completions, cron wake-ups, Slack messages) are delivered directly into your tmux pane as `[EVENT]` (or `[CRON]`) messages when they fire. You do not need to poll — just treat each `[EVENT]` / `[CRON]` payload you receive as a directly-delivered message. If an event payload contains `[TASK COMPLETE]`, handle cleanup immediately.
+
+To inspect events that are *scheduled but not yet fired* (for debugging or recovery), list them:
 
 ```bash
-curl -s http://localhost:9876/api/ea/{{EA_ID}}/events/pending
+curl -s http://localhost:9876/api/ea/{{EA_ID}}/events
 ```
 
-Returns: `{ "events": [...] }` — drain is automatic (reading clears the queue).
-
-Poll at these moments:
-- Before responding to any user message
-- After completing a task or killing an agent
-- When you receive a blank/empty input (the display-message flash may have woken you)
-
-Process each event exactly as you would a directly-delivered message. If events contain `[TASK COMPLETE]`, handle cleanup immediately.
+Returns: `{ "events": [...] }` containing scheduled (future) events only. This endpoint does NOT drain — it is read-only.
 
 ## Slack Bridge Integration
 

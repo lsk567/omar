@@ -1106,6 +1106,229 @@ pub async fn cancel_event(
     }
 }
 
+// ── Logging handlers (Action Reasoning & Goal Alignment) ──
+
+/// Maximum accepted byte length for `LogRequest.agent_name`.
+pub(crate) const LOG_AGENT_NAME_MAX: usize = 128;
+/// Maximum accepted byte length for `LogRequest.action`.
+pub(crate) const LOG_ACTION_MAX: usize = 512;
+/// Maximum accepted byte length for `LogRequest.justification`.
+pub(crate) const LOG_JUSTIFICATION_MAX: usize = 2048;
+
+/// Validate an agent name for use as a filename component.
+///
+/// Rejects empty strings, inputs that would escape the target directory
+/// (`..`, `.`, leading `.`, path separators), and enforces a conservative
+/// alphabet + length cap. On success returns `Ok(())`; on failure returns
+/// a human-readable reason suitable for a 400 response body.
+pub(crate) fn validate_log_agent_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("agent_name must not be empty".to_string());
+    }
+    if name.len() > LOG_AGENT_NAME_MAX {
+        return Err(format!(
+            "agent_name must be at most {} bytes",
+            LOG_AGENT_NAME_MAX
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err("agent_name must not be '.' or '..'".to_string());
+    }
+    if name.starts_with('.') {
+        return Err("agent_name must not start with '.'".to_string());
+    }
+    for ch in name.chars() {
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.');
+        if !ok {
+            return Err(format!(
+                "agent_name contains invalid character {:?}; allowed: [A-Za-z0-9._-]",
+                ch
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate free-form text fields on a `LogRequest`.
+pub(crate) fn validate_log_text(
+    field: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<(), String> {
+    if value.len() > max {
+        return Err(format!("{} must be at most {} bytes", field, max));
+    }
+    Ok(())
+}
+
+/// Build the EA-scoped agent hierarchy path (root → leaf) for a given caller.
+///
+/// Returns a Vec of short display names, starting with `"ea"` and ending with
+/// the caller's own display name. Cycles in the parent map are broken.
+/// Pure function — extracted so it can be unit-tested without a live tmux/App.
+pub(crate) fn build_hierarchy_path(
+    parents: &HashMap<String, String>,
+    prefix: &str,
+    manager_session: &str,
+    agent_name: &str,
+) -> Vec<String> {
+    // Normalize the caller's agent name to a full tmux session name.
+    // "ea" is the reserved alias for the EA manager session.
+    let start = if agent_name == "ea" {
+        manager_session.to_string()
+    } else if agent_name.starts_with(prefix) {
+        agent_name.to_string()
+    } else {
+        format!("{}{}", prefix, agent_name)
+    };
+
+    let mut current = start;
+    let mut path_rev: Vec<String> = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Walk upward from the caller to the EA manager.
+    loop {
+        if !visited.insert(current.clone()) {
+            break; // cycle guard
+        }
+        if current == manager_session {
+            path_rev.push("ea".to_string());
+            break;
+        }
+        path_rev.push(display_name(prefix, &current).to_string());
+        match parents.get(&current) {
+            Some(p) => current = p.clone(),
+            None => break,
+        }
+    }
+
+    // Ensure the EA sits at the root of the hierarchy even when the caller
+    // has no registered parent yet (e.g. the EA itself logging on startup).
+    if path_rev.last().map(|s| s.as_str()) != Some("ea") {
+        path_rev.push("ea".to_string());
+    }
+    // path_rev is leaf -> root; reverse for human-readable root -> leaf.
+    path_rev.reverse();
+    path_rev
+}
+
+/// Persist a single justification entry to disk.
+///
+/// Returns the path that was appended to on success. Factored out of
+/// `log_justification` so it can be exercised end-to-end from tests without
+/// constructing a full `ApiState` (which requires tmux + real `App`).
+///
+/// Safety invariants enforced by the caller:
+///   - `short_name` must have already passed `validate_log_agent_name` — it is
+///     used directly as a filename component.
+///   - `hierarchy_path` must be non-empty and root at `"ea"`.
+pub(crate) async fn write_justification_entry(
+    omar_dir: &std::path::Path,
+    session_id: &str,
+    ea_id: u32,
+    short_name: &str,
+    entry: &LogEntry,
+) -> std::io::Result<PathBuf> {
+    let log_dir = omar_dir
+        .join("logs")
+        .join(session_id)
+        .join(format!("ea_{}", ea_id));
+    tokio::fs::create_dir_all(&log_dir).await?;
+
+    let log_file = log_dir.join(format!("{}.jsonl", short_name));
+    let line = serde_json::to_string(entry)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    use tokio::io::AsyncWriteExt;
+    let mut f = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+        .await?;
+    f.write_all(format!("{}\n", line).as_bytes()).await?;
+    // Force the write through the tokio blocking pool before returning so
+    // concurrent readers (including our own tests using std::fs) see it.
+    f.flush().await?;
+    Ok(log_file)
+}
+
+/// POST /api/ea/:ea_id/logs
+///
+/// Append a structured justification entry (JSONL) for an agent action.
+/// Each agent writes to its own file under
+/// `~/.omar/logs/<session_id>/ea_<ea_id>/<agent-short-name>.jsonl`,
+/// eliminating write contention across agents and EAs.
+pub async fn log_justification(
+    Path(ea_id): Path<u32>,
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<LogRequest>,
+) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Fix 1: Reject inputs that would escape the EA-scoped log directory or
+    // produce a filename we don't control. Validate before touching disk.
+    if let Err(e) = validate_log_agent_name(&req.agent_name) {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })));
+    }
+    // Fix 4: Bound request payload sizes so a single JSONL line always fits
+    // inside PIPE_BUF (4096 bytes on Linux), keeping concurrent `append` writes
+    // atomic with respect to each other.
+    if let Err(e) = validate_log_text("action", &req.action, LOG_ACTION_MAX) {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })));
+    }
+    if let Err(e) = validate_log_text("justification", &req.justification, LOG_JUSTIFICATION_MAX) {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })));
+    }
+
+    let (prefix, manager_session, state_dir) = resolve_ea(ea_id, &state)?;
+
+    let parents = memory::load_agent_parents_from(&state_dir);
+    let hierarchy_path = build_hierarchy_path(&parents, &prefix, &manager_session, &req.agent_name);
+
+    // Human-readable log line (printed via tracing so it shows up in the
+    // dashboard's debug console and anywhere tracing is wired up).
+    tracing::info!(
+        "Justification [ea={}] [{}] Action: {} | Reason: {}",
+        ea_id,
+        hierarchy_path.join(" > "),
+        req.action,
+        req.justification
+    );
+
+    let (session_id, omar_dir) = {
+        let app = state.app.lock().await;
+        (app.session_id.clone(), state.omar_dir.clone())
+    };
+
+    let short_name = hierarchy_path
+        .last()
+        .cloned()
+        .unwrap_or_else(|| req.agent_name.clone());
+
+    let entry = LogEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ea_id,
+        agent_name: req.agent_name.clone(),
+        hierarchy_path,
+        action: req.action.clone(),
+        justification: req.justification.clone(),
+    };
+
+    if let Err(e) =
+        write_justification_entry(&omar_dir, &session_id, ea_id, &short_name, &entry).await
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to write log entry: {}", e),
+            }),
+        ));
+    }
+
+    Ok(Json(StatusResponse {
+        status: "logged".to_string(),
+        message: None,
+    }))
+}
+
 // ── Computer Use handlers (global — not EA-scoped) ──
 
 /// Helper: verify the agent holds the computer lock.
@@ -1425,7 +1648,12 @@ fn generate_agent_name_in_ea(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{infer_backend_name, timestamp_is_too_old};
+    use super::{
+        build_hierarchy_path, infer_backend_name, timestamp_is_too_old, validate_log_agent_name,
+        validate_log_text, write_justification_entry, LogEntry, LOG_ACTION_MAX, LOG_AGENT_NAME_MAX,
+        LOG_JUSTIFICATION_MAX,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn timestamp_guard_accepts_exact_one_second_boundary() {
@@ -1456,5 +1684,288 @@ mod tests {
             Some("opencode")
         );
         assert_eq!(infer_backend_name(None, "(cursor) --fast"), Some("cursor"));
+    }
+
+    // ── build_hierarchy_path tests (Action Reasoning & Goal Alignment) ──
+
+    fn ea_setup() -> (String, String) {
+        // Matches the production naming: prefix "omar-agent-0-" and manager
+        // session "omar-agent-ea-0" for EA 0.
+        ("omar-agent-0-".to_string(), "omar-agent-ea-0".to_string())
+    }
+
+    #[test]
+    fn hierarchy_for_ea_alias_is_just_ea() {
+        let (prefix, manager) = ea_setup();
+        let parents: HashMap<String, String> = HashMap::new();
+        assert_eq!(
+            build_hierarchy_path(&parents, &prefix, &manager, "ea"),
+            vec!["ea".to_string()]
+        );
+    }
+
+    #[test]
+    fn hierarchy_for_direct_child_of_ea() {
+        let (prefix, manager) = ea_setup();
+        let mut parents = HashMap::new();
+        parents.insert(format!("{}api", prefix), manager.clone());
+        assert_eq!(
+            build_hierarchy_path(&parents, &prefix, &manager, "api"),
+            vec!["ea".to_string(), "api".to_string()]
+        );
+    }
+
+    #[test]
+    fn hierarchy_accepts_full_session_name_as_input() {
+        let (prefix, manager) = ea_setup();
+        let mut parents = HashMap::new();
+        parents.insert(format!("{}api", prefix), manager.clone());
+        assert_eq!(
+            build_hierarchy_path(&parents, &prefix, &manager, &format!("{}api", prefix)),
+            vec!["ea".to_string(), "api".to_string()]
+        );
+    }
+
+    #[test]
+    fn hierarchy_for_multi_level_descent() {
+        let (prefix, manager) = ea_setup();
+        let mut parents = HashMap::new();
+        parents.insert(format!("{}api", prefix), manager.clone());
+        parents.insert(format!("{}auth", prefix), format!("{}api", prefix));
+        parents.insert(format!("{}jwt", prefix), format!("{}auth", prefix));
+        assert_eq!(
+            build_hierarchy_path(&parents, &prefix, &manager, "jwt"),
+            vec![
+                "ea".to_string(),
+                "api".to_string(),
+                "auth".to_string(),
+                "jwt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn hierarchy_breaks_cycles_without_panicking() {
+        // Cycle: a -> b -> a. Should terminate; ea is prepended as the root.
+        let (prefix, manager) = ea_setup();
+        let mut parents = HashMap::new();
+        parents.insert(format!("{}a", prefix), format!("{}b", prefix));
+        parents.insert(format!("{}b", prefix), format!("{}a", prefix));
+        let path = build_hierarchy_path(&parents, &prefix, &manager, "a");
+        // Must terminate, must start with ea, must contain a and b.
+        assert_eq!(path.first().map(|s| s.as_str()), Some("ea"));
+        assert!(path.iter().any(|s| s == "a"));
+        assert!(path.iter().any(|s| s == "b"));
+    }
+
+    #[test]
+    fn hierarchy_for_orphan_agent_still_has_ea_root() {
+        // Agent exists with no parent entry (e.g., spawned directly by EA
+        // before parent map was persisted). Path must still root at ea.
+        let (prefix, manager) = ea_setup();
+        let parents: HashMap<String, String> = HashMap::new();
+        let path = build_hierarchy_path(&parents, &prefix, &manager, "orphan");
+        assert_eq!(path.first().map(|s| s.as_str()), Some("ea"));
+        assert_eq!(path.last().map(|s| s.as_str()), Some("orphan"));
+    }
+
+    // ── validate_log_agent_name tests (path-traversal hardening) ──
+
+    #[test]
+    fn validate_agent_name_accepts_normal_names() {
+        assert!(validate_log_agent_name("ea").is_ok());
+        assert!(validate_log_agent_name("review").is_ok());
+        assert!(validate_log_agent_name("api-worker_1.v2").is_ok());
+        assert!(validate_log_agent_name("t-127").is_ok());
+    }
+
+    #[test]
+    fn validate_agent_name_rejects_path_traversal() {
+        assert!(validate_log_agent_name("..").is_err());
+        assert!(validate_log_agent_name(".").is_err());
+        assert!(validate_log_agent_name("../evil").is_err());
+        assert!(validate_log_agent_name("..\\evil").is_err());
+        assert!(validate_log_agent_name("a/b").is_err());
+        assert!(validate_log_agent_name("a\\b").is_err());
+        assert!(validate_log_agent_name(".hidden").is_err());
+    }
+
+    #[test]
+    fn validate_agent_name_rejects_empty_and_oversize() {
+        assert!(validate_log_agent_name("").is_err());
+        let big = "a".repeat(LOG_AGENT_NAME_MAX + 1);
+        assert!(validate_log_agent_name(&big).is_err());
+        let ok_max = "a".repeat(LOG_AGENT_NAME_MAX);
+        assert!(validate_log_agent_name(&ok_max).is_ok());
+    }
+
+    #[test]
+    fn validate_agent_name_rejects_control_and_null_bytes() {
+        assert!(validate_log_agent_name("evil\0").is_err());
+        assert!(validate_log_agent_name("evil\nname").is_err());
+        assert!(validate_log_agent_name("space name").is_err());
+    }
+
+    // ── validate_log_text tests (payload size cap) ──
+
+    #[test]
+    fn validate_text_accepts_up_to_limit() {
+        assert!(validate_log_text("action", "", LOG_ACTION_MAX).is_ok());
+        let at_limit = "x".repeat(LOG_ACTION_MAX);
+        assert!(validate_log_text("action", &at_limit, LOG_ACTION_MAX).is_ok());
+    }
+
+    #[test]
+    fn validate_text_rejects_oversize() {
+        let over = "x".repeat(LOG_JUSTIFICATION_MAX + 1);
+        assert!(validate_log_text("justification", &over, LOG_JUSTIFICATION_MAX).is_err());
+    }
+
+    // ── write_justification_entry end-to-end (handler IO path) ──
+
+    #[tokio::test]
+    async fn write_entry_creates_ea_scoped_directory_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let omar_dir = tmp.path().to_path_buf();
+        let session_id = "20260417_120000";
+        let entry = LogEntry {
+            timestamp: "2026-04-17T12:00:00Z".to_string(),
+            ea_id: 7,
+            agent_name: "api".to_string(),
+            hierarchy_path: vec!["ea".to_string(), "api".to_string()],
+            action: "spawn worker".to_string(),
+            justification: "need parallelism".to_string(),
+        };
+
+        let path = write_justification_entry(&omar_dir, session_id, 7, "api", &entry)
+            .await
+            .expect("write must succeed");
+
+        let expected = omar_dir
+            .join("logs")
+            .join(session_id)
+            .join("ea_7")
+            .join("api.jsonl");
+        assert_eq!(path, expected);
+        assert!(expected.exists(), "log file must exist at EA-scoped path");
+    }
+
+    #[tokio::test]
+    async fn write_entry_serializes_ea_id_in_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let omar_dir = tmp.path().to_path_buf();
+        let entry = LogEntry {
+            timestamp: "2026-04-17T12:00:00Z".to_string(),
+            ea_id: 3,
+            agent_name: "ea".to_string(),
+            hierarchy_path: vec!["ea".to_string()],
+            action: "start".to_string(),
+            justification: "boot".to_string(),
+        };
+        write_justification_entry(&omar_dir, "sid", 3, "ea", &entry)
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(
+            omar_dir
+                .join("logs")
+                .join("sid")
+                .join("ea_3")
+                .join("ea.jsonl"),
+        )
+        .unwrap();
+        let trimmed = contents.trim_end();
+        assert!(trimmed.ends_with('}'), "entry must be valid JSON line");
+        let parsed: serde_json::Value = serde_json::from_str(trimmed).unwrap();
+        assert_eq!(parsed["ea_id"], 3);
+        assert_eq!(parsed["agent_name"], "ea");
+        assert_eq!(parsed["action"], "start");
+        assert_eq!(parsed["hierarchy_path"], serde_json::json!(["ea"]));
+    }
+
+    #[tokio::test]
+    async fn write_entry_appends_on_repeat_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let omar_dir = tmp.path().to_path_buf();
+        for i in 0..3 {
+            let entry = LogEntry {
+                timestamp: format!("2026-04-17T12:00:0{}Z", i),
+                ea_id: 0,
+                agent_name: "worker".to_string(),
+                hierarchy_path: vec!["ea".to_string(), "worker".to_string()],
+                action: format!("step {}", i),
+                justification: "because".to_string(),
+            };
+            write_justification_entry(&omar_dir, "sid", 0, "worker", &entry)
+                .await
+                .unwrap();
+        }
+        let contents = std::fs::read_to_string(
+            omar_dir
+                .join("logs")
+                .join("sid")
+                .join("ea_0")
+                .join("worker.jsonl"),
+        )
+        .unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 3, "each call must append one line");
+        for (i, line) in lines.iter().enumerate() {
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed["action"], format!("step {}", i));
+        }
+    }
+
+    #[tokio::test]
+    async fn write_entry_isolates_eas() {
+        // Two EAs with same agent short-name land in separate files.
+        let tmp = tempfile::tempdir().unwrap();
+        let omar_dir = tmp.path().to_path_buf();
+        for ea in [0u32, 1u32] {
+            let entry = LogEntry {
+                timestamp: "2026-04-17T12:00:00Z".to_string(),
+                ea_id: ea,
+                agent_name: "api".to_string(),
+                hierarchy_path: vec!["ea".to_string(), "api".to_string()],
+                action: format!("action ea{}", ea),
+                justification: "x".to_string(),
+            };
+            write_justification_entry(&omar_dir, "sid", ea, "api", &entry)
+                .await
+                .unwrap();
+        }
+        let ea0 = omar_dir.join("logs/sid/ea_0/api.jsonl");
+        let ea1 = omar_dir.join("logs/sid/ea_1/api.jsonl");
+        assert!(std::fs::read_to_string(&ea0)
+            .unwrap()
+            .contains("action ea0"));
+        assert!(std::fs::read_to_string(&ea1)
+            .unwrap()
+            .contains("action ea1"));
+        assert!(!std::fs::read_to_string(&ea0)
+            .unwrap()
+            .contains("action ea1"));
+    }
+
+    #[test]
+    fn hierarchy_is_scoped_per_ea() {
+        // Verify the same agent name in two EAs produces two isolated paths
+        // because prefix and manager differ.
+        let (prefix0, manager0) = ("omar-agent-0-".to_string(), "omar-agent-ea-0".to_string());
+        let (prefix1, manager1) = ("omar-agent-1-".to_string(), "omar-agent-ea-1".to_string());
+
+        let mut parents0 = HashMap::new();
+        parents0.insert(format!("{}api", prefix0), manager0.clone());
+        let mut parents1 = HashMap::new();
+        parents1.insert(format!("{}api", prefix1), manager1.clone());
+
+        assert_eq!(
+            build_hierarchy_path(&parents0, &prefix0, &manager0, "api"),
+            vec!["ea".to_string(), "api".to_string()]
+        );
+        assert_eq!(
+            build_hierarchy_path(&parents1, &prefix1, &manager1, "api"),
+            vec!["ea".to_string(), "api".to_string()]
+        );
     }
 }
