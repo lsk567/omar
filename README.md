@@ -2,19 +2,22 @@
 
 # Open Multi-Agent Runtime
 
+**`omar` is a TUI for creating powerful agentic organizations.**
+
 Lead a team of 100 agents to solve humanity's biggest problems.
 
-**`omar` is a TUI for creating powerful agentic organizations.**
 
 <p align="center">
   <a href="https://omar.tech">omar.tech</a>&nbsp; • &nbsp;
   <a href="https://omar.tech/zh/">中文</a>&nbsp; • &nbsp;
-  <a href="https://opensource.org/licenses/BSD-2-Clause"><img src="https://img.shields.io/badge/License-BSD_2--Clause-blue.svg" alt="License" valign="middle"/></a>&nbsp; • &nbsp;
+  <a href="https://opensource.org/licenses/BSD-3-Clause"><img src="https://img.shields.io/badge/License-BSD_3--Clause-blue.svg" alt="License" valign="middle"/></a>&nbsp; • &nbsp;
   <a href="https://github.com/lsk567/omar/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/lsk567/omar/ci.yml?label=CI&logo=github" alt="CI Status" valign="middle"/></a>&nbsp; • &nbsp;
   <a href="https://discord.gg/X76PSzmfWr"><img src="https://img.shields.io/discord/1467663881588572182?label=Discord&logo=discord&logoColor=white&color=5865F2&cacheSeconds=60" alt="Discord" valign="middle"/></a>
 </p>
 
 </div>
+
+![Demo](img/demo.gif)
 
 ## Features
 
@@ -33,12 +36,7 @@ Other features include messaging systems integration (e.g., Slack), computer use
 - tmux 3.0+
 - Rust 1.70+
 - GNU Make
-- One supported agent backend:
-- [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview)
-- [Codex CLI](https://developers.openai.com/codex/cli)
-- [Cursor CLI](https://cursor.com/cli)
-- [Gemini CLI](https://geminicli.com)
-- [Opencode](https://github.com/anomalyco/opencode)
+- One or more coding agents: [Claude](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex](https://developers.openai.com/codex/cli), [Cursor](https://cursor.com/cli), [Gemini](https://geminicli.com), [Opencode](https://github.com/anomalyco/opencode)
 
 ### One-liner (recommended)
 
@@ -71,24 +69,18 @@ cd omar && make install
 $ omar
 ```
 
-https://github.com/user-attachments/assets/b720eb41-1d97-4331-9c2c-10a0e4580286
-
-Go [here](#supported-agent-backends) to see how to launch with other agent backends.
+Go [here](#supported-agent-backends) to see how to launch with specific agent backends.
 
 #### Step 2: Tell your Executive Assistant (EA) to run a test prompt.
 
 Copy the following into your EA window:
 ```
-Load and run https://github.com/lsk567/omar/blob/main/prompts/tests/project-factory.md
+Run https://github.com/lsk567/omar/blob/main/prompts/tests/project-factory.md
 ```
-
-https://github.com/user-attachments/assets/3dfe5bd3-9b9f-474c-a036-a1058413935d
 
 You should see agents being spawned by the EA.
 
-Tip: Use ↑↓ to cycle through agents at the current level. Use → to drill into a deeper level. Use ← to back out.
-
-https://github.com/user-attachments/assets/dc94edb4-24ea-4e7e-aa8c-f0bc31d09d3f
+Tip: Use `↑↓←→` to cycle through agents at the current level. Use `Tab` to drill into a deeper level. Use `Shift+Tab` to back out.
 
 #### Step 3: Shutdown the project.
 
@@ -97,38 +89,24 @@ Go back to the EA and type in:
 Shutdown the test project and its agents.
 ```
 
-https://github.com/user-attachments/assets/94b9a78f-5eb2-4557-9932-f17fed536ba5
-
 ## Supported Agent Backends
 
 | Backend | How to launch |
 |---------|---------------|
-| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar` (default) |
-| [Codex CLI](https://developers.openai.com/codex/cli) | `omar --agent codex` |
-| [Cursor CLI](https://cursor.com/cli) | `omar --agent cursor` |
-| [Gemini CLI](https://geminicli.com) | `omar --agent gemini` |
-| [Opencode](https://github.com/anomalyco/opencode) | `omar --agent opencode` |
-
-## Multi-EA CLI
-
-By default, CLI commands target the active EA stored on disk.
-
-```bash
-# List sessions for the active EA
-omar list
-
-# Switch CLI targeting to a specific EA by id or name
-omar --ea 2 list
-omar --ea Research manager start
-
-# Inspect sessions across every EA
-omar list --all-eas
-```
+| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar -a claude` (default) |
+| [Codex CLI](https://developers.openai.com/codex/cli) | `omar -a codex` |
+| [Cursor CLI](https://cursor.com/cli) | `omar -a cursor` |
+| [Gemini CLI](https://geminicli.com) | `omar -a gemini` |
+| [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode` |
 
 ## License
 
-BSD 2-Clause
+BSD 3-Clause
 
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=lsk567/omar&type=date&legend=top-left)](https://www.star-history.com/#lsk567/omar&type=date&legend=top-left)
+
+---
+
+OMAR is made with ❤️ in Berkeley, CA.
