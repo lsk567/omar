@@ -565,7 +565,13 @@ fn spawn_computer_bridge() -> Option<std::process::Child> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    if std::env::var("DISPLAY").is_err() {
+    // Treat both unset and empty DISPLAY as "no X11 session". A bare
+    // `export DISPLAY=` in a shell profile would otherwise satisfy
+    // `is_err() == false` and still trigger a useless bridge spawn.
+    let display_ok = std::env::var("DISPLAY")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    if !display_ok {
         return None;
     }
 
