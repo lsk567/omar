@@ -142,16 +142,6 @@ curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
 
 When the EA asks you to run a command and report its output, always relay the output VERBATIM — do not summarize, paraphrase, or truncate API responses. If the output is very long, include at minimum the last 2000 characters verbatim.
 
-## Status Reporting
-
-OMAR sends you a periodic `[STATUS CHECK]` event every 60 seconds. When you receive one, update your status via the API:
-```bash
-curl -X PUT http://localhost:9876/api/ea/{{EA_ID}}/agents/<YOUR NAME>/status \
-  -H "Content-Type: application/json" \
-  -d '{"status": "Currently: <brief description of what you are doing>"}'
-```
-Also update proactively after spawning sub-agents or reaching a milestone.
-
 ## Scheduling and Wake-ups
 
 IMPORTANT: Do NOT use `sleep`, polling loops, or any self-wake-up mechanism (e.g., `sleep 60 && curl ...`, `while true; do ... sleep ...; done`). OMAR has a discrete-event scheduler — use its Events API instead.

@@ -9,7 +9,7 @@ use axum::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use super::models::*;
@@ -20,7 +20,7 @@ use crate::manager::{build_agent_command, prompts_dir};
 use crate::memory;
 use crate::projects;
 use crate::scheduler::{event::ScheduledEvent, Scheduler};
-use crate::tmux::TmuxClient;
+use crate::tmux::{DeliveryOptions, TmuxClient};
 
 /// Shared state for all API handlers
 pub struct ApiState {
@@ -82,6 +82,46 @@ fn health_from_activity(activity: i64, idle_warning: i64) -> String {
     } else {
         "idle".to_string()
     }
+}
+
+fn normalize_backend_name(s: &str) -> Option<&'static str> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some("codex"),
+        "cursor" => Some("cursor"),
+        "gemini" => Some("gemini"),
+        "claude" | "claude-code" | "claude_code" => Some("claude"),
+        "opencode" => Some("opencode"),
+        _ => None,
+    }
+}
+
+fn strip_command_token_wrappers(token: &str) -> &str {
+    token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'))
+}
+
+fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> Option<&'static str> {
+    if let Some(name) = explicit_backend.and_then(normalize_backend_name) {
+        return Some(name);
+    }
+
+    for token in command.split_whitespace() {
+        let token = strip_command_token_wrappers(token);
+        if token.is_empty() {
+            continue;
+        }
+
+        let executable = std::path::Path::new(token)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(token);
+        let executable = strip_command_token_wrappers(executable);
+
+        if let Some(name) = normalize_backend_name(executable) {
+            return Some(name);
+        }
+    }
+
+    None
 }
 
 fn timestamp_is_too_old(timestamp: u64, now: u64) -> bool {
@@ -695,42 +735,64 @@ pub async fn spawn_agent(
     // Save parent mapping only after spawn succeeds to avoid orphaned entries
     memory::save_agent_parent_in(&state_dir, &session_name, &parent_session);
 
-    // Send first user message after a delay
+    let backend_name = infer_backend_name(req.backend.as_deref(), &base_command);
+
+    // Deliver first user message using readiness-aware prompt delivery.
     if let Some(ref task) = req.task {
         memory::save_worker_task_in(&state_dir, &session_name, task);
 
         let user_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", short_name, task);
         let client2 = client.clone();
         let session2 = session_name.clone();
+        let readiness_markers: Vec<&'static str> = backend_name
+            .map(crate::tmux::backend_readiness_markers)
+            .unwrap_or(&[])
+            .to_vec();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let _ = client2.send_keys_literal(&session2, &user_msg);
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let _ = client2.send_keys(&session2, "Enter");
-        });
-    }
+            let session_label = session2.clone();
 
-    // Schedule a recurring status check — ea_id is structural
-    if has_agent_prompt {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let interval: u64 = 60_000_000_000; // 60 seconds
-        let event = ScheduledEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            sender: "omar".to_string(),
-            receiver: short_name.clone(),
-            timestamp: now + interval,
-            payload: format!(
-                "[STATUS CHECK] Update your status via the API: curl -X PUT http://localhost:9876/api/ea/{}/agents/<YOUR NAME>/status -H 'Content-Type: application/json' -d '{{\"status\": \"<1-line status>\"}}'",
-                ea_id
-            ),
-            created_at: now,
-            recurring_ns: Some(interval),
-            ea_id,
-        };
-        state.scheduler.insert(event);
+            match tokio::task::spawn_blocking(move || {
+                // Markers are the authoritative readiness signal when we know
+                // the backend. If they succeed, the TUI has rendered and is
+                // accepting input — no need to also wait for a follow-up
+                // content change in wait_for_stable (Claude Code's TUI is
+                // pixel-stable after its banner draws, so requiring an
+                // *additional* change would time out for no reason).
+                let markers_proved_ready = if !readiness_markers.is_empty() {
+                    let detected = client2.wait_for_markers(
+                        &session2,
+                        &readiness_markers,
+                        Duration::from_secs(60),
+                        Duration::from_millis(250),
+                    );
+                    if !detected {
+                        eprintln!(
+                            "readiness markers timed out for {}; proceeding with prompt delivery",
+                            session2
+                        );
+                    }
+                    detected
+                } else {
+                    false
+                };
+                let opts = DeliveryOptions {
+                    startup_timeout: Duration::from_secs(45),
+                    stable_quiet: Duration::from_millis(800),
+                    verify_timeout: Duration::from_secs(6),
+                    max_retries: 4,
+                    poll_interval: Duration::from_millis(120),
+                    retry_delay: Duration::from_millis(250),
+                    require_initial_change: !markers_proved_ready,
+                };
+                client2.deliver_prompt(&session2, &user_msg, &opts)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("prompt delivery failed for {}: {}", session_label, e),
+                Err(e) => eprintln!("prompt delivery task failed for {}: {}", session_label, e),
+            }
+        });
     }
 
     Ok(Json(SpawnAgentResponse {
@@ -1363,7 +1425,7 @@ fn generate_agent_name_in_ea(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::timestamp_is_too_old;
+    use super::{infer_backend_name, timestamp_is_too_old};
 
     #[test]
     fn timestamp_guard_accepts_exact_one_second_boundary() {
@@ -1381,5 +1443,18 @@ mod tests {
     fn timestamp_guard_handles_large_timestamps_without_overflow() {
         let now = 5_000_000_000;
         assert!(!timestamp_is_too_old(u64::MAX, now));
+    }
+
+    #[test]
+    fn infer_backend_name_scans_wrapped_tokens() {
+        assert_eq!(
+            infer_backend_name(None, "env FOO=bar codex --model o3"),
+            Some("codex")
+        );
+        assert_eq!(
+            infer_backend_name(None, "npx opencode --prompt hi"),
+            Some("opencode")
+        );
+        assert_eq!(infer_backend_name(None, "(cursor) --fast"), Some("cursor"));
     }
 }

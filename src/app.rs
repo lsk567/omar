@@ -275,6 +275,22 @@ impl App {
         // Get all sessions (used for both active EA state and multi-EA CoC sidebar)
         let all_sessions = self.client.list_all_sessions()?;
         let sessions = all_sessions.clone();
+        // Only snapshot health for OMAR-owned sessions. Every EA session name
+        // starts with `base_prefix` (e.g. "omar-agent-") and the manager is
+        // `<base_prefix>ea-<id>` — so the prefix check covers both agents and
+        // managers across all EAs. This avoids running a tmux `capture-pane`
+        // per unrelated shell session on hosts where the user has many tmux
+        // sessions for their own work.
+        let mut health_snapshot: HashMap<String, HealthInfo> = HashMap::new();
+        for session in &all_sessions {
+            if !self.base_prefix.is_empty() && !session.name.starts_with(&self.base_prefix) {
+                continue;
+            }
+            health_snapshot.insert(
+                session.name.clone(),
+                self.health_checker.check_detailed(&session.name),
+            );
+        }
 
         // Separate manager from other agents, filtering out non-EA sessions
         let mut manager_session_found = None;
@@ -298,7 +314,10 @@ impl App {
 
         // Update manager info
         self.manager = manager_session_found.map(|session| {
-            let health_info = self.health_checker.check_detailed(&session.name);
+            let health_info = health_snapshot
+                .get(&session.name)
+                .cloned()
+                .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
             let health = health_info.state;
             AgentInfo {
                 session,
@@ -315,7 +334,10 @@ impl App {
         self.agents = other_sessions
             .into_iter()
             .map(|session| {
-                let health_info = self.health_checker.check_detailed(&session.name);
+                let health_info = health_snapshot
+                    .get(&session.name)
+                    .cloned()
+                    .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
                 let health = health_info.state;
                 AgentInfo {
                     session,
@@ -385,7 +407,10 @@ impl App {
                     continue;
                 }
                 if session.name == ea_manager {
-                    let health_info = self.health_checker.check_detailed(&session.name);
+                    let health_info = health_snapshot
+                        .get(&session.name)
+                        .cloned()
+                        .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
                     let health = health_info.state;
                     manager_info = Some(AgentInfo {
                         session: session.clone(),
@@ -393,7 +418,10 @@ impl App {
                         health_info,
                     });
                 } else if !ea_prefix.is_empty() && session.name.starts_with(&ea_prefix) {
-                    let health_info = self.health_checker.check_detailed(&session.name);
+                    let health_info = health_snapshot
+                        .get(&session.name)
+                        .cloned()
+                        .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
                     let health = health_info.state;
                     ea_agents.push(AgentInfo {
                         session: session.clone(),

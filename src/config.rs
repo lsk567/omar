@@ -145,10 +145,7 @@ fn detect_agent_command() -> String {
         ),
         ("cursor", "cursor agent --yolo"),
         ("gemini", "gemini --yolo"),
-        (
-            "opencode",
-            "OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode",
-        ),
+        ("opencode", "opencode"),
     ] {
         if Command::new(binary)
             .arg("--version")
@@ -173,7 +170,7 @@ fn default_command() -> String {
 /// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
 /// - `"cursor"` → `"cursor agent --yolo"`
 /// - `"gemini"` → `"gemini --yolo"`
-/// - `"opencode"` → `"opencode --dangerously-skip-permissions"`
+/// - `"opencode"` → `"opencode"` (opencode has no permission-skip flag)
 /// - anything else → error
 pub fn resolve_backend(name: &str) -> Result<String, String> {
     match name {
@@ -183,7 +180,7 @@ pub fn resolve_backend(name: &str) -> Result<String, String> {
         }
         "cursor" => Ok("cursor agent --yolo".to_string()),
         "gemini" => Ok("gemini --yolo".to_string()),
-        "opencode" => Ok("OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode".to_string()),
+        "opencode" => Ok("opencode".to_string()),
         other => Err(format!(
             "Unknown backend '{}'. Supported: claude, codex, cursor, gemini, opencode",
             other
@@ -443,10 +440,7 @@ default_command = "bash"
         );
         assert_eq!(resolve_backend("cursor").unwrap(), "cursor agent --yolo");
         assert_eq!(resolve_backend("gemini").unwrap(), "gemini --yolo");
-        assert_eq!(
-            resolve_backend("opencode").unwrap(),
-            "OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true opencode"
-        );
+        assert_eq!(resolve_backend("opencode").unwrap(), "opencode");
     }
 
     #[test]

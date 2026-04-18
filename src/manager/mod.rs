@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::ea::{self, EaId};
 use crate::memory;
-use crate::tmux::TmuxClient;
+use crate::tmux::{DeliveryOptions, TmuxClient};
 use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 
 // Embed prompt files at compile time so they work regardless of CWD.
@@ -86,6 +86,18 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
     base_command
         .split_whitespace()
         .find_map(detect_backend_token)
+}
+
+impl BackendKind {
+    fn canonical_name(self) -> &'static str {
+        match self {
+            BackendKind::Claude => "claude",
+            BackendKind::Codex => "codex",
+            BackendKind::Cursor => "cursor",
+            BackendKind::Gemini => "gemini",
+            BackendKind::Opencode => "opencode",
+        }
+    }
 }
 
 fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -> PathBuf {
@@ -528,8 +540,47 @@ fn spawn_worker(
         Some(&std::env::current_dir()?.to_string_lossy()),
     )?;
 
-    // Give it time to start
-    thread::sleep(Duration::from_secs(1));
+    // Wait for backend readiness when possible, then deliver an explicit
+    // first task message so workers begin execution deterministically.
+    // If markers succeed, the TUI is proven ready; skip require_initial_change
+    // (a fresh Claude Code banner stays pixel-stable after drawing, so any
+    // extra "wait for a change" would time out).
+    let markers_proved_ready = if let Some(kind) = detect_backend(command) {
+        let markers = crate::tmux::backend_readiness_markers(kind.canonical_name());
+        if markers.is_empty() {
+            false
+        } else {
+            let detected = client.wait_for_markers(
+                &session_name,
+                markers,
+                Duration::from_secs(60),
+                Duration::from_millis(250),
+            );
+            if !detected {
+                println!(
+                    "  {} - readiness markers timed out; attempting delivery anyway",
+                    agent.name
+                );
+            }
+            detected
+        }
+    } else {
+        false
+    };
+
+    let initial_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", agent.name, agent.task);
+    let opts = DeliveryOptions {
+        startup_timeout: Duration::from_secs(45),
+        stable_quiet: Duration::from_millis(800),
+        verify_timeout: Duration::from_secs(6),
+        max_retries: 4,
+        poll_interval: Duration::from_millis(120),
+        retry_delay: Duration::from_millis(250),
+        require_initial_change: !markers_proved_ready,
+    };
+    client
+        .deliver_prompt(&session_name, &initial_msg, &opts)
+        .map_err(|e| anyhow::anyhow!("failed to deliver initial task to {}: {}", agent.name, e))?;
 
     // Persist worker task description to EA-scoped state dir
     let state_dir = ea::ea_state_dir(ea_id, omar_dir);

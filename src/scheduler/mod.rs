@@ -8,6 +8,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 use crate::ea;
+use crate::tmux::DeliveryOptions;
 
 /// A ticker message with its creation time.
 struct TickerEntry {
@@ -198,12 +199,9 @@ pub(crate) fn deliver_to_tmux(
         format!("{}{}", prefix, receiver)
     };
     let client = crate::tmux::TmuxClient::new("");
-    if let Err(e) = client.send_keys_literal(&target, message) {
-        ticker.push(format!("tmux send-keys failed for {}: {}", target, e));
-        return;
-    }
-    if let Err(e) = client.send_keys(&target, "Enter") {
-        ticker.push(format!("tmux send-keys failed for {}: {}", target, e));
+    let opts = DeliveryOptions::default();
+    if let Err(e) = client.deliver_prompt(&target, message, &opts) {
+        ticker.push(format!("tmux prompt delivery failed for {}: {}", target, e));
         return;
     }
     ticker.push(format!("delivered event(s) to {}", receiver));
@@ -366,7 +364,26 @@ pub async fn run_event_loop(
                     // Track events delivered for this EA this tick.
                     *ea_delivery_count.entry(*ea_id).or_insert(0) += batch.len();
                     let message = format_delivery(&batch, earliest_ts);
-                    deliver_to_tmux(*ea_id, receiver, &message, &base_prefix, &ticker);
+                    let receiver_name = receiver.clone();
+                    let base_prefix_clone = base_prefix.clone();
+                    let ticker_clone = ticker.clone();
+                    let ea = *ea_id;
+                    let delivery_result = tokio::task::spawn_blocking(move || {
+                        deliver_to_tmux(
+                            ea,
+                            &receiver_name,
+                            &message,
+                            &base_prefix_clone,
+                            &ticker_clone,
+                        );
+                    })
+                    .await;
+                    if let Err(e) = delivery_result {
+                        ticker.push(format!(
+                            "delivery task failed for {} (ea {}): {}",
+                            receiver, ea_id, e
+                        ));
+                    }
 
                     // Re-insert recurring events with a fresh timestamp and ID
                     for ev in &batch {
