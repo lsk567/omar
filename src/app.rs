@@ -944,11 +944,7 @@ impl App {
         self.set_status(format!("Spawned agent: {}", short_name));
         self.refresh()?;
 
-        if let Some(pos) = self
-            .focus_child_indices
-            .iter()
-            .position(|&i| self.agents.get(i).is_some_and(|a| a.session.name == name))
-        {
+        if let Some(pos) = focus_view_index(&self.agents, &self.focus_child_indices, &name) {
             self.selected = pos;
             self.manager_selected = false;
         }
@@ -1611,6 +1607,19 @@ pub fn build_tree(
     nodes
 }
 
+/// Position of the agent named `name` within `focus_child_indices`, so the
+/// dashboard can land its cursor on a newly spawned worker that has just
+/// been re-refreshed into the current view.
+fn focus_view_index(
+    agents: &[AgentInfo],
+    focus_child_indices: &[usize],
+    name: &str,
+) -> Option<usize> {
+    focus_child_indices
+        .iter()
+        .position(|&i| agents.get(i).is_some_and(|a| a.session.name == name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1941,49 +1950,49 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_agent_parents_child_to_current_focus() {
+    fn spawn_bookkeeping_persists_parent_under_focus_and_selects_in_view() {
+        use crate::memory;
+
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path();
 
         let focus_parent = "omar-agent-api";
         let new_child = "omar-agent-api-helper";
 
-        crate::memory::save_agent_parent_in(state_dir, new_child, focus_parent);
+        memory::save_agent_parent_in(state_dir, focus_parent, TEST_MANAGER);
+        memory::save_agent_parent_in(state_dir, new_child, focus_parent);
 
-        let parents = crate::memory::load_agent_parents_from(state_dir);
+        let parents = memory::load_agent_parents_from(state_dir);
         assert_eq!(
             parents.get(new_child).map(String::as_str),
-            Some(focus_parent)
+            Some(focus_parent),
+            "the post-spawn mapping must survive a refresh-style reload"
         );
 
-        let agents = [
+        let agents = vec![
             make_agent(focus_parent, HealthState::Running),
             make_agent(new_child, HealthState::Running),
         ];
 
-        let mut under_focus = Vec::new();
-        for (i, agent) in agents.iter().enumerate() {
-            if parents
-                .get(&agent.session.name)
-                .is_some_and(|p| p == focus_parent)
-            {
-                under_focus.push(i);
-            }
-        }
-        assert_eq!(under_focus.len(), 1);
-        assert_eq!(agents[under_focus[0]].session.name, new_child);
+        let focus_child_indices: Vec<usize> = agents
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                parents
+                    .get(&a.session.name)
+                    .filter(|p| *p == focus_parent)
+                    .map(|_| i)
+            })
+            .collect();
 
-        let mut at_root = Vec::new();
-        for (i, agent) in agents.iter().enumerate() {
-            let parent = parents.get(&agent.session.name);
-            match parent {
-                Some(p) if *p == TEST_MANAGER => at_root.push(i),
-                Some(p) if agents.iter().any(|a| a.session.name == *p) => {}
-                _ => at_root.push(i),
-            }
-        }
-        assert_eq!(at_root.len(), 1);
-        assert_eq!(agents[at_root[0]].session.name, focus_parent);
+        let pos = focus_view_index(&agents, &focus_child_indices, new_child)
+            .expect("spawned child must resolve to a focus-view index");
+        assert_eq!(agents[focus_child_indices[pos]].session.name, new_child);
+
+        assert!(
+            focus_view_index(&agents, &focus_child_indices, "omar-agent-ghost").is_none(),
+            "unrelated sessions must not appear in the current view"
+        );
     }
 
     #[test]
