@@ -137,8 +137,27 @@ fn test_capture_pane() {
     thread::sleep(Duration::from_millis(200));
 
     let found = send_line_and_wait(&session_name, "echo HELLO_OMAR_TEST");
-    let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap_or_default();
-    assert!(found, "Expected output not found: {}", output);
+    assert!(found, "echo command was not observed in pane");
+
+    // `send_line_and_wait` only proves the command *text* landed in the pane
+    // (the shell echoes each keystroke). To prove capture works on actual
+    // command *output*, require a second occurrence of the needle — once
+    // for the typed command line, once for echo's output on a new line.
+    let mut output = String::new();
+    let mut output_found = false;
+    for _ in 0..10 {
+        output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap_or_default();
+        if output.matches("HELLO_OMAR_TEST").count() >= 2 {
+            output_found = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        output_found,
+        "echo command did not execute — pane: {}",
+        output
+    );
 
     // Cleanup
     let _ = tmux(&["kill-session", "-t", &session_name]);
@@ -498,9 +517,13 @@ fn test_deliver_to_tmux_ea_scoped() {
 
     thread::sleep(Duration::from_millis(200));
 
-    // Deliver distinct messages replicating deliver_to_tmux's exact tmux operations:
-    //   tmux send-keys -t <target> -l <message>
-    //   tmux send-keys -t <target> Enter
+    // The production `deliver_to_tmux` path routes through
+    // `TmuxClient::deliver_prompt` (bracketed paste + verification), which
+    // requires a full TUI to observe activity. This test targets a plain
+    // shell session to validate EA-level *routing isolation* — not the
+    // exact delivery mechanism — so we use send-keys directly: type each
+    // message into its session and confirm the shell echoes it, then
+    // assert that neither pane contains the other EA's message.
     let msg_ea0 = "DELIVER_EA0_ONLY";
     let msg_ea1 = "DELIVER_EA1_ONLY";
 

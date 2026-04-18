@@ -221,10 +221,18 @@ impl TmuxClient {
     /// Uses bracketed paste (-p) so the backend receives the entire payload
     /// as a single paste event. This is more reliable than send-keys for
     /// multi-line text and backends with custom TUI input widgets.
+    ///
+    /// A unique named buffer (`-b <uuid>`) is used per call so concurrent
+    /// deliveries — e.g. an initial-task spawn racing a scheduler event —
+    /// cannot clobber each other's payload via the shared unnamed buffer.
+    /// `-d` on paste-buffer deletes the buffer after pasting, so buffers
+    /// do not accumulate on error paths either.
     pub fn paste_text(&self, target: &str, text: &str) -> Result<()> {
-        // Load text into a tmux buffer via stdin.
+        let buffer_name = format!("omar-paste-{}", uuid::Uuid::new_v4());
+
+        // Load text into a uniquely-named tmux buffer via stdin.
         let child = Command::new("tmux")
-            .args(["load-buffer", "-"])
+            .args(["load-buffer", "-b", &buffer_name, "-"])
             .stdin(std::process::Stdio::piped())
             .spawn()
             .context("Failed to spawn tmux load-buffer")?;
@@ -244,9 +252,10 @@ impl TmuxClient {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        // Paste using bracketed paste mode so the target pane treats it as
-        // a single paste operation. -d deletes the buffer after pasting.
-        self.run(&["paste-buffer", "-t", target, "-d", "-p"])?;
+        // Paste from the named buffer using bracketed paste mode so the
+        // target pane treats it as a single paste operation. `-d` deletes
+        // the buffer after pasting.
+        self.run(&["paste-buffer", "-b", &buffer_name, "-t", target, "-d", "-p"])?;
         Ok(())
     }
 

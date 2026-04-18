@@ -88,13 +88,15 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
         .find_map(detect_backend_token)
 }
 
-fn backend_readiness_markers(kind: BackendKind) -> &'static [&'static str] {
-    match kind {
-        BackendKind::Codex => &["OpenAI Codex"],
-        BackendKind::Cursor => &["Cursor Agent"],
-        BackendKind::Gemini => &["Gemini CLI"],
-        BackendKind::Claude => &["Claude Code"],
-        BackendKind::Opencode => &["tab agents", "ctrl+p commands"],
+impl BackendKind {
+    fn canonical_name(self) -> &'static str {
+        match self {
+            BackendKind::Claude => "claude",
+            BackendKind::Codex => "codex",
+            BackendKind::Cursor => "cursor",
+            BackendKind::Gemini => "gemini",
+            BackendKind::Opencode => "opencode",
+        }
     }
 }
 
@@ -544,7 +546,7 @@ fn spawn_worker(
     // (a fresh Claude Code banner stays pixel-stable after drawing, so any
     // extra "wait for a change" would time out).
     let markers_proved_ready = if let Some(kind) = detect_backend(command) {
-        let markers = backend_readiness_markers(kind);
+        let markers = crate::tmux::backend_readiness_markers(kind.canonical_name());
         if markers.is_empty() {
             false
         } else {

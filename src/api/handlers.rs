@@ -124,17 +124,6 @@ fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> Option<&
     None
 }
 
-fn backend_readiness_markers(backend: &str) -> &'static [&'static str] {
-    match backend {
-        "codex" => &["OpenAI Codex"],
-        "cursor" => &["Cursor Agent"],
-        "gemini" => &["Gemini CLI"],
-        "claude" => &["Claude Code"],
-        "opencode" => &["tab agents", "ctrl+p commands"],
-        _ => &[],
-    }
-}
-
 fn timestamp_is_too_old(timestamp: u64, now: u64) -> bool {
     timestamp < now.saturating_sub(1_000_000_000)
 }
@@ -756,7 +745,7 @@ pub async fn spawn_agent(
         let client2 = client.clone();
         let session2 = session_name.clone();
         let readiness_markers: Vec<&'static str> = backend_name
-            .map(backend_readiness_markers)
+            .map(crate::tmux::backend_readiness_markers)
             .unwrap_or(&[])
             .to_vec();
         tokio::spawn(async move {
