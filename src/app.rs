@@ -894,28 +894,14 @@ impl App {
         Ok(())
     }
 
-    /// Generate a unique agent name (within the active EA's namespace)
+    /// Generate a unique agent name (within the active EA's namespace).
     pub fn generate_agent_name(&self) -> String {
         let existing: std::collections::HashSet<_> = self
             .agents
             .iter()
             .map(|a| a.session.name.as_str())
             .collect();
-
-        for i in 1..1000 {
-            let name = format!("{}{}", self.config.dashboard.session_prefix, i);
-            if !existing.contains(name.as_str()) {
-                return name;
-            }
-        }
-        format!(
-            "{}{}",
-            self.config.dashboard.session_prefix,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        )
+        next_agent_name(&self.session_prefix, &existing)
     }
 
     /// Spawn a new agent with default settings
@@ -1620,6 +1606,27 @@ fn focus_view_index(
         .position(|&i| agents.get(i).is_some_and(|a| a.session.name == name))
 }
 
+/// Build the next unique agent name for `prefix`, skipping names already in
+/// `existing`. Must use the EA-scoped prefix: `refresh()` filters
+/// `self.agents` by that prefix, so a name built from the base prefix is
+/// invisible to the dashboard.
+fn next_agent_name(prefix: &str, existing: &std::collections::HashSet<&str>) -> String {
+    for i in 1..1000 {
+        let candidate = format!("{}{}", prefix, i);
+        if !existing.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    format!(
+        "{}{}",
+        prefix,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1947,6 +1954,35 @@ mod tests {
             "omar-agent-api-worker"
         );
         assert_eq!(agents[child_indices[1]].session.name, "omar-agent-auth");
+    }
+
+    #[test]
+    fn next_agent_name_uses_ea_scoped_prefix_so_refresh_keeps_the_agent() {
+        // Simulates EA 0: refresh() filters agents by the EA-scoped prefix
+        // "omar-agent-0-". A name built from the base prefix ("omar-agent-")
+        // would be stripped out, which is exactly the bug this guards against.
+        let ea_prefix = "omar-agent-0-";
+        let existing: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        let name = next_agent_name(ea_prefix, &existing);
+
+        assert!(
+            name.starts_with(ea_prefix),
+            "generated name {:?} must start with EA-scoped prefix {:?}",
+            name,
+            ea_prefix
+        );
+        assert_eq!(name, "omar-agent-0-1");
+    }
+
+    #[test]
+    fn next_agent_name_skips_names_already_in_the_ea() {
+        let ea_prefix = "omar-agent-0-";
+        let mut existing: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        existing.insert("omar-agent-0-1");
+        existing.insert("omar-agent-0-2");
+
+        assert_eq!(next_agent_name(ea_prefix, &existing), "omar-agent-0-3");
     }
 
     #[test]
