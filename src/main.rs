@@ -1057,11 +1057,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             // Popup closed — clear so events resume delivery
                             *popup_receiver.lock().unwrap() = None;
                         }
-                        KeyCode::Char('n') => {
-                            if let Err(e) = app.spawn_agent() {
-                                app.set_status(format!("Error: {}", e));
-                            }
-                        }
                         KeyCode::Char('d') if app.selected_agent().is_some() => {
                             app.pending_confirm = Some(app::ConfirmAction::Kill);
                         }
