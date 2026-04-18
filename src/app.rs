@@ -902,18 +902,24 @@ impl App {
         self.client
             .new_session(&name, &self.config.agent.default_command, Some(&workdir))?;
 
+        let state_dir = self.state_dir();
+        memory::save_agent_parent_in(&state_dir, &name, &self.focus_parent);
+
         let short_name = name
             .strip_prefix(&self.config.dashboard.session_prefix)
             .unwrap_or(&name);
         self.set_status(format!("Spawned agent: {}", short_name));
         self.refresh()?;
 
-        // Select the new agent
-        if let Some(pos) = self.agents.iter().position(|a| a.session.name == name) {
+        if let Some(pos) = self
+            .focus_child_indices
+            .iter()
+            .position(|&i| self.agents.get(i).is_some_and(|a| a.session.name == name))
+        {
             self.selected = pos;
+            self.manager_selected = false;
         }
 
-        let state_dir = self.state_dir();
         let manager_session = self.manager_session_name();
         let events = self.scheduler.list_by_ea(self.active_ea);
         memory::write_memory_to(
@@ -1899,6 +1905,52 @@ mod tests {
             "omar-agent-api-worker"
         );
         assert_eq!(agents[child_indices[1]].session.name, "omar-agent-auth");
+    }
+
+    #[test]
+    fn test_spawn_agent_parents_child_to_current_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+
+        let focus_parent = "omar-agent-api";
+        let new_child = "omar-agent-api-helper";
+
+        crate::memory::save_agent_parent_in(state_dir, new_child, focus_parent);
+
+        let parents = crate::memory::load_agent_parents_from(state_dir);
+        assert_eq!(
+            parents.get(new_child).map(String::as_str),
+            Some(focus_parent)
+        );
+
+        let agents = [
+            make_agent(focus_parent, HealthState::Running),
+            make_agent(new_child, HealthState::Running),
+        ];
+
+        let mut under_focus = Vec::new();
+        for (i, agent) in agents.iter().enumerate() {
+            if parents
+                .get(&agent.session.name)
+                .is_some_and(|p| p == focus_parent)
+            {
+                under_focus.push(i);
+            }
+        }
+        assert_eq!(under_focus.len(), 1);
+        assert_eq!(agents[under_focus[0]].session.name, new_child);
+
+        let mut at_root = Vec::new();
+        for (i, agent) in agents.iter().enumerate() {
+            let parent = parents.get(&agent.session.name);
+            match parent {
+                Some(p) if *p == TEST_MANAGER => at_root.push(i),
+                Some(p) if agents.iter().any(|a| a.session.name == *p) => {}
+                _ => at_root.push(i),
+            }
+        }
+        assert_eq!(at_root.len(), 1);
+        assert_eq!(agents[at_root[0]].session.name, focus_parent);
     }
 
     #[test]
