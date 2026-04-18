@@ -556,9 +556,22 @@ fn find_computer_binary() -> Option<PathBuf> {
     Some(PathBuf::from("omar-computer"))
 }
 
-/// Spawn the computer-use bridge binary if DISPLAY is set (X11 available).
+/// Spawn the computer-use bridge binary on Linux when an X11 display is
+/// available. The bridge wraps xdotool / ImageMagick `import`, which are
+/// X11-only tools, so skip it entirely on non-Linux platforms — an
+/// XQuartz `DISPLAY` on macOS would otherwise trigger a noisy spawn of a
+/// bridge that cannot do anything useful there.
 fn spawn_computer_bridge() -> Option<std::process::Child> {
-    if std::env::var("DISPLAY").is_err() {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    // Treat both unset and empty DISPLAY as "no X11 session". A bare
+    // `export DISPLAY=` in a shell profile would otherwise satisfy
+    // `is_err() == false` and still trigger a useless bridge spawn.
+    let display_ok = std::env::var("DISPLAY")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    if !display_ok {
         return None;
     }
 

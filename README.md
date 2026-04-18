@@ -22,7 +22,7 @@ Lead a team of 100 agents to solve humanity's biggest problems.
 ## Features
 
 - **Deep hierarchies**: Agents managing agents, just like a company.
-- **Heterogeneity**: Let `claude`, `codex`, and more collaborate as a team.
+- **Heterogeneity**: Let `claude`, `codex`, and other agents collaborate as a team.
 - **Full control**: Talk to and control any subagent you want.
 - **Life span**: Long-running or ephemeral agents, your choice.
 - **Customization**: Support all `tmux` commands you love.
