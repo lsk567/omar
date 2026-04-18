@@ -139,6 +139,23 @@ impl TmuxClient {
         Ok(sessions)
     }
 
+    /// Strip BEL (`\x07`) from captured pane output.
+    ///
+    /// `tmux capture-pane -e` preserves ANSI escapes *and* any BEL the pane
+    /// emitted. When that text is re-rendered by the dashboard (via
+    /// `ansi_to_tui` → ratatui), the BEL passes through to the outer
+    /// terminal and Terminal.app / iTerm plays the audio bell — e.g. on
+    /// omar startup the Claude Code banner would trigger a speaker blip.
+    /// Nothing in omar interprets BEL semantically, so strip it at the
+    /// source for every caller.
+    fn strip_bel(s: String) -> String {
+        if s.contains('\u{07}') {
+            s.replace('\u{07}', "")
+        } else {
+            s
+        }
+    }
+
     /// Capture the last N lines of a pane's output, including ANSI escape
     /// sequences (suitable for display in a colored dashboard).
     pub fn capture_pane(&self, target: &str, lines: i32) -> Result<String> {
@@ -151,6 +168,7 @@ impl TmuxClient {
             "-S",
             &(-lines).to_string(),
         ])
+        .map(Self::strip_bel)
     }
 
     /// Capture the last N lines of a pane's output as plain text (no ANSI
@@ -166,6 +184,7 @@ impl TmuxClient {
             "-S",
             &(-lines).to_string(),
         ])
+        .map(Self::strip_bel)
     }
 
     /// Get the activity timestamp of a pane.
@@ -898,6 +917,26 @@ mod tests {
             "Expected delivered command in pane: {:?}",
             content
         );
+    }
+
+    /// Regression: BEL (`\x07`) captured from a child pane (e.g. Claude
+    /// Code's startup banner) used to pass through `capture_pane` into
+    /// the dashboard renderer, and ratatui would emit it to the outer
+    /// terminal — producing an audible bell on startup. `strip_bel` must
+    /// remove every BEL byte and leave everything else (including ANSI
+    /// escapes and other C0 control chars) untouched.
+    #[test]
+    fn strip_bel_removes_every_bel_byte_and_preserves_rest() {
+        let input = "hello\u{07}world\u{07}\u{07}end".to_string();
+        assert_eq!(TmuxClient::strip_bel(input), "helloworldend");
+
+        // ANSI escapes and other bytes are preserved verbatim.
+        let ansi = "\x1b[1mClaude\x1b[0m \x1b[1mCode\x1b[0m v2.1.113\n".to_string();
+        assert_eq!(TmuxClient::strip_bel(ansi.clone()), ansi);
+
+        // Empty and BEL-free strings are returned as-is.
+        assert_eq!(TmuxClient::strip_bel(String::new()), "");
+        assert_eq!(TmuxClient::strip_bel("plain".to_string()), "plain");
     }
 
     #[test]
