@@ -10,6 +10,13 @@ use regex::Regex;
 use crate::app::{AgentInfo, App, ConfirmAction, SidebarPanel};
 use crate::tmux::HealthState;
 
+/// Dashboard theme palette. Two named slots — selected/active vs.
+/// inactive/dim — referenced by every panel so the theme cannot drift
+/// one hunk at a time via incidental edits (as happened between v0.1.2
+/// and current main). Change these, change the whole dashboard.
+const COLOR_ACTIVE: Color = Color::LightMagenta;
+const COLOR_INACTIVE: Color = Color::DarkGray;
+
 const QUOTES: &[&str] = &[
     // Sun Tzu
     "\"The art of war is of vital importance to the State.\" — Sun Tzu",
@@ -448,7 +455,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         status_spans.push(Span::raw(" | Events: "));
         status_spans.push(Span::styled(
             format!("{}", app.scheduled_events.len()),
-            Style::default().fg(Color::LightMagenta),
+            Style::default().fg(COLOR_ACTIVE),
         ));
     }
 
@@ -462,14 +469,14 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         status_spans.push(Span::raw(" | EA Wake: "));
         status_spans.push(Span::styled(
             format_countdown_ns(event.timestamp, now_ns),
-            Style::default().fg(Color::LightMagenta),
+            Style::default().fg(COLOR_ACTIVE),
         ));
     }
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(COLOR_INACTIVE))
         .padding(Padding::horizontal(1));
 
     // Render block first, then split inner area
@@ -518,7 +525,7 @@ fn render_status_row(frame: &mut Frame, app: &App, status_spans: &[Span], area: 
 
         let quote_paragraph = Paragraph::new(Line::from(Span::styled(
             visible,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_INACTIVE),
         )));
         frame.render_widget(quote_paragraph, h_chunks[1]);
     }
@@ -527,9 +534,9 @@ fn render_status_row(frame: &mut Frame, app: &App, status_spans: &[Span], area: 
 fn render_projects_panel(frame: &mut Frame, app: &App, area: Rect) {
     let panel_active = app.sidebar_focused && app.sidebar_panel == SidebarPanel::Projects;
     let border_color = if panel_active {
-        Color::LightMagenta
+        COLOR_ACTIVE
     } else {
-        Color::DarkGray
+        COLOR_INACTIVE
     };
     let block = Block::default()
         .title(" Projects ")
@@ -541,7 +548,7 @@ fn render_projects_panel(frame: &mut Frame, app: &App, area: Rect) {
     if app.projects.is_empty() {
         let paragraph = Paragraph::new(Span::styled(
             "No active projects. Spawn a project by chatting with the executive assistant.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_INACTIVE),
         ))
         .block(block)
         .wrap(Wrap { trim: true });
@@ -570,13 +577,13 @@ fn render_agent_grid(frame: &mut Frame, app: &App, area: Rect) {
 
     if children.is_empty() {
         let empty_msg = Paragraph::new("Chat with the executive assistant to spawn agents.")
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(COLOR_INACTIVE))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Thick)
                     .title(" Agents ")
-                    .border_style(Style::default().fg(Color::DarkGray))
+                    .border_style(Style::default().fg(COLOR_INACTIVE))
                     .padding(Padding::horizontal(1)),
             );
         frame.render_widget(empty_msg, area);
@@ -658,27 +665,24 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
 
         let (border_color, title_line) = if is_selected {
             (
-                Color::LightMagenta,
+                COLOR_ACTIVE,
                 Line::from(vec![
-                    Span::styled(" [", Style::default().fg(Color::LightMagenta)),
-                    Span::styled(status_icon, Style::default().fg(Color::LightMagenta)),
-                    Span::styled("] ", Style::default().fg(Color::LightMagenta)),
-                    Span::styled(&display_title, Style::default().fg(Color::LightMagenta)),
-                    Span::styled(
-                        " - Enter to open ",
-                        Style::default().fg(Color::LightMagenta),
-                    ),
+                    Span::styled(" [", Style::default().fg(COLOR_ACTIVE)),
+                    Span::styled(status_icon, Style::default().fg(COLOR_ACTIVE)),
+                    Span::styled("] ", Style::default().fg(COLOR_ACTIVE)),
+                    Span::styled(&display_title, Style::default().fg(COLOR_ACTIVE)),
+                    Span::styled(" - Enter to open ", Style::default().fg(COLOR_ACTIVE)),
                 ]),
             )
         } else {
             (
-                Color::DarkGray,
+                COLOR_INACTIVE,
                 Line::from(vec![
-                    Span::styled(" ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" ", Style::default().fg(COLOR_INACTIVE)),
                     Span::styled(status_icon, Style::default().fg(health_color)),
-                    Span::styled(" ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" ", Style::default().fg(COLOR_INACTIVE)),
                     Span::styled(&display_title, Style::default().fg(health_color)),
-                    Span::styled(" ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" ", Style::default().fg(COLOR_INACTIVE)),
                 ]),
             )
         };
@@ -734,7 +738,7 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("PM Wake: ", Style::default().fg(Color::Cyan)),
                     Span::styled(
                         format_countdown_ns(event.timestamp, now_ns),
-                        Style::default().fg(Color::LightMagenta),
+                        Style::default().fg(COLOR_ACTIVE),
                     ),
                     Span::raw(" | "),
                     Span::styled(
@@ -742,7 +746,7 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::Green),
                     ),
                     Span::raw(" | "),
-                    Span::styled("ETA unknown", Style::default().fg(Color::DarkGray)),
+                    Span::styled("ETA unknown", Style::default().fg(COLOR_INACTIVE)),
                 ])
             } else if !workers.is_empty() {
                 Line::from(vec![
@@ -754,12 +758,12 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::Green),
                     ),
                     Span::raw(" | "),
-                    Span::styled("ETA unknown", Style::default().fg(Color::DarkGray)),
+                    Span::styled("ETA unknown", Style::default().fg(COLOR_INACTIVE)),
                 ])
             } else {
                 Line::from(vec![
                     Span::styled("PM status: ", Style::default().fg(Color::Cyan)),
-                    Span::styled("no workers", Style::default().fg(Color::DarkGray)),
+                    Span::styled("no workers", Style::default().fg(COLOR_INACTIVE)),
                 ])
             };
 
@@ -783,11 +787,11 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             .title(" Executive Assistant ")
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(COLOR_INACTIVE))
             .padding(Padding::horizontal(1));
 
         let paragraph = Paragraph::new("Starting Executive Assistant...")
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(COLOR_INACTIVE))
             .block(block);
 
         frame.render_widget(paragraph, area);
@@ -797,9 +801,9 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
 fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
     let panel_active = app.sidebar_focused && app.sidebar_panel == SidebarPanel::ChainOfCommand;
     let border_color = if panel_active {
-        Color::LightMagenta
+        COLOR_ACTIVE
     } else {
-        Color::DarkGray
+        COLOR_INACTIVE
     };
     let block = Block::default()
         .title(" Chain of Command ")
@@ -811,7 +815,7 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
     if app.command_tree.is_empty() {
         let paragraph = Paragraph::new(Span::styled(
             "No agents yet.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_INACTIVE),
         ))
         .block(block);
         frame.render_widget(paragraph, area);
@@ -835,7 +839,7 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
             // Root (EA): no connector, just name + icon
             let name_style = if is_focus {
                 Style::default()
-                    .fg(Color::LightMagenta)
+                    .fg(COLOR_ACTIVE)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -843,7 +847,7 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD)
             };
             if is_focus {
-                spans.push(Span::styled("►", Style::default().fg(Color::LightMagenta)));
+                spans.push(Span::styled("►", Style::default().fg(COLOR_ACTIVE)));
             }
             spans.push(Span::styled(format!(" {} ", node.name), name_style));
             spans.push(Span::styled(icon, Style::default().fg(health_color)));
@@ -868,18 +872,18 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
                 prefix.push_str(" ├── ");
             }
 
-            spans.push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(prefix, Style::default().fg(COLOR_INACTIVE)));
 
             let name_style = if is_focus {
                 Style::default()
-                    .fg(Color::LightMagenta)
+                    .fg(COLOR_ACTIVE)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Reset)
             };
 
             if is_focus {
-                spans.push(Span::styled("►", Style::default().fg(Color::LightMagenta)));
+                spans.push(Span::styled("►", Style::default().fg(COLOR_ACTIVE)));
             }
             spans.push(Span::styled(format!("{} ", node.name), name_style));
             spans.push(Span::styled(icon, Style::default().fg(health_color)));
@@ -895,9 +899,9 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
 fn render_event_queue(frame: &mut Frame, app: &App, area: Rect) {
     let panel_active = app.sidebar_focused && app.sidebar_panel == SidebarPanel::Events;
     let border_color = if panel_active {
-        Color::LightMagenta
+        COLOR_ACTIVE
     } else {
-        Color::DarkGray
+        COLOR_INACTIVE
     };
     let block = Block::default()
         .title(" Event Queue ")
@@ -926,7 +930,7 @@ fn render_event_queue(frame: &mut Frame, app: &App, area: Rect) {
                     format!("{:<11}", receiver),
                     Style::default().fg(Color::Yellow),
                 ),
-                Span::styled(countdown, Style::default().fg(Color::LightMagenta)),
+                Span::styled(countdown, Style::default().fg(COLOR_ACTIVE)),
             ]));
         }
 
@@ -934,7 +938,7 @@ fn render_event_queue(frame: &mut Frame, app: &App, area: Rect) {
         if remaining > 0 && lines.len() < available {
             lines.push(Line::from(Span::styled(
                 format!("+{} more", remaining),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(COLOR_INACTIVE),
             )));
         }
     }
@@ -964,9 +968,9 @@ fn render_summary_card(
     };
 
     let border_color = if selected {
-        Color::LightMagenta
+        COLOR_ACTIVE
     } else {
-        Color::DarkGray
+        COLOR_INACTIVE
     };
 
     let border_style = Style::default().fg(border_color).add_modifier(if selected {
@@ -986,11 +990,11 @@ fn render_summary_card(
     // Title with status indicator
     let title_line = if selected {
         Line::from(vec![
-            Span::styled(" [", Style::default().fg(Color::LightMagenta)),
-            Span::styled(status_icon, Style::default().fg(Color::LightMagenta)),
-            Span::styled("] ", Style::default().fg(Color::LightMagenta)),
-            Span::styled(&display, Style::default().fg(Color::LightMagenta)),
-            Span::styled(" ", Style::default().fg(Color::LightMagenta)),
+            Span::styled(" [", Style::default().fg(COLOR_ACTIVE)),
+            Span::styled(status_icon, Style::default().fg(COLOR_ACTIVE)),
+            Span::styled("] ", Style::default().fg(COLOR_ACTIVE)),
+            Span::styled(&display, Style::default().fg(COLOR_ACTIVE)),
+            Span::styled(" ", Style::default().fg(COLOR_ACTIVE)),
         ])
     } else {
         Line::from(vec![
@@ -1025,7 +1029,7 @@ fn render_summary_card(
             ),
             Span::styled(
                 " (Tab to drill in, Shift-Tab to back out)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(COLOR_INACTIVE),
             ),
         ]));
     }
@@ -1195,7 +1199,7 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
 
         // Left: help text
         let help_paragraph =
-            Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray));
+            Paragraph::new(Line::from(help_text)).style(Style::default().fg(COLOR_INACTIVE));
         frame.render_widget(help_paragraph, h_chunks[0]);
 
         // Right: status message or ticker
@@ -1225,7 +1229,7 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         // No right content — full-width help text
         let paragraph =
-            Paragraph::new(Line::from(help_text)).style(Style::default().fg(Color::DarkGray));
+            Paragraph::new(Line::from(help_text)).style(Style::default().fg(COLOR_INACTIVE));
         frame.render_widget(paragraph, area);
     }
 }
@@ -1262,7 +1266,7 @@ fn render_help_popup(frame: &mut Frame) {
         Line::from(""),
         Line::from(Span::styled(
             "Press any key to close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_INACTIVE),
         )),
     ];
 
@@ -1324,7 +1328,7 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
     if !hint.is_empty() {
         content.push(Line::from(Span::styled(
             hint,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_INACTIVE),
         )));
     }
     content.push(Line::from(""));
@@ -1365,7 +1369,7 @@ fn render_project_input(frame: &mut Frame, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             "Enter to confirm, Esc to cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_INACTIVE),
         )),
     ];
 
@@ -1399,7 +1403,7 @@ fn render_ea_input(frame: &mut Frame, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             "Enter to confirm, Esc to cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_INACTIVE),
         )),
     ];
 
@@ -1433,7 +1437,7 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
     if app.scheduled_events.is_empty() {
         lines.push(Line::from(Span::styled(
             "No events in queue",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_INACTIVE),
         )));
     } else {
         // Header
@@ -1456,7 +1460,7 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
         ]));
         lines.push(Line::from(Span::styled(
             "─".repeat(inner_width),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_INACTIVE),
         )));
 
         for event in &app.scheduled_events {
@@ -1520,9 +1524,9 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
                 Span::styled(
                     format!("{:<14}", type_str),
                     Style::default().fg(if event.recurring_ns.is_some() {
-                        Color::LightMagenta
+                        COLOR_ACTIVE
                     } else {
-                        Color::DarkGray
+                        COLOR_INACTIVE
                     }),
                 ),
                 Span::raw(payload),
@@ -1533,7 +1537,7 @@ fn render_events_popup(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Press Esc or 'e' to close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(COLOR_INACTIVE),
     )));
 
     let block = Block::default()
@@ -1563,14 +1567,14 @@ fn render_debug_console(frame: &mut Frame, app: &App) {
     if messages.is_empty() {
         lines.push(Line::from(Span::styled(
             "No messages yet",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_INACTIVE),
         )));
     } else {
         for (i, msg) in messages.iter().enumerate() {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{:>2}. ", i + 1),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(COLOR_INACTIVE),
                 ),
                 Span::styled(msg.clone(), Style::default().fg(Color::Yellow)),
             ]));
@@ -1580,7 +1584,7 @@ fn render_debug_console(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Press Esc or 'G' to close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(COLOR_INACTIVE),
     )));
 
     let block = Block::default()
@@ -1618,7 +1622,7 @@ fn render_settings_popup(frame: &mut Frame, app: &App) {
                     Style::default().fg(if selected {
                         Color::Cyan
                     } else {
-                        Color::DarkGray
+                        COLOR_INACTIVE
                     }),
                 ),
                 Span::styled(
@@ -1632,7 +1636,7 @@ fn render_settings_popup(frame: &mut Frame, app: &App) {
                     Style::default().fg(if selected {
                         Color::Reset
                     } else {
-                        Color::DarkGray
+                        COLOR_INACTIVE
                     }),
                 ),
             ]));
@@ -1642,7 +1646,7 @@ fn render_settings_popup(frame: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑↓:Select  Enter:Toggle  Esc:Close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(COLOR_INACTIVE),
     )));
 
     let block = Block::default()
@@ -1665,7 +1669,7 @@ fn render_sidebar_popup(frame: &mut Frame, app: &App, panel: SidebarPanel) {
             if app.projects.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "No active projects.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(COLOR_INACTIVE),
                 )));
             } else {
                 for p in &app.projects {
@@ -1686,7 +1690,7 @@ fn render_sidebar_popup(frame: &mut Frame, app: &App, panel: SidebarPanel) {
             if app.command_tree.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "No agents yet.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(COLOR_INACTIVE),
                 )));
             } else {
                 for node in &app.command_tree {
@@ -1697,7 +1701,7 @@ fn render_sidebar_popup(frame: &mut Frame, app: &App, panel: SidebarPanel) {
                     let is_focus = node.session_name == app.focus_parent;
 
                     let name_style = if is_focus {
-                        Style::default().fg(Color::LightMagenta)
+                        Style::default().fg(COLOR_ACTIVE)
                     } else {
                         Style::default().fg(Color::Reset)
                     };
@@ -1721,8 +1725,8 @@ fn render_sidebar_popup(frame: &mut Frame, app: &App, panel: SidebarPanel) {
                     let indicator = if is_focus { "► " } else { "  " };
 
                     lines.push(Line::from(vec![
-                        Span::styled(indicator, Style::default().fg(Color::LightMagenta)),
-                        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                        Span::styled(indicator, Style::default().fg(COLOR_ACTIVE)),
+                        Span::styled(prefix, Style::default().fg(COLOR_INACTIVE)),
                         Span::styled(format!("{} ", node.name), name_style),
                         Span::styled(icon, Style::default().fg(health_color)),
                     ]));
@@ -1736,13 +1740,13 @@ fn render_sidebar_popup(frame: &mut Frame, app: &App, panel: SidebarPanel) {
     all_lines.push(Line::from(""));
     all_lines.push(Line::from(Span::styled(
         "Press Esc or Enter to close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(COLOR_INACTIVE),
     )));
 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightMagenta))
+        .border_style(Style::default().fg(COLOR_ACTIVE))
         .padding(Padding::horizontal(1));
 
     let paragraph = Paragraph::new(all_lines).block(block);
