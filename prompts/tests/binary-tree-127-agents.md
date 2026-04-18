@@ -16,7 +16,8 @@
 EA spawns only the root agent `t-1`:
 
 ```bash
-curl -X POST http://localhost:9876/api/agents \
+# Replace {{EA_ID}} with the target EA id (e.g. 0 for the default EA).
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
   -H "Content-Type: application/json" \
   -d '{
     "name": "t-1",
@@ -52,30 +53,30 @@ Output [TASK COMPLETE] immediately.
    For each child (left and right), POST to spawn with the SAME protocol but updated node/level:
 
    ```bash
-   curl -X POST http://localhost:9876/api/agents \
+   curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
      -H "Content-Type: application/json" \
      -d '{
        "name": "t-{CHILD_NODE}",
-       "task": "You are node {CHILD_NODE} (level {CHILD_LEVEL}) in a binary tree experiment with 7 levels and 127 total nodes.\n\n## Protocol\n\nYour node number is {CHILD_NODE}. Your level is {CHILD_LEVEL}. The max level is 7.\n\n### If you are a LEAF node (level == 7):\nOutput [TASK COMPLETE] immediately.\n\n### If you are an INTERNAL node (level < 7):\n\n1. Calculate your children:\n   - Left child: node {CHILD_NODE*2}, level {CHILD_LEVEL+1}\n   - Right child: node {CHILD_NODE*2+1}, level {CHILD_LEVEL+1}\n\n2. Spawn both children using the OMAR API (same protocol, updated node/level).\n\n3. Poll both children by checking their output:\n   ```\n   curl http://localhost:9876/api/agents/t-{CHILD_NODE}\n   ```\n   Schedule wake-up events to check on children rather than using sleep loops.\n\n4. When BOTH children have reported [TASK COMPLETE] in their output:\n   a. Kill left child: curl -X DELETE http://localhost:9876/api/agents/t-{LEFT}\n   b. Kill right child: curl -X DELETE http://localhost:9876/api/agents/t-{RIGHT}\n   c. Output [TASK COMPLETE]\n\nIMPORTANT: Do NOT output [TASK COMPLETE] until both children are confirmed complete AND killed.",
+       "task": "You are node {CHILD_NODE} (level {CHILD_LEVEL}) in a binary tree experiment with 7 levels and 127 total nodes.\n\n## Protocol\n\nYour node number is {CHILD_NODE}. Your level is {CHILD_LEVEL}. The max level is 7.\n\n### If you are a LEAF node (level == 7):\nOutput [TASK COMPLETE] immediately.\n\n### If you are an INTERNAL node (level < 7):\n\n1. Calculate your children:\n   - Left child: node {CHILD_NODE*2}, level {CHILD_LEVEL+1}\n   - Right child: node {CHILD_NODE*2+1}, level {CHILD_LEVEL+1}\n\n2. Spawn both children using the OMAR API (same protocol, updated node/level).\n\n3. Poll both children by checking their output:\n   ```\n   curl http://localhost:9876/api/ea/{{EA_ID}}/agents/t-{CHILD_NODE}\n   ```\n   Schedule wake-up events to check on children rather than using sleep loops.\n\n4. When BOTH children have reported [TASK COMPLETE] in their output:\n   a. Kill left child: curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/t-{LEFT}\n   b. Kill right child: curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/t-{RIGHT}\n   c. Output [TASK COMPLETE]\n\nIMPORTANT: Do NOT output [TASK COMPLETE] until both children are confirmed complete AND killed.",
        "parent": "t-{YOUR_NODE}"
      }'
    ```
 
 3. Poll both children by checking their output:
    ```bash
-   curl http://localhost:9876/api/agents/t-{CHILD_NODE}
+   curl http://localhost:9876/api/ea/{{EA_ID}}/agents/t-{CHILD_NODE}
    ```
    Schedule wake-up events to check on children rather than using sleep loops:
    ```bash
    NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 15_000_000_000)")
-   curl -X POST http://localhost:9876/api/events \
+   curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
      -H "Content-Type: application/json" \
      -d "{\"sender\": \"t-1\", \"receiver\": \"t-1\", \"timestamp\": $NOW, \"payload\": \"Check children progress\"}"
    ```
 
 4. When BOTH children have reported [TASK COMPLETE] in their output:
-   a. Kill left child: `curl -X DELETE http://localhost:9876/api/agents/t-2`
-   b. Kill right child: `curl -X DELETE http://localhost:9876/api/agents/t-3`
+   a. Kill left child: `curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/t-2`
+   b. Kill right child: `curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/t-3`
    c. Output [TASK COMPLETE]
 
 IMPORTANT: Do NOT output [TASK COMPLETE] until both children are confirmed complete AND killed.

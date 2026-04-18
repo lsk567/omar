@@ -10,7 +10,7 @@ Returns which backends are installed, their resolved commands, and availability.
 
 ### Spawn with a specific backend
 ```bash
-curl -X POST http://localhost:9876/api/agents \
+curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
   -H "Content-Type: application/json" \
   -d '{"name": "worker", "task": "...", "parent": "<YOUR NAME>", "backend": "codex", "model": "o3"}'
 ```

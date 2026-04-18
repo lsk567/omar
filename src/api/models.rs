@@ -363,8 +363,7 @@ pub struct ComputerAvailabilityResponse {
 
 // ── Logging models ──
 
-/// Request to log a justification
-#[allow(dead_code)]
+/// Request to log a justification (Action Reasoning & Goal Alignment).
 #[derive(Debug, Deserialize)]
 pub struct LogRequest {
     pub agent_name: String,
@@ -372,11 +371,12 @@ pub struct LogRequest {
     pub justification: String,
 }
 
-/// JSONL log entry format
-#[allow(dead_code)]
+/// JSONL log entry format written to
+/// `~/.omar/logs/<session_id>/ea_<ea_id>/<agent-short-name>.jsonl`.
 #[derive(Debug, Serialize)]
 pub struct LogEntry {
     pub timestamp: String,
+    pub ea_id: u32,
     pub agent_name: String,
     pub hierarchy_path: Vec<String>,
     pub action: String,

@@ -59,6 +59,8 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/ea/:ea_id/events", post(handlers::schedule_event))
         .route("/api/ea/:ea_id/events", get(handlers::list_events))
         .route("/api/ea/:ea_id/events/:id", delete(handlers::cancel_event))
+        // EA-scoped: action reasoning / justification logs
+        .route("/api/ea/:ea_id/logs", post(handlers::log_justification))
         // Computer use (global — one screen, one mouse)
         .route("/api/computer/status", get(handlers::computer_status))
         .route("/api/computer/lock", post(handlers::computer_lock_acquire))

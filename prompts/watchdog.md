@@ -12,16 +12,22 @@ IMPORTANT: You are running on an untrusted/free backend. You do NOT have access 
 
 ### OMAR API (agent monitoring)
 
-List all agents and their health:
+First, discover which EAs exist (agent routes are EA-scoped):
 ```bash
-curl -s http://localhost:9876/api/agents | python3 -m json.tool
+curl -s http://localhost:9876/api/eas | python3 -m json.tool
+```
+Returns `{ "eas": [{ "id": <n>, ... }, ...] }`. Iterate over every EA's id.
+
+List all agents and their health for an EA:
+```bash
+curl -s http://localhost:9876/api/ea/<ea_id>/agents | python3 -m json.tool
 ```
 
 Each agent has an `auth_failure` field (true/false) indicating auth problems.
 
 Get details for a specific agent:
 ```bash
-curl -s http://localhost:9876/api/agents/<agent-id> | python3 -m json.tool
+curl -s http://localhost:9876/api/ea/<ea_id>/agents/<agent-id> | python3 -m json.tool
 ```
 
 ### Slack Bridge (user notification)
@@ -44,7 +50,7 @@ curl -s http://localhost:9877/api/slack/health
 2. If Slack channel is configured and bridge is healthy, send an alert:
    - Include which agents failed
    - Ask the user to check their subscription / re-authenticate
-3. Every 2 minutes, poll `GET /api/agents` to check current status
+3. Every 2 minutes, poll `GET /api/ea/<ea_id>/agents` for every EA returned by `GET /api/eas` to check current status
 4. If new agents fail, send updated Slack messages
 5. If all agents recover (no more `auth_failure: true`), send a recovery message and output `[TASK COMPLETE]`
 

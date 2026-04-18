@@ -19,8 +19,9 @@ You are agent #N in a 100-agent experiment. Report [TASK COMPLETE] immediately a
 EA issues 100 POST requests to spawn agents:
 
 ```bash
+# Replace {{EA_ID}} with the target EA id (e.g. 0 for the default EA).
 for i in $(seq -w 1 100); do
-  curl -X POST http://localhost:9876/api/agents \
+  curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
     -H "Content-Type: application/json" \
     -d "{\"name\": \"exp-$i\", \"task\": \"You are agent #$i in a 100-agent experiment. Report [TASK COMPLETE] immediately after acknowledging your agent number.\", \"parent\": \"ea\"}"
 done
@@ -30,17 +31,17 @@ Then monitor all agents, polling for `[TASK COMPLETE]` in each agent's output:
 
 ```bash
 # Check a single agent
-curl http://localhost:9876/api/agents/exp-001
+curl http://localhost:9876/api/ea/{{EA_ID}}/agents/exp-001
 
 # List all agents
-curl http://localhost:9876/api/agents
+curl http://localhost:9876/api/ea/{{EA_ID}}/agents
 ```
 
 Once all 100 report `[TASK COMPLETE]`, kill them all:
 
 ```bash
 for i in $(seq -w 1 100); do
-  curl -X DELETE http://localhost:9876/api/agents/exp-$i
+  curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/exp-$i
 done
 ```
 
