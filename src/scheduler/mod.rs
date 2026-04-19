@@ -146,6 +146,7 @@ fn save_events_to_store(store_path: &Path, queue: &BinaryHeap<ScheduledEvent>) {
 }
 
 impl Scheduler {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(BinaryHeap::new()),

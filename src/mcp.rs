@@ -23,7 +23,7 @@ use crate::metrics;
 use crate::projects;
 use crate::scheduler::{self, ScheduledEvent};
 use crate::tasks::{self, TaskRecord, TaskStatus};
-use crate::tmux::{HealthChecker, TmuxClient};
+use crate::tmux::{DeliveryOptions, HealthChecker, TmuxClient};
 
 const JSONRPC_VERSION: &str = "2.0";
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -210,6 +210,19 @@ struct OmarMcpServer {
     context: McpLaunchContext,
 }
 
+#[derive(Debug)]
+struct SpawnRequestInternal {
+    name: Option<String>,
+    task: Option<String>,
+    workdir: Option<String>,
+    command: Option<String>,
+    backend: Option<String>,
+    model: Option<String>,
+    role: Option<String>,
+    parent: Option<String>,
+    spawn_lock_wait_ms: u64,
+}
+
 impl OmarMcpServer {
     fn new(context: McpLaunchContext) -> Self {
         Self { context }
@@ -331,11 +344,6 @@ impl OmarMcpServer {
                 tool_error(err)
             }
         }
-    }
-
-    fn active_ea_id(&self) -> Result<EaId> {
-        let registry = ea::ensure_default_ea(&self.context.omar_dir)?;
-        Ok(ea::resolve_active_ea(&self.context.omar_dir, &registry))
     }
 
     fn ea_id(&self) -> Result<EaId> {
@@ -621,35 +629,23 @@ impl OmarMcpServer {
         let lock_wait_start = std::time::Instant::now();
         let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
         let spawn_lock_wait_ms = lock_wait_start.elapsed().as_millis() as u64;
-        let result = self.spawn_agent_internal(
-            args.name,
-            args.task,
-            args.workdir,
-            args.command,
-            args.backend,
-            args.model,
-            args.role,
-            args.parent,
+        let result = self.spawn_agent_internal(SpawnRequestInternal {
+            name: args.name,
+            task: args.task,
+            workdir: args.workdir,
+            command: args.command,
+            backend: args.backend,
+            model: args.model,
+            role: args.role,
+            parent: args.parent,
             spawn_lock_wait_ms,
-        )?;
+        })?;
         drop(_lock);
         self.refresh_memory()?;
         Ok(result)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_agent_internal(
-        &self,
-        name: Option<String>,
-        task: Option<String>,
-        workdir: Option<String>,
-        command: Option<String>,
-        backend: Option<String>,
-        model: Option<String>,
-        role: Option<String>,
-        parent: Option<String>,
-        spawn_lock_wait_ms: u64,
-    ) -> Result<Value> {
+    fn spawn_agent_internal(&self, request: SpawnRequestInternal) -> Result<Value> {
         let spawn_start = std::time::Instant::now();
         let ea_id = self.ea_id()?;
         let state_dir = self.state_dir()?;
@@ -657,7 +653,7 @@ impl OmarMcpServer {
         let manager_session = self.manager_session()?;
         let client = self.client()?;
 
-        let session_name = match name.as_deref() {
+        let session_name = match request.name.as_deref() {
             Some(n) if !n.trim().is_empty() => {
                 let stripped = n.strip_prefix(&prefix).unwrap_or(n);
                 format!("{}{}", prefix, stripped)
@@ -665,7 +661,7 @@ impl OmarMcpServer {
             _ => generate_agent_name_in_ea(&prefix),
         };
         let short_name = self.display_name(&session_name)?.to_string();
-        let parent_session = if let Some(parent) = parent {
+        let parent_session = if let Some(parent) = request.parent {
             if parent == "ea" {
                 manager_session.clone()
             } else {
@@ -680,16 +676,18 @@ impl OmarMcpServer {
             self.display_name(&parent_session)?.to_string()
         };
 
-        if backend.is_some() && command.is_some() {
+        if request.backend.is_some() && request.command.is_some() {
             return Err(anyhow!("Cannot specify both 'backend' and 'command'"));
         }
 
-        let mut base_command = if let Some(backend) = backend.clone() {
+        let mut base_command = if let Some(backend) = request.backend.clone() {
             config::resolve_backend(&backend).map_err(|err| anyhow!(err))?
         } else {
-            command.unwrap_or_else(|| self.context.default_command.clone())
+            request
+                .command
+                .unwrap_or_else(|| self.context.default_command.clone())
         };
-        if let Some(model) = model.clone() {
+        if let Some(model) = request.model.clone() {
             if !model
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
@@ -701,9 +699,13 @@ impl OmarMcpServer {
             base_command = format!("{} --model {}", base_command, model);
         }
 
-        let workdir = workdir.unwrap_or_else(|| self.context.default_workdir.clone());
-        let has_agent_prompt =
-            matches!(role.as_deref(), Some("project-manager") | Some("agent")) || task.is_some();
+        let workdir = request
+            .workdir
+            .unwrap_or_else(|| self.context.default_workdir.clone());
+        let has_agent_prompt = matches!(
+            request.role.as_deref(),
+            Some("project-manager") | Some("agent")
+        ) || request.task.is_some();
         let command = if has_agent_prompt {
             let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
             manager::build_agent_command_with_mcp(
@@ -711,7 +713,7 @@ impl OmarMcpServer {
                 &prompt_file,
                 &[
                     ("{{PARENT_NAME}}", &prompt_parent),
-                    ("{{TASK}}", task.as_deref().unwrap_or("")),
+                    ("{{TASK}}", request.task.as_deref().unwrap_or("")),
                     ("{{EA_ID}}", &ea_id.to_string()),
                 ],
                 Some(&self.context),
@@ -726,42 +728,57 @@ impl OmarMcpServer {
         let tmux_spawn_start = std::time::Instant::now();
         client.new_session(&session_name, &command, Some(&workdir))?;
         let tmux_spawn_ms = tmux_spawn_start.elapsed().as_millis() as u64;
-        let backend_name = infer_backend_name(backend.as_deref(), &base_command);
+        let backend_name = infer_backend_name(request.backend.as_deref(), &base_command);
         metrics::record_backend_bootstrap(&backend_name);
 
         memory::save_agent_parent_in(&state_dir, &session_name, &parent_session);
-        if let Some(task_text) = task {
+        if let Some(task_text) = request.task {
             memory::save_worker_task_in(&state_dir, &session_name, &task_text);
             let client2 = client.clone();
             let session2 = session_name.clone();
             let first_message = format!("YOUR NAME: {}\nYOUR TASK: {}", short_name, task_text);
             let backend_name2 = backend_name.clone();
+            let readiness_markers = crate::tmux::backend_readiness_markers(&backend_name).to_vec();
             thread::spawn(move || {
                 let delivery_start = std::time::Instant::now();
-                thread::sleep(Duration::from_secs(2));
-                let send_res = client2.send_keys_literal(&session2, &first_message);
-                thread::sleep(Duration::from_millis(200));
-                let enter_res = client2.send_keys(&session2, "Enter");
+                let _ = if !readiness_markers.is_empty() {
+                    client2.wait_for_markers(
+                        &session2,
+                        &readiness_markers,
+                        Duration::from_secs(45),
+                        Duration::from_millis(250),
+                    );
+                    Ok(())
+                } else {
+                    client2.wait_for_stable(
+                        &session2,
+                        Duration::from_millis(500),
+                        Duration::from_secs(8),
+                        Duration::from_millis(120),
+                    )
+                };
+                let opts = DeliveryOptions::default();
+                let delivery = client2.deliver_prompt(&session2, &first_message, &opts);
                 metrics::record_prompt_delivery(
                     ea_id,
                     &session2,
                     &backend_name2,
                     delivery_start.elapsed().as_millis() as u64,
-                    send_res.is_ok() && enter_res.is_ok(),
+                    delivery.is_ok(),
                 );
             });
         }
 
-        metrics::record_agent_spawn(
+        metrics::record_agent_spawn(metrics::AgentSpawnMetric {
             ea_id,
-            &session_name,
-            &short_name,
-            &backend_name,
-            has_agent_prompt,
-            spawn_lock_wait_ms,
+            session: &session_name,
+            short_name: &short_name,
+            backend: &backend_name,
+            has_task: has_agent_prompt,
+            spawn_lock_wait_ms: request.spawn_lock_wait_ms,
             tmux_spawn_ms,
-            spawn_start.elapsed().as_millis() as u64,
-        );
+            total_spawn_ms: spawn_start.elapsed().as_millis() as u64,
+        });
 
         Ok(json!({
             "id": short_name,
@@ -946,17 +963,17 @@ impl OmarMcpServer {
             .clone()
             .unwrap_or_else(|| project_name_from_task(&args.task));
         let project_id = projects::add_project_in(&state_dir, &project_name)?;
-        let agent = self.spawn_agent_internal(
-            args.name,
-            Some(args.task.clone()),
-            args.workdir,
-            None,
-            args.backend.clone(),
-            args.model.clone(),
-            Some("agent".to_string()),
-            args.parent.clone(),
-            0,
-        )?;
+        let agent = self.spawn_agent_internal(SpawnRequestInternal {
+            name: args.name,
+            task: Some(args.task.clone()),
+            workdir: args.workdir,
+            command: None,
+            backend: args.backend.clone(),
+            model: args.model.clone(),
+            role: Some("agent".to_string()),
+            parent: args.parent.clone(),
+            spawn_lock_wait_ms: 0,
+        })?;
         let agent_name = agent
             .get("id")
             .and_then(Value::as_str)
@@ -1114,17 +1131,17 @@ impl OmarMcpServer {
             }
             _ => task.task_text.clone(),
         };
-        let _ = self.spawn_agent_internal(
-            Some(task.agent_name.clone()),
-            Some(new_task_text.clone()),
-            Some(self.context.default_workdir.clone()),
-            None,
-            task.backend.clone(),
-            task.model.clone(),
-            Some("agent".to_string()),
-            Some(task.parent_agent.clone()),
-            0,
-        )?;
+        let _ = self.spawn_agent_internal(SpawnRequestInternal {
+            name: Some(task.agent_name.clone()),
+            task: Some(new_task_text.clone()),
+            workdir: Some(self.context.default_workdir.clone()),
+            command: None,
+            backend: task.backend.clone(),
+            model: task.model.clone(),
+            role: Some("agent".to_string()),
+            parent: Some(task.parent_agent.clone()),
+            spawn_lock_wait_ms: 0,
+        })?;
 
         let updated = tasks::update_task_in(&state_dir, &args.task_id, |record| {
             record.status = TaskStatus::Running;

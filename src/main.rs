@@ -242,8 +242,10 @@ async fn main() -> Result<()> {
                     &target.name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
-                    &config.agent.default_workdir,
-                    config.health.idle_warning,
+                    &manager::ManagerRuntimeOptions {
+                        default_workdir: config.agent.default_workdir.clone(),
+                        health_idle_warning: config.health.idle_warning,
+                    },
                 ),
                 Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(
                     &client,
@@ -252,8 +254,10 @@ async fn main() -> Result<()> {
                     &target.name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
-                    &config.agent.default_workdir,
-                    config.health.idle_warning,
+                    &manager::ManagerRuntimeOptions {
+                        default_workdir: config.agent.default_workdir.clone(),
+                        health_idle_warning: config.health.idle_warning,
+                    },
                 ),
             }
         }
@@ -491,8 +495,8 @@ fn list_cli_events(scheduler: &scheduler::Scheduler, ea_id: ea::EaId) -> Result<
     }
     events.sort_by_key(|event| (event.timestamp, event.created_at));
     println!(
-        "{:<36} {:<14} {:<14} {:<18} {:<12} {}",
-        "ID", "SENDER", "RECEIVER", "TIMESTAMP_NS", "RECURRING", "PAYLOAD"
+        "{:<36} {:<14} {:<14} {:<18} {:<12} PAYLOAD",
+        "ID", "SENDER", "RECEIVER", "TIMESTAMP_NS", "RECURRING"
     );
     println!("{}", "-".repeat(120));
     for event in events {

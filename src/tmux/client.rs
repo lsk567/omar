@@ -336,6 +336,32 @@ impl TmuxClient {
         false
     }
 
+    /// Wait until pane output contains any of the provided markers.
+    /// Matching is case-insensitive; returns false on timeout.
+    pub fn wait_for_markers(
+        &self,
+        session: &str,
+        markers: &[&str],
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> bool {
+        if markers.is_empty() {
+            return true;
+        }
+        let needles: Vec<String> = markers.iter().map(|m| m.to_ascii_lowercase()).collect();
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if let Ok(content) = self.capture_pane(session, 120) {
+                let hay = content.to_ascii_lowercase();
+                if needles.iter().any(|needle| hay.contains(needle)) {
+                    return true;
+                }
+            }
+            thread::sleep(poll_interval);
+        }
+        false
+    }
+
     /// Create a new detached session
     pub fn new_session(&self, name: &str, command: &str, workdir: Option<&str>) -> Result<()> {
         let mut args = vec!["new-session", "-d", "-s", name];

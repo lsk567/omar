@@ -102,28 +102,29 @@ pub fn record_manager_start(ea_id: u32, session: &str, ready: bool, startup_ms: 
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn record_agent_spawn(
-    ea_id: u32,
-    session: &str,
-    short_name: &str,
-    backend: &str,
-    has_task: bool,
-    spawn_lock_wait_ms: u64,
-    tmux_spawn_ms: u64,
-    total_spawn_ms: u64,
-) {
+pub struct AgentSpawnMetric<'a> {
+    pub ea_id: u32,
+    pub session: &'a str,
+    pub short_name: &'a str,
+    pub backend: &'a str,
+    pub has_task: bool,
+    pub spawn_lock_wait_ms: u64,
+    pub tmux_spawn_ms: u64,
+    pub total_spawn_ms: u64,
+}
+
+pub fn record_agent_spawn(metric: AgentSpawnMetric<'_>) {
     write_metric(
         "agent_spawn",
         serde_json::json!({
-            "ea_id": ea_id,
-            "session": session,
-            "short_name": short_name,
-            "backend": backend,
-            "has_task": has_task,
-            "spawn_lock_wait_ms": spawn_lock_wait_ms,
-            "tmux_spawn_ms": tmux_spawn_ms,
-            "total_spawn_ms": total_spawn_ms
+            "ea_id": metric.ea_id,
+            "session": metric.session,
+            "short_name": metric.short_name,
+            "backend": metric.backend,
+            "has_task": metric.has_task,
+            "spawn_lock_wait_ms": metric.spawn_lock_wait_ms,
+            "tmux_spawn_ms": metric.tmux_spawn_ms,
+            "total_spawn_ms": metric.total_spawn_ms
         }),
     );
 }

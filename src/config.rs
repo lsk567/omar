@@ -88,7 +88,7 @@ pub struct WatchdogConfig {
     pub slack_channel: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetricsConfig {
     /// Enable global spawn metrics sink at ~/.omar/metrics/spawn_metrics.jsonl
     #[serde(default)]
@@ -232,14 +232,6 @@ impl Default for WatchdogConfig {
             command: String::new(),
             auth_failure_patterns: default_auth_failure_patterns(),
             slack_channel: String::new(),
-        }
-    }
-}
-
-impl Default for MetricsConfig {
-    fn default() -> Self {
-        Self {
-            spawn_metrics_enabled: false,
         }
     }
 }

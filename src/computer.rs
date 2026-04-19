@@ -5,7 +5,9 @@
 
 use anyhow::{Context, Result};
 use std::process::Command;
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use tokio::sync::Mutex;
 
 /// Detect X11 display environment. Returns (DISPLAY, XAUTHORITY) if found.
@@ -89,10 +91,12 @@ fn x11_command(program: &str) -> Command {
 
 /// Shared lock for exclusive computer access.
 /// Contains the agent name that currently holds the lock, or None.
-pub type ComputerLock = Arc<Mutex<Option<String>>>;
+#[cfg(test)]
+type ComputerLock = Arc<Mutex<Option<String>>>;
 
-/// Create a new computer lock.
-pub fn new_lock() -> ComputerLock {
+/// Create a new computer lock for unit tests.
+#[cfg(test)]
+fn new_lock() -> ComputerLock {
     Arc::new(Mutex::new(None))
 }
 

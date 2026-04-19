@@ -25,6 +25,12 @@ pub struct McpLaunchContext {
     pub health_idle_warning: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ManagerRuntimeOptions {
+    pub default_workdir: String,
+    pub health_idle_warning: i64,
+}
+
 // Embed prompt files at compile time so they work regardless of CWD.
 const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
 const PROMPT_AGENT: &str = include_str!("../../prompts/agent.md");
@@ -269,6 +275,7 @@ fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
 ///   - gemini  → `-i "$(cat '<path>')"`
 ///   - opencode → `--prompt "$(cat '<path>')"`
 ///   - unknown → returns `base_command` unchanged
+#[cfg(test)]
 pub fn build_agent_command(
     base_command: &str,
     prompt_file: &Path,
@@ -362,6 +369,7 @@ pub fn build_agent_command_with_mcp(
 /// combined file to `{omar_dir}/ea/{ea_id}/ea_prompt_combined.md` (per-EA scoped,
 /// fixing Gotcha G8), and returns the CLI command with `{{EA_ID}}` and `{{EA_NAME}}`
 /// substituted via sed.
+#[cfg(test)]
 pub fn build_ea_command(base_command: &str, ea_id: EaId, ea_name: &str, omar_dir: &Path) -> String {
     build_ea_command_with_mcp(base_command, ea_id, ea_name, omar_dir, None)
 }
@@ -418,8 +426,7 @@ pub fn start_manager(
     ea_name: &str,
     omar_dir: &Path,
     base_prefix: &str,
-    default_workdir: &str,
-    health_idle_warning: i64,
+    options: &ManagerRuntimeOptions,
 ) -> Result<()> {
     let start = Instant::now();
     let session = ea::ea_manager_session(ea_id, base_prefix);
@@ -442,8 +449,8 @@ pub fn start_manager(
             ea_id,
             session_prefix: base_prefix.to_string(),
             default_command: command.to_string(),
-            default_workdir: default_workdir.to_string(),
-            health_idle_warning,
+            default_workdir: options.default_workdir.clone(),
+            health_idle_warning: options.health_idle_warning,
         }),
     );
 
@@ -474,8 +481,7 @@ pub fn run_manager_orchestration(
     ea_name: &str,
     omar_dir: &Path,
     base_prefix: &str,
-    default_workdir: &str,
-    health_idle_warning: i64,
+    options: &ManagerRuntimeOptions,
 ) -> Result<()> {
     let session = ea::ea_manager_session(ea_id, base_prefix);
 
@@ -491,8 +497,7 @@ pub fn run_manager_orchestration(
             ea_name,
             omar_dir,
             base_prefix,
-            default_workdir,
-            health_idle_warning,
+            options,
         )?;
         return Ok(());
     }
