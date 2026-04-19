@@ -368,6 +368,7 @@ impl OmarMcpServer {
             "spawn_agent_session" => self.spawn_agent_session(call.arguments),
             "kill_agent" => self.kill_agent(call.arguments),
             "send_input" => self.send_input(call.arguments),
+            "notify_parent" => self.notify_parent(call.arguments),
             "list_projects" => self.list_projects(),
             "schedule_event" => self.schedule_event(call.arguments),
             "list_events" => self.list_events(),
@@ -895,6 +896,37 @@ impl OmarMcpServer {
             client.send_keys(&session_name, "Enter")?;
         }
         Ok(json!({ "status": "sent" }))
+    }
+
+    fn notify_parent(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            name: String,
+            summary: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let state_dir = self.state_dir()?;
+        let session_name = self.qualified_session_name(&args.name)?;
+        let parents = memory::load_agent_parents_from(&state_dir);
+        let parent_session = parents
+            .get(&session_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("No parent found for agent '{}'", args.name))?;
+        let client = self.client()?;
+        if !client.has_session(&parent_session).unwrap_or(false) {
+            return Err(anyhow!(
+                "Parent session '{}' is not running",
+                parent_session
+            ));
+        }
+        let short_name = self.display_name(&session_name)?.to_string();
+        let message = format!(
+            "[CHILD COMPLETE] {}\n\nSummary:\n{}",
+            short_name, args.summary
+        );
+        let opts = DeliveryOptions::default();
+        client.deliver_prompt(&parent_session, &message, &opts)?;
+        Ok(json!({ "status": "notified", "parent": parent_session }))
     }
 
     fn schedule_event(&self, args: Value) -> Result<Value> {
@@ -1777,6 +1809,18 @@ fn tool_definitions() -> Vec<Value> {
                     "enter":{"type":"boolean"}
                 },
                 "required":["name","text"]
+            }),
+        ),
+        tool(
+            "notify_parent",
+            "Notify your parent agent that you have completed your task. Call this after printing [TASK COMPLETE]. summary may be large — delivery is handled reliably regardless of size.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "summary": {"type": "string"}
+                },
+                "required": ["name", "summary"]
             }),
         ),
         tool(

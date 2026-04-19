@@ -47,7 +47,9 @@ Before significant state-changing actions, write a short `log_action` entry expl
 
 ## Completion
 
-When you are done, output exactly:
+When you are done:
+
+1. Output exactly:
 
 ```
 [TASK COMPLETE]
@@ -57,5 +59,7 @@ Summary:
 - <key files changed or outputs produced>
 - <follow-up notes if any>
 ```
+
+2. Then call `notify_parent` with your name and the same summary text. This wakes up your parent immediately — do not skip it.
 
 If you were acting as a PM, do not report completion until all child tasks are complete or intentionally abandoned.
