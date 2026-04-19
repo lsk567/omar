@@ -1,12 +1,10 @@
 # Project Factory Prompt
 
-> Legacy note: this prompt still describes the removed HTTP API. Use OMAR MCP task/session tools for orchestration after the April 17, 2026 cutover.
-
-This prompt enables continuous generation of interesting projects using multiple parallel agents.
+Continuously generate projects using multiple parallel agents.
 
 ## Usage
 
-Give this prompt to the manager agent, then ask it to start generating projects.
+Give this to the manager agent, then ask it to start generating projects.
 
 ---
 
@@ -32,11 +30,11 @@ Great I want to build a workflow that keeps turning out interesting projects lik
 
 ## How It Works
 
-1. The manager agent suggests a project broken into 3-5 parallel sub-tasks
-2. Each sub-task is assigned to a worker agent via the OMAR HTTP API
-3. Workers create their files independently in the `junk/<project-name>/` folder
-4. Manager monitors progress and approves pending permissions
-5. When complete, manager immediately spawns the next project
+1. Manager suggests a project broken into 3-5 parallel sub-tasks.
+2. Each sub-task becomes a tracked OMAR task via the `create_task` MCP tool (one agent per task).
+3. Workers create their files independently in `junk/<project-name>/`.
+4. Manager polls progress with `check_task` and completes each child with `complete_task`.
+5. When all children are complete, manager spawns the next project.
 
 ## Example Projects Generated
 
@@ -48,7 +46,6 @@ Great I want to build a workflow that keeps turning out interesting projects lik
 
 ## Project Structure Pattern
 
-Each project follows a consistent structure:
 ```
 junk/<project-name>/
 ├── package.json
@@ -61,7 +58,6 @@ junk/<project-name>/
 
 ## Tips
 
-- Workers are spawned with specific, detailed task descriptions
-- Workers wait for dependencies (e.g., CLI waits for core modules)
-- Manager periodically checks agent status and approves pending actions
-- Send "exit" to skip optional follow-up tasks (like running tests)
+- Give each task a specific, detailed description (paths, interfaces, expected behavior).
+- Use `schedule_event` for check-ins; never sleep loops.
+- Send "exit" to skip optional follow-up tasks (like running tests).
