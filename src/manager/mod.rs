@@ -291,6 +291,37 @@ fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
         root["mcpServers"] = serde_json::json!({});
     }
 
+    // Remove the legacy plain `omar` key and any stale `omar-ea-*` entries
+    // whose context files no longer exist. Stale entries cause cursor to
+    // fail MCP server startup, which can block loading of the fresh entry.
+    if let Some(servers) = root["mcpServers"].as_object_mut() {
+        let stale_keys: Vec<String> = servers
+            .iter()
+            .filter_map(|(k, v)| {
+                if k == "omar" {
+                    return Some(k.clone());
+                }
+                if k.starts_with("omar-ea-") {
+                    let ctx_path = v
+                        .get("args")
+                        .and_then(|a| a.as_array())
+                        .and_then(|a| a.last())
+                        .and_then(|p| p.as_str())
+                        .map(PathBuf::from);
+                    if let Some(p) = ctx_path {
+                        if !p.exists() {
+                            return Some(k.clone());
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+        for k in stale_keys {
+            servers.remove(&k);
+        }
+    }
+
     let key = format!("omar-ea-{}", context.ea_id);
     root["mcpServers"][&key] = serde_json::json!({
         "command": server_exe.display().to_string(),
