@@ -1056,8 +1056,7 @@ impl App {
             "AUTH FAILURE DETECTED.\n\
 Failed agents: {}\n\
 Slack channel: {}\n\
-Use the OMAR MCP tools for inspection/control.\n\
-Slack bridge: http://localhost:9877",
+Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack_reply` MCP tool.",
             failed_list, slack_display,
         );
 

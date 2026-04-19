@@ -1,34 +1,33 @@
 # OMAR Slack Bridge
 
-> Status: this bridge still depends on the removed OMAR HTTP API and is not compatible with the MCP-only server introduced on April 17, 2026.
-
 Connects Slack channels to OMAR agents via Slack Socket Mode (no public URL needed).
 
-Messages in Slack channels/threads create and interact with OMAR agents. Agent output is polled and posted back as threaded replies.
+Messages in Slack channels/threads become events for the EA. The EA replies via the `slack_reply` OMAR MCP tool; the bridge picks those replies up and posts them back to the right thread.
 
 ## Architecture
 
 ```
-Slack (Socket Mode WS)                           OMAR (localhost:9876)
-       │                                                │
-       │ @mention event                                 │
-       ▼                                                │
-  omar-slack bridge ──POST /api/events──────────►  Event Queue
-       ▲            (receiver: "ea")                    │
-       │                                                ▼
-       │                                           EA (tmux)
-       │                                                │
-       │◄──curl POST /api/slack/reply──────────────────┘
-       │   (localhost:9877)
+Slack (Socket Mode WS)                       OMAR
+       │                                       │
+       │ @mention event                        │
+       ▼                                       │
+  omar-slack bridge ──────────────────────►  omar mcp-server
+       │          schedule_event (stdio)     (subprocess)
+       │                                       │
+       │                                       ▼
+       │                                  EA (tmux)
+       │                                       │
+       │                 slack_reply tool      │
+       │          writes ~/.omar/slack_outbox/ │
+       │          ◄────────────────────────────┘
        ▼
   Slack (chat.postMessage)
 ```
 
-- **Socket Mode**: WebSocket connection via app-level token — no public endpoint required
-- **Event-driven**: Slack messages are routed to the EA via OMAR's event queue
-- **Bidirectional**: Bridge runs an HTTP server so the EA can push replies back to Slack
-- **Popup-aware**: Events are deferred when the user is interacting with the EA popup
-- **Auto-reconnect**: WebSocket reconnects automatically on disconnection
+- **Socket Mode**: WebSocket connection via app-level token — no public endpoint required.
+- **Inbound**: bridge spawns `omar mcp-server` as a subprocess, calls `schedule_event` over its stdio.
+- **Outbound**: EA calls the `slack_reply` MCP tool, which atomically queues a JSON file in `~/.omar/slack_outbox/`. The bridge polls the directory every 500 ms and delivers to Slack; files are deleted on successful delivery, retained on failure, so transient Slack errors (or a bridge restart) don't lose messages.
+- **No HTTP surface**: the bridge no longer binds any loopback port.
 
 ## Setup
 
@@ -106,18 +105,14 @@ cargo build --release
 
 ## How It Works
 
-1. Bridge authenticates with Slack (`auth.test`) and connects via Socket Mode WebSocket
-2. Bridge starts an HTTP callback server on `SLACK_BRIDGE_PORT` (default 9877)
+1. Bridge authenticates with Slack (`auth.test`) and connects via Socket Mode WebSocket.
+2. Bridge spawns `omar mcp-server` as a subprocess and completes the MCP `initialize` handshake over stdio.
 3. When someone @mentions the bot in a channel:
-   - Bridge formats the message as a `[SLACK MESSAGE]` event payload (includes channel, thread, user, reply curl command)
-   - Posts it to the OMAR event queue via `POST /api/events` with `receiver: "ea"`
-4. OMAR's event scheduler delivers the event to the EA (deferred if popup is open)
-5. EA processes the request and replies by curling `POST /api/slack/reply` on the bridge
-6. Bridge posts the reply back to the correct Slack thread (auto-chunked if >3900 chars)
-
-## Agent Naming
-
-Agents are named `slack-<channel_suffix>-<thread_ts>` for traceability in OMAR's dashboard.
+   - Bridge formats the message as a `[SLACK MESSAGE]` event payload (includes channel, thread, user, and reply instructions that point at the `slack_reply` MCP tool).
+   - Calls `schedule_event` on the MCP server with `receiver: "ea"`.
+4. OMAR's scheduler delivers the event to the EA (deferred if a popup is open).
+5. EA processes the request and replies by invoking the `slack_reply` MCP tool with the channel and thread from the inbound payload.
+6. Bridge's outbox watcher picks the queued reply up and posts it to the correct Slack thread (auto-chunked if >3900 chars).
 
 ## Config Reference
 
@@ -125,7 +120,7 @@ Agents are named `slack-<channel_suffix>-<thread_ts>` for traceability in OMAR's
 |---------|----------|---------|-------------|
 | `SLACK_BOT_TOKEN` | Yes | — | Bot OAuth token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | Yes | — | App-level token (`xapp-...`) |
-| `OMAR_URL` | No | `http://127.0.0.1:9876` | OMAR API endpoint |
-| `SLACK_BRIDGE_PORT` | No | `9877` | Bridge HTTP callback server port |
+| `OMAR_BINARY` | No | next to `omar-slack`, else PATH | Path to the `omar` executable |
+| `OMAR_DIR` | No | `~/.omar` | OMAR state dir (for the `slack_outbox/` rendezvous) |
 | `MAX_MESSAGE_LENGTH` | No | `3900` | Max Slack message chunk size |
 | `RUST_LOG` | No | `info` | Log level (trace/debug/info/warn/error) |

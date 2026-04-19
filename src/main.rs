@@ -113,9 +113,12 @@ enum Commands {
 
     /// Start the OMAR MCP server over stdio
     McpServer {
-        /// Path to a serialized MCP server context JSON file
+        /// Path to a serialized MCP server context JSON file. When omitted,
+        /// the server builds a default context from the current config and
+        /// active EA — used by peer processes (e.g. the Slack bridge) that
+        /// aren't spawned by a specific backend launch.
         #[arg(long)]
-        context_file: String,
+        context_file: Option<String>,
     },
 }
 
@@ -291,9 +294,10 @@ async fn main() -> Result<()> {
                 EventAction::Cancel { id } => cancel_cli_event(&scheduler, target.id, &id),
             }
         }
-        Some(Commands::McpServer { context_file }) => {
-            mcp::run_server_from_context_file(PathBuf::from(context_file))
-        }
+        Some(Commands::McpServer { context_file }) => match context_file {
+            Some(path) => mcp::run_server_from_context_file(PathBuf::from(path)),
+            None => mcp::run_server_with_default_context(),
+        },
         None => {
             if std::env::var("TMUX").is_err() {
                 relaunch_in_tmux()

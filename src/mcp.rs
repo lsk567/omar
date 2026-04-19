@@ -241,6 +241,29 @@ pub fn run_server_from_context_file(path: PathBuf) -> Result<()> {
     OmarMcpServer::new(context).run()
 }
 
+/// Run an MCP server without a pre-built context file. Used by peer
+/// processes (e.g. the Slack bridge) that aren't spawned by a specific
+/// backend launch and need a default context derived from the current
+/// config + active EA.
+pub fn run_server_with_default_context() -> Result<()> {
+    let omar_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".omar");
+    let config = crate::config::Config::load(None)
+        .with_context(|| format!("Failed to load omar config for {}", omar_dir.display()))?;
+    let registered = ea::ensure_default_ea(&omar_dir)?;
+    let ea_id = ea::resolve_active_ea(&omar_dir, &registered);
+    let context = McpLaunchContext {
+        omar_dir,
+        ea_id,
+        session_prefix: config.dashboard.session_prefix,
+        default_command: config.agent.default_command,
+        default_workdir: config.agent.default_workdir,
+        health_idle_warning: config.health.idle_warning,
+    };
+    OmarMcpServer::new(context).run()
+}
+
 struct OmarMcpServer {
     context: McpLaunchContext,
 }
@@ -355,6 +378,7 @@ impl OmarMcpServer {
             "replace_stuck_task_agent" => self.replace_stuck_task_agent(call.arguments),
             "append_manager_note" => self.append_manager_note(call.arguments),
             "log_action" => self.log_action(call.arguments),
+            "slack_reply" => self.slack_reply(call.arguments),
             "computer_status" => self.computer_status(),
             "computer_lock_acquire" => self.computer_lock_acquire(call.arguments),
             "computer_lock_release" => self.computer_lock_release(call.arguments),
@@ -1200,6 +1224,46 @@ impl OmarMcpServer {
         Ok(json!({ "status": "appended", "path": path }))
     }
 
+    /// Queue a Slack reply for the `omar-slack-bridge` peer to pick up and
+    /// post to Slack. File-based rendezvous via `{omar_dir}/slack_outbox/`
+    /// keeps the MCP surface free of loopback HTTP and survives a bridge
+    /// that's momentarily down — the bridge drains the outbox on restart.
+    fn slack_reply(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            channel: String,
+            #[serde(default)]
+            thread_ts: Option<String>,
+            text: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        if args.channel.trim().is_empty() {
+            return Err(anyhow!("slack_reply requires a non-empty channel"));
+        }
+        if args.text.is_empty() {
+            return Err(anyhow!("slack_reply requires a non-empty text"));
+        }
+        let dir = self.context.omar_dir.join("slack_outbox");
+        fs::create_dir_all(&dir).context("Failed to create slack outbox directory")?;
+        let id = Uuid::new_v4();
+        let tmp = dir.join(format!("{}.json.tmp", id));
+        // Prefix filename with timestamp so the bridge delivers messages in
+        // the order they were queued even under heavy fan-out.
+        let final_path = dir.join(format!("{}-{}.json", now_ns(), id));
+        let payload = serde_json::to_vec(&json!({
+            "channel": args.channel,
+            "thread_ts": args.thread_ts,
+            "text": args.text,
+            "queued_at": now_rfc3339(),
+        }))?;
+        fs::write(&tmp, &payload).context("Failed to stage slack reply")?;
+        fs::rename(&tmp, &final_path).context("Failed to commit slack reply")?;
+        Ok(json!({
+            "status": "queued",
+            "path": final_path,
+        }))
+    }
+
     fn log_action(&self, args: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct Args {
@@ -1824,6 +1888,19 @@ fn tool_definitions() -> Vec<Value> {
             }),
         ),
         tool(
+            "slack_reply",
+            "Queue a reply to a Slack thread. The omar-slack-bridge peer picks it up and posts to Slack. Use the channel and thread_ts values provided in the inbound [SLACK MESSAGE] event.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "channel":{"type":"string"},
+                    "thread_ts":{"type":"string"},
+                    "text":{"type":"string"}
+                },
+                "required":["channel","text"]
+            }),
+        ),
+        tool(
             "computer_status",
             "Check desktop control availability.",
             json!({"type":"object","properties":{}}),
@@ -1931,6 +2008,47 @@ mod tests {
             default_workdir: ".".to_string(),
             health_idle_warning: 15,
         }
+    }
+
+    #[test]
+    fn slack_reply_queues_file_in_outbox() {
+        let server = OmarMcpServer::new(test_context());
+        let outbox = server.context.omar_dir.join("slack_outbox");
+
+        let result = server
+            .slack_reply(json!({
+                "channel": "C123",
+                "thread_ts": "1700000000.001",
+                "text": "hello from test",
+            }))
+            .expect("slack_reply should succeed");
+
+        assert_eq!(result["status"], json!("queued"));
+        assert!(outbox.is_dir(), "outbox dir must exist");
+
+        let entries: Vec<_> = std::fs::read_dir(&outbox)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one outbox file");
+
+        let body = std::fs::read_to_string(entries[0].path()).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["channel"], json!("C123"));
+        assert_eq!(parsed["thread_ts"], json!("1700000000.001"));
+        assert_eq!(parsed["text"], json!("hello from test"));
+    }
+
+    #[test]
+    fn slack_reply_rejects_empty_channel_or_text() {
+        let server = OmarMcpServer::new(test_context());
+        assert!(server
+            .slack_reply(json!({"channel": "", "text": "x"}))
+            .is_err());
+        assert!(server
+            .slack_reply(json!({"channel": "C1", "text": ""}))
+            .is_err());
     }
 
     #[test]
