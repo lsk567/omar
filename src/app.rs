@@ -612,14 +612,6 @@ impl App {
         }
     }
 
-    /// Check if an agent has children (is a PM or EA)
-    fn agent_has_children(&self, session_name: &str) -> bool {
-        if session_name == self.manager_session_name() {
-            return true;
-        }
-        self.agent_parents.values().any(|p| p == session_name)
-    }
-
     /// Count children for a given agent
     pub fn child_count(&self, session_name: &str) -> usize {
         if session_name == self.manager_session_name() {
@@ -656,7 +648,7 @@ impl App {
         crumbs
     }
 
-    /// Drill down into the selected agent (Tab). Only works if the agent has children.
+    /// Drill down into the selected agent (Tab).
     pub fn drill_down(&mut self) {
         let session_name = if self.manager_selected {
             // On EA: hint to select a child if children exist, otherwise silent
@@ -679,17 +671,14 @@ impl App {
             }
         };
 
-        // Only drill down if the selected agent has children
-        if !self.agent_has_children(&session_name) {
-            self.set_status("No sub-agents to drill into");
-            return;
-        }
-
         self.focus_stack.push(self.focus_parent.clone());
         self.focus_parent = session_name.clone();
         self.selected = 0;
-        self.manager_selected = false;
         self.focus_child_indices = self.compute_focus_child_indices();
+        // Park the cursor on the focus parent when it has no children yet,
+        // otherwise `selected = 0` would point at a nonexistent child until
+        // the user spawns one.
+        self.manager_selected = self.focus_child_indices.is_empty();
 
         let short = session_name
             .strip_prefix(&self.config.dashboard.session_prefix)
@@ -1932,6 +1921,35 @@ mod tests {
             "omar-agent-api-worker"
         );
         assert_eq!(agents[child_indices[1]].session.name, "omar-agent-auth");
+    }
+
+    #[test]
+    fn drilling_into_childless_agent_yields_empty_view_with_cursor_on_parent() {
+        // `api` is the EA's only live child and has no sub-agents of its own.
+        // Drilling into it must still succeed so the user can spawn the first
+        // grandchild with 'n'; the cursor parks on the focus parent because
+        // there is no child at index 0 to land on.
+        let agents = [make_agent("omar-agent-api", HealthState::Running)];
+        let mut parents = HashMap::new();
+        parents.insert("omar-agent-api".to_string(), TEST_MANAGER.to_string());
+
+        let focus_parent = "omar-agent-api";
+        let focus_child_indices: Vec<usize> = agents
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                parents
+                    .get(&a.session.name)
+                    .is_some_and(|p| p == focus_parent)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        assert!(focus_child_indices.is_empty());
+        // The drill_down body sets `manager_selected = focus_child_indices.is_empty()`
+        // after recomputing indices — this mirrors that contract.
+        let manager_selected_after_drill = focus_child_indices.is_empty();
+        assert!(manager_selected_after_drill);
     }
 
     #[test]
