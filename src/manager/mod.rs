@@ -6,11 +6,12 @@ use anyhow::Result;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::ea::{self, EaId};
 use crate::memory;
+use crate::metrics;
 use crate::tmux::{DeliveryOptions, TmuxClient};
 use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
 
@@ -190,8 +191,8 @@ fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
 fn gemini_mcp_bootstrap(base_command: &str, context: &McpLaunchContext) -> Option<String> {
     let server_exe = std::env::current_exe().ok()?;
     let context_file = materialize_mcp_context_file(context)?;
-    let gemini_exec = backend_token(base_command, BackendKind::Gemini)
-        .unwrap_or_else(|| "gemini".to_string());
+    let gemini_exec =
+        backend_token(base_command, BackendKind::Gemini).unwrap_or_else(|| "gemini".to_string());
     let server_exe = server_exe.display().to_string();
     let context_file = context_file.display().to_string();
     Some(format!(
@@ -420,6 +421,7 @@ pub fn start_manager(
     default_workdir: &str,
     health_idle_warning: i64,
 ) -> Result<()> {
+    let start = Instant::now();
     let session = ea::ea_manager_session(ea_id, base_prefix);
 
     // Check if manager already exists
@@ -455,6 +457,7 @@ pub fn start_manager(
 
     // Give it time to start
     thread::sleep(Duration::from_secs(2));
+    metrics::record_manager_start(ea_id, &session, true, start.elapsed().as_millis() as u64);
 
     // Attach to the session
     println!("Attaching to manager session...");

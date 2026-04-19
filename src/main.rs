@@ -6,6 +6,7 @@ mod event;
 mod manager;
 mod mcp;
 mod memory;
+mod metrics;
 mod projects;
 mod scheduler;
 mod tasks;
@@ -58,6 +59,10 @@ struct Cli {
     /// EA to target by id or name [default: active EA]
     #[arg(long, global = true)]
     ea: Option<String>,
+
+    /// Enable global spawn metrics logging sink
+    #[arg(long, global = true)]
+    spawn_metrics: bool,
 }
 
 #[derive(Subcommand)]
@@ -172,11 +177,20 @@ enum EventAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config_path = Config::resolve_path(cli.config.as_deref());
+    let config_preexisted = config_path.exists();
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(ref agent) = cli.agent {
         config.agent.default_command =
             config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
     }
+    if cli.spawn_metrics {
+        config.metrics.spawn_metrics_enabled = true;
+        if !config_preexisted {
+            config.save();
+        }
+    }
+    metrics::configure(config.metrics.spawn_metrics_enabled);
     let omar_dir = omar_dir();
 
     if let Some(ref selector) = cli.ea {

@@ -17,6 +17,9 @@ pub struct Config {
 
     #[serde(default)]
     pub watchdog: WatchdogConfig,
+
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +86,13 @@ pub struct WatchdogConfig {
     /// Slack channel ID for watchdog alerts (empty = no Slack alerts)
     #[serde(default)]
     pub slack_channel: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Enable global spawn metrics sink at ~/.omar/metrics/spawn_metrics.jsonl
+    #[serde(default)]
+    pub spawn_metrics_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -226,6 +236,14 @@ impl Default for WatchdogConfig {
     }
 }
 
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            spawn_metrics_enabled: false,
+        }
+    }
+}
+
 impl Config {
     /// Default config path: ~/.omar/config.toml
     pub fn default_path() -> PathBuf {
@@ -235,12 +253,17 @@ impl Config {
             .join("config.toml")
     }
 
-    /// Load config from file. Creates default config at ~/.omar/config.toml on first run.
-    pub fn load(path: Option<&str>) -> Result<Self> {
-        let expanded_path = match path {
+    /// Resolve a config path from CLI input, expanding `~/`.
+    pub fn resolve_path(path: Option<&str>) -> PathBuf {
+        match path {
             Some(p) => expand_tilde(p),
             None => Self::default_path(),
-        };
+        }
+    }
+
+    /// Load config from file. Creates default config at ~/.omar/config.toml on first run.
+    pub fn load(path: Option<&str>) -> Result<Self> {
+        let expanded_path = Self::resolve_path(path);
 
         if !expanded_path.exists() {
             let config = Self::default();
@@ -317,6 +340,7 @@ mod tests {
         assert!(config.dashboard.sidebar_right);
         assert_eq!(config.health.idle_warning, 15);
         assert_eq!(config.health.idle_critical, 300);
+        assert!(!config.metrics.spawn_metrics_enabled);
     }
 
     #[test]
@@ -478,5 +502,15 @@ default_command = "claude --dangerously-skip-permissions"
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.watchdog.command.is_empty());
         assert!(!config.watchdog.auth_failure_patterns.is_empty());
+    }
+
+    #[test]
+    fn test_parse_metrics_config() {
+        let toml = r#"
+[metrics]
+spawn_metrics_enabled = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.metrics.spawn_metrics_enabled);
     }
 }

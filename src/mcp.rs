@@ -19,6 +19,7 @@ use crate::config;
 use crate::ea::{self, EaId};
 use crate::manager::{self, McpLaunchContext};
 use crate::memory;
+use crate::metrics;
 use crate::projects;
 use crate::scheduler::{self, ScheduledEvent};
 use crate::tasks::{self, TaskRecord, TaskStatus};
@@ -83,6 +84,39 @@ fn now_ns() -> u64 {
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> String {
+    fn normalize(s: &str) -> Option<&'static str> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "codex" => Some("codex"),
+            "cursor" => Some("cursor"),
+            "gemini" => Some("gemini"),
+            "claude" | "claude-code" | "claude_code" => Some("claude"),
+            "opencode" => Some("opencode"),
+            _ => None,
+        }
+    }
+
+    if let Some(name) = explicit_backend.and_then(normalize) {
+        return name.to_string();
+    }
+
+    for token in command.split_whitespace() {
+        let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']'));
+        if token.is_empty() {
+            continue;
+        }
+        let executable = Path::new(token)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(token);
+        if let Some(name) = normalize(executable) {
+            return name.to_string();
+        }
+    }
+
+    "unknown".to_string()
 }
 
 fn append_debug_log(context: &McpLaunchContext, line: &str) {
@@ -584,7 +618,9 @@ impl OmarMcpServer {
         }
         let args: Args = serde_json::from_value(args)?;
         let state_dir = self.state_dir()?;
+        let lock_wait_start = std::time::Instant::now();
         let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
+        let spawn_lock_wait_ms = lock_wait_start.elapsed().as_millis() as u64;
         let result = self.spawn_agent_internal(
             args.name,
             args.task,
@@ -594,6 +630,7 @@ impl OmarMcpServer {
             args.model,
             args.role,
             args.parent,
+            spawn_lock_wait_ms,
         )?;
         drop(_lock);
         self.refresh_memory()?;
@@ -611,7 +648,9 @@ impl OmarMcpServer {
         model: Option<String>,
         role: Option<String>,
         parent: Option<String>,
+        spawn_lock_wait_ms: u64,
     ) -> Result<Value> {
+        let spawn_start = std::time::Instant::now();
         let ea_id = self.ea_id()?;
         let state_dir = self.state_dir()?;
         let prefix = self.session_prefix()?;
@@ -684,7 +723,11 @@ impl OmarMcpServer {
         if client.has_session(&session_name).unwrap_or(false) {
             return Err(anyhow!("Agent '{}' already exists", short_name));
         }
+        let tmux_spawn_start = std::time::Instant::now();
         client.new_session(&session_name, &command, Some(&workdir))?;
+        let tmux_spawn_ms = tmux_spawn_start.elapsed().as_millis() as u64;
+        let backend_name = infer_backend_name(backend.as_deref(), &base_command);
+        metrics::record_backend_bootstrap(&backend_name);
 
         memory::save_agent_parent_in(&state_dir, &session_name, &parent_session);
         if let Some(task_text) = task {
@@ -692,13 +735,33 @@ impl OmarMcpServer {
             let client2 = client.clone();
             let session2 = session_name.clone();
             let first_message = format!("YOUR NAME: {}\nYOUR TASK: {}", short_name, task_text);
+            let backend_name2 = backend_name.clone();
             thread::spawn(move || {
+                let delivery_start = std::time::Instant::now();
                 thread::sleep(Duration::from_secs(2));
-                let _ = client2.send_keys_literal(&session2, &first_message);
+                let send_res = client2.send_keys_literal(&session2, &first_message);
                 thread::sleep(Duration::from_millis(200));
-                let _ = client2.send_keys(&session2, "Enter");
+                let enter_res = client2.send_keys(&session2, "Enter");
+                metrics::record_prompt_delivery(
+                    ea_id,
+                    &session2,
+                    &backend_name2,
+                    delivery_start.elapsed().as_millis() as u64,
+                    send_res.is_ok() && enter_res.is_ok(),
+                );
             });
         }
+
+        metrics::record_agent_spawn(
+            ea_id,
+            &session_name,
+            &short_name,
+            &backend_name,
+            has_agent_prompt,
+            spawn_lock_wait_ms,
+            tmux_spawn_ms,
+            spawn_start.elapsed().as_millis() as u64,
+        );
 
         Ok(json!({
             "id": short_name,
@@ -892,6 +955,7 @@ impl OmarMcpServer {
             args.model.clone(),
             Some("agent".to_string()),
             args.parent.clone(),
+            0,
         )?;
         let agent_name = agent
             .get("id")
@@ -1059,6 +1123,7 @@ impl OmarMcpServer {
             task.model.clone(),
             Some("agent".to_string()),
             Some(task.parent_agent.clone()),
+            0,
         )?;
 
         let updated = tasks::update_task_in(&state_dir, &args.task_id, |record| {
