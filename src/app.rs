@@ -72,10 +72,6 @@ pub struct AgentGroup<'a> {
 
 /// Application state
 pub struct App {
-    /// Unique session identifier (timestamp) used to group log files
-    /// written by the `/api/ea/:ea_id/logs` endpoint for this OMAR run.
-    pub session_id: String,
-
     // EA fields
     pub active_ea: EaId,
     pub registered_eas: Vec<EaInfo>,
@@ -176,7 +172,6 @@ impl App {
         std::fs::create_dir_all(state_dir.join("status")).ok();
 
         Self {
-            session_id: chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string(),
             active_ea,
             registered_eas,
             base_prefix,
@@ -483,19 +478,19 @@ impl App {
             .unwrap_or("Default");
 
         // Build command with EA system prompt + memory baked in
-        let cmd = crate::manager::build_ea_command_with_mcp(
+        let cmd = crate::manager::build_ea_command(
             &self.default_command,
             self.active_ea,
             ea_name,
             &self.omar_dir,
-            Some(&crate::manager::McpLaunchContext {
+            &crate::manager::McpLaunchContext {
                 omar_dir: self.omar_dir.clone(),
                 ea_id: self.active_ea,
                 session_prefix: self.base_prefix.clone(),
                 default_command: self.default_command.clone(),
                 default_workdir: self.default_workdir.clone(),
                 health_idle_warning: self.health_threshold,
-            }),
+            },
         );
 
         // Start manager session — system prompt set at process start
@@ -1022,18 +1017,18 @@ impl App {
 
         let watchdog_cmd = &self.config.watchdog.command;
         let prompt_file = crate::manager::prompts_dir(&self.omar_dir).join("watchdog.md");
-        let cmd = crate::manager::build_agent_command_with_mcp(
+        let cmd = crate::manager::build_agent_command(
             watchdog_cmd,
             &prompt_file,
             &[],
-            Some(&crate::manager::McpLaunchContext {
+            &crate::manager::McpLaunchContext {
                 omar_dir: self.omar_dir.clone(),
                 ea_id: self.active_ea,
                 session_prefix: self.base_prefix.clone(),
                 default_command: self.default_command.clone(),
                 default_workdir: self.default_workdir.clone(),
                 health_idle_warning: self.health_threshold,
-            }),
+            },
         );
 
         let workdir = std::env::current_dir()

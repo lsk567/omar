@@ -167,6 +167,41 @@ fn lock_path_for_state_dir(state_dir: &Path) -> PathBuf {
     state_dir.join(".mcp-state.lock")
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct LockFile {
+    pid: u32,
+    owner: String,
+}
+
+#[derive(Debug)]
+struct LockInfo {
+    pid: Option<u32>,
+    owner: String,
+}
+
+/// Return true if a process with the given PID currently exists. Uses
+/// `kill -0 <pid>`, which is the standard POSIX no-op signal check —
+/// works on Linux, macOS, and BSD without pulling in a libc dep. On
+/// non-Unix platforms, conservatively assume the process is still alive
+/// rather than risk reclaiming a lock we shouldn't.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 struct FileLock {
     path: PathBuf,
 }
@@ -323,6 +358,7 @@ impl OmarMcpServer {
             "computer_status" => self.computer_status(),
             "computer_lock_acquire" => self.computer_lock_acquire(call.arguments),
             "computer_lock_release" => self.computer_lock_release(call.arguments),
+            "computer_lock_break" => self.computer_lock_break(),
             "computer_screenshot" => self.computer_screenshot(call.arguments),
             "computer_mouse" => self.computer_mouse(call.arguments),
             "computer_keyboard" => self.computer_keyboard(call.arguments),
@@ -708,7 +744,7 @@ impl OmarMcpServer {
         ) || request.task.is_some();
         let command = if has_agent_prompt {
             let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
-            manager::build_agent_command_with_mcp(
+            manager::build_agent_command(
                 &base_command,
                 &prompt_file,
                 &[
@@ -716,7 +752,7 @@ impl OmarMcpServer {
                     ("{{TASK}}", request.task.as_deref().unwrap_or("")),
                     ("{{EA_ID}}", &ea_id.to_string()),
                 ],
-                Some(&self.context),
+                &self.context,
             )
         } else {
             base_command.clone()
@@ -851,24 +887,10 @@ impl OmarMcpServer {
         }
         let args: Args = serde_json::from_value(args)?;
         let base = now_ns();
-        let delay_ns = match (args.delay_seconds, args.delay_ns) {
-            (Some(seconds), Some(extra_ns)) => seconds
-                .saturating_mul(1_000_000_000)
-                .saturating_add(extra_ns),
-            (Some(seconds), None) => seconds.saturating_mul(1_000_000_000),
-            (None, Some(extra_ns)) => extra_ns,
-            (None, None) => 0,
-        };
-        let recurring_ns = match (args.recurring_seconds, args.recurring_ns) {
-            (Some(seconds), Some(extra_ns)) => Some(
-                seconds
-                    .saturating_mul(1_000_000_000)
-                    .saturating_add(extra_ns),
-            ),
-            (Some(seconds), None) => Some(seconds.saturating_mul(1_000_000_000)),
-            (None, Some(extra_ns)) => Some(extra_ns),
-            (None, None) => None,
-        };
+        let delay_ns =
+            scheduler::combine_seconds_and_ns(args.delay_seconds, args.delay_ns).unwrap_or(0);
+        let recurring_ns =
+            scheduler::combine_seconds_and_ns(args.recurring_seconds, args.recurring_ns);
         let event = ScheduledEvent {
             id: Uuid::new_v4().to_string(),
             sender: args.sender.unwrap_or_else(|| "ea".to_string()),
@@ -1205,11 +1227,34 @@ impl OmarMcpServer {
         self.context.omar_dir.join("computer.lock")
     }
 
-    fn read_computer_holder(&self) -> Option<String> {
-        fs::read_to_string(self.computer_lock_path())
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+    /// Read the current lock file. Returns the owner string and — when the
+    /// file is in the new JSON format — the PID that claimed it, so the
+    /// caller can detect a stale lock left behind by a crashed process.
+    fn read_computer_lock(&self) -> Option<LockInfo> {
+        let raw = fs::read_to_string(self.computer_lock_path()).ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Ok(parsed) = serde_json::from_str::<LockFile>(trimmed) {
+            // A well-formed JSON payload with an empty `owner` is not a valid
+            // lock — treat it as unreadable rather than falling through to
+            // the legacy path, which would otherwise return the raw JSON
+            // string as the owner.
+            if parsed.owner.is_empty() {
+                return None;
+            }
+            return Some(LockInfo {
+                pid: Some(parsed.pid),
+                owner: parsed.owner,
+            });
+        }
+        // Legacy plain-text lock (older omar build). No PID → never
+        // reclaimable as stale; use `computer_lock_break` to clear.
+        Some(LockInfo {
+            pid: None,
+            owner: trimmed.to_string(),
+        })
     }
 
     fn computer_status(&self) -> Result<Value> {
@@ -1228,8 +1273,16 @@ impl OmarMcpServer {
             "display": screen_size.is_some(),
             "screenshot_ready": screenshot && screen_size.is_some(),
             "screen_size": screen_size,
-            "held_by": self.read_computer_holder(),
+            "held_by": self.read_computer_lock().map(|info| info.owner),
         }))
+    }
+
+    fn serialize_lock_payload(&self, owner: &str) -> Result<Vec<u8>> {
+        serde_json::to_vec(&LockFile {
+            pid: std::process::id(),
+            owner: owner.to_string(),
+        })
+        .context("Failed to serialize computer lock payload")
     }
 
     fn computer_lock_acquire(&self, args: Value) -> Result<Value> {
@@ -1241,23 +1294,75 @@ impl OmarMcpServer {
         let owner = format!("{}:{}", self.ea_id()?, args.agent);
         let path = self.computer_lock_path();
         match OpenOptions::new().write(true).create_new(true).open(&path) {
+            // Write the payload on the handle returned by `create_new` so
+            // another process racing on `read_computer_lock` can never see
+            // an empty-but-present file and mistake it for a reclaim target.
             Ok(mut file) => {
-                write!(file, "{}", owner)?;
+                let payload = self.serialize_lock_payload(&owner)?;
+                file.write_all(&payload)
+                    .context("Failed to write computer lock payload")?;
                 Ok(json!({ "status": "acquired", "held_by": owner }))
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                let held_by = self.read_computer_holder();
-                if held_by.as_deref() == Some(owner.as_str()) {
-                    Ok(json!({ "status": "already_held", "held_by": owner }))
-                } else {
-                    Err(anyhow!(
-                        "Computer is locked by '{}'",
-                        held_by.unwrap_or_else(|| "unknown".to_string())
-                    ))
+                let held = self.read_computer_lock();
+                match held {
+                    Some(info) if info.owner == owner => {
+                        Ok(json!({ "status": "already_held", "held_by": owner }))
+                    }
+                    Some(info) if info.pid.is_some_and(|pid| !pid_alive(pid)) => {
+                        // Prior holder's process is gone. Remove the stale
+                        // file and re-race via create_new so two concurrent
+                        // reclaimers can't both believe they won.
+                        let _ = fs::remove_file(&path);
+                        match OpenOptions::new().write(true).create_new(true).open(&path) {
+                            Ok(mut file) => {
+                                let payload = self.serialize_lock_payload(&owner)?;
+                                file.write_all(&payload)
+                                    .context("Failed to write computer lock payload")?;
+                                Ok(json!({
+                                    "status": "reclaimed",
+                                    "held_by": owner,
+                                    "previous_holder": info.owner,
+                                    "previous_pid": info.pid,
+                                }))
+                            }
+                            Err(_) => {
+                                let new_holder = self
+                                    .read_computer_lock()
+                                    .map(|i| i.owner)
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                Err(anyhow!("Computer is locked by '{}'", new_holder))
+                            }
+                        }
+                    }
+                    Some(info) => Err(anyhow!("Computer is locked by '{}'", info.owner)),
+                    None => {
+                        // File exists but we can't parse it. Could be mid-write
+                        // by another acquirer, or a corrupted/legacy leftover.
+                        // Don't reclaim blindly — the caller can retry, or
+                        // invoke `computer_lock_break` if they're certain.
+                        Err(anyhow!(
+                            "Computer lock file exists but is unreadable; \
+                             retry, or use computer_lock_break if stale"
+                        ))
+                    }
                 }
             }
             Err(err) => Err(err).context("Failed to acquire computer lock"),
         }
+    }
+
+    /// Forcibly remove the computer lock regardless of who holds it. Use
+    /// only when the operator is certain the holder is gone — e.g. a
+    /// legacy plain-text lock from a pre-0.3 build (no PID → never
+    /// auto-reclaimable), or a corrupted lock file.
+    fn computer_lock_break(&self) -> Result<Value> {
+        let previous = self.read_computer_lock().map(|info| info.owner);
+        let _ = fs::remove_file(self.computer_lock_path());
+        Ok(json!({
+            "status": "broken",
+            "previous_holder": previous,
+        }))
     }
 
     fn computer_lock_release(&self, args: Value) -> Result<Value> {
@@ -1267,22 +1372,22 @@ impl OmarMcpServer {
         }
         let args: Args = serde_json::from_value(args)?;
         let owner = format!("{}:{}", self.ea_id()?, args.agent);
-        let held_by = self.read_computer_holder();
-        match held_by {
-            Some(ref holder) if *holder == owner => {
+        let held = self.read_computer_lock();
+        match held {
+            Some(ref info) if info.owner == owner => {
                 let _ = fs::remove_file(self.computer_lock_path());
                 Ok(json!({ "status": "released" }))
             }
-            Some(holder) => Err(anyhow!("Lock held by '{}', not '{}'", holder, owner)),
+            Some(info) => Err(anyhow!("Lock held by '{}', not '{}'", info.owner, owner)),
             None => Ok(json!({ "status": "not_held" })),
         }
     }
 
     fn verify_computer_lock(&self, agent: &str) -> Result<()> {
         let expected = format!("{}:{}", self.ea_id()?, agent);
-        match self.read_computer_holder() {
-            Some(holder) if holder == expected => Ok(()),
-            Some(holder) => Err(anyhow!("Computer is locked by '{}'", holder)),
+        match self.read_computer_lock() {
+            Some(info) if info.owner == expected => Ok(()),
+            Some(info) => Err(anyhow!("Computer is locked by '{}'", info.owner)),
             None => Err(anyhow!("You must acquire the computer lock first")),
         }
     }
@@ -1742,6 +1847,11 @@ fn tool_definitions() -> Vec<Value> {
             }),
         ),
         tool(
+            "computer_lock_break",
+            "Forcibly clear the computer control lock regardless of who holds it. Use only for known-stale locks (e.g. a legacy lock with no PID, or a lock left by a crashed process that the PID check didn't catch).",
+            json!({"type":"object","properties":{}}),
+        ),
+        tool(
             "computer_screenshot",
             "Take a screenshot while holding the lock.",
             json!({
@@ -1817,7 +1927,7 @@ mod tests {
             omar_dir: std::env::temp_dir().join(format!("omar-mcp-test-{}", Uuid::new_v4())),
             ea_id: 0,
             session_prefix: "omar-test-".to_string(),
-            default_command: "claude --dangerously-skip-permissions".to_string(),
+            default_command: "claude".to_string(),
             default_workdir: ".".to_string(),
             health_idle_warning: 15,
         }

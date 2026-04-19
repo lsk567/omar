@@ -76,6 +76,20 @@ fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
+/// Combine an optional `seconds` and optional `extra_ns` duration into a
+/// single nanosecond count, saturating on overflow. Returns `None` only
+/// when both inputs are absent — callers that want a default (e.g. "no
+/// delay means 0") should `.unwrap_or(0)`. Shared between the CLI and
+/// MCP event-scheduling paths so the arithmetic has one definition.
+pub fn combine_seconds_and_ns(seconds: Option<u64>, extra_ns: Option<u64>) -> Option<u64> {
+    match (seconds, extra_ns) {
+        (Some(s), Some(n)) => Some(s.saturating_mul(1_000_000_000).saturating_add(n)),
+        (Some(s), None) => Some(s.saturating_mul(1_000_000_000)),
+        (None, Some(n)) => Some(n),
+        (None, None) => None,
+    }
+}
+
 pub struct Scheduler {
     queue: Mutex<BinaryHeap<ScheduledEvent>>,
     notify: Notify,
@@ -192,8 +206,36 @@ impl Scheduler {
     ) -> R {
         match &self.store_path {
             Some(store_path) => {
-                let _store_lock = StoreLock::acquire(store_lock_path(store_path))
-                    .unwrap_or_else(|err| panic!("Failed to acquire scheduler lock: {}", err));
+                // If the on-disk lock can't be acquired (stuck peer, slow FS),
+                // degrade to an in-memory operation rather than panicking the
+                // caller — the event loop or any other thread holding a live
+                // Scheduler would otherwise take down the whole process.
+                // Consequence on a write op: the change only lands in the
+                // in-memory heap and will be overwritten by the next
+                // successful `with_queue` (which reloads from disk), so the
+                // event is effectively lost if the dashboard restarts or
+                // another writer succeeds first. Still preferable to a crash.
+                let _store_lock = match StoreLock::acquire(store_lock_path(store_path)) {
+                    Ok(lock) => lock,
+                    Err(err) => {
+                        if persist {
+                            eprintln!(
+                                "scheduler: WARNING: failed to acquire store lock ({}); \
+                                 write applied to in-memory cache only — NOT persisted to disk \
+                                 and may be lost on restart",
+                                err
+                            );
+                        } else {
+                            eprintln!(
+                                "scheduler: failed to acquire store lock ({}); \
+                                 read returned from (potentially stale) in-memory cache",
+                                err
+                            );
+                        }
+                        let mut queue = self.queue.lock().unwrap();
+                        return f(&mut queue);
+                    }
+                };
                 let mut queue = BinaryHeap::new();
                 for event in load_events_from_store(store_path) {
                     queue.push(event);
@@ -216,6 +258,11 @@ impl Scheduler {
         self.with_queue(true, |queue| {
             queue.push(event);
         });
+        // `notify_waiters` only wakes currently-parked tasks — a non-persistent
+        // scheduler whose event loop is about to call `notified().await` could
+        // still miss the wake. Acceptable here because the persistent mode
+        // (used by the dashboard + CLI) layers a 500 ms poll on top, and the
+        // non-persistent mode is test-only.
         self.notify.notify_waiters();
     }
 

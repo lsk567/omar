@@ -448,25 +448,9 @@ fn schedule_cli_event(
     every_ns: Option<u64>,
 ) -> Result<()> {
     let base = now_ns();
-    let delay_ns = match (in_seconds, in_ns) {
-        (Some(seconds), Some(extra_ns)) => seconds
-            .saturating_mul(1_000_000_000)
-            .saturating_add(extra_ns),
-        (Some(seconds), None) => seconds.saturating_mul(1_000_000_000),
-        (None, Some(extra_ns)) => extra_ns,
-        (None, None) => 0,
-    };
+    let delay_ns = scheduler::combine_seconds_and_ns(in_seconds, in_ns).unwrap_or(0);
     let timestamp = at_ns.unwrap_or_else(|| base.saturating_add(delay_ns));
-    let recurring_ns = match (every_seconds, every_ns) {
-        (Some(seconds), Some(extra_ns)) => Some(
-            seconds
-                .saturating_mul(1_000_000_000)
-                .saturating_add(extra_ns),
-        ),
-        (Some(seconds), None) => Some(seconds.saturating_mul(1_000_000_000)),
-        (None, Some(extra_ns)) => Some(extra_ns),
-        (None, None) => None,
-    };
+    let recurring_ns = scheduler::combine_seconds_and_ns(every_seconds, every_ns);
 
     let event = scheduler::ScheduledEvent {
         id: uuid::Uuid::new_v4().to_string(),
@@ -852,6 +836,15 @@ async fn run_dashboard(config: Config) -> Result<()> {
     // styling and makes the TUI monochrome. The dashboard is explicitly color-coded.
     if std::env::var_os("NO_COLOR").is_some() {
         std::env::remove_var("NO_COLOR");
+    }
+
+    // Best-effort cleanup of pre-0.3 MCP context files left behind in
+    // `/tmp/omar-mcp/`. Current builds write to `~/.omar/mcp/ea-<id>/`.
+    // Runs only from the dashboard entry point; `omar mcp-server` is
+    // spawned by live backends and must not touch their context files.
+    let legacy_tmp = std::env::temp_dir().join("omar-mcp");
+    if legacy_tmp.is_dir() {
+        let _ = std::fs::remove_dir_all(&legacy_tmp);
     }
 
     // Create the ticker buffer and scheduler, then spawn the event loop
