@@ -326,6 +326,7 @@ fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
     root["mcpServers"][&key] = serde_json::json!({
         "command": server_exe.display().to_string(),
         "args": ["mcp-server", "--context-file", context_file.display().to_string()],
+        "enabled": true,
     });
 
     // Best-effort cleanup of any `mcp.json.omar-*.tmp` leftovers from a
