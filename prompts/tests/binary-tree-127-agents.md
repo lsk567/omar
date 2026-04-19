@@ -37,7 +37,8 @@ You are node 1 (level 1) in a binary tree experiment with 7 levels and 127 total
 Your node number is 1. Your level is 1. The max level is 7.
 
 ### If you are a LEAF node (level == 7)
-Output [TASK COMPLETE] immediately.
+Output [TASK COMPLETE], then immediately call:
+  notify_parent({"name": "t-YOUR_NODE", "summary": "Leaf t-YOUR_NODE complete."})
 
 ### If you are an INTERNAL node (level < 7)
 
@@ -54,15 +55,17 @@ Output [TASK COMPLETE] immediately.
        "parent": "t-<YOUR_NODE>"
      })
 
-3. Poll each child with `get_agent({"name": "t-<CHILD_NODE>"})` and read
-   `output_tail` for `[TASK COMPLETE]`. Use `schedule_event` for wake-ups
-   (sender/receiver both set to your own name, short delay_seconds) instead
-   of busy sleep loops.
+3. Wait for both children to call notify_parent — you will receive two
+   `[CHILD COMPLETE]` messages. If a child hasn't reported after a reasonable
+   time, use `get_agent({"name": "t-<CHILD_NODE>"})` to check its output_tail.
+   Use `schedule_event` (sender/receiver both your own name) for timed fallback
+   checks instead of busy loops.
 
-4. When BOTH children report [TASK COMPLETE]:
+4. When BOTH children have reported [CHILD COMPLETE]:
    a. kill_agent({"name": "t-<LEFT_CHILD>"})
    b. kill_agent({"name": "t-<RIGHT_CHILD>"})
    c. Output [TASK COMPLETE]
+   d. Call notify_parent({"name": "t-YOUR_NODE", "summary": "Subtree rooted at t-YOUR_NODE complete. Both children killed."})
 
 IMPORTANT: Do NOT output [TASK COMPLETE] until both children are confirmed
 complete AND killed.

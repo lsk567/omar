@@ -11,7 +11,7 @@ EA spawns 100 agents named `exp-001` through `exp-100` in rapid succession via t
 Each agent receives:
 
 ```
-You are agent #N in a 100-agent experiment. Report [TASK COMPLETE] immediately after acknowledging your agent number.
+You are agent #N in a 100-agent experiment. Acknowledge your agent number, then output [TASK COMPLETE] and call notify_parent({"name": "exp-N", "summary": "Agent #N complete."}).
 ```
 
 ## How to Run
@@ -21,7 +21,7 @@ EA issues 100 `spawn_agent_session` calls, one per agent:
 ```
 spawn_agent_session({
   "name": "exp-001",
-  "task": "You are agent #1 in a 100-agent experiment. Report [TASK COMPLETE] immediately after acknowledging your agent number.",
+  "task": "You are agent #1 in a 100-agent experiment. Acknowledge your agent number, then output [TASK COMPLETE] and call notify_parent({\"name\": \"exp-001\", \"summary\": \"Agent #1 complete.\"}).",
   "parent": "ea"
 })
 ```
@@ -30,7 +30,7 @@ Repeat for `exp-002` through `exp-100`, incrementing both the `name` suffix and 
 
 ## Monitoring
 
-Poll each agent with `get_agent` and look for `[TASK COMPLETE]` in `output_tail`. `list_agents` returns everything in one call. Schedule periodic check-ins with `schedule_event` instead of sleep loops.
+Each agent calls `notify_parent` on completion, which delivers a `[CHILD COMPLETE]` message directly to the EA. The EA counts incoming completions — no polling needed. Use `list_agents` + `get_agent` only to investigate stragglers that haven't reported in after a reasonable timeout.
 
 ## Cleanup
 

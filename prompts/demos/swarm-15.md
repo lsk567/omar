@@ -66,6 +66,7 @@ The root spawns the rest of the tree via its own `spawn_agent_session` calls. EA
 - Use `schedule_event` for check-ins; never sleep loops.
 - Do NOT kill any agents — all 15 must remain alive after completion.
 - Reply `[TASK COMPLETE]` only once all children report `[TASK COMPLETE]`.
+- After `[TASK COMPLETE]`, always call `notify_parent({"name": "YOUR_NAME", "summary": "..."})` to wake your parent immediately.
 
 ## Root Agent Task (`claude-architect`)
 
@@ -78,9 +79,9 @@ Steps:
 1. Create junk/chat-system/ and write package.json (deps: express, ws, better-sqlite3, jsonwebtoken, bcryptjs, uuid; devDeps: jest, supertest; test script `jest --testMatch=**/test/*.test.js`).
 2. Spawn codex-backend (backend="codex") with the Backend-Lead task below.
 3. Spawn opencode-frontend (backend="opencode") with the Frontend-Lead task below.
-4. Monitor both via `get_agent` / `schedule_event` wake-ups until both report [TASK COMPLETE].
+4. Wait for `[CHILD COMPLETE]` messages from both. Use `get_agent` + `schedule_event` as fallback if a child hasn't notified after a reasonable time.
 5. Run the tests: `cd junk/chat-system && npm install && npm test`.
-6. Report [TASK COMPLETE] with results. Do NOT kill any agents.
+6. Report [TASK COMPLETE] with results. Call `notify_parent({"name": "claude-architect", "summary": "<results>"})`. Do NOT kill any agents.
 ```
 
 ## Level-2 Tasks
@@ -94,9 +95,9 @@ You are codex-backend, Backend Lead in the 15-agent swarm. Follow swarm-15 globa
 
 1. Spawn cursor-api (backend="cursor") with the API-Lead task.
 2. Spawn claude-data (backend="claude") with the Data-Lead task.
-3. Monitor both until they report [TASK COMPLETE].
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback.
 4. Write junk/chat-system/src/server.js: wire api.js, ws.js, db.js, and auth.js into an Express+WebSocket server on port 3000.
-5. Report [TASK COMPLETE]. Do NOT kill any agents.
+5. Report [TASK COMPLETE]. Call `notify_parent({"name": "codex-backend", "summary": "Backend complete."})`. Do NOT kill any agents.
 ```
 
 ### `opencode-frontend`
@@ -108,8 +109,8 @@ You are opencode-frontend, Frontend Lead in the 15-agent swarm. Follow swarm-15 
 
 1. Spawn codex-ui (backend="codex") with the UI-Lead task.
 2. Spawn opencode-infra (backend="opencode") with the Infra-Lead task.
-3. Monitor both until they report [TASK COMPLETE].
-4. Report [TASK COMPLETE]. Do NOT kill any agents.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback.
+4. Report [TASK COMPLETE]. Call `notify_parent({"name": "opencode-frontend", "summary": "Frontend complete."})`. Do NOT kill any agents.
 ```
 
 ## Level-3 Tasks
@@ -124,8 +125,8 @@ Follow swarm-15 global rules.
 
 1. Spawn claude-rest (backend="claude") with the REST-API task.
 2. Spawn codex-ws (backend="codex") with the WebSocket task.
-3. Monitor both until [TASK COMPLETE]. Verify src/api.js and src/ws.js exist and parse.
-4. Report [TASK COMPLETE]. Do NOT kill any agents.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback. Verify src/api.js and src/ws.js exist.
+4. Report [TASK COMPLETE]. Call `notify_parent({"name": "cursor-api", "summary": "API layer complete."})`. Do NOT kill any agents.
 ```
 
 ### `claude-data` (Data Lead)
@@ -138,8 +139,8 @@ Follow swarm-15 global rules.
 
 1. Spawn opencode-db (backend="opencode") with the Storage task.
 2. Spawn cursor-auth (backend="cursor") with the Auth task.
-3. Monitor both until [TASK COMPLETE]. Verify src/db.js and src/auth.js exist.
-4. Report [TASK COMPLETE]. Do NOT kill any agents.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback. Verify src/db.js and src/auth.js exist.
+4. Report [TASK COMPLETE]. Call `notify_parent({"name": "claude-data", "summary": "Data layer complete."})`. Do NOT kill any agents.
 ```
 
 ### `codex-ui` (UI Lead)
@@ -152,8 +153,8 @@ Follow swarm-15 global rules.
 
 1. Spawn claude-chat (backend="claude") with the Chat-UI task.
 2. Spawn codex-admin (backend="codex") with the Admin-Panel task.
-3. Monitor both until [TASK COMPLETE]. Verify their files exist.
-4. Report [TASK COMPLETE]. Do NOT kill any agents.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback. Verify their files exist.
+4. Report [TASK COMPLETE]. Call `notify_parent({"name": "codex-ui", "summary": "UI complete."})`. Do NOT kill any agents.
 ```
 
 ### `opencode-infra` (Infra Lead)
@@ -166,8 +167,8 @@ Follow swarm-15 global rules.
 
 1. Spawn opencode-cli (backend="opencode") with the CLI task.
 2. Spawn cursor-tests (backend="cursor") with the Test-Suite task.
-3. Monitor both until [TASK COMPLETE]. Verify their files exist.
-4. Report [TASK COMPLETE]. Do NOT kill any agents.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback. Verify their files exist.
+4. Report [TASK COMPLETE]. Call `notify_parent({"name": "opencode-infra", "summary": "Infra complete."})`. Do NOT kill any agents.
 ```
 
 ## Level-4 Worker Tasks
@@ -183,7 +184,7 @@ Build junk/chat-system/src/api.js — an Express router:
 JSON-only; auth routes public, others require JWT via the auth middleware.
 auth.js exports: hashPassword, comparePassword, generateToken, authMiddleware.
 db.js exports:   createUser, findUser, getRooms, createRoom, getMessages, addMessage.
-Report [TASK COMPLETE] when done.
+Report [TASK COMPLETE], then call `notify_parent({"name": "claude-rest", "summary": "REST API complete: src/api.js written."})`.
 ```
 
 ### `codex-ws` — WebSocket
@@ -195,7 +196,7 @@ Build junk/chat-system/src/ws.js using the ws library:
 - Track presence: who is online, who is in which room.
 - Export setupWebSocket(server) that attaches WS to an HTTP server.
 auth.js exports verifyToken. db.js exports addMessage.
-Report [TASK COMPLETE] when done.
+Report [TASK COMPLETE], then call `notify_parent({"name": "codex-ws", "summary": "WebSocket complete: src/ws.js written."})`.
 ```
 
 ### `opencode-db` — Storage
@@ -206,7 +207,7 @@ Build junk/chat-system/src/db.js using better-sqlite3 (synchronous):
 - createUser/findUser/findUserById
 - getRooms/createRoom/getRoom
 - getMessages(roomId, limit=50)/addMessage
-Export all. Report [TASK COMPLETE].
+Export all. Report [TASK COMPLETE], then call `notify_parent({"name": "opencode-db", "summary": "Storage complete: src/db.js written."})`.
 ```
 
 ### `cursor-auth` — Auth
@@ -217,7 +218,7 @@ Build junk/chat-system/src/auth.js:
 - generateToken (JWT, {id, username}, 24h expiry; secret from env or default)
 - verifyToken
 - authMiddleware (Express: read Bearer token from Authorization, attach req.user)
-Export all. Report [TASK COMPLETE].
+Export all. Report [TASK COMPLETE], then call `notify_parent({"name": "cursor-auth", "summary": "Auth complete: src/auth.js written."})`.
 ```
 
 ### `claude-chat` — Chat UI
@@ -227,7 +228,7 @@ Build junk/chat-system/public/index.html + public/app.js:
 - Responsive HTML, login/signup forms, room list sidebar, message area, input box.
 - app.js: /api for auth, WebSocket for real-time messaging, typing indicators, online users.
 - Dark theme, embedded CSS, no frameworks.
-Report [TASK COMPLETE].
+Report [TASK COMPLETE], then call `notify_parent({"name": "claude-chat", "summary": "Chat UI complete: public/index.html and public/app.js written."})`.
 ```
 
 ### `codex-admin` — Admin Panel
@@ -236,7 +237,7 @@ Report [TASK COMPLETE].
 Build junk/chat-system/public/admin.html + public/admin.js:
 - List all users, list rooms, message counts per room, create/delete rooms.
 - Match main chat UI's dark theme, embedded CSS.
-Report [TASK COMPLETE].
+Report [TASK COMPLETE], then call `notify_parent({"name": "codex-admin", "summary": "Admin panel complete: public/admin.html and public/admin.js written."})`.
 ```
 
 ### `opencode-cli` — CLI Client
@@ -248,7 +249,7 @@ Build junk/chat-system/src/cli.js (terminal chat client):
 - Receive via WebSocket, display in terminal.
 - readline for input, ws for WebSocket. Defaults to http://localhost:3000 (configurable via CLI arg).
 - Proper CLI entry point (`#!/usr/bin/env node`).
-Report [TASK COMPLETE].
+Report [TASK COMPLETE], then call `notify_parent({"name": "opencode-cli", "summary": "CLI client complete: src/cli.js written."})`.
 ```
 
 ### `cursor-tests` — Test Suite
@@ -261,7 +262,7 @@ Build junk/chat-system/test/:
 - Use jest + supertest. Fresh in-memory / temp SQLite per test for isolation.
 - At least 20 test cases total.
 Add the `test` script to package.json if it's not already there.
-Report [TASK COMPLETE].
+Report [TASK COMPLETE], then call `notify_parent({"name": "cursor-tests", "summary": "Test suite complete: test/ directory written with 20+ cases."})`.
 ```
 
 ## Expected Behavior
