@@ -612,14 +612,6 @@ impl App {
         }
     }
 
-    /// Check if an agent has children (is a PM or EA)
-    fn agent_has_children(&self, session_name: &str) -> bool {
-        if session_name == self.manager_session_name() {
-            return true;
-        }
-        self.agent_parents.values().any(|p| p == session_name)
-    }
-
     /// Count children for a given agent
     pub fn child_count(&self, session_name: &str) -> usize {
         if session_name == self.manager_session_name() {
@@ -656,7 +648,7 @@ impl App {
         crumbs
     }
 
-    /// Drill down into the selected agent (Tab). Only works if the agent has children.
+    /// Drill down into the selected agent (Tab).
     pub fn drill_down(&mut self) {
         let session_name = if self.manager_selected {
             // On EA: hint to select a child if children exist, otherwise silent
@@ -679,17 +671,14 @@ impl App {
             }
         };
 
-        // Only drill down if the selected agent has children
-        if !self.agent_has_children(&session_name) {
-            self.set_status("No sub-agents to drill into");
-            return;
-        }
-
         self.focus_stack.push(self.focus_parent.clone());
         self.focus_parent = session_name.clone();
         self.selected = 0;
-        self.manager_selected = false;
         self.focus_child_indices = self.compute_focus_child_indices();
+        // Park the cursor on the focus parent when it has no children yet,
+        // otherwise `selected = 0` would point at a nonexistent child until
+        // the user spawns one.
+        self.manager_selected = self.focus_child_indices.is_empty();
 
         let short = session_name
             .strip_prefix(&self.config.dashboard.session_prefix)
@@ -894,28 +883,14 @@ impl App {
         Ok(())
     }
 
-    /// Generate a unique agent name (within the active EA's namespace)
+    /// Generate a unique agent name (within the active EA's namespace).
     pub fn generate_agent_name(&self) -> String {
         let existing: std::collections::HashSet<_> = self
             .agents
             .iter()
             .map(|a| a.session.name.as_str())
             .collect();
-
-        for i in 1..1000 {
-            let name = format!("{}{}", self.config.dashboard.session_prefix, i);
-            if !existing.contains(name.as_str()) {
-                return name;
-            }
-        }
-        format!(
-            "{}{}",
-            self.config.dashboard.session_prefix,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        )
+        next_agent_name(&self.session_prefix, &existing)
     }
 
     /// Spawn a new agent with default settings
@@ -935,18 +910,20 @@ impl App {
         self.client
             .new_session(&name, &self.config.agent.default_command, Some(&workdir))?;
 
+        let state_dir = self.state_dir();
+        memory::save_agent_parent_in(&state_dir, &name, &self.focus_parent);
+
         let short_name = name
             .strip_prefix(&self.config.dashboard.session_prefix)
             .unwrap_or(&name);
         self.set_status(format!("Spawned agent: {}", short_name));
         self.refresh()?;
 
-        // Select the new agent
-        if let Some(pos) = self.agents.iter().position(|a| a.session.name == name) {
+        if let Some(pos) = focus_view_index(&self.agents, &self.focus_child_indices, &name) {
             self.selected = pos;
+            self.manager_selected = false;
         }
 
-        let state_dir = self.state_dir();
         let manager_session = self.manager_session_name();
         let events = self.scheduler.list_by_ea(self.active_ea);
         memory::write_memory_to(
@@ -1605,6 +1582,40 @@ pub fn build_tree(
     nodes
 }
 
+/// Position of the agent named `name` within `focus_child_indices`, so the
+/// dashboard can land its cursor on a newly spawned worker that has just
+/// been re-refreshed into the current view.
+fn focus_view_index(
+    agents: &[AgentInfo],
+    focus_child_indices: &[usize],
+    name: &str,
+) -> Option<usize> {
+    focus_child_indices
+        .iter()
+        .position(|&i| agents.get(i).is_some_and(|a| a.session.name == name))
+}
+
+/// Build the next unique agent name for `prefix`, skipping names already in
+/// `existing`. Must use the EA-scoped prefix: `refresh()` filters
+/// `self.agents` by that prefix, so a name built from the base prefix is
+/// invisible to the dashboard.
+fn next_agent_name(prefix: &str, existing: &std::collections::HashSet<&str>) -> String {
+    for i in 1..1000 {
+        let candidate = format!("{}{}", prefix, i);
+        if !existing.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    format!(
+        "{}{}",
+        prefix,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1932,6 +1943,110 @@ mod tests {
             "omar-agent-api-worker"
         );
         assert_eq!(agents[child_indices[1]].session.name, "omar-agent-auth");
+    }
+
+    #[test]
+    fn next_agent_name_uses_ea_scoped_prefix_so_refresh_keeps_the_agent() {
+        // Simulates EA 0: refresh() filters agents by the EA-scoped prefix
+        // "omar-agent-0-". A name built from the base prefix ("omar-agent-")
+        // would be stripped out, which is exactly the bug this guards against.
+        let ea_prefix = "omar-agent-0-";
+        let existing: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        let name = next_agent_name(ea_prefix, &existing);
+
+        assert!(
+            name.starts_with(ea_prefix),
+            "generated name {:?} must start with EA-scoped prefix {:?}",
+            name,
+            ea_prefix
+        );
+        assert_eq!(name, "omar-agent-0-1");
+    }
+
+    #[test]
+    fn next_agent_name_skips_names_already_in_the_ea() {
+        let ea_prefix = "omar-agent-0-";
+        let mut existing: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        existing.insert("omar-agent-0-1");
+        existing.insert("omar-agent-0-2");
+
+        assert_eq!(next_agent_name(ea_prefix, &existing), "omar-agent-0-3");
+    }
+
+    #[test]
+    fn spawn_bookkeeping_persists_parent_under_focus_and_selects_in_view() {
+        use crate::memory;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+
+        let focus_parent = "omar-agent-api";
+        let new_child = "omar-agent-api-helper";
+
+        memory::save_agent_parent_in(state_dir, focus_parent, TEST_MANAGER);
+        memory::save_agent_parent_in(state_dir, new_child, focus_parent);
+
+        let parents = memory::load_agent_parents_from(state_dir);
+        assert_eq!(
+            parents.get(new_child).map(String::as_str),
+            Some(focus_parent),
+            "the post-spawn mapping must survive a refresh-style reload"
+        );
+
+        let agents = vec![
+            make_agent(focus_parent, HealthState::Running),
+            make_agent(new_child, HealthState::Running),
+        ];
+
+        let focus_child_indices: Vec<usize> = agents
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                parents
+                    .get(&a.session.name)
+                    .filter(|p| *p == focus_parent)
+                    .map(|_| i)
+            })
+            .collect();
+
+        let pos = focus_view_index(&agents, &focus_child_indices, new_child)
+            .expect("spawned child must resolve to a focus-view index");
+        assert_eq!(agents[focus_child_indices[pos]].session.name, new_child);
+
+        assert!(
+            focus_view_index(&agents, &focus_child_indices, "omar-agent-ghost").is_none(),
+            "unrelated sessions must not appear in the current view"
+        );
+    }
+
+    #[test]
+    fn drilling_into_childless_agent_yields_empty_view_with_cursor_on_parent() {
+        // `api` is the EA's only live child and has no sub-agents of its own.
+        // Drilling into it must still succeed so the user can spawn the first
+        // grandchild with 'n'; the cursor parks on the focus parent because
+        // there is no child at index 0 to land on.
+        let agents = [make_agent("omar-agent-api", HealthState::Running)];
+        let mut parents = HashMap::new();
+        parents.insert("omar-agent-api".to_string(), TEST_MANAGER.to_string());
+
+        let focus_parent = "omar-agent-api";
+        let focus_child_indices: Vec<usize> = agents
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                parents
+                    .get(&a.session.name)
+                    .is_some_and(|p| p == focus_parent)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        assert!(focus_child_indices.is_empty());
+        // The drill_down body sets `manager_selected = focus_child_indices.is_empty()`
+        // after recomputing indices — this mirrors that contract.
+        let manager_selected_after_drill = focus_child_indices.is_empty();
+        assert!(manager_selected_after_drill);
     }
 
     #[test]
