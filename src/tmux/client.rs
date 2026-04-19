@@ -245,9 +245,12 @@ impl TmuxClient {
             let content_before = self.capture_pane(session, 50).unwrap_or_default();
             let activity_before = self.get_pane_activity(session).unwrap_or(0);
 
-            // Paste text via bracketed paste (no trailing newline — Enter
-            // is sent separately below).
-            self.paste_text(session, text)?;
+            // Deliver text using the same literal path as send_input: no
+            // bracketed-paste (-p) flag. Bracketed paste can cause silent
+            // delivery failure for large/complex payloads because the TUI
+            // takes longer to reflect the change, causing wait_for_change to
+            // time out → C-u clears good input on retry.
+            self.send_keys_literal(session, text)?;
 
             // Send Enter 3 times with small gaps. Some backends need time
             // to process the pasted text before accepting Enter, and a

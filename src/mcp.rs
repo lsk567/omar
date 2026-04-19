@@ -675,8 +675,8 @@ impl OmarMcpServer {
     fn spawn_agent_session(&self, args: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct Args {
-            name: Option<String>,
-            task: Option<String>,
+            name: String,
+            task: String,
             workdir: Option<String>,
             command: Option<String>,
             backend: Option<String>,
@@ -690,8 +690,8 @@ impl OmarMcpServer {
         let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
         let spawn_lock_wait_ms = lock_wait_start.elapsed().as_millis() as u64;
         let result = self.spawn_agent_internal(SpawnRequestInternal {
-            name: args.name,
-            task: args.task,
+            name: Some(args.name),
+            task: Some(args.task),
             workdir: args.workdir,
             command: args.command,
             backend: args.backend,
@@ -993,7 +993,7 @@ impl OmarMcpServer {
         #[derive(Deserialize)]
         struct Args {
             task: String,
-            name: Option<String>,
+            name: String,
             project_name: Option<String>,
             parent: Option<String>,
             backend: Option<String>,
@@ -1010,7 +1010,7 @@ impl OmarMcpServer {
             .unwrap_or_else(|| project_name_from_task(&args.task));
         let project_id = projects::add_project_in(&state_dir, &project_name)?;
         let agent = self.spawn_agent_internal(SpawnRequestInternal {
-            name: args.name,
+            name: Some(args.name),
             task: Some(args.task.clone()),
             workdir: args.workdir,
             command: None,
@@ -1741,7 +1741,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "spawn_agent_session",
-            "Spawn a raw agent/demo session. Prefer create_task for tracked work.",
+            "Spawn an agent or demo session. task is required so the dashboard always shows what the session is for. Use create_task instead for tracked work with project lifecycle.",
             json!({
                 "type":"object",
                 "properties":{
@@ -1753,7 +1753,8 @@ fn tool_definitions() -> Vec<Value> {
                     "model":{"type":"string"},
                     "role":{"type":"string"},
                     "parent":{"type":"string"}
-                }
+                },
+                "required":["name","task"]
             }),
         ),
         tool(
@@ -1829,7 +1830,7 @@ fn tool_definitions() -> Vec<Value> {
                     "model":{"type":"string"},
                     "workdir":{"type":"string"}
                 },
-                "required":["task"]
+                "required":["task","name"]
             }),
         ),
         tool(

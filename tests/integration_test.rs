@@ -727,6 +727,7 @@ fn test_omar_mcp_server_spawn_agent_session_via_cli() {
         "spawn_agent_session",
         json!({
             "name": name,
+            "task": "sleep session for integration test",
             "command": "sleep 30",
         }),
     );
