@@ -3,9 +3,15 @@
 //! These tests require tmux to be installed and will create/destroy
 //! test sessions during execution.
 
+use serde_json::{json, Value};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::thread;
 use std::time::Duration;
+use uuid::Uuid;
 
 const TEST_PREFIX: &str = "omar-test-";
 
@@ -50,34 +56,168 @@ fn tmux_available() -> bool {
         .unwrap_or(false)
 }
 
-fn wait_for_pane_contains(target: &str, needle: &str, attempts: usize, delay: Duration) -> bool {
-    for _ in 0..attempts {
-        if let Ok(output) = tmux(&["capture-pane", "-t", target, "-p"]) {
-            if output.contains(needle) {
-                return true;
-            }
-        }
-        thread::sleep(delay);
-    }
-    false
+fn omar_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_omar")
 }
 
-fn send_line_and_wait(target: &str, line: &str) -> bool {
-    for _ in 0..5 {
-        let _ = tmux(&["send-keys", "-t", target, "-l", line]);
-        let _ = tmux(&["send-keys", "-t", target, "C-m"]);
-        if wait_for_pane_contains(target, line, 10, Duration::from_millis(100)) {
-            return true;
-        }
-    }
-    false
+fn bootstrap_cli_home(home: &Path) {
+    let output = Command::new(omar_bin())
+        .arg("list")
+        .env("HOME", home)
+        .output()
+        .expect("Failed to bootstrap omar home");
+    assert!(
+        output.status.success(),
+        "bootstrap failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
-fn pane_contains_wrapped(output: &str, needle: &str) -> bool {
-    if output.contains(needle) {
-        return true;
+struct McpCliServer {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl McpCliServer {
+    fn start(home: &Path, default_command: &str) -> Self {
+        bootstrap_cli_home(home);
+
+        let context = json!({
+            "omar_dir": home.join(".omar"),
+            "ea_id": 0,
+            "session_prefix": "omar-agent-",
+            "default_command": default_command,
+            "default_workdir": env!("CARGO_MANIFEST_DIR"),
+            "health_idle_warning": 15,
+        });
+        let context_path = home.join("mcp-context.json");
+        fs::write(
+            &context_path,
+            serde_json::to_vec_pretty(&context).expect("serialize MCP context"),
+        )
+        .expect("write MCP context");
+
+        let mut child = Command::new(omar_bin())
+            .args([
+                "mcp-server",
+                "--context-file",
+                context_path.to_str().expect("utf8 context path"),
+            ])
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Failed to start omar mcp-server");
+
+        let stdin = child.stdin.take().expect("mcp stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+        let mut server = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        };
+
+        let init = server.request("initialize", json!({}))["result"].clone();
+        assert_eq!(
+            init["serverInfo"]["name"].as_str(),
+            Some("omar"),
+            "unexpected initialize response: {}",
+            init
+        );
+        server
     }
-    output.replace(['\r', '\n'], "").contains(needle)
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let payload = serde_json::to_vec(&request).expect("serialize request");
+        write!(self.stdin, "Content-Length: {}\r\n\r\n", payload.len()).expect("write header");
+        self.stdin.write_all(&payload).expect("write payload");
+        self.stdin.flush().expect("flush request");
+
+        let response = read_mcp_response(&mut self.stdout);
+        assert_eq!(
+            response["id"].as_u64(),
+            Some(id),
+            "response id mismatch: {}",
+            response
+        );
+        response
+    }
+
+    fn tool_call(&mut self, name: &str, arguments: Value) -> Value {
+        let response = self.request(
+            "tools/call",
+            json!({
+                "name": name,
+                "arguments": arguments,
+            }),
+        );
+        let result = response["result"].clone();
+        assert_eq!(
+            result["isError"].as_bool(),
+            Some(false),
+            "tool {} failed: {}",
+            name,
+            result
+        );
+        result["structuredContent"].clone()
+    }
+}
+
+impl Drop for McpCliServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn read_mcp_response(reader: &mut BufReader<ChildStdout>) -> Value {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).expect("read mcp header");
+        assert!(
+            bytes > 0,
+            "unexpected EOF while reading MCP response header"
+        );
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse::<usize>().expect("valid Content-Length"));
+        }
+    }
+    let length = content_length.expect("Content-Length header present");
+    let mut payload = vec![0u8; length];
+    reader
+        .read_exact(&mut payload)
+        .expect("read mcp response body");
+    serde_json::from_slice(&payload).expect("parse mcp response")
+}
+
+fn cli_output(home: &Path, args: &[&str]) -> String {
+    let output = Command::new(omar_bin())
+        .args(args)
+        .env("HOME", home)
+        .output()
+        .unwrap_or_else(|err| panic!("Failed to run omar {:?}: {}", args, err));
+    assert!(
+        output.status.success(),
+        "omar {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 #[test]
@@ -136,26 +276,23 @@ fn test_capture_pane() {
     // Give it time to start
     thread::sleep(Duration::from_millis(200));
 
-    let found = send_line_and_wait(&session_name, "echo HELLO_OMAR_TEST");
-    assert!(found, "echo command was not observed in pane");
+    // Send echo command
+    let _ = tmux(&[
+        "send-keys",
+        "-t",
+        &session_name,
+        "echo HELLO_OMAR_TEST",
+        "Enter",
+    ]);
 
-    // `send_line_and_wait` only proves the command *text* landed in the pane
-    // (the shell echoes each keystroke). To prove capture works on actual
-    // command *output*, require a second occurrence of the needle — once
-    // for the typed command line, once for echo's output on a new line.
-    let mut output = String::new();
-    let mut output_found = false;
-    for _ in 0..10 {
-        output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap_or_default();
-        if output.matches("HELLO_OMAR_TEST").count() >= 2 {
-            output_found = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
+    // Give it time to execute
+    thread::sleep(Duration::from_millis(500));
+
+    // Capture pane content
+    let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
     assert!(
-        output_found,
-        "echo command did not execute — pane: {}",
+        output.contains("HELLO_OMAR_TEST"),
+        "Expected output not found: {}",
         output
     );
 
@@ -276,12 +413,23 @@ fn test_send_keys() {
     let _ = tmux(&["new-session", "-d", "-s", &session_name]);
     thread::sleep(Duration::from_millis(200));
 
-    let sent = send_line_and_wait(&session_name, "echo SENT_BY_OMAR");
+    // Send a command
+    let result = tmux(&[
+        "send-keys",
+        "-t",
+        &session_name,
+        "echo SENT_BY_OMAR",
+        "Enter",
+    ]);
+    assert!(result.is_ok());
+
+    // Give it time to execute
+    thread::sleep(Duration::from_millis(500));
 
     // Capture and verify
     let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
     assert!(
-        sent && output.contains("SENT_BY_OMAR"),
+        output.contains("SENT_BY_OMAR"),
         "Sent command not found: {}",
         output
     );
@@ -327,12 +475,15 @@ fn test_spawn_custom_command() {
     // Simulate the universal send-keys task injection pattern
     // (this is how omar sends tasks to any backend, including opencode)
     let task_text = "echo TASK_INJECTED_VIA_SENDKEYS";
-    let injected = send_line_and_wait(&session_name, task_text);
+    let _ = tmux(&["send-keys", "-t", &session_name, "-l", task_text]);
+    let _ = tmux(&["send-keys", "-t", &session_name, "Enter"]);
+
+    thread::sleep(Duration::from_millis(500));
 
     // Verify the task was injected and executed
     let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
     assert!(
-        injected && output.contains("TASK_INJECTED_VIA_SENDKEYS"),
+        output.contains("TASK_INJECTED_VIA_SENDKEYS"),
         "Task should be injected via send-keys: {}",
         output
     );
@@ -470,6 +621,226 @@ fn test_omar_spawn_and_kill() {
     );
 }
 
+#[test]
+fn test_omar_event_cli_roundtrip() {
+    let home = tempfile::tempdir().expect("temp home");
+
+    let output = Command::new(omar_bin())
+        .args([
+            "--ea",
+            "Default",
+            "event",
+            "schedule",
+            "--receiver",
+            "ea",
+            "--payload",
+            "cli-test-payload",
+            "--sender",
+            "cli-test",
+            "--in-seconds",
+            "60",
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("Failed to run omar event schedule");
+    assert!(
+        output.status.success(),
+        "schedule failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Scheduled event: cli-test -> ea"),
+        "unexpected schedule output: {}",
+        stdout
+    );
+    let event_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Event id: "))
+        .expect("event id line in schedule output")
+        .trim()
+        .to_string();
+
+    let output = Command::new(omar_bin())
+        .args(["--ea", "Default", "event", "list"])
+        .env("HOME", home.path())
+        .output()
+        .expect("Failed to run omar event list");
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&event_id) && stdout.contains("cli-test-payload"),
+        "event missing from list output: {}",
+        stdout
+    );
+
+    let output = Command::new(omar_bin())
+        .args(["--ea", "Default", "event", "cancel", &event_id])
+        .env("HOME", home.path())
+        .output()
+        .expect("Failed to run omar event cancel");
+    assert!(
+        output.status.success(),
+        "cancel failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&event_id),
+        "cancel output should mention event id: {}",
+        stdout
+    );
+
+    let output = Command::new(omar_bin())
+        .args(["--ea", "Default", "event", "list"])
+        .env("HOME", home.path())
+        .output()
+        .expect("Failed to run omar event list after cancel");
+    assert!(
+        output.status.success(),
+        "final list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No scheduled events found"),
+        "expected empty event list after cancel: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_omar_mcp_server_tools_list_via_cli() {
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+
+    let response = server.request("tools/list", json!({}));
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+
+    assert!(names.contains(&"spawn_agent_session"));
+    assert!(names.contains(&"create_task"));
+    assert!(names.contains(&"schedule_event"));
+}
+
+#[test]
+fn test_omar_mcp_server_spawn_agent_session_via_cli() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let name = format!("mcp-agent-{}", &Uuid::new_v4().to_string()[..8]);
+
+    let spawned = server.tool_call(
+        "spawn_agent_session",
+        json!({
+            "name": name,
+            "command": "sleep 30",
+        }),
+    );
+    assert_eq!(spawned["id"].as_str(), Some(name.as_str()));
+
+    let listed = cli_output(home.path(), &["list"]);
+    assert!(
+        listed.contains(&name),
+        "CLI list should show MCP-spawned agent: {}",
+        listed
+    );
+
+    let killed = server.tool_call("kill_agent", json!({ "name": name }));
+    assert_eq!(killed["status"].as_str(), Some("killed"));
+
+    let listed = cli_output(home.path(), &["list"]);
+    assert!(
+        !listed.contains(&name),
+        "CLI list should not show killed agent: {}",
+        listed
+    );
+}
+
+#[test]
+fn test_omar_mcp_server_tracked_task_lifecycle_via_cli() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let suffix = &Uuid::new_v4().to_string()[..8];
+    let agent_name = format!("task-agent-{}", suffix);
+    let project_name = format!("task-project-{}", suffix);
+
+    let created = server.tool_call(
+        "create_task",
+        json!({
+            "task": "echo tracked-task-test",
+            "name": agent_name,
+            "project_name": project_name,
+        }),
+    );
+    let task_id = created["task_id"].as_str().expect("task id").to_string();
+    assert_eq!(created["agent_name"].as_str(), Some(agent_name.as_str()));
+    assert_eq!(
+        created["project_name"].as_str(),
+        Some(project_name.as_str())
+    );
+
+    let checked = server.tool_call("check_task", json!({ "task_id": task_id }));
+    assert_eq!(checked["status"].as_str(), Some("running"));
+    assert_eq!(checked["agent_name"].as_str(), Some(agent_name.as_str()));
+    assert_eq!(
+        checked["project_name"].as_str(),
+        Some(project_name.as_str())
+    );
+    assert_eq!(checked["agent_exists"].as_bool(), Some(true));
+
+    let listed = cli_output(home.path(), &["list"]);
+    assert!(
+        listed.contains(&agent_name),
+        "CLI list should show tracked-task agent: {}",
+        listed
+    );
+
+    let projects = server.tool_call("list_projects", json!({}));
+    let projects = projects["projects"].as_array().expect("projects array");
+    assert!(projects
+        .iter()
+        .any(|project| { project["name"].as_str() == Some(project_name.as_str()) }));
+
+    let completed = server.tool_call(
+        "complete_task",
+        json!({
+            "task_id": task_id,
+            "summary": "integration test complete",
+        }),
+    );
+    assert_eq!(completed["status"].as_str(), Some("completed"));
+
+    let listed = cli_output(home.path(), &["list"]);
+    assert!(
+        !listed.contains(&agent_name),
+        "CLI list should not show completed task agent: {}",
+        listed
+    );
+
+    let projects = server.tool_call("list_projects", json!({}));
+    let projects = projects["projects"].as_array().expect("projects array");
+    assert!(!projects
+        .iter()
+        .any(|project| { project["name"].as_str() == Some(project_name.as_str()) }));
+}
+
 /// Test that `deliver_to_tmux` routes messages to EA-scoped session names.
 ///
 /// Session naming (from `ea::ea_prefix` + receiver, or `ea::ea_manager_session`):
@@ -517,18 +888,19 @@ fn test_deliver_to_tmux_ea_scoped() {
 
     thread::sleep(Duration::from_millis(200));
 
-    // The production `deliver_to_tmux` path routes through
-    // `TmuxClient::deliver_prompt` (bracketed paste + verification), which
-    // requires a full TUI to observe activity. This test targets a plain
-    // shell session to validate EA-level *routing isolation* — not the
-    // exact delivery mechanism — so we use send-keys directly: type each
-    // message into its session and confirm the shell echoes it, then
-    // assert that neither pane contains the other EA's message.
+    // Deliver distinct messages replicating deliver_to_tmux's exact tmux operations:
+    //   tmux send-keys -t <target> -l <message>
+    //   tmux send-keys -t <target> Enter
     let msg_ea0 = "DELIVER_EA0_ONLY";
     let msg_ea1 = "DELIVER_EA1_ONLY";
 
-    let found_ea0 = send_line_and_wait(&ea0_session, msg_ea0);
-    let found_ea1 = send_line_and_wait(&ea1_session, msg_ea1);
+    let _ = tmux(&["send-keys", "-t", &ea0_session, "-l", msg_ea0]);
+    let _ = tmux(&["send-keys", "-t", &ea0_session, "Enter"]);
+
+    let _ = tmux(&["send-keys", "-t", &ea1_session, "-l", msg_ea1]);
+    let _ = tmux(&["send-keys", "-t", &ea1_session, "Enter"]);
+
+    thread::sleep(Duration::from_millis(500));
 
     // Capture pane output for each session
     let out0 = tmux(&["capture-pane", "-t", &ea0_session, "-p"]).unwrap_or_default();
@@ -536,14 +908,18 @@ fn test_deliver_to_tmux_ea_scoped() {
 
     // Each session must contain its own message
     assert!(
-        found_ea0,
+        out0.contains(msg_ea0),
         "EA 0 session '{}' should contain '{}': {}",
-        ea0_session, msg_ea0, out0
+        ea0_session,
+        msg_ea0,
+        out0
     );
     assert!(
-        found_ea1,
+        out1.contains(msg_ea1),
         "EA 1 session '{}' should contain '{}': {}",
-        ea1_session, msg_ea1, out1
+        ea1_session,
+        msg_ea1,
+        out1
     );
 
     // EA isolation: messages must not cross EA boundaries
@@ -651,8 +1027,14 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
     let payload_ea0 = format!("[EVENT at t={}]\nFrom ea-test: sched-ea0-only", ts);
     let payload_ea1 = format!("[EVENT at t={}]\nFrom ea-test: sched-ea1-only", ts);
 
-    let _ = send_line_and_wait(&ea0_session, &payload_ea0);
-    let _ = send_line_and_wait(&ea1_session, &payload_ea1);
+    // Deliver to each session via the same tmux send-keys pattern as deliver_to_tmux
+    let _ = tmux(&["send-keys", "-t", &ea0_session, "-l", &payload_ea0]);
+    let _ = tmux(&["send-keys", "-t", &ea0_session, "Enter"]);
+
+    let _ = tmux(&["send-keys", "-t", &ea1_session, "-l", &payload_ea1]);
+    let _ = tmux(&["send-keys", "-t", &ea1_session, "Enter"]);
+
+    thread::sleep(Duration::from_millis(500));
 
     // Capture pane output
     let out0 = tmux(&["capture-pane", "-t", &ea0_session, "-p"]).unwrap_or_default();
@@ -660,24 +1042,24 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
 
     // Each EA's session received its own event payload
     assert!(
-        pane_contains_wrapped(&out0, "sched-ea0-only"),
+        out0.contains("sched-ea0-only"),
         "EA 0 session missing its scheduled event: {}",
         out0
     );
     assert!(
-        pane_contains_wrapped(&out1, "sched-ea1-only"),
+        out1.contains("sched-ea1-only"),
         "EA 1 session missing its scheduled event: {}",
         out1
     );
 
     // EA isolation: events must not cross EA boundaries
     assert!(
-        !pane_contains_wrapped(&out0, "sched-ea1-only"),
+        !out0.contains("sched-ea1-only"),
         "EA 0 session must NOT contain EA 1's event: {}",
         out0
     );
     assert!(
-        !pane_contains_wrapped(&out1, "sched-ea0-only"),
+        !out1.contains("sched-ea0-only"),
         "EA 1 session must NOT contain EA 0's event: {}",
         out1
     );

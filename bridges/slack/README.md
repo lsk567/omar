@@ -1,5 +1,7 @@
 # OMAR Slack Bridge
 
+> Status: this bridge still depends on the removed OMAR HTTP API and is not compatible with the MCP-only server introduced on April 17, 2026.
+
 Connects Slack channels to OMAR agents via Slack Socket Mode (no public URL needed).
 
 Messages in Slack channels/threads create and interact with OMAR agents. Agent output is polled and posted back as threaded replies.

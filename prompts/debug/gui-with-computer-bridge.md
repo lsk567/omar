@@ -1,5 +1,7 @@
 # Debugging Omar GUI with Claude Code + Computer Bridge
 
+> Legacy note: this recipe still shows the removed HTTP API and is not executable after the MCP cutover on April 17, 2026. Use the OMAR MCP `computer_*` tools instead of `curl http://localhost:9876/...`.
+
 Debug the omar TUI dashboard visually using plain Claude Code (not running inside omar) and omar's computer bridge API.
 
 ## Prerequisites

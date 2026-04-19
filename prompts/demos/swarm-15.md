@@ -1,5 +1,7 @@
 # 15-Agent Swarm Demo
 
+> Legacy note: this demo still embeds the removed HTTP API. Use OMAR MCP tools for spawning, status checks, and cleanup before running it after the April 17, 2026 MCP cutover.
+
 Demo OMAR's multi-level hierarchy with heterogeneous backends building a real system. 15 persistent agents across 4 levels, mixing all available backends with default models.
 
 ## Structure

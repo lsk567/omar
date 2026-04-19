@@ -1,5 +1,7 @@
 # Flat 100-Agent Stress Test
 
+> Legacy note: this stress test still documents the removed HTTP API. Re-run it through OMAR MCP tools such as `spawn_agent_session`, `get_agent`, `list_agents`, and `kill_agent` instead of `curl http://localhost:9876/...`.
+
 **Purpose:** Validate OMAR can handle 100 concurrent agents spawned in parallel. Tests spawn throughput, concurrent execution, and cleanup.
 
 ## Setup

@@ -1,5 +1,7 @@
 # Project Factory Prompt
 
+> Legacy note: this prompt still describes the removed HTTP API. Use OMAR MCP task/session tools for orchestration after the April 17, 2026 cutover.
+
 This prompt enables continuous generation of interesting projects using multiple parallel agents.
 
 ## Usage

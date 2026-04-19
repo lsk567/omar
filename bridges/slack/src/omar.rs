@@ -5,7 +5,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-/// Client for the OMAR HTTP API (localhost:9876).
+/// Legacy client for the removed OMAR HTTP API.
+///
+/// This bridge has not been migrated to the MCP server yet.
 #[derive(Clone)]
 pub struct OmarClient {
     client: Client,

@@ -16,9 +16,6 @@ pub struct Config {
     pub agent: AgentConfig,
 
     #[serde(default)]
-    pub api: ApiConfig,
-
-    #[serde(default)]
     pub watchdog: WatchdogConfig,
 }
 
@@ -69,21 +66,6 @@ pub struct AgentConfig {
     /// Default working directory
     #[serde(default = "default_workdir")]
     pub default_workdir: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiConfig {
-    /// Whether to enable the HTTP API
-    #[serde(default = "default_api_enabled")]
-    pub enabled: bool,
-
-    /// Host to bind to
-    #[serde(default = "default_api_host")]
-    pub host: String,
-
-    /// Port to listen on
-    #[serde(default = "default_api_port")]
-    pub port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,18 +185,6 @@ fn default_auth_failure_patterns() -> Vec<String> {
     ]
 }
 
-fn default_api_enabled() -> bool {
-    true
-}
-
-fn default_api_host() -> String {
-    "127.0.0.1".to_string()
-}
-
-fn default_api_port() -> u16 {
-    9876
-}
-
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
@@ -242,16 +212,6 @@ impl Default for AgentConfig {
         Self {
             default_command: default_command(),
             default_workdir: default_workdir(),
-        }
-    }
-}
-
-impl Default for ApiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_api_enabled(),
-            host: default_api_host(),
-            port: default_api_port(),
         }
     }
 }

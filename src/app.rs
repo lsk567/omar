@@ -483,11 +483,19 @@ impl App {
             .unwrap_or("Default");
 
         // Build command with EA system prompt + memory baked in
-        let cmd = crate::manager::build_ea_command(
+        let cmd = crate::manager::build_ea_command_with_mcp(
             &self.default_command,
             self.active_ea,
             ea_name,
             &self.omar_dir,
+            Some(&crate::manager::McpLaunchContext {
+                omar_dir: self.omar_dir.clone(),
+                ea_id: self.active_ea,
+                session_prefix: self.base_prefix.clone(),
+                default_command: self.default_command.clone(),
+                default_workdir: self.default_workdir.clone(),
+                health_idle_warning: self.health_threshold,
+            }),
         );
 
         // Start manager session — system prompt set at process start
@@ -1014,7 +1022,19 @@ impl App {
 
         let watchdog_cmd = &self.config.watchdog.command;
         let prompt_file = crate::manager::prompts_dir(&self.omar_dir).join("watchdog.md");
-        let cmd = crate::manager::build_agent_command(watchdog_cmd, &prompt_file, &[]);
+        let cmd = crate::manager::build_agent_command_with_mcp(
+            watchdog_cmd,
+            &prompt_file,
+            &[],
+            Some(&crate::manager::McpLaunchContext {
+                omar_dir: self.omar_dir.clone(),
+                ea_id: self.active_ea,
+                session_prefix: self.base_prefix.clone(),
+                default_command: self.default_command.clone(),
+                default_workdir: self.default_workdir.clone(),
+                health_idle_warning: self.health_threshold,
+            }),
+        );
 
         let workdir = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
@@ -1041,9 +1061,9 @@ impl App {
             "AUTH FAILURE DETECTED.\n\
 Failed agents: {}\n\
 Slack channel: {}\n\
-Omar API: http://localhost:{}\n\
+Use the OMAR MCP tools for inspection/control.\n\
 Slack bridge: http://localhost:9877",
-            failed_list, slack_display, self.config.api.port,
+            failed_list, slack_display,
         );
 
         let client = self.client.clone();

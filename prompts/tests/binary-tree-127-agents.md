@@ -1,5 +1,7 @@
 # Binary Tree Self-Terminating Stress Test
 
+> Legacy note: this scenario still references the removed HTTP API and event endpoints. Rewrite it around OMAR MCP task/session tools before using it after the April 17, 2026 MCP cutover.
+
 **Purpose:** Validate OMAR supports recursive agent hierarchies where agents spawn children, coordinate, and self-terminate. Tests multi-level delegation, inter-agent polling, and cascading cleanup.
 
 ## Structure
