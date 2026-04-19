@@ -1102,6 +1102,7 @@ impl OmarMcpServer {
         let args: Args = serde_json::from_value(args)?;
         let state_dir = self.state_dir()?;
         let task = tasks::find_task_in(&state_dir, &args.task_id)
+            .or_else(|| tasks::find_task_by_agent_in(&state_dir, &args.task_id))
             .ok_or_else(|| anyhow!("Task '{}' not found", args.task_id))?;
         let client = self.client()?;
         let session_name = self.qualified_session_name(&task.agent_name)?;
@@ -1146,6 +1147,7 @@ impl OmarMcpServer {
         let state_dir = self.state_dir()?;
         let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
         let existing = tasks::find_task_in(&state_dir, &args.task_id)
+            .or_else(|| tasks::find_task_by_agent_in(&state_dir, &args.task_id))
             .ok_or_else(|| anyhow!("Task '{}' not found", args.task_id))?;
         if existing.status == TaskStatus::Completed {
             return Ok(json!({
@@ -1194,6 +1196,7 @@ impl OmarMcpServer {
         let state_dir = self.state_dir()?;
         let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
         let task = tasks::find_task_in(&state_dir, &args.task_id)
+            .or_else(|| tasks::find_task_by_agent_in(&state_dir, &args.task_id))
             .ok_or_else(|| anyhow!("Task '{}' not found", args.task_id))?;
         if task.status == TaskStatus::Completed {
             return Err(anyhow!("Task '{}' is already completed", args.task_id));
