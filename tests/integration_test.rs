@@ -35,16 +35,12 @@ fn tmux(args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Clean up any test sessions
-fn cleanup_test_sessions() {
-    // List all sessions and kill ones with our test prefix
-    if let Ok(output) = tmux(&["list-sessions", "-F", "#{session_name}"]) {
-        for line in output.lines() {
-            if line.starts_with(TEST_PREFIX) {
-                let _ = tmux(&["kill-session", "-t", line]);
-            }
-        }
-    }
+/// Kill a specific tmux session if it exists. Scoped per-test so
+/// concurrent tests don't clobber each other's sessions. Use this both
+/// at the start of a test (to clear leftovers from a prior failed run)
+/// and at the end (so the next run starts clean).
+fn cleanup_session(session_name: &str) {
+    let _ = tmux(&["kill-session", "-t", session_name]);
 }
 
 /// Check if tmux is available
@@ -235,9 +231,8 @@ fn test_create_and_list_session() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}create-list", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Create a session
     let result = tmux(&["new-session", "-d", "-s", &session_name, "sleep", "60"]);
@@ -265,9 +260,8 @@ fn test_capture_pane() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}capture", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Create a session with a shell
     let result = tmux(&["new-session", "-d", "-s", &session_name]);
@@ -307,9 +301,8 @@ fn test_kill_session() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}kill", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Create a session
     let _ = tmux(&["new-session", "-d", "-s", &session_name, "sleep", "60"]);
@@ -340,9 +333,8 @@ fn test_session_activity() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}activity", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Create a session
     let _ = tmux(&["new-session", "-d", "-s", &session_name, "sleep", "60"]);
@@ -372,9 +364,8 @@ fn test_has_session() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}has-session", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Check non-existent session
     let result = Command::new("tmux")
@@ -405,9 +396,8 @@ fn test_send_keys() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}send-keys", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Create a session with a shell
     let _ = tmux(&["new-session", "-d", "-s", &session_name]);
@@ -448,9 +438,8 @@ fn test_spawn_custom_command() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}custom-cmd", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Spawn a session with a non-claude command (simulates opencode or other backend)
     let result = tmux(&["new-session", "-d", "-s", &session_name, "bash"]);
@@ -516,16 +505,17 @@ fn test_omar_list_empty() {
         return;
     }
 
-    cleanup_test_sessions();
+    // Isolate HOME so we don't read the developer's live `~/.omar/` nor
+    // race against other tests that bootstrap their own omar dir.
+    let home = tempfile::tempdir().expect("temp home");
 
-    let output = Command::new("cargo")
-        .args(["run", "--", "list"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+    let output = Command::new(omar_bin())
+        .arg("list")
+        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar list");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Should show "No agent sessions" since we have no prefix by default
     assert!(
         stdout.contains("No agent sessions") || stdout.contains("NAME"),
         "Unexpected output: {}",
@@ -540,76 +530,68 @@ fn test_omar_spawn_and_kill() {
         return;
     }
 
-    cleanup_test_sessions();
+    // Per-test unique agent name: tmux sessions are process-global so even
+    // with isolated HOME, a parallel test running the same CLI would race
+    // on the tmux daemon. The uuid suffix pins this test's session.
+    let home = tempfile::tempdir().expect("temp home");
+    let agent_name = format!("test-spawn-{}", &Uuid::new_v4().to_string()[..8]);
 
-    // Clean up from previous test runs across EA namespaces
-    if let Ok(output) = tmux(&["list-sessions", "-F", "#{session_name}"]) {
-        for line in output.lines() {
-            if line == "test-spawn" || line.ends_with("-test-spawn") {
-                let _ = tmux(&["kill-session", "-t", line]);
-            }
-        }
-    }
-
-    // Spawn a new agent
-    let output = Command::new("cargo")
-        .args(["run", "--", "spawn", "-n", "test-spawn", "-c", "sleep 60"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+    // Spawn a new agent.
+    let output = Command::new(omar_bin())
+        .args(["spawn", "-n", &agent_name, "-c", "sleep 60"])
+        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar spawn");
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Spawned agent: test-spawn"),
+        stdout.contains(&format!("Spawned agent: {}", agent_name)),
         "Should confirm spawn: {}",
         stdout
     );
 
-    // Resolve the full spawned session name dynamically, since active EA id can vary.
+    // Resolve the full spawned session name — prefix depends on active EA.
     thread::sleep(Duration::from_millis(200));
+    let suffix = format!("-{}", agent_name);
     let all_sessions = tmux(&["list-sessions", "-F", "#{session_name}"]).unwrap_or_default();
     let full_session = all_sessions
         .lines()
-        .find(|line| *line == "test-spawn" || line.ends_with("-test-spawn"))
+        .find(|line| *line == agent_name || line.ends_with(&suffix))
         .map(ToString::to_string)
-        .expect("Expected a spawned session ending with '-test-spawn'");
+        .unwrap_or_else(|| panic!("Expected a spawned session ending with {:?}", suffix));
 
-    // Verify session exists
     let result = Command::new("tmux")
         .args(["has-session", "-t", &full_session])
         .output()
         .unwrap();
     assert!(result.status.success(), "Session should exist after spawn");
 
-    // List should show the agent (displayed without prefix)
-    let output = Command::new("cargo")
-        .args(["run", "--", "list"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+    // `list` should show the agent (displayed without prefix).
+    let output = Command::new(omar_bin())
+        .arg("list")
+        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar list");
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("test-spawn"),
+        stdout.contains(&agent_name),
         "List should show spawned agent: {}",
         stdout
     );
 
-    // Kill the agent (using short name)
-    let output = Command::new("cargo")
-        .args(["run", "--", "kill", "test-spawn"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+    // Kill the agent (short name).
+    let output = Command::new(omar_bin())
+        .args(["kill", &agent_name])
+        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar kill");
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Killed agent: test-spawn"),
+        stdout.contains(&format!("Killed agent: {}", agent_name)),
         "Should confirm kill: {}",
         stdout
     );
 
-    // Verify session is gone
+    // Verify session is gone.
     thread::sleep(Duration::from_millis(100));
     let result = Command::new("tmux")
         .args(["has-session", "-t", &full_session])
