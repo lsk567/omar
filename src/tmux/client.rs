@@ -279,7 +279,12 @@ impl TmuxClient {
         }
 
         // Best-effort: even if verification failed, the prompt may have been
-        // delivered (some backends are slow to reflect changes).
+        // delivered (some backends are slow to reflect changes). Log so the
+        // operator can investigate if the agent appears stuck.
+        eprintln!(
+            "[deliver_prompt] verification failed after {} retries for session '{}'",
+            opts.max_retries, session
+        );
         Ok(())
     }
 

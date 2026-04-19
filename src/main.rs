@@ -180,8 +180,6 @@ enum EventAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = Config::resolve_path(cli.config.as_deref());
-    let config_preexisted = config_path.exists();
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(ref agent) = cli.agent {
         config.agent.default_command =
@@ -189,9 +187,7 @@ async fn main() -> Result<()> {
     }
     if cli.spawn_metrics {
         config.metrics.spawn_metrics_enabled = true;
-        if !config_preexisted {
-            config.save();
-        }
+        config.save();
     }
     metrics::configure(config.metrics.spawn_metrics_enabled);
     let omar_dir = omar_dir();

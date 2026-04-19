@@ -258,12 +258,9 @@ impl Scheduler {
         self.with_queue(true, |queue| {
             queue.push(event);
         });
-        // `notify_waiters` only wakes currently-parked tasks — a non-persistent
-        // scheduler whose event loop is about to call `notified().await` could
-        // still miss the wake. Acceptable here because the persistent mode
-        // (used by the dashboard + CLI) layers a 500 ms poll on top, and the
-        // non-persistent mode is test-only.
-        self.notify.notify_waiters();
+        // `notify_one` stores a permit so the event loop wakes up even if it
+        // isn't currently parked on `notified().await`.
+        self.notify.notify_one();
     }
 
     /// Cancel an event only if it belongs to the specified EA.

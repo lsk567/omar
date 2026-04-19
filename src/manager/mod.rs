@@ -838,6 +838,10 @@ fn spawn_worker(
     // Give it time to start
     thread::sleep(Duration::from_secs(1));
 
+    // Deliver initial task context so agent.md's "Task Header" section is satisfied
+    let first_message = format!("YOUR NAME: {}\nYOUR TASK: {}", agent.name, agent.task);
+    let _ = client.deliver_prompt(&session_name, &first_message, &DeliveryOptions::default());
+
     // Persist worker task description to EA-scoped state dir
     let state_dir = ea::ea_state_dir(ea_id, omar_dir);
     memory::save_worker_task_in(&state_dir, &session_name, &agent.task);
