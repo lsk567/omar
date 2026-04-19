@@ -637,8 +637,11 @@ impl OmarMcpServer {
             })
             .map(|record| record.agent_name)
             .collect();
+        let activity = client.get_pane_activity(&session_name).unwrap_or(0);
+        let health = health_from_activity(activity, self.context.health_idle_warning);
         Ok(json!({
             "id": short_name,
+            "health": health,
             "task": task.as_ref().map(|record| record.task_text.clone()),
             "status": task.as_ref().and_then(|record| record.last_status.clone()),
             "children": children,
