@@ -1784,7 +1784,7 @@ fn tool_definitions() -> Vec<Value> {
                 "type":"object",
                 "properties":{
                     "name":{"type":"string"},
-                    "task":{"type":"string"},
+                    "task":{"type":"string","description":"Clean work description shown in the dashboard. What to build or do — no [TASK COMPLETE] or notify_parent instructions; those are already in every agent's system prompt."},
                     "workdir":{"type":"string"},
                     "command":{"type":"string"},
                     "backend":{"type":"string"},
@@ -1872,7 +1872,7 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "task":{"type":"string"},
+                    "task":{"type":"string","description":"Clean work description shown in the dashboard. What to build or do — no [TASK COMPLETE] or notify_parent instructions; those are already in every agent's system prompt."},
                     "name":{"type":"string"},
                     "project_name":{"type":"string"},
                     "parent":{"type":"string"},

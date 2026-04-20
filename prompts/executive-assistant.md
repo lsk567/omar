@@ -39,7 +39,7 @@ Use `create_task` for normal work. It:
 - records authoritative task state
 
 Inputs you may set:
-- `task`: required
+- `task`: required — clean description of what the worker should build or do; no `[TASK COMPLETE]` or `notify_parent` instructions (those are already in every agent's system prompt)
 - `name`: short worker name
 - `project_name`: short project label
 - `parent`: usually omit for EA-owned tasks
