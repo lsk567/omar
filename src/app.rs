@@ -11,6 +11,7 @@ use crate::ea::{self, EaId, EaInfo};
 use crate::memory;
 use crate::projects::{self, Project};
 use crate::scheduler::{ScheduledEvent, Scheduler, TickerBuffer};
+use crate::tasks;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -370,6 +371,16 @@ impl App {
         // Load parent mappings, worker tasks, and build the chain-of-command tree
         self.agent_parents = memory::load_agent_parents_from(&state_dir);
         self.worker_tasks = memory::load_worker_tasks_from(&state_dir);
+        // Augment from task_registry.json so newly-spawned agents always show
+        // their task before worker_tasks.json catches up.
+        for record in tasks::load_tasks_from(&state_dir) {
+            let session = format!(
+                "{}{}",
+                ea::ea_prefix(record.ea_id, &self.base_prefix),
+                record.agent_name
+            );
+            self.worker_tasks.entry(session).or_insert(record.task_text);
+        }
 
         // Cache agent statuses so render and API reads avoid per-frame disk I/O
         {
