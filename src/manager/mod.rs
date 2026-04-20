@@ -65,6 +65,56 @@ enum BackendKind {
     Opencode,
 }
 
+/// How a backend consumes the agent.md prompt.
+///
+/// Group 1 backends accept a real system prompt (invisible to chat turns),
+/// so the YOUR NAME / YOUR TASK header must arrive as a follow-up user
+/// message via `TmuxClient::deliver_prompt`.
+///
+/// Group 2 backends receive agent.md as the first user message. To avoid
+/// a wasted round-trip (and, for opencode, protocol drift) we materialize
+/// a single combined prompt that already contains the task header and
+/// skip the follow-up delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptDeliveryMode {
+    /// Task header needs a follow-up `deliver_prompt` call (claude, codex).
+    SystemPrompt,
+    /// Task header is already inline in the spawn command (cursor, gemini, opencode).
+    InitialUserMessage,
+}
+
+impl PromptDeliveryMode {
+    /// Whether the spawn command already contains the task header.
+    ///
+    /// Callers that would otherwise follow up with `deliver_prompt` must
+    /// skip that step when this returns `true`.
+    pub fn delivers_task_inline(self) -> bool {
+        matches!(self, PromptDeliveryMode::InitialUserMessage)
+    }
+}
+
+impl BackendKind {
+    fn prompt_delivery_mode(self) -> PromptDeliveryMode {
+        match self {
+            BackendKind::Claude | BackendKind::Codex => PromptDeliveryMode::SystemPrompt,
+            BackendKind::Cursor | BackendKind::Gemini | BackendKind::Opencode => {
+                PromptDeliveryMode::InitialUserMessage
+            }
+        }
+    }
+}
+
+/// Detect the prompt delivery mode for a base command.
+///
+/// Unknown backends fall back to `SystemPrompt` — the conservative choice,
+/// since that keeps the existing two-step flow and does not suppress the
+/// task delivery.
+pub fn prompt_delivery_mode(base_command: &str) -> PromptDeliveryMode {
+    detect_backend(base_command)
+        .map(BackendKind::prompt_delivery_mode)
+        .unwrap_or(PromptDeliveryMode::SystemPrompt)
+}
+
 fn detect_backend_token(token: &str) -> Option<BackendKind> {
     let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')'));
     let executable = Path::new(token)
@@ -130,6 +180,55 @@ fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -
     }
 }
 
+/// Render agent.md (with substitutions applied) plus a trailing
+/// `YOUR NAME` / `YOUR TASK` header into a fresh temp file and return the
+/// path. Used for group-2 backends so the entire first user message fits in
+/// one round-trip.
+fn materialize_combined_prompt(
+    prompt_file: &Path,
+    substitutions: &[(&str, &str)],
+    short_name: &str,
+    task: &str,
+) -> PathBuf {
+    let mut content = std::fs::read_to_string(prompt_file).unwrap_or_default();
+    for (pattern, replacement) in substitutions {
+        content = content.replace(pattern, replacement);
+    }
+    content.push_str(&format!(
+        "\n\n---\n\nYOUR NAME: {}\nYOUR TASK: {}\n",
+        short_name, task
+    ));
+
+    let dir = std::env::temp_dir().join("omar-prompts");
+    std::fs::create_dir_all(&dir).ok();
+
+    let stem = prompt_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("prompt");
+    let ext = prompt_file
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("md");
+    let rendered = dir.join(format!("{}-combined-{}.{}", stem, Uuid::new_v4(), ext));
+
+    if std::fs::write(&rendered, &content).is_ok() {
+        rendered
+    } else {
+        prompt_file.to_path_buf()
+    }
+}
+
+/// Command and delivery mode returned by `build_worker_agent_command`.
+#[derive(Debug, Clone)]
+pub struct AgentSpawnCommand {
+    /// The shell command to spawn the backend.
+    pub command: String,
+    /// How the task header reaches the agent — used by callers to decide
+    /// whether a follow-up `deliver_prompt` call is needed.
+    pub delivery_mode: PromptDeliveryMode,
+}
+
 /// Build a CLI command with system prompt loaded from a file via native flag.
 ///
 /// - `prompt_file`: absolute path to the prompt .md file
@@ -180,6 +279,61 @@ pub fn build_agent_command(
         }
         Some(BackendKind::Opencode) => format!("{} --prompt \"{}\"", base_command, shell_expr),
         None => base_command.to_string(),
+    }
+}
+
+/// Build a spawn command for a worker agent that also takes ownership of the
+/// `YOUR NAME` / `YOUR TASK` header.
+///
+/// - Group 1 backends (claude, codex): returns the same command as
+///   `build_agent_command` with `delivery_mode = SystemPrompt`. The caller
+///   must follow up with a `deliver_prompt` carrying the task header.
+/// - Group 2 backends (cursor, gemini, opencode): materializes a combined
+///   prompt file (agent.md with substitutions applied + the task header
+///   appended) and feeds it to the backend as a single initial user
+///   message. `delivery_mode = InitialUserMessage` tells the caller to
+///   skip any follow-up `deliver_prompt` — the task is already inline.
+/// - Unknown backends: returns `base_command` unchanged with
+///   `SystemPrompt`, so an upstream `deliver_prompt` still runs and the
+///   task arrives.
+pub fn build_worker_agent_command(
+    base_command: &str,
+    prompt_file: &Path,
+    substitutions: &[(&str, &str)],
+    short_name: &str,
+    task: &str,
+) -> AgentSpawnCommand {
+    let mode = prompt_delivery_mode(base_command);
+    match mode {
+        PromptDeliveryMode::SystemPrompt => AgentSpawnCommand {
+            command: build_agent_command(base_command, prompt_file, substitutions),
+            delivery_mode: mode,
+        },
+        PromptDeliveryMode::InitialUserMessage => {
+            let combined =
+                materialize_combined_prompt(prompt_file, substitutions, short_name, task);
+            let path_str = combined.display();
+            let shell_expr = format!("$(cat '{}')", path_str);
+            let command = match detect_backend(base_command) {
+                Some(BackendKind::Cursor) => format!(
+                    "{} \"Load the '{}' file and follow the instructions.\"",
+                    base_command, path_str
+                ),
+                Some(BackendKind::Gemini) => {
+                    format!("TERM=xterm-256color {} -i \"{}\"", base_command, shell_expr)
+                }
+                Some(BackendKind::Opencode) => {
+                    format!("{} --prompt \"{}\"", base_command, shell_expr)
+                }
+                // Unreachable: prompt_delivery_mode only returns
+                // InitialUserMessage for the three backends above.
+                _ => base_command.to_string(),
+            };
+            AgentSpawnCommand {
+                command,
+                delivery_mode: mode,
+            }
+        }
     }
 }
 
@@ -520,10 +674,13 @@ fn spawn_worker(
         return Ok(());
     }
 
-    // Build command with worker system prompt (template vars substituted via sed)
+    // Build command with worker system prompt. For group-2 backends
+    // (cursor/gemini/opencode) the task header is folded into the initial
+    // prompt; for group-1 backends (claude/codex) a follow-up
+    // `deliver_prompt` carries the task header.
     let parent_name = "ea";
     let prompt_file = prompts_dir(omar_dir).join("agent.md");
-    let cmd = build_agent_command(
+    let spawn_cmd = build_worker_agent_command(
         command,
         &prompt_file,
         &[
@@ -531,56 +688,65 @@ fn spawn_worker(
             ("{{TASK}}", &agent.task),
             ("{{EA_ID}}", &ea_id.to_string()),
         ],
+        &agent.name,
+        &agent.task,
     );
 
     // Create worker session — system prompt set at process start
     client.new_session(
         &session_name,
-        &cmd,
+        &spawn_cmd.command,
         Some(&std::env::current_dir()?.to_string_lossy()),
     )?;
 
-    // Wait for backend readiness when possible, then deliver an explicit
-    // first task message so workers begin execution deterministically.
-    // If markers succeed, the TUI is proven ready; skip require_initial_change
-    // (a fresh Claude Code banner stays pixel-stable after drawing, so any
-    // extra "wait for a change" would time out).
-    let markers_proved_ready = if let Some(kind) = detect_backend(command) {
-        let markers = crate::tmux::backend_readiness_markers(kind.canonical_name());
-        if markers.is_empty() {
-            false
-        } else {
-            let detected = client.wait_for_markers(
-                &session_name,
-                markers,
-                Duration::from_secs(60),
-                Duration::from_millis(250),
-            );
-            if !detected {
-                println!(
-                    "  {} - readiness markers timed out; attempting delivery anyway",
-                    agent.name
+    // Group-2 backends already received the task header in the spawn
+    // command; skip the follow-up delivery so we don't duplicate the turn.
+    if !spawn_cmd.delivery_mode.delivers_task_inline() {
+        // Wait for backend readiness when possible, then deliver an explicit
+        // first task message so workers begin execution deterministically.
+        // If markers succeed, the TUI is proven ready; skip
+        // require_initial_change (a fresh Claude Code banner stays
+        // pixel-stable after drawing, so any extra "wait for a change" would
+        // time out).
+        let markers_proved_ready = if let Some(kind) = detect_backend(command) {
+            let markers = crate::tmux::backend_readiness_markers(kind.canonical_name());
+            if markers.is_empty() {
+                false
+            } else {
+                let detected = client.wait_for_markers(
+                    &session_name,
+                    markers,
+                    Duration::from_secs(60),
+                    Duration::from_millis(250),
                 );
+                if !detected {
+                    println!(
+                        "  {} - readiness markers timed out; attempting delivery anyway",
+                        agent.name
+                    );
+                }
+                detected
             }
-            detected
-        }
-    } else {
-        false
-    };
+        } else {
+            false
+        };
 
-    let initial_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", agent.name, agent.task);
-    let opts = DeliveryOptions {
-        startup_timeout: Duration::from_secs(45),
-        stable_quiet: Duration::from_millis(800),
-        verify_timeout: Duration::from_secs(6),
-        max_retries: 4,
-        poll_interval: Duration::from_millis(120),
-        retry_delay: Duration::from_millis(250),
-        require_initial_change: !markers_proved_ready,
-    };
-    client
-        .deliver_prompt(&session_name, &initial_msg, &opts)
-        .map_err(|e| anyhow::anyhow!("failed to deliver initial task to {}: {}", agent.name, e))?;
+        let initial_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", agent.name, agent.task);
+        let opts = DeliveryOptions {
+            startup_timeout: Duration::from_secs(45),
+            stable_quiet: Duration::from_millis(800),
+            verify_timeout: Duration::from_secs(6),
+            max_retries: 4,
+            poll_interval: Duration::from_millis(120),
+            retry_delay: Duration::from_millis(250),
+            require_initial_change: !markers_proved_ready,
+        };
+        client
+            .deliver_prompt(&session_name, &initial_msg, &opts)
+            .map_err(|e| {
+                anyhow::anyhow!("failed to deliver initial task to {}: {}", agent.name, e)
+            })?;
+    }
 
     // Persist worker task description to EA-scoped state dir
     let state_dir = ea::ea_state_dir(ea_id, omar_dir);
@@ -813,5 +979,239 @@ mod tests {
         let pdir = prompts_dir(dir.path());
         assert!(pdir.join("executive-assistant.md").exists());
         assert!(pdir.join("agent.md").exists());
+    }
+
+    // ── PromptDeliveryMode classification ──
+    //
+    // Group-1 backends (claude, codex) install agent.md as a real system
+    // prompt, so the YOUR NAME/YOUR TASK header must be delivered as a
+    // follow-up user message. Group-2 backends (cursor, gemini, opencode)
+    // receive agent.md as the first user turn; the fix folds the task
+    // header into that same turn, so callers must NOT re-deliver it.
+
+    #[test]
+    fn test_prompt_delivery_mode_group1_claude() {
+        assert_eq!(
+            prompt_delivery_mode("claude --yolo"),
+            PromptDeliveryMode::SystemPrompt
+        );
+        assert!(!prompt_delivery_mode("claude").delivers_task_inline());
+    }
+
+    #[test]
+    fn test_prompt_delivery_mode_group1_codex() {
+        assert_eq!(
+            prompt_delivery_mode("codex --no-alt-screen"),
+            PromptDeliveryMode::SystemPrompt
+        );
+        assert!(!prompt_delivery_mode("env FOO=bar codex").delivers_task_inline());
+    }
+
+    #[test]
+    fn test_prompt_delivery_mode_group2_cursor() {
+        assert_eq!(
+            prompt_delivery_mode("cursor agent --yolo"),
+            PromptDeliveryMode::InitialUserMessage
+        );
+        assert!(prompt_delivery_mode("cursor agent --yolo").delivers_task_inline());
+    }
+
+    #[test]
+    fn test_prompt_delivery_mode_group2_gemini() {
+        assert_eq!(
+            prompt_delivery_mode("gemini --yolo"),
+            PromptDeliveryMode::InitialUserMessage
+        );
+        assert!(prompt_delivery_mode("gemini").delivers_task_inline());
+    }
+
+    #[test]
+    fn test_prompt_delivery_mode_group2_opencode() {
+        assert_eq!(
+            prompt_delivery_mode("opencode"),
+            PromptDeliveryMode::InitialUserMessage
+        );
+        assert!(prompt_delivery_mode("npx opencode --model local").delivers_task_inline());
+    }
+
+    #[test]
+    fn test_prompt_delivery_mode_unknown_falls_back_to_system_prompt() {
+        // Unknown backend: conservative fallback keeps the follow-up
+        // deliver_prompt step (otherwise the task would never reach it).
+        assert_eq!(
+            prompt_delivery_mode("vim"),
+            PromptDeliveryMode::SystemPrompt
+        );
+        assert!(!prompt_delivery_mode("vim").delivers_task_inline());
+    }
+
+    // ── build_worker_agent_command behaviour ──
+
+    /// Helper: render a real agent.md template to a temp file (mirroring
+    /// what `prompts_dir` would install) so tests can read the combined
+    /// output back from disk.
+    fn write_real_agent_prompt(dir: &Path) -> PathBuf {
+        let pdir = prompts_dir(dir);
+        pdir.join("agent.md")
+    }
+
+    fn read_combined_file_from_command(cmd: &str) -> String {
+        // Commands for group-2 backends reference a rendered file either
+        // directly (cursor: "Load the 'PATH' file...") or via `$(cat 'PATH')`
+        // (gemini, opencode). Extract the first quoted path and read it.
+        let start = cmd.find('\'').expect("expected quoted path in command");
+        let rest = &cmd[start + 1..];
+        let end = rest.find('\'').expect("expected closing quote");
+        let path = &rest[..end];
+        std::fs::read_to_string(path).expect("combined prompt file should exist")
+    }
+
+    #[test]
+    fn test_build_worker_agent_command_group1_claude_uses_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_file = write_real_agent_prompt(dir.path());
+        let spawn = build_worker_agent_command(
+            "claude",
+            &prompt_file,
+            &[
+                ("{{PARENT_NAME}}", "ea"),
+                ("{{TASK}}", "do a thing"),
+                ("{{EA_ID}}", "0"),
+            ],
+            "worker-42",
+            "do a thing",
+        );
+        assert_eq!(spawn.delivery_mode, PromptDeliveryMode::SystemPrompt);
+        assert!(spawn.command.contains("--system-prompt"));
+        // Group-1 commands do NOT embed the YOUR NAME header — the
+        // follow-up deliver_prompt carries it.
+        assert!(!spawn.command.contains("YOUR NAME: worker-42"));
+    }
+
+    #[test]
+    fn test_build_worker_agent_command_group1_codex_uses_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_file = write_real_agent_prompt(dir.path());
+        let spawn = build_worker_agent_command(
+            "codex --no-alt-screen",
+            &prompt_file,
+            &[
+                ("{{PARENT_NAME}}", "ea"),
+                ("{{TASK}}", "do a thing"),
+                ("{{EA_ID}}", "0"),
+            ],
+            "codex-worker",
+            "do a thing",
+        );
+        assert_eq!(spawn.delivery_mode, PromptDeliveryMode::SystemPrompt);
+        assert!(spawn.command.contains("developer_instructions"));
+        // Group-1 commands leave task delivery to the follow-up deliver_prompt.
+        assert!(!spawn.command.contains("YOUR NAME: codex-worker"));
+    }
+
+    #[test]
+    fn test_build_worker_agent_command_cursor_combines_prompt_and_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_file = write_real_agent_prompt(dir.path());
+        let spawn = build_worker_agent_command(
+            "cursor agent --yolo",
+            &prompt_file,
+            &[
+                ("{{PARENT_NAME}}", "ea"),
+                ("{{TASK}}", "ship it"),
+                ("{{EA_ID}}", "0"),
+            ],
+            "cursor-worker",
+            "ship it",
+        );
+        assert_eq!(spawn.delivery_mode, PromptDeliveryMode::InitialUserMessage);
+        assert!(spawn.command.contains("Load the "));
+        assert!(spawn.command.contains("file and follow the instructions."));
+
+        let combined = read_combined_file_from_command(&spawn.command);
+        assert!(
+            combined.contains("You operate in one of two distinct roles"),
+            "combined prompt should include agent.md body text"
+        );
+        assert!(combined.contains("YOUR NAME: cursor-worker"));
+        assert!(combined.contains("YOUR TASK: ship it"));
+    }
+
+    #[test]
+    fn test_build_worker_agent_command_gemini_combines_prompt_and_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_file = write_real_agent_prompt(dir.path());
+        let spawn = build_worker_agent_command(
+            "gemini --yolo",
+            &prompt_file,
+            &[
+                ("{{PARENT_NAME}}", "ea"),
+                ("{{TASK}}", "summarize logs"),
+                ("{{EA_ID}}", "0"),
+            ],
+            "gem-worker",
+            "summarize logs",
+        );
+        assert_eq!(spawn.delivery_mode, PromptDeliveryMode::InitialUserMessage);
+        assert!(spawn.command.starts_with("TERM=xterm-256color "));
+        assert!(spawn.command.contains(" -i "));
+
+        let combined = read_combined_file_from_command(&spawn.command);
+        assert!(combined.contains("You operate in one of two distinct roles"));
+        assert!(combined.contains("YOUR NAME: gem-worker"));
+        assert!(combined.contains("YOUR TASK: summarize logs"));
+    }
+
+    #[test]
+    fn test_build_worker_agent_command_opencode_combines_prompt_and_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_file = write_real_agent_prompt(dir.path());
+        let spawn = build_worker_agent_command(
+            "opencode",
+            &prompt_file,
+            &[
+                ("{{PARENT_NAME}}", "ea"),
+                ("{{TASK}}", "refactor foo.rs"),
+                ("{{EA_ID}}", "0"),
+            ],
+            "oc-worker",
+            "refactor foo.rs",
+        );
+        assert_eq!(spawn.delivery_mode, PromptDeliveryMode::InitialUserMessage);
+        assert!(spawn.command.contains("--prompt "));
+
+        let combined = read_combined_file_from_command(&spawn.command);
+        assert!(combined.contains("You operate in one of two distinct roles"));
+        assert!(combined.contains("YOUR NAME: oc-worker"));
+        assert!(combined.contains("YOUR TASK: refactor foo.rs"));
+    }
+
+    #[test]
+    fn test_build_worker_agent_command_group2_substitutions_rendered() {
+        // Substitutions inside agent.md (e.g. {{EA_ID}}) must be expanded
+        // in the combined file because group-2 backends read the file
+        // content directly — there is no sed layer between us and the
+        // backend as there is for claude/codex.
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_file = write_real_agent_prompt(dir.path());
+        let spawn = build_worker_agent_command(
+            "opencode",
+            &prompt_file,
+            &[
+                ("{{PARENT_NAME}}", "ea"),
+                ("{{TASK}}", "t"),
+                ("{{EA_ID}}", "7"),
+            ],
+            "oc",
+            "t",
+        );
+        let combined = read_combined_file_from_command(&spawn.command);
+        // agent.md references {{EA_ID}} in the curl examples; after
+        // substitution the literal placeholder must be gone.
+        assert!(
+            !combined.contains("{{EA_ID}}"),
+            "combined prompt should have {{{{EA_ID}}}} substituted"
+        );
+        assert!(combined.contains("ea_7") || combined.contains("/ea/7"));
     }
 }

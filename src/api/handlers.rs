@@ -16,7 +16,7 @@ use super::models::*;
 use crate::app::App;
 use crate::computer::{self, ComputerLock};
 use crate::ea;
-use crate::manager::{build_agent_command, prompts_dir};
+use crate::manager::{build_worker_agent_command, prompts_dir, PromptDeliveryMode};
 use crate::memory;
 use crate::projects;
 use crate::scheduler::{event::ScheduledEvent, Scheduler};
@@ -682,13 +682,18 @@ pub async fn spawn_agent(
             .unwrap_or_else(|_| ".".to_string())
     });
 
-    // Build the agent command (App lock is no longer held)
+    // Build the agent command (App lock is no longer held).
+    //
+    // For worker agents we use `build_worker_agent_command`, which folds the
+    // YOUR NAME / YOUR TASK header into the initial prompt for group-2
+    // backends (cursor/gemini/opencode). `delivery_mode` tells us whether a
+    // follow-up `deliver_prompt` is still required below.
     let has_agent_prompt = matches!(req.role.as_deref(), Some("project-manager") | Some("agent"))
         || req.task.is_some();
-    let cmd = if has_agent_prompt {
+    let (cmd, delivery_mode) = if has_agent_prompt {
         let task = req.task.as_deref().unwrap_or("");
         let prompt_file = prompts_dir(&state.omar_dir).join("agent.md");
-        build_agent_command(
+        let spawn_cmd = build_worker_agent_command(
             &base_command,
             &prompt_file,
             &[
@@ -696,9 +701,12 @@ pub async fn spawn_agent(
                 ("{{TASK}}", task),
                 ("{{EA_ID}}", &ea_id.to_string()),
             ],
-        )
+            &short_name,
+            task,
+        );
+        (spawn_cmd.command, Some(spawn_cmd.delivery_mode))
     } else {
-        base_command.clone()
+        (base_command.clone(), None)
     };
 
     // Ensure state directory exists
@@ -738,9 +746,16 @@ pub async fn spawn_agent(
     let backend_name = infer_backend_name(req.backend.as_deref(), &base_command);
 
     // Deliver first user message using readiness-aware prompt delivery.
+    //
+    // For group-2 backends (cursor/gemini/opencode) the spawn command
+    // already contains the task header, so this step is skipped — issuing
+    // it anyway would duplicate the task or land while the backend is
+    // still processing the combined initial prompt.
+    let skip_task_delivery = matches!(delivery_mode, Some(PromptDeliveryMode::InitialUserMessage));
     if let Some(ref task) = req.task {
         memory::save_worker_task_in(&state_dir, &session_name, task);
-
+    }
+    if let (Some(task), false) = (req.task.as_ref(), skip_task_delivery) {
         let user_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", short_name, task);
         let client2 = client.clone();
         let session2 = session_name.clone();
