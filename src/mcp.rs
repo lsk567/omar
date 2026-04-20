@@ -1752,7 +1752,7 @@ fn tool_definitions() -> Vec<Value> {
             "Get detailed agent output.",
             json!({
                 "type":"object",
-                "properties":{"name":{"type":"string"}},
+                "properties":{"name":{"type":"string","description":"Short agent name without the session prefix."}},
                 "required":["name"]
             }),
         ),
@@ -1761,7 +1761,7 @@ fn tool_definitions() -> Vec<Value> {
             "Get agent task and child summary.",
             json!({
                 "type":"object",
-                "properties":{"name":{"type":"string"}},
+                "properties":{"name":{"type":"string","description":"Short agent name without the session prefix."}},
                 "required":["name"]
             }),
         ),
@@ -1771,26 +1771,26 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "name":{"type":"string"},
-                    "status":{"type":"string"}
+                    "name":{"type":"string","description":"Your own agent name."},
+                    "status":{"type":"string","description":"One-line status shown in the dashboard (e.g. 'Writing auth module — 60% done')."}
                 },
                 "required":["name","status"]
             }),
         ),
         tool(
             "spawn_agent_session",
-            "Spawn an agent or demo session. task is required so the dashboard always shows what the session is for. Use create_task instead for tracked work with project lifecycle.",
+            "Spawn an interactive agent or demo session. Use this when you need to direct the agent step-by-step via send_input, or for raw demo/bash windows. Use create_task when the agent should run autonomously to completion.",
             json!({
                 "type":"object",
                 "properties":{
                     "name":{"type":"string"},
-                    "task":{"type":"string","description":"Clean work description shown in the dashboard. What to build or do — no [TASK COMPLETE] or notify_parent instructions; those are already in every agent's system prompt."},
+                    "task":{"type":"string","description":"Delivered to the agent as their initial task and shown in the dashboard. What to build or do — no [TASK COMPLETE] or notify_parent instructions; those are already in every agent's system prompt."},
                     "workdir":{"type":"string"},
-                    "command":{"type":"string"},
-                    "backend":{"type":"string"},
+                    "command":{"type":"string","description":"Raw command to run. Mutually exclusive with backend."},
+                    "backend":{"type":"string","description":"One of: 'claude', 'codex', 'cursor', 'opencode', 'gemini'. Mutually exclusive with command."},
                     "model":{"type":"string"},
-                    "role":{"type":"string"},
-                    "parent":{"type":"string"}
+                    "role":{"type":"string","description":"Set to 'agent' or 'project-manager' to inject the agent.md system prompt. Omit for raw sessions (e.g. bash demos)."},
+                    "parent":{"type":"string","description":"Your own agent name for hierarchy tracking. Omit if the EA is the direct parent."}
                 },
                 "required":["name","task"]
             }),
@@ -1823,8 +1823,8 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
-                    "summary": {"type": "string"}
+                    "name": {"type": "string", "description": "Your own agent name (not your parent's)."},
+                    "summary": {"type": "string", "description": "Completion summary — same text as your [TASK COMPLETE] output."}
                 },
                 "required": ["name", "summary"]
             }),
@@ -1840,14 +1840,14 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "receiver":{"type":"string"},
-                    "payload":{"type":"string"},
+                    "receiver":{"type":"string","description":"Target agent short name, or 'ea' for the Executive Assistant."},
+                    "payload":{"type":"string","description":"Message text injected into the receiver's session."},
                     "sender":{"type":"string"},
-                    "timestamp_ns":{"type":"integer"},
-                    "delay_seconds":{"type":"integer"},
-                    "delay_ns":{"type":"integer"},
-                    "recurring_seconds":{"type":"integer"},
-                    "recurring_ns":{"type":"integer"}
+                    "delay_seconds":{"type":"integer","description":"Deliver this many seconds from now. Preferred over timestamp_ns for simplicity."},
+                    "timestamp_ns":{"type":"integer","description":"Absolute logical timestamp in nanoseconds. Use delay_seconds instead unless you need precise coordination."},
+                    "delay_ns":{"type":"integer","description":"Deliver this many nanoseconds from now. Use for sub-second precision."},
+                    "recurring_seconds":{"type":"integer","description":"Auto-reschedule every N seconds after each delivery (cron job)."},
+                    "recurring_ns":{"type":"integer","description":"Auto-reschedule every N nanoseconds after each delivery."}
                 },
                 "required":["receiver","payload"]
             }),
@@ -1868,15 +1868,15 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "create_task",
-            "Create a tracked task: add project, spawn worker, and persist lifecycle state.",
+            "Spawn a worker that runs autonomously to completion: the agent receives the task, does the work, and signals done. Use this for all normal delegated work. For interactive sessions where you will direct the agent step-by-step, use spawn_agent_session instead.",
             json!({
                 "type":"object",
                 "properties":{
-                    "task":{"type":"string","description":"Clean work description shown in the dashboard. What to build or do — no [TASK COMPLETE] or notify_parent instructions; those are already in every agent's system prompt."},
+                    "task":{"type":"string","description":"Delivered to the agent as their initial task and shown in the dashboard. What to build or do — no [TASK COMPLETE] or notify_parent instructions; those are already in every agent's system prompt."},
                     "name":{"type":"string"},
-                    "project_name":{"type":"string"},
-                    "parent":{"type":"string"},
-                    "backend":{"type":"string"},
+                    "project_name":{"type":"string","description":"Auto-derived from the first line of task if omitted."},
+                    "parent":{"type":"string","description":"Your own agent name when spawning child tasks. Omit for EA-owned tasks."},
+                    "backend":{"type":"string","description":"One of: 'claude', 'codex', 'cursor', 'opencode', 'gemini'."},
                     "model":{"type":"string"},
                     "workdir":{"type":"string"}
                 },
@@ -1888,7 +1888,7 @@ fn tool_definitions() -> Vec<Value> {
             "Inspect tracked task state.",
             json!({
                 "type":"object",
-                "properties":{"task_id":{"type":"string"}},
+                "properties":{"task_id":{"type":"string","description":"Task UUID from create_task, or the worker's short name."}},
                 "required":["task_id"]
             }),
         ),
@@ -1898,7 +1898,7 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "task_id":{"type":"string"},
+                    "task_id":{"type":"string","description":"Task UUID from create_task, or the worker's short name."},
                     "summary":{"type":"string"}
                 },
                 "required":["task_id"]
@@ -1910,8 +1910,8 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "task_id":{"type":"string"},
-                    "additional_context":{"type":"string"}
+                    "task_id":{"type":"string","description":"Task UUID from create_task, or the worker's short name."},
+                    "additional_context":{"type":"string","description":"Extra instructions appended to the original task text for the replacement worker."}
                 },
                 "required":["task_id"]
             }),
@@ -1931,9 +1931,9 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "agent_name":{"type":"string"},
+                    "agent_name":{"type":"string","description":"Your own agent name."},
                     "action":{"type":"string"},
-                    "justification":{"type":"string"}
+                    "justification":{"type":"string","description":"Why this action serves the user's goal."}
                 },
                 "required":["agent_name","action","justification"]
             }),
@@ -1944,8 +1944,8 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "channel":{"type":"string"},
-                    "thread_ts":{"type":"string"},
+                    "channel":{"type":"string","description":"From the inbound [SLACK MESSAGE] event."},
+                    "thread_ts":{"type":"string","description":"From the inbound [SLACK MESSAGE] event. Omit to start a new thread."},
                     "text":{"type":"string"}
                 },
                 "required":["channel","text"]
@@ -1961,7 +1961,7 @@ fn tool_definitions() -> Vec<Value> {
             "Acquire the computer control lock.",
             json!({
                 "type":"object",
-                "properties":{"agent":{"type":"string"}},
+                "properties":{"agent":{"type":"string","description":"Your own agent name. Only one agent may hold the lock at a time."}},
                 "required":["agent"]
             }),
         ),
@@ -1970,7 +1970,7 @@ fn tool_definitions() -> Vec<Value> {
             "Release the computer control lock.",
             json!({
                 "type":"object",
-                "properties":{"agent":{"type":"string"}},
+                "properties":{"agent":{"type":"string","description":"Your own agent name. Must match the name that acquired the lock."}},
                 "required":["agent"]
             }),
         ),
@@ -1985,9 +1985,9 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "agent":{"type":"string"},
-                    "max_width":{"type":"integer"},
-                    "max_height":{"type":"integer"}
+                    "agent":{"type":"string","description":"Your own agent name — proves you hold the lock."},
+                    "max_width":{"type":"integer","description":"Resize screenshot to at most this width in pixels."},
+                    "max_height":{"type":"integer","description":"Resize screenshot to at most this height in pixels."}
                 },
                 "required":["agent"]
             }),
@@ -1998,15 +1998,15 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "agent":{"type":"string"},
-                    "action":{"type":"string"},
-                    "x":{"type":"integer"},
-                    "y":{"type":"integer"},
-                    "button":{"type":"integer"},
-                    "to_x":{"type":"integer"},
-                    "to_y":{"type":"integer"},
-                    "scroll_direction":{"type":"string"},
-                    "scroll_amount":{"type":"integer"}
+                    "agent":{"type":"string","description":"Your own agent name — proves you hold the lock."},
+                    "action":{"type":"string","description":"One of: 'move', 'click', 'double_click', 'drag', 'scroll'."},
+                    "x":{"type":"integer","description":"X coordinate in pixels."},
+                    "y":{"type":"integer","description":"Y coordinate in pixels."},
+                    "button":{"type":"integer","description":"Mouse button: 1=left, 2=middle, 3=right. Defaults to 1."},
+                    "to_x":{"type":"integer","description":"Drag destination X (drag action only)."},
+                    "to_y":{"type":"integer","description":"Drag destination Y (drag action only)."},
+                    "scroll_direction":{"type":"string","description":"'up' or 'down' (scroll action only)."},
+                    "scroll_amount":{"type":"integer","description":"Number of scroll steps (scroll action only)."}
                 },
                 "required":["agent","action","x","y"]
             }),
@@ -2017,9 +2017,9 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "agent":{"type":"string"},
-                    "action":{"type":"string"},
-                    "text":{"type":"string"}
+                    "agent":{"type":"string","description":"Your own agent name — proves you hold the lock."},
+                    "action":{"type":"string","description":"'type' to type a string, 'key' to press a key combination (e.g. 'ctrl+c', 'Return')."},
+                    "text":{"type":"string","description":"Text to type, or key combination to press."}
                 },
                 "required":["agent","action","text"]
             }),

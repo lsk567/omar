@@ -87,7 +87,7 @@ Do not overwrite OMAR memory files directly.
 
 For a bash/demo window that should stay open for the user, use `spawn_agent_session` with a raw `command` such as `bash`.
 
-Use `send_input` only for demo/bash sessions or explicit operator control. Prefer tracked task tools for normal agent work.
+Use `send_input` to communicate with already-running agents (e.g. send a follow-up instruction or unblock a waiting agent). Do not use it to assign new work — use `create_task` for that.
 
 ## Backends
 
