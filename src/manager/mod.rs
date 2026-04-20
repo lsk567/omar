@@ -179,6 +179,44 @@ fn backend_token(base_command: &str, kind: BackendKind) -> Option<String> {
     })
 }
 
+fn prompt_temp_dir() -> PathBuf {
+    std::env::temp_dir().join("omar-prompts")
+}
+
+fn sweep_prompt_temp_dir(dir: &Path) {
+    const MAX_PROMPT_FILES: usize = 256;
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+
+    if files.len() <= MAX_PROMPT_FILES {
+        return;
+    }
+
+    files.sort_by_key(|(modified, _)| *modified);
+    let remove_count = files.len() - MAX_PROMPT_FILES;
+    for (_, stale_path) in files.into_iter().take(remove_count) {
+        let _ = std::fs::remove_file(stale_path);
+    }
+}
+
 fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -> PathBuf {
     if substitutions.is_empty() {
         return prompt_file.to_path_buf();
@@ -189,8 +227,9 @@ fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -
         content = content.replace(pattern, replacement);
     }
 
-    let dir = std::env::temp_dir().join("omar-prompts");
+    let dir = prompt_temp_dir();
     std::fs::create_dir_all(&dir).ok();
+    sweep_prompt_temp_dir(&dir);
 
     let stem = prompt_file
         .file_stem()
@@ -232,8 +271,9 @@ fn materialize_combined_prompt(
         short_name, task
     ));
 
-    let dir = std::env::temp_dir().join("omar-prompts");
+    let dir = prompt_temp_dir();
     std::fs::create_dir_all(&dir).ok()?;
+    sweep_prompt_temp_dir(&dir);
 
     let stem = prompt_file
         .file_stem()
