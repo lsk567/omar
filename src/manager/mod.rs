@@ -184,13 +184,17 @@ fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -
 /// `YOUR NAME` / `YOUR TASK` header into a fresh temp file and return the
 /// path. Used for group-2 backends so the entire first user message fits in
 /// one round-trip.
+///
+/// Returns `None` on any I/O failure (unreadable source, failed write) so
+/// the caller can fall back to the two-step flow rather than silently
+/// spawning a worker that will never receive the task header.
 fn materialize_combined_prompt(
     prompt_file: &Path,
     substitutions: &[(&str, &str)],
     short_name: &str,
     task: &str,
-) -> PathBuf {
-    let mut content = std::fs::read_to_string(prompt_file).unwrap_or_default();
+) -> Option<PathBuf> {
+    let mut content = std::fs::read_to_string(prompt_file).ok()?;
     for (pattern, replacement) in substitutions {
         content = content.replace(pattern, replacement);
     }
@@ -200,7 +204,7 @@ fn materialize_combined_prompt(
     ));
 
     let dir = std::env::temp_dir().join("omar-prompts");
-    std::fs::create_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).ok()?;
 
     let stem = prompt_file
         .file_stem()
@@ -212,11 +216,8 @@ fn materialize_combined_prompt(
         .unwrap_or("md");
     let rendered = dir.join(format!("{}-combined-{}.{}", stem, Uuid::new_v4(), ext));
 
-    if std::fs::write(&rendered, &content).is_ok() {
-        rendered
-    } else {
-        prompt_file.to_path_buf()
-    }
+    std::fs::write(&rendered, &content).ok()?;
+    Some(rendered)
 }
 
 /// Command and delivery mode returned by `build_worker_agent_command`.
@@ -310,8 +311,25 @@ pub fn build_worker_agent_command(
             delivery_mode: mode,
         },
         PromptDeliveryMode::InitialUserMessage => {
-            let combined =
-                materialize_combined_prompt(prompt_file, substitutions, short_name, task);
+            let Some(combined) =
+                materialize_combined_prompt(prompt_file, substitutions, short_name, task)
+            else {
+                // Falling back to the legacy two-step flow: render the
+                // agent.md prompt without the task header and tell the
+                // caller to deliver the task via a follow-up
+                // `deliver_prompt`. This preserves correctness (the agent
+                // still gets its task) at the cost of the extra round-trip
+                // this PR is otherwise trying to eliminate.
+                eprintln!(
+                    "warning: failed to materialize combined prompt for {}; \
+                     falling back to two-step delivery",
+                    short_name
+                );
+                return AgentSpawnCommand {
+                    command: build_agent_command(base_command, prompt_file, substitutions),
+                    delivery_mode: PromptDeliveryMode::SystemPrompt,
+                };
+            };
             let path_str = combined.display();
             let shell_expr = format!("$(cat '{}')", path_str);
             let command = match detect_backend(base_command) {
@@ -1184,6 +1202,25 @@ mod tests {
         assert!(combined.contains("You operate in one of two distinct roles"));
         assert!(combined.contains("YOUR NAME: oc-worker"));
         assert!(combined.contains("YOUR TASK: refactor foo.rs"));
+    }
+
+    #[test]
+    fn test_build_worker_agent_command_group2_falls_back_on_materialize_failure() {
+        // If the combined-prompt file can't be written (here: non-existent
+        // source file that can't be read), `build_worker_agent_command` must
+        // fall back to the legacy two-step flow so the task is still
+        // delivered via the follow-up `deliver_prompt`. Silently returning
+        // InitialUserMessage with no task embedded would leave the worker
+        // waiting forever.
+        let missing = Path::new("/nonexistent/does-not-exist.md");
+        let spawn =
+            build_worker_agent_command("opencode", missing, &[("{{TASK}}", "x")], "oc", "x");
+        assert_eq!(spawn.delivery_mode, PromptDeliveryMode::SystemPrompt);
+        assert!(!spawn.delivery_mode.delivers_task_inline());
+        // Command should still be valid opencode syntax (built by the
+        // legacy `build_agent_command` path).
+        assert!(spawn.command.contains("opencode"));
+        assert!(spawn.command.contains("--prompt"));
     }
 
     #[test]
