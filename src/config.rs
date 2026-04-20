@@ -16,10 +16,10 @@ pub struct Config {
     pub agent: AgentConfig,
 
     #[serde(default)]
-    pub watchdog: WatchdogConfig,
+    pub api: ApiConfig,
 
     #[serde(default)]
-    pub metrics: MetricsConfig,
+    pub watchdog: WatchdogConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +72,21 @@ pub struct AgentConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Whether to enable the HTTP API
+    #[serde(default = "default_api_enabled")]
+    pub enabled: bool,
+
+    /// Host to bind to
+    #[serde(default = "default_api_host")]
+    pub host: String,
+
+    /// Port to listen on
+    #[serde(default = "default_api_port")]
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchdogConfig {
     /// Command to run the watchdog agent (empty = watchdog disabled).
     /// Should be an untrusted/free backend — no secrets will be passed.
@@ -86,13 +101,6 @@ pub struct WatchdogConfig {
     /// Slack channel ID for watchdog alerts (empty = no Slack alerts)
     #[serde(default)]
     pub slack_channel: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MetricsConfig {
-    /// Enable global spawn metrics sink at ~/.omar/metrics/spawn_metrics.jsonl
-    #[serde(default)]
-    pub spawn_metrics_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -195,6 +203,18 @@ fn default_auth_failure_patterns() -> Vec<String> {
     ]
 }
 
+fn default_api_enabled() -> bool {
+    true
+}
+
+fn default_api_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_api_port() -> u16 {
+    9876
+}
+
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
@@ -226,6 +246,16 @@ impl Default for AgentConfig {
     }
 }
 
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_api_enabled(),
+            host: default_api_host(),
+            port: default_api_port(),
+        }
+    }
+}
+
 impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
@@ -245,17 +275,12 @@ impl Config {
             .join("config.toml")
     }
 
-    /// Resolve a config path from CLI input, expanding `~/`.
-    pub fn resolve_path(path: Option<&str>) -> PathBuf {
-        match path {
-            Some(p) => expand_tilde(p),
-            None => Self::default_path(),
-        }
-    }
-
     /// Load config from file. Creates default config at ~/.omar/config.toml on first run.
     pub fn load(path: Option<&str>) -> Result<Self> {
-        let expanded_path = Self::resolve_path(path);
+        let expanded_path = match path {
+            Some(p) => expand_tilde(p),
+            None => Self::default_path(),
+        };
 
         if !expanded_path.exists() {
             let config = Self::default();
@@ -332,7 +357,6 @@ mod tests {
         assert!(config.dashboard.sidebar_right);
         assert_eq!(config.health.idle_warning, 15);
         assert_eq!(config.health.idle_critical, 300);
-        assert!(!config.metrics.spawn_metrics_enabled);
     }
 
     #[test]
@@ -494,15 +518,5 @@ default_command = "claude --dangerously-skip-permissions"
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.watchdog.command.is_empty());
         assert!(!config.watchdog.auth_failure_patterns.is_empty());
-    }
-
-    #[test]
-    fn test_parse_metrics_config() {
-        let toml = r#"
-[metrics]
-spawn_metrics_enabled = true
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(config.metrics.spawn_metrics_enabled);
     }
 }

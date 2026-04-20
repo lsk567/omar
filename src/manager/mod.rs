@@ -6,30 +6,13 @@ use anyhow::Result;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::ea::{self, EaId};
 use crate::memory;
-use crate::metrics;
 use crate::tmux::{DeliveryOptions, TmuxClient};
 use protocol::{parse_manager_message, ManagerMessage, ProposedAgent};
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct McpLaunchContext {
-    pub omar_dir: PathBuf,
-    pub ea_id: EaId,
-    pub session_prefix: String,
-    pub default_command: String,
-    pub default_workdir: String,
-    pub health_idle_warning: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct ManagerRuntimeOptions {
-    pub default_workdir: String,
-    pub health_idle_warning: i64,
-}
 
 // Embed prompt files at compile time so they work regardless of CWD.
 const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
@@ -105,18 +88,16 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
         .find_map(detect_backend_token)
 }
 
-fn backend_token(base_command: &str, kind: BackendKind) -> Option<String> {
-    base_command.split_whitespace().find_map(|token| {
-        if detect_backend_token(token) == Some(kind) {
-            Some(
-                token
-                    .trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')'))
-                    .to_string(),
-            )
-        } else {
-            None
+impl BackendKind {
+    fn canonical_name(self) -> &'static str {
+        match self {
+            BackendKind::Claude => "claude",
+            BackendKind::Codex => "codex",
+            BackendKind::Cursor => "cursor",
+            BackendKind::Gemini => "gemini",
+            BackendKind::Opencode => "opencode",
         }
-    })
+    }
 }
 
 fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -> PathBuf {
@@ -149,209 +130,6 @@ fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -
     }
 }
 
-/// MCP state directory for a given EA. Stable per-EA path — avoids leaking
-/// files into world-readable `/tmp` and prevents unbounded growth from
-/// per-spawn UUID filenames.
-fn mcp_ea_dir(context: &McpLaunchContext) -> Option<PathBuf> {
-    let dir = context
-        .omar_dir
-        .join("mcp")
-        .join(format!("ea-{}", context.ea_id));
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
-}
-
-/// Write `bytes` to `path` with mode 0600 on Unix. Caller-readable only,
-/// because these files embed workdirs and the omar binary path which leak
-/// detail about the user's environment to other accounts on shared hosts.
-fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
-}
-
-fn materialize_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
-    let dir = mcp_ea_dir(context)?;
-    let path = dir.join("context.json");
-    let json = serde_json::to_vec(context).ok()?;
-    write_private_file(&path, &json).ok()?;
-    Some(path)
-}
-
-fn materialize_claude_mcp_config(context: &McpLaunchContext) -> Option<PathBuf> {
-    let server_exe = std::env::current_exe().ok()?;
-    let context_file = materialize_mcp_context_file(context)?;
-    let json = serde_json::json!({
-        "mcpServers": {
-            "omar": {
-                "type": "stdio",
-                "command": server_exe,
-                "args": ["mcp-server", "--context-file", context_file],
-            }
-        }
-    });
-
-    let dir = mcp_ea_dir(context)?;
-    let path = dir.join("claude-mcp.json");
-    write_private_file(&path, &serde_json::to_vec(&json).ok()?).ok()?;
-    Some(path)
-}
-
-fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
-    let server_exe = std::env::current_exe().ok()?;
-    let context_file = materialize_mcp_context_file(context)?;
-    let command = serde_json::to_string(&server_exe.display().to_string()).ok()?;
-    let args = serde_json::to_string(&vec![
-        "mcp-server".to_string(),
-        "--context-file".to_string(),
-        context_file.display().to_string(),
-    ])
-    .ok()?;
-    Some(format!(
-        "-c 'mcp_servers.omar.command={}' -c 'mcp_servers.omar.args={}'",
-        command, args
-    ))
-}
-
-fn gemini_mcp_bootstrap(base_command: &str, context: &McpLaunchContext) -> Option<String> {
-    let server_exe = std::env::current_exe().ok()?;
-    let context_file = materialize_mcp_context_file(context)?;
-    let gemini_exec =
-        backend_token(base_command, BackendKind::Gemini).unwrap_or_else(|| "gemini".to_string());
-    let server_exe = server_exe.display().to_string();
-    let context_file = context_file.display().to_string();
-    Some(format!(
-        "({gemini} mcp remove omar >/dev/null 2>&1 || true; \
-         {gemini} mcp add -s user omar '{server}' mcp-server --context-file '{context}' >/dev/null 2>&1 || true)",
-        gemini = gemini_exec,
-        server = server_exe,
-        context = context_file
-    ))
-}
-
-fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
-    let server_exe = std::env::current_exe().ok()?;
-    let context_file = materialize_mcp_context_file(context)?;
-    let config = serde_json::json!({
-        "mcp": {
-            "omar": {
-                "type": "local",
-                "enabled": true,
-                "command": [
-                    server_exe.display().to_string(),
-                    "mcp-server",
-                    "--context-file",
-                    context_file.display().to_string()
-                ]
-            }
-        }
-    });
-    Some(config.to_string())
-}
-
-fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
-    // Cursor only reads MCP servers from `~/.cursor/mcp.json`, so we have to
-    // write there. Scope the key per-EA (`omar-ea-<id>`) so concurrent spawns
-    // across EAs don't clobber each other, preserve every non-omar key the
-    // user already has, and write via tmp+rename so partial writes under
-    // concurrency can't corrupt the file.
-    let server_exe = std::env::current_exe().ok()?;
-    let context_file = materialize_mcp_context_file(context)?;
-    let home = std::env::var("HOME").ok()?;
-    let cursor_dir = PathBuf::from(home).join(".cursor");
-    std::fs::create_dir_all(&cursor_dir).ok()?;
-    let path = cursor_dir.join("mcp.json");
-
-    let mut root = match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-    {
-        Some(v) if v.is_object() => v,
-        _ => serde_json::json!({}),
-    };
-
-    if !root
-        .get("mcpServers")
-        .map(|v| v.is_object())
-        .unwrap_or(false)
-    {
-        root["mcpServers"] = serde_json::json!({});
-    }
-
-    // Remove the legacy plain `omar` key and any stale `omar-ea-*` entries
-    // whose context files no longer exist. Stale entries cause cursor to
-    // fail MCP server startup, which can block loading of the fresh entry.
-    if let Some(servers) = root["mcpServers"].as_object_mut() {
-        let stale_keys: Vec<String> = servers
-            .iter()
-            .filter_map(|(k, v)| {
-                if k == "omar" {
-                    return Some(k.clone());
-                }
-                if k.starts_with("omar-ea-") {
-                    let ctx_path = v
-                        .get("args")
-                        .and_then(|a| a.as_array())
-                        .and_then(|a| a.last())
-                        .and_then(|p| p.as_str())
-                        .map(PathBuf::from);
-                    if let Some(p) = ctx_path {
-                        if !p.exists() {
-                            return Some(k.clone());
-                        }
-                    }
-                }
-                None
-            })
-            .collect();
-        for k in stale_keys {
-            servers.remove(&k);
-        }
-    }
-
-    let key = format!("omar-ea-{}", context.ea_id);
-    root["mcpServers"][&key] = serde_json::json!({
-        "command": server_exe.display().to_string(),
-        "args": ["mcp-server", "--context-file", context_file.display().to_string()],
-        "enabled": true,
-    });
-
-    // Best-effort cleanup of any `mcp.json.omar-*.tmp` leftovers from a
-    // prior crash between write and rename. We own this naming scheme, so
-    // it's safe to sweep on every successful call.
-    if let Ok(entries) = std::fs::read_dir(&cursor_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("mcp.json.omar-") && name.ends_with(".tmp") {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
-
-    let payload = serde_json::to_vec_pretty(&root).ok()?;
-    let tmp = cursor_dir.join(format!("mcp.json.omar-{}.tmp", Uuid::new_v4()));
-    std::fs::write(&tmp, &payload).ok()?;
-    if std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return None;
-    }
-    Some(())
-}
-
 /// Build a CLI command with system prompt loaded from a file via native flag.
 ///
 /// - `prompt_file`: absolute path to the prompt .md file
@@ -368,7 +146,6 @@ pub fn build_agent_command(
     base_command: &str,
     prompt_file: &Path,
     substitutions: &[(&str, &str)],
-    mcp_context: &McpLaunchContext,
 ) -> String {
     let path_str = prompt_file.display();
     let shell_expr = if substitutions.is_empty() {
@@ -382,60 +159,26 @@ pub fn build_agent_command(
         format!("$(sed '{}' '{}')", sed_script, path_str)
     };
 
-    // Per-backend MCP wiring. Each helper returns None only on an IO-level
-    // failure (omar_dir unwritable, current_exe missing, serde error) — in
-    // that case we fall back to launching the agent without MCP so the
-    // session can still come up and the human operator sees the problem
-    // via a degraded but visible agent, rather than a launch failure.
     match detect_backend(base_command) {
-        Some(BackendKind::Claude) => match materialize_claude_mcp_config(mcp_context) {
-            Some(mcp_config) => format!(
-                "{} --system-prompt \"{}\" --mcp-config '{}'",
-                base_command,
-                shell_expr,
-                mcp_config.display()
-            ),
-            None => format!("{} --system-prompt \"{}\"", base_command, shell_expr),
-        },
-        Some(BackendKind::Codex) => {
-            let mut cmd = format!(
-                "{} -c \"developer_instructions='''{}'''\"",
-                base_command, shell_expr
-            );
-            if let Some(overrides) = codex_mcp_overrides(mcp_context) {
-                cmd.push(' ');
-                cmd.push_str(&overrides);
-            }
-            cmd
+        Some(BackendKind::Claude) => {
+            format!("{} --system-prompt \"{}\"", base_command, shell_expr)
         }
+        Some(BackendKind::Codex) => format!(
+            "{} -c \"developer_instructions='''{}'''\"",
+            base_command, shell_expr
+        ),
         Some(BackendKind::Cursor) => {
             let rendered = materialize_prompt_file(prompt_file, substitutions);
-            let _ = ensure_cursor_mcp_config(mcp_context);
             format!(
-                "{} --approve-mcps \"Load the '{}' file and follow the instructions.\"",
+                "{} \"Load the '{}' file and follow the instructions.\"",
                 base_command,
                 rendered.display()
             )
         }
         Some(BackendKind::Gemini) => {
-            let mut cmd = format!(
-                "TERM=xterm-256color {} --allowed-mcp-server-names omar -i \"{}\"",
-                base_command, shell_expr
-            );
-            if let Some(setup) = gemini_mcp_bootstrap(base_command, mcp_context) {
-                cmd = format!("{}; {}", setup, cmd);
-            }
-            cmd
+            format!("TERM=xterm-256color {} -i \"{}\"", base_command, shell_expr)
         }
-        Some(BackendKind::Opencode) => match opencode_config_env(mcp_context) {
-            Some(config) => format!(
-                "OPENCODE_CONFIG_CONTENT='{}' {} --prompt \"{}\"",
-                config.replace('\'', "'\\''"),
-                base_command,
-                shell_expr
-            ),
-            None => format!("{} --prompt \"{}\"", base_command, shell_expr),
-        },
+        Some(BackendKind::Opencode) => format!("{} --prompt \"{}\"", base_command, shell_expr),
         None => base_command.to_string(),
     }
 }
@@ -446,13 +189,7 @@ pub fn build_agent_command(
 /// combined file to `{omar_dir}/ea/{ea_id}/ea_prompt_combined.md` (per-EA scoped,
 /// fixing Gotcha G8), and returns the CLI command with `{{EA_ID}}` and `{{EA_NAME}}`
 /// substituted via sed.
-pub fn build_ea_command(
-    base_command: &str,
-    ea_id: EaId,
-    ea_name: &str,
-    omar_dir: &Path,
-    mcp_context: &McpLaunchContext,
-) -> String {
+pub fn build_ea_command(base_command: &str, ea_id: EaId, ea_name: &str, omar_dir: &Path) -> String {
     let prompt_file = prompts_dir(omar_dir).join("executive-assistant.md");
     let state_dir = ea::ea_state_dir(ea_id, omar_dir);
     let mem = memory::load_memory_from(&state_dir);
@@ -486,7 +223,6 @@ pub fn build_ea_command(
         base_command,
         &combined_path,
         &[("{{EA_ID}}", &ea_id.to_string()), ("{{EA_NAME}}", ea_name)],
-        mcp_context,
     )
 }
 
@@ -498,9 +234,7 @@ pub fn start_manager(
     ea_name: &str,
     omar_dir: &Path,
     base_prefix: &str,
-    options: &ManagerRuntimeOptions,
 ) -> Result<()> {
-    let start = Instant::now();
     let session = ea::ea_manager_session(ea_id, base_prefix);
 
     // Check if manager already exists
@@ -511,20 +245,7 @@ pub fn start_manager(
     }
 
     // Build command with EA system prompt + memory baked in
-    let cmd = build_ea_command(
-        command,
-        ea_id,
-        ea_name,
-        omar_dir,
-        &McpLaunchContext {
-            omar_dir: omar_dir.to_path_buf(),
-            ea_id,
-            session_prefix: base_prefix.to_string(),
-            default_command: command.to_string(),
-            default_workdir: options.default_workdir.clone(),
-            health_idle_warning: options.health_idle_warning,
-        },
-    );
+    let cmd = build_ea_command(command, ea_id, ea_name, omar_dir);
 
     // Create manager session — system prompt set at process start
     println!("Starting manager agent (EA {})...", ea_id);
@@ -536,7 +257,6 @@ pub fn start_manager(
 
     // Give it time to start
     thread::sleep(Duration::from_secs(2));
-    metrics::record_manager_start(ea_id, &session, true, start.elapsed().as_millis() as u64);
 
     // Attach to the session
     println!("Attaching to manager session...");
@@ -553,7 +273,6 @@ pub fn run_manager_orchestration(
     ea_name: &str,
     omar_dir: &Path,
     base_prefix: &str,
-    options: &ManagerRuntimeOptions,
 ) -> Result<()> {
     let session = ea::ea_manager_session(ea_id, base_prefix);
 
@@ -562,15 +281,7 @@ pub fn run_manager_orchestration(
     // Check if manager exists
     if !client.has_session(&session)? {
         println!("No manager session found. Starting one...");
-        start_manager(
-            client,
-            command,
-            ea_id,
-            ea_name,
-            omar_dir,
-            base_prefix,
-            options,
-        )?;
+        start_manager(client, command, ea_id, ea_name, omar_dir, base_prefix)?;
         return Ok(());
     }
 
@@ -774,7 +485,8 @@ fn reject_plan(client: &TmuxClient, session: &str) -> Result<()> {
 }
 
 fn send_to_manager(client: &TmuxClient, session: &str, message: &str) -> Result<()> {
-    client.deliver_prompt(session, message, &DeliveryOptions::default())?;
+    client.send_keys_literal(session, message)?;
+    client.send_keys(session, "Enter")?;
     println!("Sent to manager: {}", message);
     Ok(())
 }
@@ -787,7 +499,8 @@ fn send_to_agent(client: &TmuxClient, agent: &str, message: &str) -> Result<()> 
         return Ok(());
     }
 
-    client.deliver_prompt(&session_name, message, &DeliveryOptions::default())?;
+    client.send_keys_literal(&session_name, message)?;
+    client.send_keys(&session_name, "Enter")?;
     println!("Sent to {}: {}", agent, message);
     Ok(())
 }
@@ -818,14 +531,6 @@ fn spawn_worker(
             ("{{TASK}}", &agent.task),
             ("{{EA_ID}}", &ea_id.to_string()),
         ],
-        &McpLaunchContext {
-            omar_dir: omar_dir.to_path_buf(),
-            ea_id,
-            session_prefix: base_prefix.to_string(),
-            default_command: command.to_string(),
-            default_workdir: ".".to_string(),
-            health_idle_warning: 15,
-        },
     );
 
     // Create worker session — system prompt set at process start
@@ -835,12 +540,47 @@ fn spawn_worker(
         Some(&std::env::current_dir()?.to_string_lossy()),
     )?;
 
-    // Give it time to start
-    thread::sleep(Duration::from_secs(1));
+    // Wait for backend readiness when possible, then deliver an explicit
+    // first task message so workers begin execution deterministically.
+    // If markers succeed, the TUI is proven ready; skip require_initial_change
+    // (a fresh Claude Code banner stays pixel-stable after drawing, so any
+    // extra "wait for a change" would time out).
+    let markers_proved_ready = if let Some(kind) = detect_backend(command) {
+        let markers = crate::tmux::backend_readiness_markers(kind.canonical_name());
+        if markers.is_empty() {
+            false
+        } else {
+            let detected = client.wait_for_markers(
+                &session_name,
+                markers,
+                Duration::from_secs(60),
+                Duration::from_millis(250),
+            );
+            if !detected {
+                println!(
+                    "  {} - readiness markers timed out; attempting delivery anyway",
+                    agent.name
+                );
+            }
+            detected
+        }
+    } else {
+        false
+    };
 
-    // Deliver initial task context so agent.md's "Task Header" section is satisfied
-    let first_message = format!("YOUR NAME: {}\nYOUR TASK: {}", agent.name, agent.task);
-    let _ = client.deliver_prompt(&session_name, &first_message, &DeliveryOptions::default());
+    let initial_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", agent.name, agent.task);
+    let opts = DeliveryOptions {
+        startup_timeout: Duration::from_secs(45),
+        stable_quiet: Duration::from_millis(800),
+        verify_timeout: Duration::from_secs(6),
+        max_retries: 4,
+        poll_interval: Duration::from_millis(120),
+        retry_delay: Duration::from_millis(250),
+        require_initial_change: !markers_proved_ready,
+    };
+    client
+        .deliver_prompt(&session_name, &initial_msg, &opts)
+        .map_err(|e| anyhow::anyhow!("failed to deliver initial task to {}: {}", agent.name, e))?;
 
     // Persist worker task description to EA-scoped state dir
     let state_dir = ea::ea_state_dir(ea_id, omar_dir);
@@ -860,142 +600,138 @@ fn spawn_worker(
 mod tests {
     use super::*;
 
-    /// A minimal MCP context scoped to a caller-supplied temp dir. Tests that
-    /// exercise only command-string shape (no filesystem assertions) can pass
-    /// any path — the per-backend materializers return `None` silently on IO
-    /// failure, which is part of what we're asserting on. Tests that also
-    /// need the context files on disk must use a real `tempfile::tempdir()`.
-    fn test_mcp_context(omar_dir: &Path) -> McpLaunchContext {
-        McpLaunchContext {
-            omar_dir: omar_dir.to_path_buf(),
-            ea_id: 0,
-            session_prefix: "omar-agent-".to_string(),
-            default_command: "claude".to_string(),
-            default_workdir: ".".to_string(),
-            health_idle_warning: 15,
-        }
-    }
-
     #[test]
     fn test_build_agent_command_claude() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd = build_agent_command(
-            "claude --some-flag",
-            Path::new("/tmp/prompts/ea.md"),
-            &[],
-            &test_mcp_context(dir.path()),
+        let cmd = build_agent_command("claude --some-flag", Path::new("/tmp/prompts/ea.md"), &[]);
+        assert_eq!(
+            cmd,
+            "claude --some-flag --system-prompt \"$(cat '/tmp/prompts/ea.md')\""
         );
-        assert!(
-            cmd.starts_with("claude --some-flag --system-prompt \"$(cat '/tmp/prompts/ea.md')\""),
-            "unexpected claude command: {cmd}"
-        );
-        assert!(cmd.contains("--mcp-config"));
-    }
-
-    #[test]
-    fn test_build_agent_command_codex() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd = build_agent_command(
-            "codex --no-alt-screen",
-            Path::new("/tmp/prompts/ea.md"),
-            &[],
-            &test_mcp_context(dir.path()),
-        );
-        assert!(cmd.starts_with(
-            "codex --no-alt-screen -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
-        ));
-        assert!(cmd.contains("mcp_servers.omar.command"));
-        assert!(cmd.contains("mcp_servers.omar.args"));
-    }
-
-    #[test]
-    fn test_build_agent_command_cursor() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd = build_agent_command(
-            "cursor agent --yolo",
-            Path::new("/tmp/prompts/ea.md"),
-            &[],
-            &test_mcp_context(dir.path()),
-        );
-        assert!(cmd.contains("cursor agent --yolo --approve-mcps"));
-        assert!(cmd.contains("Load the '/tmp/"));
-    }
-
-    #[test]
-    fn test_build_agent_command_gemini() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd = build_agent_command(
-            "gemini --yolo",
-            Path::new("/tmp/prompts/ea.md"),
-            &[],
-            &test_mcp_context(dir.path()),
-        );
-        assert!(cmd.contains("gemini mcp remove omar"));
-        assert!(cmd.contains("gemini mcp add -s user omar"));
-        assert!(cmd.contains("mcp-server --context-file"));
-        assert!(cmd.contains(
-            "TERM=xterm-256color gemini --yolo --allowed-mcp-server-names omar -i \"$(cat '/tmp/prompts/ea.md')\""
-        ));
     }
 
     #[test]
     fn test_build_agent_command_opencode() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd = build_agent_command(
-            "opencode",
-            Path::new("/tmp/prompts/pm.md"),
-            &[],
-            &test_mcp_context(dir.path()),
-        );
-        assert!(cmd.contains("OPENCODE_CONFIG_CONTENT="));
-        assert!(cmd.contains("\"mcp\""));
-        assert!(cmd.contains("\"omar\""));
-        assert!(cmd.contains("--prompt \"$(cat '/tmp/prompts/pm.md')\""));
+        let cmd = build_agent_command("opencode", Path::new("/tmp/prompts/pm.md"), &[]);
+        assert_eq!(cmd, "opencode --prompt \"$(cat '/tmp/prompts/pm.md')\"");
     }
 
     #[test]
-    fn test_build_agent_command_env_wrapper_preserved() {
-        // Backend detection must look past shell-env prefixes like
-        // `env FOO=bar <backend>` so per-backend flags still get added.
-        let dir = tempfile::tempdir().unwrap();
+    fn test_build_agent_command_codex() {
         let cmd = build_agent_command(
-            "env ANTHROPIC_API_KEY=test claude --yolo",
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
             Path::new("/tmp/prompts/ea.md"),
             &[],
-            &test_mcp_context(dir.path()),
         );
-        assert!(cmd.starts_with("env ANTHROPIC_API_KEY=test claude --yolo --system-prompt"));
+        assert_eq!(
+            cmd,
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_claude() {
+        let cmd = build_agent_command(
+            "env ANTHROPIC_API_KEY=test claude --some-flag",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "env ANTHROPIC_API_KEY=test claude --some-flag --system-prompt \"$(cat '/tmp/prompts/ea.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_opencode() {
+        let cmd = build_agent_command(
+            "npx opencode --model local",
+            Path::new("/tmp/prompts/pm.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "npx opencode --model local --prompt \"$(cat '/tmp/prompts/pm.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_codex() {
+        let cmd = build_agent_command(
+            "env OPENAI_API_KEY=test codex --no-alt-screen",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "env OPENAI_API_KEY=test codex --no-alt-screen -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_cursor() {
+        let cmd = build_agent_command("cursor agent --yolo", Path::new("/tmp/prompts/ea.md"), &[]);
+        assert_eq!(
+            cmd,
+            "cursor agent --yolo \"Load the '/tmp/prompts/ea.md' file and follow the instructions.\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_gemini() {
+        let cmd = build_agent_command("gemini --yolo", Path::new("/tmp/prompts/ea.md"), &[]);
+        assert_eq!(
+            cmd,
+            "TERM=xterm-256color gemini --yolo -i \"$(cat '/tmp/prompts/ea.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_gemini() {
+        let cmd = build_agent_command(
+            "env FOO=bar gemini --yolo",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "TERM=xterm-256color env FOO=bar gemini --yolo -i \"$(cat '/tmp/prompts/ea.md')\""
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_wrapped_cursor() {
+        let cmd = build_agent_command(
+            "env FOO=bar cursor agent --yolo",
+            Path::new("/tmp/prompts/ea.md"),
+            &[],
+        );
+        assert_eq!(
+            cmd,
+            "env FOO=bar cursor agent --yolo \"Load the '/tmp/prompts/ea.md' file and follow the instructions.\""
+        );
     }
 
     #[test]
     fn test_build_agent_command_unknown_backend() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd = build_agent_command(
-            "vim",
-            Path::new("/tmp/prompts/ea.md"),
-            &[],
-            &test_mcp_context(dir.path()),
-        );
+        let cmd = build_agent_command("vim", Path::new("/tmp/prompts/ea.md"), &[]);
         assert_eq!(cmd, "vim");
     }
 
     #[test]
     fn test_build_agent_command_with_substitutions() {
-        let dir = tempfile::tempdir().unwrap();
         let cmd = build_agent_command(
             "claude",
             Path::new("/prompts/worker.md"),
             &[("{{PARENT_NAME}}", "pm-api"), ("{{TASK}}", "build it")],
-            &test_mcp_context(dir.path()),
         );
-        assert!(cmd.contains("s|{{PARENT_NAME}}|pm-api|g"));
-        assert!(cmd.contains("s|{{TASK}}|build it|g"));
-        assert!(cmd.contains("'/prompts/worker.md'"));
+        assert_eq!(
+            cmd,
+            "claude --system-prompt \"$(sed 's|{{PARENT_NAME}}|pm-api|g; s|{{TASK}}|build it|g' '/prompts/worker.md')\""
+        );
     }
 
     #[test]
     fn test_build_agent_command_with_ea_id() {
-        let dir = tempfile::tempdir().unwrap();
         let cmd = build_agent_command(
             "claude",
             Path::new("/prompts/agent.md"),
@@ -1004,7 +740,6 @@ mod tests {
                 ("{{TASK}}", "do stuff"),
                 ("{{EA_ID}}", "2"),
             ],
-            &test_mcp_context(dir.path()),
         );
         assert!(cmd.contains("s|{{EA_ID}}|2|g"));
     }
@@ -1033,13 +768,7 @@ mod tests {
         let state_dir = ea::ea_state_dir(0, omar_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        let cmd = build_ea_command(
-            "claude",
-            0,
-            "Default",
-            omar_dir,
-            &test_mcp_context(omar_dir),
-        );
+        let cmd = build_ea_command("claude", 0, "Default", omar_dir);
         assert!(cmd.contains("s|{{EA_ID}}|0|g"));
         assert!(cmd.contains("s|{{EA_NAME}}|Default|g"));
     }
@@ -1052,20 +781,7 @@ mod tests {
         let state_dir = ea::ea_state_dir(1, omar_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        build_ea_command(
-            "claude",
-            1,
-            "Research",
-            omar_dir,
-            &McpLaunchContext {
-                omar_dir: omar_dir.to_path_buf(),
-                ea_id: 1,
-                session_prefix: "omar-agent-".to_string(),
-                default_command: "claude".to_string(),
-                default_workdir: ".".to_string(),
-                health_idle_warning: 15,
-            },
-        );
+        build_ea_command("claude", 1, "Research", omar_dir);
 
         // Combined prompt should be in EA-scoped directory, not global
         let combined = state_dir.join("ea_prompt_combined.md");
@@ -1083,13 +799,7 @@ mod tests {
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::write(state_dir.join("memory.md"), "# Saved state\nSome memory").unwrap();
 
-        build_ea_command(
-            "claude",
-            0,
-            "Default",
-            omar_dir,
-            &test_mcp_context(omar_dir),
-        );
+        build_ea_command("claude", 0, "Default", omar_dir);
 
         let combined = state_dir.join("ea_prompt_combined.md");
         let content = std::fs::read_to_string(&combined).unwrap();

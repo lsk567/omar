@@ -1,15 +1,13 @@
+mod api;
 mod app;
 mod computer;
 mod config;
 mod ea;
 mod event;
 mod manager;
-mod mcp;
 mod memory;
-mod metrics;
 mod projects;
 mod scheduler;
-mod tasks;
 mod tmux;
 mod ui;
 
@@ -59,10 +57,6 @@ struct Cli {
     /// EA to target by id or name [default: active EA]
     #[arg(long, global = true)]
     ea: Option<String>,
-
-    /// Enable global spawn metrics logging sink
-    #[arg(long, global = true)]
-    spawn_metrics: bool,
 }
 
 #[derive(Subcommand)]
@@ -104,22 +98,6 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ManagerAction>,
     },
-
-    /// Manage scheduled events for the target EA
-    Event {
-        #[command(subcommand)]
-        action: EventAction,
-    },
-
-    /// Start the OMAR MCP server over stdio
-    McpServer {
-        /// Path to a serialized MCP server context JSON file. When omitted,
-        /// the server builds a default context from the current config and
-        /// active EA — used by peer processes (e.g. the Slack bridge) that
-        /// aren't spawned by a specific backend launch.
-        #[arg(long)]
-        context_file: Option<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -130,53 +108,6 @@ enum ManagerAction {
     Orchestrate,
 }
 
-#[derive(Subcommand)]
-enum EventAction {
-    /// Schedule an event for an agent or the EA
-    Schedule {
-        /// Receiver name ("ea" for the manager)
-        #[arg(long)]
-        receiver: String,
-
-        /// Event payload text
-        #[arg(long)]
-        payload: String,
-
-        /// Sender label shown in the delivered message
-        #[arg(long)]
-        sender: Option<String>,
-
-        /// Absolute trigger timestamp in nanoseconds since epoch
-        #[arg(long)]
-        at_ns: Option<u64>,
-
-        /// Relative delay in seconds from now
-        #[arg(long)]
-        in_seconds: Option<u64>,
-
-        /// Relative delay in nanoseconds from now
-        #[arg(long)]
-        in_ns: Option<u64>,
-
-        /// Recurrence interval in seconds
-        #[arg(long)]
-        every_seconds: Option<u64>,
-
-        /// Recurrence interval in nanoseconds
-        #[arg(long)]
-        every_ns: Option<u64>,
-    },
-
-    /// List scheduled events for the target EA
-    List,
-
-    /// Cancel a scheduled event by id
-    Cancel {
-        /// Event id
-        id: String,
-    },
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -185,11 +116,6 @@ async fn main() -> Result<()> {
         config.agent.default_command =
             config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
     }
-    if cli.spawn_metrics {
-        config.metrics.spawn_metrics_enabled = true;
-        config.save();
-    }
-    metrics::configure(config.metrics.spawn_metrics_enabled);
     let omar_dir = omar_dir();
 
     if let Some(ref selector) = cli.ea {
@@ -221,12 +147,7 @@ async fn main() -> Result<()> {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
             let client =
                 TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
-            kill_agent(
-                &client,
-                &name,
-                &scheduler::Scheduler::with_store(scheduler::events_store_path(&omar_dir)),
-                target.id,
-            )
+            kill_agent(&client, &name)
         }
         Some(Commands::SetupTmux) => setup_tmux(),
         Some(Commands::Manager { action }) => {
@@ -241,10 +162,6 @@ async fn main() -> Result<()> {
                     &target.name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
-                    &manager::ManagerRuntimeOptions {
-                        default_workdir: config.agent.default_workdir.clone(),
-                        health_idle_warning: config.health.idle_warning,
-                    },
                 ),
                 Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(
                     &client,
@@ -253,47 +170,9 @@ async fn main() -> Result<()> {
                     &target.name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
-                    &manager::ManagerRuntimeOptions {
-                        default_workdir: config.agent.default_workdir.clone(),
-                        health_idle_warning: config.health.idle_warning,
-                    },
                 ),
             }
         }
-        Some(Commands::Event { action }) => {
-            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
-            let scheduler =
-                scheduler::Scheduler::with_store(scheduler::events_store_path(&omar_dir));
-            match action {
-                EventAction::Schedule {
-                    receiver,
-                    payload,
-                    sender,
-                    at_ns,
-                    in_seconds,
-                    in_ns,
-                    every_seconds,
-                    every_ns,
-                } => schedule_cli_event(
-                    &scheduler,
-                    target.id,
-                    receiver,
-                    payload,
-                    sender,
-                    at_ns,
-                    in_seconds,
-                    in_ns,
-                    every_seconds,
-                    every_ns,
-                ),
-                EventAction::List => list_cli_events(&scheduler, target.id),
-                EventAction::Cancel { id } => cancel_cli_event(&scheduler, target.id, &id),
-            }
-        }
-        Some(Commands::McpServer { context_file }) => match context_file {
-            Some(path) => mcp::run_server_from_context_file(PathBuf::from(path)),
-            None => mcp::run_server_with_default_context(),
-        },
         None => {
             if std::env::var("TMUX").is_err() {
                 relaunch_in_tmux()
@@ -409,12 +288,7 @@ fn spawn_agent(
     Ok(())
 }
 
-fn kill_agent(
-    client: &TmuxClient,
-    name: &str,
-    scheduler: &scheduler::Scheduler,
-    ea_id: ea::EaId,
-) -> Result<()> {
+fn kill_agent(client: &TmuxClient, name: &str) -> Result<()> {
     let full_name = format!("{}{}", client.prefix(), name);
 
     if !client.has_session(&full_name)? {
@@ -422,93 +296,8 @@ fn kill_agent(
     }
 
     client.kill_session(&full_name)?;
-    let _ = scheduler.cancel_by_receiver_and_ea(name, ea_id);
     println!("Killed agent: {}", name);
     Ok(())
-}
-
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_nanos() as u64
-}
-
-#[allow(clippy::too_many_arguments)]
-fn schedule_cli_event(
-    scheduler: &scheduler::Scheduler,
-    ea_id: ea::EaId,
-    receiver: String,
-    payload: String,
-    sender: Option<String>,
-    at_ns: Option<u64>,
-    in_seconds: Option<u64>,
-    in_ns: Option<u64>,
-    every_seconds: Option<u64>,
-    every_ns: Option<u64>,
-) -> Result<()> {
-    let base = now_ns();
-    let delay_ns = scheduler::combine_seconds_and_ns(in_seconds, in_ns).unwrap_or(0);
-    let timestamp = at_ns.unwrap_or_else(|| base.saturating_add(delay_ns));
-    let recurring_ns = scheduler::combine_seconds_and_ns(every_seconds, every_ns);
-
-    let event = scheduler::ScheduledEvent {
-        id: uuid::Uuid::new_v4().to_string(),
-        sender: sender.unwrap_or_else(|| "ea".to_string()),
-        receiver,
-        timestamp,
-        payload,
-        created_at: base,
-        recurring_ns,
-        ea_id,
-    };
-    scheduler.insert(event.clone());
-    println!(
-        "Scheduled event: {} -> {} at {}",
-        event.sender, event.receiver, event.timestamp
-    );
-    println!("Event id: {}", event.id);
-    Ok(())
-}
-
-fn list_cli_events(scheduler: &scheduler::Scheduler, ea_id: ea::EaId) -> Result<()> {
-    let mut events = scheduler.list_by_ea(ea_id);
-    if events.is_empty() {
-        println!("No scheduled events found for EA {}", ea_id);
-        return Ok(());
-    }
-    events.sort_by_key(|event| (event.timestamp, event.created_at));
-    println!(
-        "{:<36} {:<14} {:<14} {:<18} {:<12} PAYLOAD",
-        "ID", "SENDER", "RECEIVER", "TIMESTAMP_NS", "RECURRING"
-    );
-    println!("{}", "-".repeat(120));
-    for event in events {
-        let recurring = event
-            .recurring_ns
-            .map(|ns| ns.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{:<36} {:<14} {:<14} {:<18} {:<12} {}",
-            event.id, event.sender, event.receiver, event.timestamp, recurring, event.payload
-        );
-    }
-    Ok(())
-}
-
-fn cancel_cli_event(
-    scheduler: &scheduler::Scheduler,
-    ea_id: ea::EaId,
-    event_id: &str,
-) -> Result<()> {
-    match scheduler.cancel_if_ea(event_id, ea_id) {
-        Ok(event) => {
-            println!("Cancelled event: {}", event.id);
-            Ok(())
-        }
-        Err(true) => anyhow::bail!("Event '{}' belongs to a different EA", event_id),
-        Err(false) => anyhow::bail!("Event '{}' not found", event_id),
-    }
 }
 
 /// Re-launch omar inside a tmux session.
@@ -838,22 +627,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
         std::env::remove_var("NO_COLOR");
     }
 
-    // Best-effort cleanup of pre-0.3 MCP context files left behind in
-    // `/tmp/omar-mcp/`. Current builds write to `~/.omar/mcp/ea-<id>/`.
-    // Runs only from the dashboard entry point; `omar mcp-server` is
-    // spawned by live backends and must not touch their context files.
-    let legacy_tmp = std::env::temp_dir().join("omar-mcp");
-    if legacy_tmp.is_dir() {
-        let _ = std::fs::remove_dir_all(&legacy_tmp);
-    }
-
     // Create the ticker buffer and scheduler, then spawn the event loop
     let ticker = scheduler::TickerBuffer::new();
     let app_ticker = ticker.clone();
-    let omar_dir = omar_dir();
-    let scheduler = Arc::new(scheduler::Scheduler::with_store(
-        scheduler::events_store_path(&omar_dir),
-    ));
+    let scheduler = Arc::new(scheduler::Scheduler::new());
     let popup_receiver = scheduler::new_popup_receiver();
     let base_prefix = config.dashboard.session_prefix.clone();
     tokio::spawn(scheduler::run_event_loop(
@@ -863,12 +640,36 @@ async fn run_dashboard(config: Config) -> Result<()> {
         base_prefix,
     ));
 
-    // Create SINGLE shared App instance for the dashboard/runtime state.
+    // Create SINGLE shared App instance (fixes V1: Two-App Problem / BUG-C2).
+    // Both the API server and dashboard operate on the same App via Arc<Mutex<App>>.
     let shared_app = Arc::new(Mutex::new(App::new(
         &config,
         ticker.clone(),
         scheduler.clone(),
     )));
+
+    // Start API server if enabled
+    if config.api.enabled {
+        let api_config = config.api.clone();
+        let (base_prefix, omar_dir) = {
+            let app_guard = shared_app.lock().await;
+            (app_guard.base_prefix.clone(), app_guard.omar_dir.clone())
+        };
+        let api_state = Arc::new(api::handlers::ApiState {
+            app: shared_app.clone(), // Same Arc — single source of truth
+            scheduler: scheduler.clone(),
+            computer_lock: computer::new_lock(),
+            base_prefix,
+            omar_dir,
+            health_idle_warning: config.health.idle_warning,
+            spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
+        });
+        tokio::spawn(async move {
+            if let Err(e) = api::start_server(api_state, &api_config).await {
+                eprintln!("API server error: {}", e);
+            }
+        });
+    }
 
     // Spawn Slack bridge if configured
     let mut slack_bridge = spawn_slack_bridge();
