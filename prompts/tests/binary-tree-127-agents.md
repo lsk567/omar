@@ -4,33 +4,30 @@
 
 ## Structure
 
-- Perfect binary tree, 7 levels deep
-- 127 total agents (nodes 1-127, heap-numbered)
-- Naming: `t-{node}` (e.g., `t-1`, `t-2`, `t-3`, ..., `t-127`)
-- Heap numbering: left child = `2*n`, right child = `2*n+1`
-- Leaf nodes: level 7, nodes 64-127 (64 leaves)
-- Internal nodes: nodes 1-63 (63 internal)
+- Perfect binary tree, 7 levels deep.
+- 127 total agents (nodes 1-127, heap-numbered).
+- Naming: `t-{node}` (e.g., `t-1`, `t-2`, ..., `t-127`).
+- Heap numbering: left child = `2*n`, right child = `2*n+1`.
+- Leaf nodes: level 7, nodes 64-127 (64 leaves).
+- Internal nodes: nodes 1-63 (63 internal).
 
 ## How to Run
 
-EA spawns only the root agent `t-1`:
+EA spawns only the root `t-1` via `spawn_agent_session`:
 
-```bash
-# Replace {{EA_ID}} with the target EA id (e.g. 0 for the default EA).
-curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "t-1",
-    "task": "<paste the root agent task template below>",
-    "parent": "ea"
-  }'
+```
+spawn_agent_session({
+  "name": "t-1",
+  "task": "<paste the root agent task below>",
+  "parent": "ea"
+})
 ```
 
-The root agent recursively spawns the entire tree. EA only needs to monitor `t-1` for `[TASK COMPLETE]`.
+The root recursively spawns the whole tree. EA only monitors `t-1` for `[TASK COMPLETE]`.
 
-## Root Agent Task Template
+## Root Agent Task
 
-Give this task to `t-1`. The protocol is recursive — each internal node passes it (with updated parameters) to its children.
+Give this to `t-1`. Each internal node passes the same protocol to its children with updated node/level.
 
 ```
 You are node 1 (level 1) in a binary tree experiment with 7 levels and 127 total nodes.
@@ -39,73 +36,65 @@ You are node 1 (level 1) in a binary tree experiment with 7 levels and 127 total
 
 Your node number is 1. Your level is 1. The max level is 7.
 
-### If you are a LEAF node (level == 7):
-Output [TASK COMPLETE] immediately.
+### If you are a LEAF node (level == 7)
+Output [TASK COMPLETE], then immediately call:
+  notify_parent({"name": "t-YOUR_NODE", "summary": "Leaf t-YOUR_NODE complete."})
 
-### If you are an INTERNAL node (level < 7):
+### If you are an INTERNAL node (level < 7)
 
 1. Calculate your children:
-   - Left child: node 2, level 2
-   - Right child: node 3, level 2
+   - Left  child: node 2*YOUR_NODE, level YOUR_LEVEL+1
+   - Right child: node 2*YOUR_NODE+1, level YOUR_LEVEL+1
 
-2. Spawn both children using the OMAR API:
+2. Spawn each child with the OMAR `spawn_agent_session` MCP tool, passing the same
+   protocol (updated node/level) and `parent` set to your own name:
 
-   For each child (left and right), POST to spawn with the SAME protocol but updated node/level:
+     spawn_agent_session({
+       "name": "t-<CHILD_NODE>",
+       "task": "<this same protocol with CHILD_NODE and CHILD_LEVEL>",
+       "parent": "t-<YOUR_NODE>"
+     })
 
-   ```bash
-   curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/agents \
-     -H "Content-Type: application/json" \
-     -d '{
-       "name": "t-{CHILD_NODE}",
-       "task": "You are node {CHILD_NODE} (level {CHILD_LEVEL}) in a binary tree experiment with 7 levels and 127 total nodes.\n\n## Protocol\n\nYour node number is {CHILD_NODE}. Your level is {CHILD_LEVEL}. The max level is 7.\n\n### If you are a LEAF node (level == 7):\nOutput [TASK COMPLETE] immediately.\n\n### If you are an INTERNAL node (level < 7):\n\n1. Calculate your children:\n   - Left child: node {CHILD_NODE*2}, level {CHILD_LEVEL+1}\n   - Right child: node {CHILD_NODE*2+1}, level {CHILD_LEVEL+1}\n\n2. Spawn both children using the OMAR API (same protocol, updated node/level).\n\n3. Poll both children by checking their output:\n   ```\n   curl http://localhost:9876/api/ea/{{EA_ID}}/agents/t-{CHILD_NODE}\n   ```\n   Schedule wake-up events to check on children rather than using sleep loops.\n\n4. When BOTH children have reported [TASK COMPLETE] in their output:\n   a. Kill left child: curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/t-{LEFT}\n   b. Kill right child: curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/t-{RIGHT}\n   c. Output [TASK COMPLETE]\n\nIMPORTANT: Do NOT output [TASK COMPLETE] until both children are confirmed complete AND killed.",
-       "parent": "t-{YOUR_NODE}"
-     }'
-   ```
+3. Wait for both children to call notify_parent — you will receive two
+   `[CHILD COMPLETE]` messages. If a child hasn't reported after a reasonable
+   time, use `get_agent({"name": "t-<CHILD_NODE>"})` to check its output_tail.
+   Use `schedule_event` (sender/receiver both your own name) for timed fallback
+   checks instead of busy loops.
 
-3. Poll both children by checking their output:
-   ```bash
-   curl http://localhost:9876/api/ea/{{EA_ID}}/agents/t-{CHILD_NODE}
-   ```
-   Schedule wake-up events to check on children rather than using sleep loops:
-   ```bash
-   NOW=$(python3 -c "import time; print(int(time.time() * 1e9) + 15_000_000_000)")
-   curl -X POST http://localhost:9876/api/ea/{{EA_ID}}/events \
-     -H "Content-Type: application/json" \
-     -d "{\"sender\": \"t-1\", \"receiver\": \"t-1\", \"timestamp\": $NOW, \"payload\": \"Check children progress\"}"
-   ```
-
-4. When BOTH children have reported [TASK COMPLETE] in their output:
-   a. Kill left child: `curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/t-2`
-   b. Kill right child: `curl -X DELETE http://localhost:9876/api/ea/{{EA_ID}}/agents/t-3`
+4. When BOTH children have reported [CHILD COMPLETE]:
+   a. kill_agent({"name": "t-<LEFT_CHILD>"})
+   b. kill_agent({"name": "t-<RIGHT_CHILD>"})
    c. Output [TASK COMPLETE]
+   d. Call notify_parent({"name": "t-YOUR_NODE", "summary": "Subtree rooted at t-YOUR_NODE complete. Both children killed."})
 
-IMPORTANT: Do NOT output [TASK COMPLETE] until both children are confirmed complete AND killed.
+IMPORTANT: Do NOT output [TASK COMPLETE] until both children are confirmed
+complete AND killed.
 ```
 
 ## Expected Behavior
 
-1. EA spawns `t-1`
-2. `t-1` spawns `t-2` and `t-3`
-3. Recursion continues until all 64 leaf nodes (level 7) exist
-4. Leaves immediately report `[TASK COMPLETE]`
-5. Parents detect both children complete, kill them, report `[TASK COMPLETE]`
-6. Cascade continues up to `t-1`
-7. `t-1` reports `[TASK COMPLETE]` to EA
+1. EA spawns `t-1`.
+2. `t-1` spawns `t-2` and `t-3`.
+3. Recursion continues until all 64 leaf nodes (level 7) exist.
+4. Leaves immediately report `[TASK COMPLETE]`.
+5. Parents detect both children complete, kill them, report `[TASK COMPLETE]`.
+6. Cascade continues up to `t-1`.
+7. `t-1` reports `[TASK COMPLETE]` to EA.
 
 ## Success Criteria
 
-- Root `t-1` eventually reports `[TASK COMPLETE]`
-- Tree self-terminates from leaves to root
-- All 127 agents are cleaned up (no stragglers on dashboard)
+- Root `t-1` eventually reports `[TASK COMPLETE]`.
+- Tree self-terminates from leaves to root.
+- All 127 agents are cleaned up (no stragglers).
 
 ## Previous Result
 
-- **Duration:** ~4 minutes total
-- **Self-cleanup rate:** 89% (113/127 agents self-terminated)
-- **Stragglers:** 14/127 needed manual cleanup by EA
-- **Root cause of stragglers:** Some parent agents exit before confirming child kill requests completed, leaving orphaned children
+- **Duration:** ~4 minutes total.
+- **Self-cleanup rate:** 89% (113/127 agents self-terminated).
+- **Stragglers:** 14/127 needed manual cleanup by EA.
+- **Root cause:** Some parents exit before confirming child `kill_agent` calls completed, leaving orphans.
 
 ## Known Issues
 
-- **Straggler problem:** Parents sometimes output `[TASK COMPLETE]` and exit before the DELETE requests for their children are confirmed. This leaves orphaned agents. Mitigation: EA should run a cleanup sweep after `t-1` completes, killing any remaining `t-*` agents.
-- **Polling overhead:** Deep trees create many concurrent polling loops. Using OMAR events API (wake-ups) instead of sleep loops is critical to avoid resource waste.
+- **Straggler problem:** Parents sometimes output `[TASK COMPLETE]` and exit before kills for their children are confirmed. Mitigation: EA should sweep remaining `t-*` agents after `t-1` reports complete, via `list_agents` + `kill_agent`.
+- **Polling overhead:** Deep trees create many concurrent polling loops. Use `schedule_event` wake-ups rather than sleep loops to avoid resource waste.
