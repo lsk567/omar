@@ -3,8 +3,6 @@ pub mod event;
 pub use event::ScheduledEvent;
 
 use std::collections::{BinaryHeap, VecDeque};
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -76,190 +74,21 @@ fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
-/// Combine an optional `seconds` and optional `extra_ns` duration into a
-/// single nanosecond count, saturating on overflow. Returns `None` only
-/// when both inputs are absent — callers that want a default (e.g. "no
-/// delay means 0") should `.unwrap_or(0)`. Shared between the CLI and
-/// MCP event-scheduling paths so the arithmetic has one definition.
-pub fn combine_seconds_and_ns(seconds: Option<u64>, extra_ns: Option<u64>) -> Option<u64> {
-    match (seconds, extra_ns) {
-        (Some(s), Some(n)) => Some(s.saturating_mul(1_000_000_000).saturating_add(n)),
-        (Some(s), None) => Some(s.saturating_mul(1_000_000_000)),
-        (None, Some(n)) => Some(n),
-        (None, None) => None,
-    }
-}
-
 pub struct Scheduler {
     queue: Mutex<BinaryHeap<ScheduledEvent>>,
     notify: Notify,
-    store_path: Option<PathBuf>,
-}
-
-struct StoreLock {
-    path: PathBuf,
-}
-
-impl StoreLock {
-    fn acquire(path: PathBuf) -> std::io::Result<Self> {
-        for _ in 0..500 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("Timed out waiting for scheduler lock {:?}", path),
-        ))
-    }
-}
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-pub fn events_store_path(omar_dir: &Path) -> PathBuf {
-    omar_dir.join("scheduled_events.json")
-}
-
-fn store_lock_path(store_path: &Path) -> PathBuf {
-    store_path.with_extension("lock")
-}
-
-fn load_events_from_store(store_path: &Path) -> Vec<ScheduledEvent> {
-    fs::read_to_string(store_path)
-        .ok()
-        .and_then(|content| serde_json::from_str(&content).ok())
-        .unwrap_or_default()
-}
-
-fn save_events_to_store(store_path: &Path, queue: &BinaryHeap<ScheduledEvent>) {
-    let mut events: Vec<ScheduledEvent> = queue.iter().cloned().collect();
-    events.sort_by_key(|event| (event.timestamp, event.created_at));
-    if let Some(parent) = store_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let tmp = store_path.with_extension("tmp");
-    if let Ok(content) = serde_json::to_string_pretty(&events) {
-        if fs::write(&tmp, content).is_ok() {
-            let _ = fs::rename(&tmp, store_path);
-        } else {
-            let _ = fs::remove_file(&tmp);
-        }
-    }
 }
 
 impl Scheduler {
-    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(BinaryHeap::new()),
             notify: Notify::new(),
-            store_path: None,
-        }
-    }
-
-    pub fn with_store(store_path: PathBuf) -> Self {
-        let mut queue = BinaryHeap::new();
-        for event in load_events_from_store(&store_path) {
-            queue.push(event);
-        }
-        Self {
-            queue: Mutex::new(queue),
-            notify: Notify::new(),
-            store_path: Some(store_path),
-        }
-    }
-
-    pub fn is_persistent(&self) -> bool {
-        self.store_path.is_some()
-    }
-
-    pub fn sync_from_store(&self) {
-        let Some(store_path) = self.store_path.as_ref() else {
-            return;
-        };
-        let Ok(_store_lock) = StoreLock::acquire(store_lock_path(store_path)) else {
-            return;
-        };
-        let mut queue = BinaryHeap::new();
-        for event in load_events_from_store(store_path) {
-            queue.push(event);
-        }
-        *self.queue.lock().unwrap() = queue;
-    }
-
-    fn with_queue<R>(
-        &self,
-        persist: bool,
-        f: impl FnOnce(&mut BinaryHeap<ScheduledEvent>) -> R,
-    ) -> R {
-        match &self.store_path {
-            Some(store_path) => {
-                // If the on-disk lock can't be acquired (stuck peer, slow FS),
-                // degrade to an in-memory operation rather than panicking the
-                // caller — the event loop or any other thread holding a live
-                // Scheduler would otherwise take down the whole process.
-                // Consequence on a write op: the change only lands in the
-                // in-memory heap and will be overwritten by the next
-                // successful `with_queue` (which reloads from disk), so the
-                // event is effectively lost if the dashboard restarts or
-                // another writer succeeds first. Still preferable to a crash.
-                let _store_lock = match StoreLock::acquire(store_lock_path(store_path)) {
-                    Ok(lock) => lock,
-                    Err(err) => {
-                        if persist {
-                            eprintln!(
-                                "scheduler: WARNING: failed to acquire store lock ({}); \
-                                 write applied to in-memory cache only — NOT persisted to disk \
-                                 and may be lost on restart",
-                                err
-                            );
-                        } else {
-                            eprintln!(
-                                "scheduler: failed to acquire store lock ({}); \
-                                 read returned from (potentially stale) in-memory cache",
-                                err
-                            );
-                        }
-                        let mut queue = self.queue.lock().unwrap();
-                        return f(&mut queue);
-                    }
-                };
-                let mut queue = BinaryHeap::new();
-                for event in load_events_from_store(store_path) {
-                    queue.push(event);
-                }
-                let result = f(&mut queue);
-                if persist {
-                    save_events_to_store(store_path, &queue);
-                }
-                *self.queue.lock().unwrap() = queue;
-                result
-            }
-            None => {
-                let mut queue = self.queue.lock().unwrap();
-                f(&mut queue)
-            }
         }
     }
 
     pub fn insert(&self, event: ScheduledEvent) {
-        self.with_queue(true, |queue| {
-            queue.push(event);
-        });
-        // `notify_one` stores a permit so the event loop wakes up even if it
-        // isn't currently parked on `notified().await`.
+        self.queue.lock().unwrap().push(event);
         self.notify.notify_one();
     }
 
@@ -271,99 +100,86 @@ impl Scheduler {
     ///   Err(true)  if found but ea_id doesn't match (event stays in queue)
     ///   Err(false) if not found
     pub fn cancel_if_ea(&self, event_id: &str, ea_id: u32) -> Result<ScheduledEvent, bool> {
-        let result = self.with_queue(true, |queue| {
-            let events: Vec<ScheduledEvent> = queue.drain().collect();
-            let mut cancelled = None;
-            let mut wrong_ea = false;
-            let mut remaining = BinaryHeap::new();
-            for ev in events {
-                if ev.id == event_id && cancelled.is_none() {
-                    if ev.ea_id == ea_id {
-                        cancelled = Some(ev);
-                    } else {
-                        wrong_ea = true;
-                        remaining.push(ev);
-                    }
+        let mut queue = self.queue.lock().unwrap();
+        let events: Vec<ScheduledEvent> = queue.drain().collect();
+        let mut cancelled = None;
+        let mut wrong_ea = false;
+        let mut remaining = BinaryHeap::new();
+        for ev in events {
+            if ev.id == event_id && cancelled.is_none() {
+                if ev.ea_id == ea_id {
+                    cancelled = Some(ev);
                 } else {
-                    remaining.push(ev);
+                    wrong_ea = true;
+                    remaining.push(ev); // put it back — wrong EA
                 }
+            } else {
+                remaining.push(ev);
             }
-            *queue = remaining;
-            match cancelled {
-                Some(ev) => Ok(ev),
-                None => Err(wrong_ea),
-            }
-        });
-        self.notify.notify_waiters();
-        result
+        }
+        *queue = remaining;
+        match cancelled {
+            Some(ev) => Ok(ev),
+            None => Err(wrong_ea),
+        }
     }
 
     /// List events for a specific EA only.
     pub fn list_by_ea(&self, ea_id: u32) -> Vec<ScheduledEvent> {
-        self.with_queue(false, |queue| {
-            queue.iter().filter(|e| e.ea_id == ea_id).cloned().collect()
-        })
+        let queue = self.queue.lock().unwrap();
+        queue.iter().filter(|e| e.ea_id == ea_id).cloned().collect()
     }
 
     /// Cancel all events for a specific EA. Returns the number cancelled.
     pub fn cancel_by_ea(&self, ea_id: u32) -> usize {
-        let count = self.with_queue(true, |queue| {
-            let events: Vec<ScheduledEvent> = queue.drain().collect();
-            let mut count = 0;
-            let mut remaining = BinaryHeap::new();
-            for ev in events {
-                if ev.ea_id == ea_id {
-                    count += 1;
-                } else {
-                    remaining.push(ev);
-                }
+        let mut queue = self.queue.lock().unwrap();
+        let events: Vec<ScheduledEvent> = queue.drain().collect();
+        let mut count = 0;
+        let mut remaining = BinaryHeap::new();
+        for ev in events {
+            if ev.ea_id == ea_id {
+                count += 1;
+            } else {
+                remaining.push(ev);
             }
-            *queue = remaining;
-            count
-        });
-        self.notify.notify_waiters();
+        }
+        *queue = remaining;
         count
     }
 
     /// Cancel all events for a given receiver within a specific EA only.
     /// Fix V5: EA-scoped receiver cancellation prevents cross-EA event leaks.
     pub fn cancel_by_receiver_and_ea(&self, receiver: &str, ea_id: u32) -> usize {
-        let count = self.with_queue(true, |queue| {
-            let events: Vec<ScheduledEvent> = queue.drain().collect();
-            let mut count = 0;
-            let mut remaining = BinaryHeap::new();
-            for ev in events {
-                if ev.receiver == receiver && ev.ea_id == ea_id {
-                    count += 1;
-                } else {
-                    remaining.push(ev);
-                }
+        let mut queue = self.queue.lock().unwrap();
+        let events: Vec<ScheduledEvent> = queue.drain().collect();
+        let mut count = 0;
+        let mut remaining = BinaryHeap::new();
+        for ev in events {
+            if ev.receiver == receiver && ev.ea_id == ea_id {
+                count += 1;
+            } else {
+                remaining.push(ev);
             }
-            *queue = remaining;
-            count
-        });
-        self.notify.notify_waiters();
+        }
+        *queue = remaining;
         count
     }
 
     /// Pop all events matching the given receiver, EA, and timestamp.
     /// Fix V7: EA-scoped batching prevents cross-EA event delivery.
     pub fn pop_batch(&self, receiver: &str, ea_id: u32, timestamp: u64) -> Vec<ScheduledEvent> {
-        let batch = self.with_queue(true, |queue| {
-            let events: Vec<ScheduledEvent> = queue.drain().collect();
-            let mut batch = Vec::new();
-            let mut remaining = BinaryHeap::new();
-            for ev in events {
-                if ev.receiver == receiver && ev.ea_id == ea_id && ev.timestamp == timestamp {
-                    batch.push(ev);
-                } else {
-                    remaining.push(ev);
-                }
+        let mut queue = self.queue.lock().unwrap();
+        let events: Vec<ScheduledEvent> = queue.drain().collect();
+        let mut batch = Vec::new();
+        let mut remaining = BinaryHeap::new();
+        for ev in events {
+            if ev.receiver == receiver && ev.ea_id == ea_id && ev.timestamp == timestamp {
+                batch.push(ev);
+            } else {
+                remaining.push(ev);
             }
-            *queue = remaining;
-            batch
-        });
-        self.notify.notify_waiters();
+        }
+        *queue = remaining;
         batch
     }
 }
@@ -445,9 +261,7 @@ pub async fn run_event_loop(
     popup_receiver: PopupReceiver,
     base_prefix: String,
 ) {
-    let external_poll_interval = std::time::Duration::from_millis(500);
     loop {
-        scheduler.sync_from_store();
         let next_ts = {
             let queue = scheduler.queue.lock().unwrap();
             queue.peek().map(|e| e.timestamp)
@@ -455,26 +269,21 @@ pub async fn run_event_loop(
 
         match next_ts {
             None => {
-                if scheduler.is_persistent() {
-                    tokio::time::sleep(external_poll_interval).await;
-                } else {
-                    scheduler.notify.notified().await;
-                }
+                // No events — wait for a notification.
+                scheduler.notify.notified().await;
                 continue;
             }
             Some(ts) => {
                 let now = now_ns();
                 if ts > now {
                     let sleep_ns = ts - now;
-                    let mut duration = std::time::Duration::from_nanos(sleep_ns);
-                    if scheduler.is_persistent() {
-                        duration = duration.min(external_poll_interval);
-                    }
+                    let duration = std::time::Duration::from_nanos(sleep_ns);
                     tokio::select! {
                         _ = tokio::time::sleep(duration) => {
-                            continue;
+                            // Timer fired — fall through to delivery.
                         }
                         _ = scheduler.notify.notified() => {
+                            // Queue changed — re-check from the top.
                             continue;
                         }
                     }
@@ -949,22 +758,5 @@ mod tests {
         assert_eq!(buf.len(), 50);
         // Oldest entries should have been dropped
         assert_eq!(buf.front().unwrap().text, "msg10");
-    }
-
-    #[test]
-    fn test_persistent_scheduler_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let store_path = events_store_path(dir.path());
-        let sched = Scheduler::with_store(store_path.clone());
-
-        let mut ev = make_event("alice", "manager", 100, "persist me");
-        ev.ea_id = 7;
-        sched.insert(ev);
-
-        let reloaded = Scheduler::with_store(store_path);
-        let events = reloaded.list_by_ea(7);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload, "persist me");
-        assert_eq!(events[0].receiver, "alice");
     }
 }

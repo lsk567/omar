@@ -11,7 +11,6 @@ use crate::ea::{self, EaId, EaInfo};
 use crate::memory;
 use crate::projects::{self, Project};
 use crate::scheduler::{ScheduledEvent, Scheduler, TickerBuffer};
-use crate::tasks;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
@@ -73,6 +72,10 @@ pub struct AgentGroup<'a> {
 
 /// Application state
 pub struct App {
+    /// Unique session identifier (timestamp) used to group log files
+    /// written by the `/api/ea/:ea_id/logs` endpoint for this OMAR run.
+    pub session_id: String,
+
     // EA fields
     pub active_ea: EaId,
     pub registered_eas: Vec<EaInfo>,
@@ -173,6 +176,7 @@ impl App {
         std::fs::create_dir_all(state_dir.join("status")).ok();
 
         Self {
+            session_id: chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string(),
             active_ea,
             registered_eas,
             base_prefix,
@@ -371,16 +375,6 @@ impl App {
         // Load parent mappings, worker tasks, and build the chain-of-command tree
         self.agent_parents = memory::load_agent_parents_from(&state_dir);
         self.worker_tasks = memory::load_worker_tasks_from(&state_dir);
-        // Augment from task_registry.json so newly-spawned agents always show
-        // their task before worker_tasks.json catches up.
-        for record in tasks::load_tasks_from(&state_dir) {
-            let session = format!(
-                "{}{}",
-                ea::ea_prefix(record.ea_id, &self.base_prefix),
-                record.agent_name
-            );
-            self.worker_tasks.entry(session).or_insert(record.task_text);
-        }
 
         // Cache agent statuses so render and API reads avoid per-frame disk I/O
         {
@@ -494,14 +488,6 @@ impl App {
             self.active_ea,
             ea_name,
             &self.omar_dir,
-            &crate::manager::McpLaunchContext {
-                omar_dir: self.omar_dir.clone(),
-                ea_id: self.active_ea,
-                session_prefix: self.base_prefix.clone(),
-                default_command: self.default_command.clone(),
-                default_workdir: self.default_workdir.clone(),
-                health_idle_warning: self.health_threshold,
-            },
         );
 
         // Start manager session — system prompt set at process start
@@ -1005,19 +991,7 @@ impl App {
 
         let watchdog_cmd = &self.config.watchdog.command;
         let prompt_file = crate::manager::prompts_dir(&self.omar_dir).join("watchdog.md");
-        let cmd = crate::manager::build_agent_command(
-            watchdog_cmd,
-            &prompt_file,
-            &[],
-            &crate::manager::McpLaunchContext {
-                omar_dir: self.omar_dir.clone(),
-                ea_id: self.active_ea,
-                session_prefix: self.base_prefix.clone(),
-                default_command: self.default_command.clone(),
-                default_workdir: self.default_workdir.clone(),
-                health_idle_warning: self.health_threshold,
-            },
-        );
+        let cmd = crate::manager::build_agent_command(watchdog_cmd, &prompt_file, &[]);
 
         let workdir = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
@@ -1044,8 +1018,9 @@ impl App {
             "AUTH FAILURE DETECTED.\n\
 Failed agents: {}\n\
 Slack channel: {}\n\
-Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack_reply` MCP tool.",
-            failed_list, slack_display,
+Omar API: http://localhost:{}\n\
+Slack bridge: http://localhost:9877",
+            failed_list, slack_display, self.config.api.port,
         );
 
         let client = self.client.clone();
