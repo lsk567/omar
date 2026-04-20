@@ -161,13 +161,23 @@ impl TmuxClient {
         ])
     }
 
-    /// Get the activity timestamp of a pane
+    /// Get the activity timestamp of a pane.
+    ///
+    /// Uses `#{window_activity}` — the per-pane `#{pane_activity}` format is
+    /// empty on tmux 3.6a (macOS Homebrew) unless `monitor-activity` is
+    /// enabled, which breaks every readiness check (empty string → parse
+    /// error → caller's `unwrap_or_default()` yields 0 → health always
+    /// reads as "idle", which makes EAs replace working agents). Window
+    /// activity is universally populated and tracks the most recent
+    /// input/output in the window. OMAR worker sessions always have
+    /// exactly one window and one pane, so window-level granularity is
+    /// equivalent to pane-level.
     pub fn get_pane_activity(&self, target: &str) -> Result<i64> {
-        let output = self.run(&["display-message", "-t", target, "-p", "#{pane_activity}"])?;
+        let output = self.run(&["display-message", "-t", target, "-p", "#{window_activity}"])?;
         output
             .trim()
             .parse()
-            .context("Failed to parse pane activity timestamp")
+            .context("Failed to parse window activity timestamp")
     }
 
     /// Send keys to a pane
@@ -731,6 +741,52 @@ mod tests {
         assert!(
             found,
             "wait_for_markers must match 'Claude Code' even when rendered with ANSI escapes between the words"
+        );
+    }
+
+    /// Regression: get_pane_activity must return a parseable timestamp on
+    /// every supported tmux. On tmux 3.6a (macOS Homebrew), `#{pane_activity}`
+    /// is empty unless `monitor-activity` is enabled, so parsing fails and
+    /// callers that `unwrap_or_default()` get 0 — which makes
+    /// `health_from_activity` always report "idle". This caused EAs to
+    /// replace working agents. `#{window_activity}` is populated universally.
+    #[test]
+    fn test_get_pane_activity_returns_recent_timestamp() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let session = "omar-client-test-pane-activity";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let _guard = SessionGuard(session.to_string());
+
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+
+        let client = TmuxClient::new("omar-client-test-");
+        let activity = client
+            .get_pane_activity(session)
+            .expect("get_pane_activity must succeed on freshly created session");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // Activity should be within the last 10 minutes — if it's 0 or ancient,
+        // the underlying format string is empty on this tmux (regression).
+        assert!(
+            now - activity < 600,
+            "get_pane_activity returned a stale timestamp ({}s old) — format string is probably empty on this tmux version",
+            now - activity
         );
     }
 }
