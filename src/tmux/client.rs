@@ -146,6 +146,21 @@ impl TmuxClient {
         ])
     }
 
+    /// Capture pane output as plain text (no ANSI escapes). Required for
+    /// substring matching — e.g. Claude Code renders its banner as
+    /// `Claude<ESC>[0m <ESC>[1mCode`, so an ANSI capture does *not* contain
+    /// the contiguous string "Claude Code".
+    pub fn capture_pane_plain(&self, target: &str, lines: i32) -> Result<String> {
+        self.run(&[
+            "capture-pane",
+            "-t",
+            target,
+            "-p",
+            "-S",
+            &(-lines).to_string(),
+        ])
+    }
+
     /// Get the activity timestamp of a pane
     pub fn get_pane_activity(&self, target: &str) -> Result<i64> {
         let output = self.run(&["display-message", "-t", target, "-p", "#{pane_activity}"])?;
@@ -359,7 +374,7 @@ impl TmuxClient {
         let needles: Vec<String> = markers.iter().map(|m| m.to_ascii_lowercase()).collect();
         let start = Instant::now();
         while start.elapsed() < timeout {
-            if let Ok(content) = self.capture_pane(session, 120) {
+            if let Ok(content) = self.capture_pane_plain(session, 120) {
                 let hay = content.to_ascii_lowercase();
                 if needles.iter().any(|needle| hay.contains(needle)) {
                     return true;
@@ -670,5 +685,52 @@ mod tests {
         // but small enough to catch the ~1-3 KB tasks that silently fail
         const { assert!(TmuxClient::LARGE_PAYLOAD_THRESHOLD >= 512) };
         const { assert!(TmuxClient::LARGE_PAYLOAD_THRESHOLD <= 8192) };
+    }
+
+    /// Regression: wait_for_markers must match text that renders with ANSI
+    /// escapes between words (e.g. Claude Code's `Claude<ESC>[0m Code` banner).
+    /// A prior change made wait_for_markers use `capture-pane -e`, which
+    /// included escapes and broke this matching, silently delaying initial
+    /// task delivery by the full 45s timeout on every spawn.
+    #[test]
+    fn test_wait_for_markers_ignores_ansi_escapes() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let session = "omar-client-test-markers-ansi";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let _guard = SessionGuard(session.to_string());
+
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+
+        let client = TmuxClient::new("omar-client-test-");
+        // Emit "Claude<ESC>[0m <ESC>[1mCode" — the exact split CC renders
+        // in its banner. The raw terminal shows "Claude Code"; an ANSI
+        // capture does not.
+        let _ = client.send_keys_literal(session, "printf 'Claude\\033[0m \\033[1mCode\\n'");
+        let _ = client.send_keys(session, "Enter");
+        thread::sleep(Duration::from_millis(200));
+
+        let found = client.wait_for_markers(
+            session,
+            &["Claude Code"],
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+        );
+        assert!(
+            found,
+            "wait_for_markers must match 'Claude Code' even when rendered with ANSI escapes between the words"
+        );
     }
 }
