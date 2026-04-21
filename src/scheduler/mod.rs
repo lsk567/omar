@@ -255,6 +255,43 @@ pub fn new_popup_receiver() -> PopupReceiver {
     Arc::new(Mutex::new(None))
 }
 
+/// How long to push delivery out while the user's popup is open.
+/// If the popup stays open past this, the loop simply defers again —
+/// no unbounded fan-out, one event stays one event.
+pub(crate) const POPUP_DEFER_NS: u64 = 30_000_000_000;
+
+/// Decide whether to defer an event for `(receiver, ea_id)` because the user
+/// has an agent popup open on that exact pane. Scoped per-EA so same-named
+/// workers in other EAs deliver as normal.
+///
+/// `deliver_to_tmux` treats the EA pane as either `"ea"` or `"omar"`, so both
+/// forms are accepted as aliases: if the popup is on the EA pane, any event
+/// addressed to that EA manager (via either alias) is deferred.
+pub(crate) fn should_defer_for_popup(
+    popup_receiver: &PopupReceiver,
+    receiver: &str,
+    ea_id: ea::EaId,
+) -> bool {
+    popup_receiver
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|(r, eid)| *eid == ea_id && receivers_match(r, receiver))
+}
+
+/// True when `popup` (the identifier stored when the popup opened) refers to
+/// the same receiver pane as `event_receiver`.
+///
+/// `deliver_to_tmux` treats both `"ea"` and `"omar"` as names for the EA
+/// manager pane. `selected_popup_receiver_name` only ever stores `"ea"` for
+/// that pane (never `"omar"`), so the alias is intentionally *one-way*:
+/// a popup on the EA pane (`"ea"`) must cover events addressed as either
+/// `"ea"` or `"omar"`, but a worker short name that happens to be `"omar"`
+/// must NOT defer events addressed to the EA.
+fn receivers_match(popup: &str, event_receiver: &str) -> bool {
+    popup == event_receiver || (popup == "ea" && event_receiver == "omar")
+}
+
 pub async fn run_event_loop(
     scheduler: Arc<Scheduler>,
     ticker: TickerBuffer,
@@ -330,19 +367,14 @@ pub async fn run_event_loop(
                         continue;
                     }
 
-                    // If the user has a popup open for this receiver, defer by 30s.
-                    // The event will keep getting rescheduled on each attempt until
-                    // the popup is closed.
-                    let popup_active = popup_receiver
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .is_some_and(|(r, eid)| r == receiver && eid == ea_id);
-                    if popup_active {
+                    // If the user has a popup open for this receiver, defer the
+                    // due batch by POPUP_DEFER_NS. The same batch keeps being
+                    // re-queued on each tick — no duplication, no growth — and
+                    // it just keeps re-deferring until the popup closes.
+                    if should_defer_for_popup(&popup_receiver, receiver, *ea_id) {
                         let batch = scheduler.pop_batch(receiver, *ea_id, earliest_ts);
-                        let defer_ns: u64 = 30_000_000_000;
                         for mut ev in batch {
-                            ev.timestamp = now_ns() + defer_ns;
+                            ev.timestamp = now_ns() + POPUP_DEFER_NS;
                             scheduler.insert(ev);
                         }
                         ticker.push(format!("deferred event(s) for {} (popup open)", receiver));
@@ -758,5 +790,231 @@ mod tests {
         assert_eq!(buf.len(), 50);
         // Oldest entries should have been dropped
         assert_eq!(buf.front().unwrap().text, "msg10");
+    }
+
+    // ── Popup-defer decision (pure helper) ──
+    //
+    // When the user opens the tmux popup for an agent pane, the scheduler
+    // must defer events bound for that pane so injected [EVENT]/[CRON]/
+    // [SLACK MESSAGE] lines don't corrupt input the user is typing.
+    //
+    // `should_defer_for_popup` makes the decision based only on the popup
+    // state; the surrounding loop then picks the defer window.
+
+    #[test]
+    fn popup_decision_defer_when_receiver_and_ea_match() {
+        let popup = new_popup_receiver();
+        *popup.lock().unwrap() = Some(("worker".to_string(), 7));
+        assert!(should_defer_for_popup(&popup, "worker", 7));
+    }
+
+    #[test]
+    fn popup_decision_no_defer_when_receiver_differs() {
+        let popup = new_popup_receiver();
+        *popup.lock().unwrap() = Some(("worker".to_string(), 7));
+        assert!(!should_defer_for_popup(&popup, "other", 7));
+    }
+
+    #[test]
+    fn popup_decision_no_defer_when_ea_differs() {
+        // Fix V5 style per-EA scoping: same-named worker in a different EA
+        // must NOT be deferred.
+        let popup = new_popup_receiver();
+        *popup.lock().unwrap() = Some(("worker".to_string(), 7));
+        assert!(!should_defer_for_popup(&popup, "worker", 8));
+    }
+
+    #[test]
+    fn popup_decision_no_defer_when_no_popup_open() {
+        let popup = new_popup_receiver();
+        assert!(!should_defer_for_popup(&popup, "worker", 7));
+    }
+
+    #[test]
+    fn popup_decision_defer_ea_alias_matches_omar() {
+        // Popup opened on the EA pane (stored as "ea") must defer events
+        // addressed either as "ea" or as "omar" — both route to the manager
+        // session in `deliver_to_tmux`.
+        let popup = new_popup_receiver();
+        *popup.lock().unwrap() = Some(("ea".to_string(), 3));
+        assert!(should_defer_for_popup(&popup, "ea", 3));
+        assert!(should_defer_for_popup(&popup, "omar", 3));
+        // Sanity: worker in the same EA still delivers normally
+        assert!(!should_defer_for_popup(&popup, "worker", 3));
+    }
+
+    #[test]
+    fn popup_decision_ea_alias_still_scoped_per_ea() {
+        let popup = new_popup_receiver();
+        *popup.lock().unwrap() = Some(("ea".to_string(), 3));
+        // Events for the EA in a different EA namespace are NOT deferred.
+        assert!(!should_defer_for_popup(&popup, "ea", 4));
+        assert!(!should_defer_for_popup(&popup, "omar", 4));
+    }
+
+    #[test]
+    fn popup_decision_alias_is_one_way() {
+        // A worker legitimately named "omar" (an unfortunate but legal short
+        // name — the receiver field is free-form) must not hijack the EA
+        // defer path. Only a popup stored as the canonical "ea" covers the
+        // "omar" alias; a popup on worker "omar" covers only "omar".
+        let popup = new_popup_receiver();
+        *popup.lock().unwrap() = Some(("omar".to_string(), 2));
+        assert!(should_defer_for_popup(&popup, "omar", 2));
+        assert!(!should_defer_for_popup(&popup, "ea", 2));
+    }
+
+    #[test]
+    fn event_loop_defers_entire_batch_as_a_batch() {
+        // Multiple events sharing the same (receiver, ea_id, timestamp) are
+        // deferred together — the deferred batch stays one batch, not fanned
+        // out or deduplicated.
+        use tokio::runtime::Runtime;
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let scheduler = Arc::new(Scheduler::new());
+            let ticker = TickerBuffer::new();
+            let popup_receiver = new_popup_receiver();
+            *popup_receiver.lock().unwrap() = Some(("popup-target".to_string(), 5));
+
+            let due_ts = now_ns().saturating_sub(500_000_000);
+            for i in 0..3 {
+                let mut ev = make_event("popup-target", "sender", due_ts, &format!("batch-{}", i));
+                ev.ea_id = 5;
+                scheduler.insert(ev);
+            }
+
+            let loop_handle = tokio::spawn(run_event_loop(
+                scheduler.clone(),
+                ticker.clone(),
+                popup_receiver.clone(),
+                "omar-agent-".to_string(),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            loop_handle.abort();
+
+            let events = scheduler.list_by_ea(5);
+            assert_eq!(events.len(), 3, "all 3 events must remain queued");
+            // All should share a freshly-deferred timestamp (~30s from now).
+            for ev in &events {
+                let delta_secs = (ev.timestamp as i128 - now_ns() as i128) / 1_000_000_000;
+                assert!(
+                    (25..=31).contains(&delta_secs),
+                    "each event must be deferred ~30s; delta={}s",
+                    delta_secs
+                );
+            }
+        });
+    }
+
+    // ── Event-loop behaviour with popup state ──
+    //
+    // Regression check: with the popup open for `(receiver, ea_id)`, a
+    // past-due event for the same target must be re-queued ~30s into the
+    // future instead of being delivered. Without the popup it would be
+    // popped and handed to `deliver_to_tmux`.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_loop_defers_event_while_popup_open() {
+        let scheduler = Arc::new(Scheduler::new());
+        let ticker = TickerBuffer::new();
+        let popup_receiver = new_popup_receiver();
+        *popup_receiver.lock().unwrap() = Some(("popup-target".to_string(), 42));
+
+        // Past-due event — loop will try to deliver immediately
+        let mut ev = make_event(
+            "popup-target",
+            "sender",
+            now_ns().saturating_sub(1_000_000_000),
+            "hi",
+        );
+        ev.ea_id = 42;
+        scheduler.insert(ev);
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            scheduler.clone(),
+            ticker.clone(),
+            popup_receiver.clone(),
+            "omar-agent-".to_string(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        loop_handle.abort();
+
+        let events = scheduler.list_by_ea(42);
+        assert_eq!(
+            events.len(),
+            1,
+            "event must stay queued while popup is open"
+        );
+        let delta_secs = (events[0].timestamp as i128 - now_ns() as i128) / 1_000_000_000;
+        assert!(
+            (25..=31).contains(&delta_secs),
+            "event must be deferred ~30s into future; delta={}s",
+            delta_secs
+        );
+
+        let ticker_text = ticker.render(std::time::Duration::from_secs(60));
+        assert!(
+            ticker_text.contains("deferred event(s) for popup-target"),
+            "ticker must note the defer: {}",
+            ticker_text
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_loop_keeps_deferring_while_popup_stays_open() {
+        // The popup can stay open longer than 30s. Each delivery attempt
+        // must re-defer another 30s — no eventual delivery, no unbounded
+        // queue growth.
+        let scheduler = Arc::new(Scheduler::new());
+        let ticker = TickerBuffer::new();
+        let popup_receiver = new_popup_receiver();
+        *popup_receiver.lock().unwrap() = Some(("popup-target".to_string(), 1));
+
+        let mut ev = make_event(
+            "popup-target",
+            "sender",
+            now_ns().saturating_sub(500_000_000),
+            "hi",
+        );
+        ev.ea_id = 1;
+        scheduler.insert(ev);
+
+        let loop_handle = tokio::spawn(run_event_loop(
+            scheduler.clone(),
+            ticker.clone(),
+            popup_receiver.clone(),
+            "omar-agent-".to_string(),
+        ));
+
+        // Run the loop for long enough to see multiple defer decisions.
+        // We can't wait 30s in a unit test, so instead artificially pull
+        // the event back into "due" territory and observe that the loop
+        // re-defers each time.
+        for _ in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            let mut q = scheduler.queue.lock().unwrap();
+            let mut events: Vec<ScheduledEvent> = q.drain().collect();
+            for e in events.iter_mut() {
+                e.timestamp = now_ns().saturating_sub(10_000_000);
+            }
+            for e in events {
+                q.push(e);
+            }
+            drop(q);
+            scheduler.notify.notify_one();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        loop_handle.abort();
+
+        // Queue still holds exactly one event (no duplicates, no delivery).
+        let events = scheduler.list_by_ea(1);
+        assert_eq!(events.len(), 1, "event must not be lost or duplicated");
+        let delta_secs = (events[0].timestamp as i128 - now_ns() as i128) / 1_000_000_000;
+        assert!(
+            delta_secs > 25,
+            "event must still be deferred; delta={}s",
+            delta_secs
+        );
     }
 }
