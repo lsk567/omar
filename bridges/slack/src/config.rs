@@ -40,10 +40,22 @@ impl Config {
         let omar_url =
             std::env::var("OMAR_URL").unwrap_or_else(|_| "http://127.0.0.1:9876".to_string());
 
-        let omar_ea_id: u32 = std::env::var("OMAR_EA_ID")
-            .unwrap_or_else(|_| "0".to_string())
-            .parse()
-            .unwrap_or(0);
+        // OMAR_EA_ID is unusual: silently defaulting on parse errors would
+        // misroute every event to EA 0 with no signal. Default only when the
+        // var is unset; fail loudly on anything else.
+        let omar_ea_id: u32 = match std::env::var("OMAR_EA_ID") {
+            Ok(value) => value.parse().map_err(|err| {
+                anyhow::anyhow!(
+                    "OMAR_EA_ID must be a valid unsigned integer, got {:?}: {}",
+                    value,
+                    err
+                )
+            })?,
+            Err(std::env::VarError::NotPresent) => 0,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("OMAR_EA_ID must contain valid Unicode")
+            }
+        };
 
         let max_message_length: usize = std::env::var("MAX_MESSAGE_LENGTH")
             .unwrap_or_else(|_| "3900".to_string())

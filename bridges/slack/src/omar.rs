@@ -83,7 +83,9 @@ impl OmarClient {
     /// `/agents/foo`). The result has the form
     /// `{base}/api/ea/{ea_id}{suffix}`.
     pub fn ea_url(&self, suffix: &str) -> String {
-        debug_assert!(
+        // Enforce the invariant in release builds too — a missing leading
+        // slash would produce `/api/ea/0agents` and 404 silently.
+        assert!(
             suffix.starts_with('/'),
             "ea_url suffix must start with '/': {}",
             suffix
@@ -94,7 +96,7 @@ impl OmarClient {
     /// Build a global (non-EA-scoped) API URL — used for `/api/health` and
     /// similar manager-wide endpoints.
     pub fn global_url(&self, suffix: &str) -> String {
-        debug_assert!(
+        assert!(
             suffix.starts_with('/'),
             "global_url suffix must start with '/': {}",
             suffix
@@ -266,7 +268,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ea_url_uses_ea_prefix_by_default() {
+    fn ea_url_uses_ea_prefix_for_zero_ea_id() {
         let c = OmarClient::new("http://127.0.0.1:9876", 0);
         assert_eq!(c.ea_url("/events"), "http://127.0.0.1:9876/api/ea/0/events");
         assert_eq!(c.ea_url("/agents"), "http://127.0.0.1:9876/api/ea/0/agents");
