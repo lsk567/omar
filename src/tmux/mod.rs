@@ -12,19 +12,23 @@ pub use session::Session;
 /// `spawn_agent` path and the CLI `manager::spawn_worker` path.
 ///
 /// For Claude Code specifically we require both the product banner
-/// ("Claude Code") AND the input-widget footer ("? for shortcuts"): on
-/// v2.1.116 the banner renders several hundred ms before the input widget
-/// is actually wired up to accept keystrokes, so matching only on
-/// "Claude Code" lets `deliver_prompt` fire Enter into a pane that silently
-/// swallows it. The shortcuts footer is the last thing Claude Code draws
-/// once the input widget is live, so its presence is a reliable signal
-/// that Enter will actually submit.
+/// ("Claude Code") AND the input-widget prompt glyph ("❯"): on v2.1.116
+/// the banner renders several hundred ms before the input widget is
+/// actually wired up to accept keystrokes, so matching only on "Claude
+/// Code" lets `deliver_prompt` fire Enter into a pane that silently
+/// swallows it. "❯" is drawn by Claude Code as the leading character of
+/// the input line and only appears once the widget has been laid out,
+/// making it a reliable readiness signal that survives tmux config
+/// differences (unlike the "? for shortcuts" hint, which Claude Code
+/// replaces with a `tmux focus-events off` warning on stock Ubuntu tmux
+/// configs — rendering that marker absent on Linux and stalling
+/// `wait_for_markers` for its full timeout).
 pub fn backend_readiness_markers(backend: &str) -> &'static [&'static str] {
     match backend {
         "codex" => &["OpenAI Codex"],
         "cursor" => &["Cursor Agent"],
         "gemini" => &["Gemini CLI"],
-        "claude" => &["Claude Code", "? for shortcuts"],
+        "claude" => &["Claude Code", "❯"],
         "opencode" => &["tab agents", "ctrl+p commands"],
         _ => &[],
     }

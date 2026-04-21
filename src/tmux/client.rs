@@ -966,7 +966,7 @@ mod tests {
     /// when only the banner was visible and let `deliver_prompt` fire
     /// Enter into a pane that would silently swallow it. With all-of
     /// semantics, we don't succeed until every marker (banner + input-
-    /// widget footer for claude) has rendered.
+    /// widget prompt glyph "❯" for claude) has rendered.
     #[test]
     fn test_wait_for_markers_requires_all_markers() {
         if !tmux_available() {
@@ -1022,6 +1022,59 @@ mod tests {
         assert!(
             found,
             "wait_for_markers must return true once ALL markers are present"
+        );
+    }
+
+    /// Regression: the claude readiness marker set includes "❯" (U+276F),
+    /// the non-ASCII input-widget prompt glyph. `wait_for_markers` lowercases
+    /// the hay with `to_ascii_lowercase`, which leaves "❯" byte-identical,
+    /// so substring matching must still find it. This test locks in that
+    /// UTF-8 markers work, so nobody later "fixes" readiness matching with a
+    /// full-Unicode lowercase transform that would shift the bytes and break
+    /// the match. Also guards against a prior bug where `capture_pane` (with
+    /// `-e`, ANSI-inclusive) was used for marker matching, which inserts
+    /// escape sequences mid-string and breaks multi-byte char boundaries.
+    #[test]
+    fn test_wait_for_markers_matches_claude_prompt_glyph() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let session = "omar-test-claude-glyph-marker";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let _guard = SessionGuard(session.to_string());
+
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+
+        let client = TmuxClient::new("omar-test-");
+
+        // Put "Claude Code" and "❯" directly into the pane as literal
+        // bytes via `send-keys -l`. Avoids running a shell command so
+        // the test is independent of the sandbox's default shell actually
+        // executing inputs.
+        let _ = client.send_keys_literal(session, "Claude Code ❯ ");
+
+        let found = client.wait_for_markers(
+            session,
+            &["Claude Code", "❯"],
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+        );
+        assert!(
+            found,
+            "wait_for_markers must match the non-ASCII \"❯\" glyph used as \
+             Claude Code's input prompt — regresses the v2.1.116 Enter- \
+             swallow fix if missing"
         );
     }
 
