@@ -6,6 +6,7 @@ mod ea;
 mod event;
 mod manager;
 mod memory;
+mod panic_hook;
 mod projects;
 mod scheduler;
 mod tmux;
@@ -108,8 +109,26 @@ enum ManagerAction {
     Orchestrate,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Install the persisted-panic hook FIRST, before tokio builds its
+    // runtime (and spawns worker threads). If the tmux parent dies it
+    // takes the stderr pane with it (see issue #118), so panics need
+    // to be written to disk before unwind. The hook chains to whatever
+    // hook was previously installed, preserving RUST_BACKTRACE /
+    // default stderr behaviour for non-tmux runs.
+    //
+    // We deliberately don't use `#[tokio::main]`: that macro builds
+    // the runtime BEFORE the `async fn` body runs, so any panic on a
+    // worker spawned during runtime construction would miss the hook.
+    panic_hook::install(omar_dir().join("logs").join("panics"));
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(ref agent) = cli.agent {
