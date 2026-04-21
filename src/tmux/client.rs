@@ -294,24 +294,41 @@ impl TmuxClient {
             opts.require_initial_change,
         )?;
 
-        for attempt in 1..=opts.max_retries {
-            // Snapshot pane state before delivery so we can detect changes.
-            let content_before = self.capture_pane(session, 50).unwrap_or_default();
-            let activity_before = self.get_pane_activity(session).unwrap_or(0);
+        // Phase 2: settle delay after markers/stability confirm readiness.
+        // Claude Code v2.1.116 paints its banner + input-widget frame
+        // several hundred ms before the widget is actually wired up to
+        // accept keystrokes; without this pause, the Enter presses fired
+        // by this function land before the widget is live and get
+        // swallowed, while the pasted payload (which hits the terminal
+        // input stream directly) has already bumped the activity
+        // timestamp — masking the failure from wait_for_change.
+        thread::sleep(Duration::from_millis(500));
 
+        for attempt in 1..=opts.max_retries {
             // Paste text via bracketed paste (no trailing newline — Enter
             // is sent separately below).
             self.paste_text(session, text)?;
 
-            // Send Enter 3 times with small gaps. Some backends need time
-            // to process the pasted text before accepting Enter, and a
-            // single Enter can be lost. Redundant Enters are harmless.
+            // Snapshot pane state AFTER paste but BEFORE the Enter keys,
+            // so wait_for_change below actually verifies that the Enter
+            // submitted the prompt — not merely that paste_text drew the
+            // payload into the input widget. Without this ordering, a
+            // swallowed Enter still appears "successful" because the
+            // paste itself counts as a pane change.
+            let content_before = self.capture_pane(session, 50).unwrap_or_default();
+            let activity_before = self.get_pane_activity(session).unwrap_or(0);
+
+            // Send Enter 3 times with 400 ms gaps. The wider gap gives
+            // Claude Code's input widget time to finish ingesting the
+            // paste (it runs a debounce before accepting submit) before
+            // we try to trigger submission. Redundant Enters are harmless
+            // on all supported backends.
             for _ in 0..3 {
-                thread::sleep(Duration::from_millis(150));
+                thread::sleep(Duration::from_millis(400));
                 let _ = self.send_keys(session, "Enter");
             }
 
-            // Verify the backend processed the input.
+            // Verify the backend processed the Enter (not just the paste).
             if self.wait_for_change(
                 session,
                 activity_before,
@@ -319,6 +336,14 @@ impl TmuxClient {
                 opts.verify_timeout,
                 opts.poll_interval,
             ) {
+                // Belt-and-suspenders: one more trailing Enter after
+                // verification. If the widget had only just become live
+                // during the retry window, the observed pane change may
+                // have been a caret blink or spinner rather than actual
+                // submission — this extra Enter guarantees submit in
+                // that edge case and is a no-op when the prompt has
+                // already been accepted.
+                let _ = self.send_keys(session, "Enter");
                 return Ok(());
             }
 
@@ -400,8 +425,14 @@ impl TmuxClient {
         false
     }
 
-    /// Wait until pane output contains any of the provided markers.
+    /// Wait until pane output contains ALL of the provided markers.
     /// Matching is case-insensitive; returns false on timeout.
+    ///
+    /// All-match (rather than any-match) semantics matter for backends like
+    /// Claude Code v2.1.116, where the product banner paints hundreds of
+    /// ms before the input widget is actually ready to accept keystrokes.
+    /// Matching on only one of several markers would let the caller fire
+    /// Enter into a pane that silently swallows it.
     pub fn wait_for_markers(
         &self,
         session: &str,
@@ -420,7 +451,7 @@ impl TmuxClient {
             // independently (Claude Code inserts a reset between them).
             if let Ok(content) = self.capture_pane_plain(session, 120) {
                 let hay = content.to_ascii_lowercase();
-                if needles.iter().any(|needle| hay.contains(needle)) {
+                if needles.iter().all(|needle| hay.contains(needle)) {
                     return true;
                 }
             }
@@ -925,6 +956,72 @@ mod tests {
             content.contains("DELIVERED_AFTER_MARKERS"),
             "Expected delivered command in pane: {:?}",
             content
+        );
+    }
+
+    /// Regression: `wait_for_markers` must require ALL markers to be
+    /// present, not any-of. Claude Code v2.1.116 paints "Claude Code" in
+    /// its banner several hundred ms before the input widget is actually
+    /// wired up to accept Enter; any-of matching returned true immediately
+    /// when only the banner was visible and let `deliver_prompt` fire
+    /// Enter into a pane that would silently swallow it. With all-of
+    /// semantics, we don't succeed until every marker (banner + input-
+    /// widget footer for claude) has rendered.
+    #[test]
+    fn test_wait_for_markers_requires_all_markers() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let session = "omar-test-wait-markers-all";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let _guard = SessionGuard(session.to_string());
+
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+
+        let client = TmuxClient::new("omar-test-");
+
+        // Print only the first marker. With the old any-of semantics
+        // wait_for_markers would return true; with all-of it must not.
+        let _ = client.send_keys_literal(session, "echo FIRST_MARKER_ONLY");
+        let _ = client.send_keys(session, "Enter");
+        thread::sleep(Duration::from_millis(300));
+
+        let found = client.wait_for_markers(
+            session,
+            &["FIRST_MARKER_ONLY", "SECOND_MARKER_MISSING"],
+            Duration::from_millis(600),
+            Duration::from_millis(50),
+        );
+        assert!(
+            !found,
+            "wait_for_markers must require ALL markers; returning true \
+             when only one is present regresses the Claude Code v2.1.116 \
+             Enter-swallow fix"
+        );
+
+        // Now print the second marker too; both present -> must return true.
+        let _ = client.send_keys_literal(session, "echo SECOND_MARKER_MISSING");
+        let _ = client.send_keys(session, "Enter");
+        let found = client.wait_for_markers(
+            session,
+            &["FIRST_MARKER_ONLY", "SECOND_MARKER_MISSING"],
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+        );
+        assert!(
+            found,
+            "wait_for_markers must return true once ALL markers are present"
         );
     }
 
