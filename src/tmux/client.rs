@@ -529,6 +529,15 @@ mod tests {
         }
     }
 
+    /// Cleanup guard: remove a path on drop (even on panic or early return).
+    /// Best-effort — missing files are fine.
+    struct TempPathGuard(std::path::PathBuf);
+    impl Drop for TempPathGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     /// Deliver a prompt to a shell session and verify the command actually ran.
     #[test]
     fn test_deliver_prompt_to_shell_session() {
@@ -956,7 +965,22 @@ mod tests {
 
         let tmp_path =
             std::env::temp_dir().join(format!("omar-paste-lf-{}.txt", uuid::Uuid::new_v4()));
-        let tmp_str = tmp_path.to_str().unwrap();
+        let tmp_str = match tmp_path.to_str() {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "Skipping test: temp path is not valid UTF-8: {:?}",
+                    tmp_path
+                );
+                return;
+            }
+        };
+        // Single-quote-escape the path for the shell command below so a
+        // TMPDIR containing spaces or metacharacters doesn't break the test
+        // (which would mask the regression by spuriously skipping).
+        let quoted_tmp_path = format!("'{}'", tmp_str.replace('\'', r"'\''"));
+        // Clean up the tmp file on every exit path (skip, assert fail, panic).
+        let _tmp_guard = TempPathGuard(tmp_path.clone());
 
         // Start with an rc-less, non-login shell so users' rc files can't
         // break session startup on CI runners with unusual setups.
@@ -979,7 +1003,7 @@ mod tests {
         let reader_cmd = format!(
             "stty -icrnl -icanon; dd bs=1 count={} of={} 2>/dev/null",
             payload.len(),
-            tmp_str,
+            quoted_tmp_path,
         );
 
         let client = TmuxClient::new("omar-test-");
@@ -1014,11 +1038,9 @@ mod tests {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("Skipping test: tmp file not produced: {}", e);
-                let _ = std::fs::remove_file(&tmp_path);
                 return;
             }
         };
-        let _ = std::fs::remove_file(&tmp_path);
 
         // The core assertion: LFs must survive. With the bug, every \n in
         // the payload arrives as \r, so the file would be "line1\rline2\rline3".
