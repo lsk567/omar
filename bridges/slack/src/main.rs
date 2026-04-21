@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
 
     // Create clients
     let slack_client = SlackClient::new(&config.bot_token, &config.app_token);
-    let omar_client = OmarClient::new(&config.omar_url);
+    let omar_client = OmarClient::new(&config.omar_url, config.omar_ea_id);
 
     // Build the bridge (holds the shared SlackClient)
     let bridge = Bridge::new(config.clone(), slack_client, omar_client);

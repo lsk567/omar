@@ -11,7 +11,7 @@ Slack (Socket Mode WS)                           OMAR (localhost:9876)
        │                                                │
        │ @mention event                                 │
        ▼                                                │
-  omar-slack bridge ──POST /api/events──────────►  Event Queue
+  omar-slack bridge ─POST /api/ea/{id}/events───►  Event Queue
        ▲            (receiver: "ea")                    │
        │                                                ▼
        │                                           EA (tmux)
@@ -108,7 +108,7 @@ cargo build --release
 2. Bridge starts an HTTP callback server on `SLACK_BRIDGE_PORT` (default 9877)
 3. When someone @mentions the bot in a channel:
    - Bridge formats the message as a `[SLACK MESSAGE]` event payload (includes channel, thread, user, reply curl command)
-   - Posts it to the OMAR event queue via `POST /api/events` with `receiver: "ea"`
+   - Posts it to the OMAR event queue via `POST /api/ea/{OMAR_EA_ID}/events` with `receiver: "ea"`
 4. OMAR's event scheduler delivers the event to the EA (deferred if popup is open)
 5. EA processes the request and replies by curling `POST /api/slack/reply` on the bridge
 6. Bridge posts the reply back to the correct Slack thread (auto-chunked if >3900 chars)
@@ -124,6 +124,7 @@ Agents are named `slack-<channel_suffix>-<thread_ts>` for traceability in OMAR's
 | `SLACK_BOT_TOKEN` | Yes | — | Bot OAuth token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | Yes | — | App-level token (`xapp-...`) |
 | `OMAR_URL` | No | `http://127.0.0.1:9876` | OMAR API endpoint |
+| `OMAR_EA_ID` | No | `0` | OMAR EA id for routing (`/api/ea/{id}/...`) |
 | `SLACK_BRIDGE_PORT` | No | `9877` | Bridge HTTP callback server port |
 | `MAX_MESSAGE_LENGTH` | No | `3900` | Max Slack message chunk size |
 | `RUST_LOG` | No | `info` | Log level (trace/debug/info/warn/error) |

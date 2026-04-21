@@ -9,6 +9,9 @@ pub struct Config {
     pub app_token: String,
     /// OMAR API base URL (default: http://127.0.0.1:9876)
     pub omar_url: String,
+    /// OMAR EA id for routing agent/event/project calls under `/api/ea/{id}/...`
+    /// (default: 0 — the single-EA deployment id).
+    pub omar_ea_id: u32,
     /// Maximum Slack message length before chunking (Slack limit is 4000)
     pub max_message_length: usize,
     /// Port for the bridge's HTTP callback server (default: 9877)
@@ -37,6 +40,11 @@ impl Config {
         let omar_url =
             std::env::var("OMAR_URL").unwrap_or_else(|_| "http://127.0.0.1:9876".to_string());
 
+        let omar_ea_id: u32 = std::env::var("OMAR_EA_ID")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .unwrap_or(0);
+
         let max_message_length: usize = std::env::var("MAX_MESSAGE_LENGTH")
             .unwrap_or_else(|_| "3900".to_string())
             .parse()
@@ -51,6 +59,7 @@ impl Config {
             bot_token,
             app_token,
             omar_url,
+            omar_ea_id,
             max_message_length,
             bridge_port,
         })
