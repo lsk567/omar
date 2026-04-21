@@ -1004,8 +1004,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             // Tell the scheduler which agent popup is open so it
                             // defers events for that receiver until the popup closes.
                             // Include ea_id so suppression is scoped per-EA.
+                            //
+                            // Uses `selected_popup_receiver_name` so the EA pane
+                            // normalizes to "ea" — matches the `receiver` field
+                            // the scheduler sees (e.g. from Slack bridge).
                             *popup_receiver.lock().unwrap() = app
-                                .selected_agent_short_name()
+                                .selected_popup_receiver_name()
                                 .map(|name| (name, app.active_ea));
 
                             // Release App lock before blocking popup call
