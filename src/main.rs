@@ -6,6 +6,7 @@ mod ea;
 mod event;
 mod manager;
 mod memory;
+mod panic_hook;
 mod projects;
 mod scheduler;
 mod tmux;
@@ -110,6 +111,14 @@ enum ManagerAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the persisted-panic hook FIRST, before tokio workers or
+    // any other thread exists. If the tmux parent dies it takes the
+    // stderr pane with it (see issue #118), so panics need to be
+    // written to disk before unwind. The hook chains to whatever hook
+    // was previously installed, preserving RUST_BACKTRACE/default
+    // stderr behaviour for non-tmux runs.
+    panic_hook::install(omar_dir().join("logs").join("panics"));
+
     let cli = Cli::parse();
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(ref agent) = cli.agent {
