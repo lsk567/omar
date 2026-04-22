@@ -377,8 +377,8 @@ const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
     ),
     (
         "extended-keys",
-        "set -g extended-keys always",
-        "Shift+Enter in agents",
+        "set -g extended-keys on",
+        "Shift+Enter in agents (on, not always — always breaks Shift+Tab in omar)",
     ),
     (
         "set-clipboard",
@@ -1245,4 +1245,32 @@ async fn run_dashboard(config: Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `extended-keys always` forces tmux to emit modify-other-keys
+    /// sequences to every client, including omar's dashboard, which doesn't
+    /// push the kitty flag. Crossterm can't parse those sequences and silently
+    /// collapses Shift+Tab to plain Tab — so `drill_up` never runs. `on`
+    /// emits extended sequences only for clients that opt in via DECSET 2017,
+    /// which keeps Shift+Enter working in Claude panes while leaving the
+    /// dashboard on legacy xterm encoding (where Shift+Tab → `\x1b[Z` →
+    /// `KeyCode::BackTab`). Do not flip back to `always`.
+    #[test]
+    fn tmux_extended_keys_recommendation_is_on_not_always() {
+        let entry = TMUX_RECOMMENDED
+            .iter()
+            .find(|(opt, _, _)| *opt == "extended-keys")
+            .expect("TMUX_RECOMMENDED must include an extended-keys entry");
+        let value = entry.1.split_whitespace().last().unwrap_or("");
+        assert_eq!(
+            value, "on",
+            "extended-keys must be `on`, not `{}` — `always` breaks Shift+Tab \
+             in the dashboard (see tests comment)",
+            value
+        );
+    }
 }
