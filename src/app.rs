@@ -11,11 +11,22 @@ use crate::ea::{self, EaId, EaInfo};
 use crate::memory;
 use crate::projects::{self, Project};
 use crate::scheduler::{ScheduledEvent, Scheduler, TickerBuffer};
+use crate::tasks;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
 /// Shared app state for API access
 pub type SharedApp = App;
+
+/// Wall-clock timestamp in nanoseconds for task-record fields. Duplicates
+/// the private `now_ns` helpers in mcp.rs and scheduler, but keeping it
+/// local avoids widening those modules' public surface just for this.
+fn now_ns_app() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
 
 /// What kind of confirmation the user is being prompted for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,10 +83,6 @@ pub struct AgentGroup<'a> {
 
 /// Application state
 pub struct App {
-    /// Unique session identifier (timestamp) used to group log files
-    /// written by the `/api/ea/:ea_id/logs` endpoint for this OMAR run.
-    pub session_id: String,
-
     // EA fields
     pub active_ea: EaId,
     pub registered_eas: Vec<EaInfo>,
@@ -176,7 +183,6 @@ impl App {
         std::fs::create_dir_all(state_dir.join("status")).ok();
 
         Self {
-            session_id: chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string(),
             active_ea,
             registered_eas,
             base_prefix,
@@ -272,6 +278,18 @@ impl App {
     /// Refresh the list of agents (scoped to active EA)
     pub fn refresh(&mut self) -> Result<()> {
         self.registered_eas = ea::load_registry(&self.omar_dir);
+
+        // Pick up out-of-band EA switches (e.g. via the MCP `switch_ea` tool)
+        // that mutated `~/.omar/active_ea` while the dashboard was running.
+        // `load_active_ea` returns None on read/parse failure, in which case
+        // we keep the current value rather than crash the UI loop.
+        if let Some(persisted) = ea::load_active_ea(&self.omar_dir) {
+            if persisted != self.active_ea && self.registered_eas.iter().any(|e| e.id == persisted)
+            {
+                return self.switch_ea(persisted);
+            }
+        }
+
         let manager_session = self.manager_session_name();
 
         // Ensure manager exists
@@ -375,6 +393,16 @@ impl App {
         // Load parent mappings, worker tasks, and build the chain-of-command tree
         self.agent_parents = memory::load_agent_parents_from(&state_dir);
         self.worker_tasks = memory::load_worker_tasks_from(&state_dir);
+        // Augment from task_registry.json so newly-spawned agents always show
+        // their task before worker_tasks.json catches up.
+        for record in tasks::load_tasks_from(&state_dir) {
+            let session = format!(
+                "{}{}",
+                ea::ea_prefix(record.ea_id, &self.base_prefix),
+                record.agent_name
+            );
+            self.worker_tasks.entry(session).or_insert(record.task_text);
+        }
 
         // Cache agent statuses so render and API reads avoid per-frame disk I/O
         {
@@ -488,6 +516,14 @@ impl App {
             self.active_ea,
             ea_name,
             &self.omar_dir,
+            &crate::manager::McpLaunchContext {
+                omar_dir: self.omar_dir.clone(),
+                ea_id: self.active_ea,
+                session_prefix: self.base_prefix.clone(),
+                default_command: self.default_command.clone(),
+                default_workdir: self.default_workdir.clone(),
+                health_idle_warning: self.health_threshold,
+            },
         );
 
         // Start manager session — system prompt set at process start
@@ -882,8 +918,31 @@ impl App {
             }
 
             let name = agent.session.name.clone();
-            self.client.kill_session(&name)?;
             let state_dir = self.state_dir();
+
+            // If this agent has a tracked task, mark it Failed before we kill
+            // the session — prevents the same orphan-row pattern that
+            // complete_task / replace_stuck_task_agent guard against.
+            let short_name = name
+                .strip_prefix(self.client.prefix())
+                .unwrap_or(&name)
+                .to_string();
+            if let Some(task) = tasks::load_tasks_from(&state_dir)
+                .into_iter()
+                .find(|t| t.agent_name == short_name && t.status == tasks::TaskStatus::Running)
+            {
+                let _ = tasks::update_task_in(&state_dir, &task.task_id, |r| {
+                    r.status = tasks::TaskStatus::Failed;
+                    r.updated_at = now_ns_app();
+                });
+            }
+            // Cancel any scheduled events targeting this agent (the outer
+            // main-loop handler also cancels; this keeps kill_selected
+            // self-contained for any other caller).
+            self.scheduler
+                .cancel_by_receiver_and_ea(&short_name, self.active_ea);
+
+            self.client.kill_session(&name)?;
             memory::remove_agent_parent_in(&state_dir, &name);
             self.status_message = Some(format!("Killed agent: {}", name));
             self.refresh()?;
@@ -933,7 +992,46 @@ impl App {
 
         let short_name = name
             .strip_prefix(&self.config.dashboard.session_prefix)
-            .unwrap_or(&name);
+            .unwrap_or(&name)
+            .to_string();
+
+        // Keep 'n'-spawned agents first-class in the task system: auto-create
+        // (or reuse) a "manual" project for the active EA and record the
+        // spawn as a Running task. Without this, dashboard-spawned agents
+        // are invisible to check_task / complete_task / replace_stuck_task_agent.
+        let state_dir = self.state_dir();
+        let (project_id, project_name) = match projects::load_projects_from(&state_dir)
+            .into_iter()
+            .find(|p| p.name == "manual")
+        {
+            Some(p) => (p.id, p.name),
+            None => {
+                let id = projects::add_project_in(&state_dir, "manual")?;
+                (id, "manual".to_string())
+            }
+        };
+        let _ = tasks::add_task_in(
+            &state_dir,
+            tasks::TaskRecord {
+                task_id: uuid::Uuid::new_v4().to_string(),
+                ea_id: self.active_ea,
+                project_id,
+                project_name,
+                agent_name: short_name.clone(),
+                parent_agent: "ea".to_string(),
+                task_text: "dashboard-manual spawn".to_string(),
+                backend: None,
+                model: None,
+                status: tasks::TaskStatus::Running,
+                created_at: now_ns_app(),
+                updated_at: now_ns_app(),
+                replacement_count: 0,
+                previous_agents: Vec::new(),
+                summary: None,
+                last_status: None,
+            },
+        );
+
         self.set_status(format!("Spawned agent: {}", short_name));
         self.refresh()?;
 
@@ -1009,7 +1107,19 @@ impl App {
 
         let watchdog_cmd = &self.config.watchdog.command;
         let prompt_file = crate::manager::prompts_dir(&self.omar_dir).join("watchdog.md");
-        let cmd = crate::manager::build_agent_command(watchdog_cmd, &prompt_file, &[]);
+        let cmd = crate::manager::build_agent_command(
+            watchdog_cmd,
+            &prompt_file,
+            &[],
+            &crate::manager::McpLaunchContext {
+                omar_dir: self.omar_dir.clone(),
+                ea_id: self.active_ea,
+                session_prefix: self.base_prefix.clone(),
+                default_command: self.default_command.clone(),
+                default_workdir: self.default_workdir.clone(),
+                health_idle_warning: self.health_threshold,
+            },
+        );
 
         let workdir = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
@@ -1036,9 +1146,8 @@ impl App {
             "AUTH FAILURE DETECTED.\n\
 Failed agents: {}\n\
 Slack channel: {}\n\
-Omar API: http://localhost:{}\n\
-Slack bridge: http://localhost:9877",
-            failed_list, slack_display, self.config.api.port,
+Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack_reply` MCP tool.",
+            failed_list, slack_display,
         );
 
         let client = self.client.clone();
