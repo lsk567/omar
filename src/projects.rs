@@ -89,6 +89,13 @@ pub fn add_project_in(state_dir: &Path, name: &str) -> Result<usize> {
     Ok(id)
 }
 
+/// Find a project by id. None if not present.
+pub fn find_project_in(state_dir: &Path, id: usize) -> Option<Project> {
+    load_projects_from(state_dir)
+        .into_iter()
+        .find(|p| p.id == id)
+}
+
 /// Remove a project by id from an EA, returns whether it was found
 pub fn remove_project_in(state_dir: &Path, id: usize) -> Result<bool> {
     let _guard = PROJECTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());

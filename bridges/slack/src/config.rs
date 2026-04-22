@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use std::path::PathBuf;
 
 /// Configuration for the Slack bridge, loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -7,15 +8,14 @@ pub struct Config {
     pub bot_token: String,
     /// Slack app-level token (xapp-...) — used for Socket Mode WebSocket connection
     pub app_token: String,
-    /// OMAR API base URL (default: http://127.0.0.1:9876)
-    pub omar_url: String,
-    /// OMAR EA id for routing agent/event/project calls under `/api/ea/{id}/...`
-    /// (default: 0 — the single-EA deployment id).
-    pub omar_ea_id: u32,
+    /// Path to the `omar` binary. The bridge spawns `omar mcp-server` as a
+    /// subprocess and talks to it over stdio.
+    pub omar_binary: PathBuf,
+    /// `~/.omar` — holds the `slack_outbox/` directory the bridge polls for
+    /// outbound replies queued by the EA.
+    pub omar_dir: PathBuf,
     /// Maximum Slack message length before chunking (Slack limit is 4000)
     pub max_message_length: usize,
-    /// Port for the bridge's HTTP callback server (default: 9877)
-    pub bridge_port: u16,
 }
 
 impl Config {
@@ -37,24 +37,14 @@ impl Config {
             bail!("SLACK_APP_TOKEN must start with 'xapp-'");
         }
 
-        let omar_url =
-            std::env::var("OMAR_URL").unwrap_or_else(|_| "http://127.0.0.1:9876".to_string());
+        let omar_binary = match std::env::var("OMAR_BINARY") {
+            Ok(v) if !v.is_empty() => PathBuf::from(v),
+            _ => resolve_default_omar_binary(),
+        };
 
-        // OMAR_EA_ID is unusual: silently defaulting on parse errors would
-        // misroute every event to EA 0 with no signal. Default only when the
-        // var is unset; fail loudly on anything else.
-        let omar_ea_id: u32 = match std::env::var("OMAR_EA_ID") {
-            Ok(value) => value.parse().map_err(|err| {
-                anyhow::anyhow!(
-                    "OMAR_EA_ID must be a valid unsigned integer, got {:?}: {}",
-                    value,
-                    err
-                )
-            })?,
-            Err(std::env::VarError::NotPresent) => 0,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                bail!("OMAR_EA_ID must contain valid Unicode")
-            }
+        let omar_dir = match std::env::var("OMAR_DIR") {
+            Ok(v) if !v.is_empty() => PathBuf::from(v),
+            _ => dirs_home()?.join(".omar"),
         };
 
         let max_message_length: usize = std::env::var("MAX_MESSAGE_LENGTH")
@@ -62,18 +52,37 @@ impl Config {
             .parse()
             .unwrap_or(3900);
 
-        let bridge_port: u16 = std::env::var("SLACK_BRIDGE_PORT")
-            .unwrap_or_else(|_| "9877".to_string())
-            .parse()
-            .unwrap_or(9877);
-
         Ok(Self {
             bot_token,
             app_token,
-            omar_url,
-            omar_ea_id,
+            omar_binary,
+            omar_dir,
             max_message_length,
-            bridge_port,
         })
     }
+}
+
+/// Fall back to `$HOME` when `dirs::home_dir()` isn't available (we don't
+/// pull in the `dirs` crate from the bridge just for this).
+fn dirs_home() -> Result<PathBuf> {
+    match std::env::var("HOME") {
+        Ok(v) if !v.is_empty() => Ok(PathBuf::from(v)),
+        _ => bail!("HOME is not set; pass OMAR_DIR explicitly"),
+    }
+}
+
+/// Look for `omar` next to the currently-running bridge binary first so
+/// installations that drop both binaries into the same directory work
+/// without any env vars. Fall back to the bare name so a PATH lookup
+/// resolves it.
+fn resolve_default_omar_binary() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("omar");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("omar")
 }
