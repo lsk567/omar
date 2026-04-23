@@ -129,7 +129,6 @@ pub struct App {
     health_threshold: i64,
     default_command: String,
     default_workdir: String,
-    session_prefix: String,
     pub scheduler: Arc<Scheduler>,
     /// Whether the watchdog agent has been spawned
     watchdog_spawned: bool,
@@ -232,7 +231,6 @@ impl App {
             health_threshold: config.health.idle_warning,
             default_command: config.agent.default_command.clone(),
             default_workdir: config.agent.default_workdir.clone(),
-            session_prefix,
             scheduler,
             watchdog_spawned: false,
         }
@@ -246,6 +244,10 @@ impl App {
     /// Manager session name for the active EA
     pub fn manager_session_name(&self) -> String {
         ea::ea_manager_session(self.active_ea, &self.base_prefix)
+    }
+
+    fn active_session_prefix(&self) -> String {
+        ea::ea_prefix(self.active_ea, &self.base_prefix)
     }
 
     /// True when any popup or input overlay is active.
@@ -314,12 +316,12 @@ impl App {
             } else if session.name == DASHBOARD_SESSION {
                 // Skip the dashboard's own tmux session
                 continue;
-            } else if !self.session_prefix.is_empty()
-                && !session.name.starts_with(&self.session_prefix)
-            {
-                // Skip sessions that don't match the active EA's prefix
-                continue;
             } else {
+                let session_prefix = self.active_session_prefix();
+                if !session_prefix.is_empty() && !session.name.starts_with(&session_prefix) {
+                    // Skip sessions that don't match the active EA's prefix
+                    continue;
+                }
                 other_sessions.push(session);
             }
         }
@@ -929,12 +931,14 @@ impl App {
 
     /// Generate a unique agent name (within the active EA's namespace).
     pub fn generate_agent_name(&self) -> String {
-        let existing: std::collections::HashSet<_> = self
-            .agents
-            .iter()
-            .map(|a| a.session.name.as_str())
-            .collect();
-        next_agent_name(&self.session_prefix, &existing)
+        let mut existing: std::collections::HashSet<String> =
+            self.agents.iter().map(|a| a.session.name.clone()).collect();
+        if let Ok(live_sessions) = self.client.list_sessions() {
+            existing.extend(live_sessions.into_iter().map(|session| session.name));
+        }
+        let existing_refs: std::collections::HashSet<&str> =
+            existing.iter().map(String::as_str).collect();
+        next_agent_name(&self.active_session_prefix(), &existing_refs)
     }
 
     /// Spawn a new agent with default settings
@@ -942,7 +946,6 @@ impl App {
         // Refresh first to get current state
         self.refresh()?;
 
-        let name = self.generate_agent_name();
         let workdir = if self.config.agent.default_workdir == "." {
             std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -951,8 +954,30 @@ impl App {
             self.config.agent.default_workdir.clone()
         };
 
-        self.client
-            .new_session(&name, &self.config.agent.default_command, Some(&workdir))?;
+        let mut name = None;
+        for _ in 0..5 {
+            let candidate = self.generate_agent_name();
+            if self.client.has_session(&candidate).unwrap_or(false) {
+                self.refresh()?;
+                continue;
+            }
+            match self.client.new_session(
+                &candidate,
+                &self.config.agent.default_command,
+                Some(&workdir),
+            ) {
+                Ok(()) => {
+                    name = Some(candidate);
+                    break;
+                }
+                Err(err) if err.to_string().contains("duplicate session") => {
+                    self.refresh()?;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let name = name.ok_or_else(|| anyhow::anyhow!("Unable to allocate a unique agent name"))?;
 
         let state_dir = self.state_dir();
         memory::save_agent_parent_in(&state_dir, &name, &self.focus_parent);
@@ -1216,7 +1241,6 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
 
         // Reconstruct tmux client with new EA's prefix
         let new_prefix = ea::ea_prefix(ea_id, &self.base_prefix);
-        self.session_prefix = new_prefix.clone();
         self.client = TmuxClient::new(&new_prefix);
         self.health_checker = HealthChecker::new(self.client.clone(), self.health_threshold)
             .with_auth_failure_patterns(self.config.watchdog.auth_failure_patterns.clone());
