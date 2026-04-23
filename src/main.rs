@@ -10,7 +10,6 @@ mod metrics;
 mod panic_hook;
 mod projects;
 mod scheduler;
-mod tasks;
 mod tmux;
 mod ui;
 

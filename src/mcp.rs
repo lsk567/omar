@@ -22,16 +22,15 @@ use crate::memory;
 use crate::metrics;
 use crate::projects;
 use crate::scheduler::{self, ScheduledEvent};
-use crate::tasks::{self, TaskRecord, TaskStatus};
 use crate::tmux::{DeliveryOptions, HealthChecker, TmuxClient};
 
 const JSONRPC_VERSION: &str = "2.0";
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_INSTRUCTIONS: &str = concat!(
     "OMAR provides orchestration tools for executive assistant and worker sessions. ",
-    "Search OMAR tools when the task involves agents, tracked tasks, projects, scheduled events, ",
+    "Search OMAR tools when the task involves agents, projects, scheduled events, ",
     "manager notes, action logs, or computer control. ",
-    "Use spawn_agent/check_task/complete_task for normal delegated work, ",
+    "Use spawn_agent for delegated work, ",
     "append_manager_note for persistent manager notes, ",
     "log_justification before state-changing operations, ",
     "and omar_wake_later/list_events/cancel_event instead of sleep loops."
@@ -259,10 +258,7 @@ fn last_output_line(output: &str) -> String {
         .collect()
 }
 
-/// True when the `[TASK COMPLETE]` sentinel appears on one of the final `tail_lines`
-/// non-empty lines of `output`. A raw `output.contains("[TASK COMPLETE]")` check
-/// against a 200-line pane capture false-positives on agent reasoning text that
-/// mentions the sentinel without actually being the terminal tail.
+#[cfg(test)]
 fn ready_to_complete_tail(output: &str, tail_lines: usize) -> bool {
     output
         .lines()
@@ -497,9 +493,6 @@ impl OmarMcpServer {
             "omar_wake_later" => self.omar_wake_later(call.arguments),
             "list_events" => self.list_events(),
             "cancel_event" => self.cancel_event(call.arguments),
-            "check_task" => self.check_task(call.arguments),
-            "complete_task" => self.complete_task(call.arguments),
-            "replace_stuck_task_agent" => self.replace_stuck_task_agent(call.arguments),
             "append_manager_note" => self.append_manager_note(call.arguments),
             "log_justification" => self.log_justification(call.arguments),
             "slack_reply" => self.slack_reply(call.arguments),
@@ -785,21 +778,28 @@ impl OmarMcpServer {
             return Err(anyhow!("Agent '{}' not found", args.name));
         }
         let short_name = self.display_name(&session_name)?.to_string();
-        let task = tasks::find_task_by_agent_in(&state_dir, &short_name);
-        let children: Vec<String> = tasks::load_tasks_from(&state_dir)
+        let task = memory::load_worker_tasks_from(&state_dir)
+            .remove(&session_name)
+            .filter(|text| !text.trim().is_empty());
+        let agent_parents = memory::load_agent_parents_from(&state_dir);
+        let children: Vec<String> = client
+            .list_sessions()?
             .into_iter()
-            .filter(|record| {
-                record.parent_agent == short_name && record.status == TaskStatus::Running
+            .filter_map(|session| {
+                if agent_parents.get(&session.name) == Some(&session_name) {
+                    Some(self.display_name(&session.name).ok()?.to_string())
+                } else {
+                    None
+                }
             })
-            .map(|record| record.agent_name)
             .collect();
         let activity = client.get_pane_activity(&session_name).unwrap_or(0);
         let health = health_from_activity(activity, self.context.health_idle_warning);
         Ok(json!({
             "id": short_name,
             "health": health,
-            "task": task.as_ref().map(|record| record.task_text.clone()),
-            "status": task.as_ref().and_then(|record| record.last_status.clone()),
+            "task": task,
+            "status": memory::load_agent_status_in(&state_dir, &session_name),
             "children": children,
         }))
     }
@@ -819,23 +819,12 @@ impl OmarMcpServer {
             return Err(anyhow!("Agent '{}' not found", args.name));
         }
         memory::save_agent_status_in(&state_dir, &session_name, &args.status);
-        if let Some(task) =
-            tasks::find_task_by_agent_in(&state_dir, self.display_name(&session_name)?)
-        {
-            let _ = tasks::update_task_in(&state_dir, &task.task_id, |record| {
-                record.last_status = Some(args.status.clone());
-                record.updated_at = now_ns();
-            })?;
-        }
         drop(_lock);
         self.refresh_memory()?;
         Ok(json!({ "status": "updated" }))
     }
 
-    /// The single spawn-path MCP tool. Mirrors the pre-#108 REST agent-spawn
-    /// endpoint (`POST /api/ea/:ea_id/agents` → `handlers::spawn_agent`):
-    /// one call creates the tmux session and records a tracked task.
-    /// Requires an existing `project_id` (no implicit project creation).
+    /// The single MCP spawn path. Requires an existing `project_id`.
     fn spawn_agent(&self, args: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct Args {
@@ -850,7 +839,6 @@ impl OmarMcpServer {
             parent: Option<String>,
         }
         let args: Args = serde_json::from_value(args)?;
-        let ea_id = self.ea_id()?;
         let state_dir = self.state_dir()?;
         let lock_wait_start = std::time::Instant::now();
         let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
@@ -868,19 +856,20 @@ impl OmarMcpServer {
         let project_id = project.id;
         let project_name = project.name.clone();
 
-        // Readable task_text for the dashboard. If the caller passed a
-        // `task`, use it verbatim. Otherwise, for raw-command sessions
-        // (e.g. `command: "bash"` demos), record the command so the task
-        // record is self-explanatory.
-        let task_text = match (args.task.as_deref(), args.command.as_deref()) {
-            (Some(task), _) => task.to_string(),
-            (None, Some(cmd)) => format!("command: {}", cmd),
-            (None, None) => String::new(),
-        };
+        let task = args
+            .task
+            .as_deref()
+            .map(str::trim)
+            .filter(|task| !task.is_empty())
+            .ok_or_else(|| anyhow!("spawn_agent requires a non-empty 'task'"))?
+            .to_string();
+
+        // `task` is metadata for the dashboard and the agent prompt.
+        let task_text = task.clone();
 
         let spawn_result = self.spawn_agent_internal(SpawnRequestInternal {
             name: Some(args.name.clone()),
-            task: args.task.clone(),
+            task: Some(task),
             workdir: args.workdir,
             command: args.command,
             backend: args.backend.clone(),
@@ -895,33 +884,11 @@ impl OmarMcpServer {
             .and_then(Value::as_str)
             .unwrap_or(&args.name)
             .to_string();
-        let task_id = Uuid::new_v4().to_string();
-        let parent_agent = args.parent.unwrap_or_else(|| "ea".to_string());
-        tasks::add_task_in(
-            &state_dir,
-            TaskRecord {
-                task_id: task_id.clone(),
-                ea_id,
-                project_id,
-                project_name: project_name.clone(),
-                agent_name: agent_name.clone(),
-                parent_agent,
-                task_text,
-                backend: args.backend,
-                model: args.model,
-                status: TaskStatus::Running,
-                created_at: now_ns(),
-                updated_at: now_ns(),
-                replacement_count: 0,
-                previous_agents: Vec::new(),
-                summary: None,
-                last_status: None,
-            },
-        )?;
+        let session_name = self.qualified_session_name(&agent_name)?;
+        memory::save_worker_task_in(&state_dir, &session_name, &task_text);
         drop(_lock);
         self.refresh_memory()?;
         Ok(json!({
-            "task_id": task_id,
             "project_id": project_id,
             "project_name": project_name,
             "agent_name": agent_name,
@@ -1085,8 +1052,13 @@ impl OmarMcpServer {
         if session_name == manager_session {
             return Err(anyhow!("Cannot kill manager via MCP"));
         }
-        if !client.has_session(&session_name).unwrap_or(false) {
-            return Err(anyhow!("Agent '{}' not found", args.name));
+        let session = client
+            .list_sessions()?
+            .into_iter()
+            .find(|session| session.name == session_name)
+            .ok_or_else(|| anyhow!("Agent '{}' not found", args.name))?;
+        if session.attached {
+            return Err(anyhow!("Cannot kill attached session"));
         }
         client.kill_session(&session_name)?;
         memory::remove_agent_parent_in(&state_dir, &session_name);
@@ -1095,30 +1067,11 @@ impl OmarMcpServer {
             .scheduler()
             .cancel_by_receiver_and_ea(&short_name, self.ea_id()?);
 
-        // If this agent has a Running task record, mark it Failed so the
-        // registry doesn't accumulate orphan rows with dead sessions.
-        // Mirrors the fix in `App::kill_selected` (dashboard 'd' key).
-        let task_status = if let Some(task) = tasks::load_tasks_from(&state_dir)
-            .into_iter()
-            .find(|t| t.agent_name == short_name && t.status == TaskStatus::Running)
-        {
-            tasks::update_task_in(&state_dir, &task.task_id, |r| {
-                r.status = TaskStatus::Failed;
-                r.updated_at = now_ns();
-            })
-            .ok()
-            .flatten()
-            .map(|_| "failed")
-        } else {
-            None
-        };
-
         drop(_lock);
         self.refresh_memory()?;
         Ok(json!({
             "status": "killed",
             "events_cancelled": events_cancelled,
-            "task_status": task_status,
         }))
     }
 
@@ -1270,21 +1223,6 @@ impl OmarMcpServer {
         let state_dir = self.state_dir()?;
         let project = projects::find_project_in(&state_dir, args.project_id)
             .ok_or_else(|| anyhow!("Project '{}' not found", args.project_id))?;
-        let attached: Vec<String> = tasks::load_tasks_from(&state_dir)
-            .into_iter()
-            .filter(|t| t.project_id == args.project_id && t.status == TaskStatus::Running)
-            .map(|t| t.task_id)
-            .collect();
-        if !attached.is_empty() {
-            return Err(anyhow!(
-                "Project '{}' still has {} running task(s): {}. \
-                 Complete, replace, or kill them before calling complete_project. \
-                 (Tasks in Failed/Replaced state do not block removal — those are terminal history.)",
-                args.project_id,
-                attached.len(),
-                attached.join(", ")
-            ));
-        }
         let removed = projects::remove_project_in(&state_dir, args.project_id)?;
         if !removed {
             return Err(anyhow!(
@@ -1297,174 +1235,6 @@ impl OmarMcpServer {
             "project_id": project.id,
             "name": project.name,
             "status": "completed",
-        }))
-    }
-
-    fn check_task(&self, args: Value) -> Result<Value> {
-        #[derive(Deserialize)]
-        struct Args {
-            task_id: String,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        let state_dir = self.state_dir()?;
-        let task = tasks::find_task_in(&state_dir, &args.task_id)
-            .or_else(|| tasks::find_task_by_agent_in(&state_dir, &args.task_id))
-            .ok_or_else(|| anyhow!("Task '{}' not found", args.task_id))?;
-        let client = self.client()?;
-        let session_name = self.qualified_session_name(&task.agent_name)?;
-        let agent_exists = client.has_session(&session_name).unwrap_or(false);
-        let output_tail = if agent_exists {
-            client.capture_pane(&session_name, 200).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let health = if agent_exists {
-            let activity = client.get_pane_activity(&session_name).unwrap_or_default();
-            Some(health_from_activity(
-                activity,
-                self.context.health_idle_warning,
-            ))
-        } else {
-            None
-        };
-        // Tail-anchor the sentinel: only trust it if it shows up in the final
-        // few pane lines, not anywhere in the 200-line scrollback (agent
-        // reasoning text can mention [TASK COMPLETE] without completing).
-        let ready_to_complete = ready_to_complete_tail(&output_tail, 10);
-        Ok(json!({
-            "task_id": task.task_id,
-            "agent_name": task.agent_name,
-            "project_id": task.project_id,
-            "project_name": task.project_name,
-            "status": task.status,
-            "summary": task.summary,
-            "last_status": task.last_status,
-            "agent_exists": agent_exists,
-            "health": health,
-            "ready_to_complete": ready_to_complete,
-            "last_output": last_output_line(&output_tail),
-            "output_tail": output_tail,
-        }))
-    }
-
-    fn complete_task(&self, args: Value) -> Result<Value> {
-        #[derive(Deserialize)]
-        struct Args {
-            task_id: String,
-            summary: Option<String>,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        let state_dir = self.state_dir()?;
-        let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
-        let existing = tasks::find_task_in(&state_dir, &args.task_id)
-            .or_else(|| tasks::find_task_by_agent_in(&state_dir, &args.task_id))
-            .ok_or_else(|| anyhow!("Task '{}' not found", args.task_id))?;
-        if existing.status == TaskStatus::Completed {
-            return Ok(json!({
-                "task_id": existing.task_id,
-                "status": "completed",
-                "agent_name": existing.agent_name,
-                "project_id": existing.project_id,
-            }));
-        }
-
-        let client = self.client()?;
-        let session_name = self.qualified_session_name(&existing.agent_name)?;
-        if client.has_session(&session_name).unwrap_or(false) {
-            let _ = client.kill_session(&session_name);
-        }
-        let events_cancelled = self
-            .scheduler()
-            .cancel_by_receiver_and_ea(&existing.agent_name, self.ea_id()?);
-        // Projects are a separate lifecycle now (stream 4). complete_task
-        // no longer removes the project — callers use complete_project
-        // when all tasks on a project are done.
-        memory::remove_agent_parent_in(&state_dir, &session_name);
-        let updated = tasks::update_task_in(&state_dir, &existing.task_id, |record| {
-            record.status = TaskStatus::Completed;
-            record.summary = args.summary.clone().or_else(|| record.summary.clone());
-            record.updated_at = now_ns();
-        })?
-        .ok_or_else(|| {
-            anyhow!(
-                "internal: task row vanished between read and update (task_id='{}', resolved='{}')",
-                args.task_id,
-                existing.task_id
-            )
-        })?;
-        drop(_lock);
-        self.refresh_memory()?;
-        Ok(json!({
-            "task_id": updated.task_id,
-            "status": "completed",
-            "agent_name": updated.agent_name,
-            "project_id": updated.project_id,
-            "summary": updated.summary,
-            "events_cancelled": events_cancelled,
-        }))
-    }
-
-    fn replace_stuck_task_agent(&self, args: Value) -> Result<Value> {
-        #[derive(Deserialize)]
-        struct Args {
-            task_id: String,
-            additional_context: Option<String>,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        let state_dir = self.state_dir()?;
-        let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
-        let task = tasks::find_task_in(&state_dir, &args.task_id)
-            .or_else(|| tasks::find_task_by_agent_in(&state_dir, &args.task_id))
-            .ok_or_else(|| anyhow!("Task '{}' not found", args.task_id))?;
-        if task.status == TaskStatus::Completed {
-            return Err(anyhow!("Task '{}' is already completed", args.task_id));
-        }
-        let client = self.client()?;
-        let session_name = self.qualified_session_name(&task.agent_name)?;
-        if client.has_session(&session_name).unwrap_or(false) {
-            let _ = client.kill_session(&session_name);
-        }
-        self.scheduler()
-            .cancel_by_receiver_and_ea(&task.agent_name, self.ea_id()?);
-
-        let new_task_text = match args.additional_context {
-            Some(extra) if !extra.trim().is_empty() => {
-                format!("{}\n\nAdditional context:\n{}", task.task_text, extra)
-            }
-            _ => task.task_text.clone(),
-        };
-        let _ = self.spawn_agent_internal(SpawnRequestInternal {
-            name: Some(task.agent_name.clone()),
-            task: Some(new_task_text.clone()),
-            workdir: Some(self.context.default_workdir.clone()),
-            command: None,
-            backend: task.backend.clone(),
-            model: task.model.clone(),
-            role: Some("agent".to_string()),
-            parent: Some(task.parent_agent.clone()),
-            spawn_lock_wait_ms: 0,
-        })?;
-
-        let updated = tasks::update_task_in(&state_dir, &task.task_id, |record| {
-            record.status = TaskStatus::Running;
-            record.task_text = new_task_text.clone();
-            record.replacement_count += 1;
-            record.updated_at = now_ns();
-        })?
-        .ok_or_else(|| {
-            anyhow!(
-                "internal: task row vanished between read and update (task_id='{}', resolved='{}')",
-                args.task_id,
-                task.task_id
-            )
-        })?;
-        drop(_lock);
-        self.refresh_memory()?;
-        Ok(json!({
-            "task_id": updated.task_id,
-            "status": "running",
-            "agent_name": updated.agent_name,
-            "replacement_count": updated.replacement_count,
         }))
     }
 
@@ -2004,20 +1774,20 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "spawn_agent",
-            "Spawn an agent session and record a tracked task. Accepts optional `command` for raw sessions (e.g. demo bash windows). Always records a task; use `complete_task` when done. Mirrors the pre-#108 REST agent-spawn endpoint.",
+            "Spawn an agent session. `task` is required so the dashboard and prompt always show the assigned work; session lifecycle is controlled separately via session tools.",
             json!({
                 "type":"object",
                 "properties":{
                     "name":{"type":"string","description":"Short agent name (session prefix is added automatically)."},
                     "project_id":{"type":"integer","description":"Existing project id from add_project or list_projects. Required — spawn_agent does not auto-create projects."},
-                    "task":{"type":"string","description":"Delivered to the agent as their initial task and shown in the dashboard. What to build or do — no [TASK COMPLETE] or parent-wakeup instructions; those are already in every agent's system prompt. Omit for raw-command demo sessions."},
+                    "task":{"type":"string","description":"Delivered to the agent as their initial task and shown in the dashboard. What to build or do — no [TASK COMPLETE] or parent-wakeup instructions; those are already in every agent's system prompt."},
                     "command":{"type":"string","description":"Raw command to run instead of a backend agent (e.g. 'bash' for a demo window). Mutually exclusive with backend."},
                     "backend":{"type":"string","description":"One of: 'claude', 'codex', 'cursor', 'opencode', 'gemini'. Mutually exclusive with command."},
                     "model":{"type":"string"},
                     "workdir":{"type":"string"},
                     "parent":{"type":"string","description":"Your own agent name for hierarchy tracking. Omit if the EA is the direct parent."}
                 },
-                "required":["name","project_id"]
+                "required":["name","project_id","task"]
             }),
         ),
         tool(
@@ -2060,7 +1830,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "complete_project",
-            "Remove a project from the registry. Errors if any task attached to it is still not completed; complete or replace those tasks first.",
+            "Remove a project from the registry.",
             json!({
                 "type":"object",
                 "properties":{
@@ -2099,39 +1869,6 @@ fn tool_definitions() -> Vec<Value> {
                 "type":"object",
                 "properties":{"event_id":{"type":"string"}},
                 "required":["event_id"]
-            }),
-        ),
-        tool(
-            "check_task",
-            "Inspect tracked task state. If the response has `agent_exists: false` while `status != completed`, the worker is dead — call `replace_stuck_task_agent`, NOT `spawn_agent`.",
-            json!({
-                "type":"object",
-                "properties":{"task_id":{"type":"string","description":"Task UUID from spawn_agent, or the worker's short name."}},
-                "required":["task_id"]
-            }),
-        ),
-        tool(
-            "complete_task",
-            "Complete a tracked task atomically. Does not remove the underlying project; use complete_project for that.",
-            json!({
-                "type":"object",
-                "properties":{
-                    "task_id":{"type":"string","description":"Task UUID from spawn_agent, or the worker's short name."},
-                    "summary":{"type":"string"}
-                },
-                "required":["task_id"]
-            }),
-        ),
-        tool(
-            "replace_stuck_task_agent",
-            "Replace the worker behind a tracked task. Use this when `check_task` shows a dead worker (`agent_exists: false` while `status == running`) or when a worker is idle/stuck. Reuses the same task_id — do NOT call `create_task` for the same work.",
-            json!({
-                "type":"object",
-                "properties":{
-                    "task_id":{"type":"string","description":"Task UUID from spawn_agent, or the worker's short name."},
-                    "additional_context":{"type":"string","description":"Extra instructions appended to the original task text for the replacement worker."}
-                },
-                "required":["task_id"]
             }),
         ),
         tool(
