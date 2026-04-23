@@ -526,11 +526,7 @@ fn spawn_worker(
     let cmd = build_agent_command(
         command,
         &prompt_file,
-        &[
-            ("{{PARENT_NAME}}", parent_name),
-            ("{{TASK}}", &agent.task),
-            ("{{EA_ID}}", &ea_id.to_string()),
-        ],
+        &[("{{TASK}}", &agent.task), ("{{EA_ID}}", &ea_id.to_string())],
     );
 
     // Create worker session — system prompt set at process start
@@ -568,7 +564,10 @@ fn spawn_worker(
         false
     };
 
-    let initial_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", agent.name, agent.task);
+    let initial_msg = format!(
+        "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
+        agent.name, parent_name, agent.task
+    );
     let opts = DeliveryOptions {
         startup_timeout: Duration::from_secs(45),
         stable_quiet: Duration::from_millis(800),
@@ -722,11 +721,11 @@ mod tests {
         let cmd = build_agent_command(
             "claude",
             Path::new("/prompts/worker.md"),
-            &[("{{PARENT_NAME}}", "pm-api"), ("{{TASK}}", "build it")],
+            &[("{{TASK}}", "build it"), ("{{EA_ID}}", "0")],
         );
         assert_eq!(
             cmd,
-            "claude --system-prompt \"$(sed 's|{{PARENT_NAME}}|pm-api|g; s|{{TASK}}|build it|g' '/prompts/worker.md')\""
+            "claude --system-prompt \"$(sed 's|{{TASK}}|build it|g; s|{{EA_ID}}|0|g' '/prompts/worker.md')\""
         );
     }
 
@@ -735,11 +734,7 @@ mod tests {
         let cmd = build_agent_command(
             "claude",
             Path::new("/prompts/agent.md"),
-            &[
-                ("{{PARENT_NAME}}", "ea"),
-                ("{{TASK}}", "do stuff"),
-                ("{{EA_ID}}", "2"),
-            ],
+            &[("{{TASK}}", "do stuff"), ("{{EA_ID}}", "2")],
         );
         assert!(cmd.contains("s|{{EA_ID}}|2|g"));
     }
