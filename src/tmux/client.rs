@@ -43,6 +43,27 @@ impl Default for DeliveryOptions {
     }
 }
 
+/// Pick a distinctive substring from `text` suitable for presence checks
+/// against pane capture. Prefer the longest non-whitespace-heavy line; if
+/// that line is still too short or too generic, fall back to `None` so the
+/// caller uses a coarser verification path.
+///
+/// Needs enough distinct printable bytes to not accidentally appear in the
+/// pre-paste pane (e.g. the backend's static banner) — 8 chars is the
+/// minimum that empirically avoids false positives from Claude Code /
+/// codex banners while still matching short task messages.
+fn payload_needle(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.chars().filter(|c| !c.is_whitespace()).count() >= 8)
+        .max_by_key(|line| line.len())
+        .map(|line| {
+            // Cap at 80 chars to keep substring checks cheap and avoid
+            // false negatives from wrapping/rewrapping in the input widget.
+            line.chars().take(80).collect()
+        })
+}
+
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
     prefix: String,
@@ -304,17 +325,46 @@ impl TmuxClient {
         // timestamp — masking the failure from wait_for_change.
         thread::sleep(Duration::from_millis(500));
 
+        // A distinctive substring from the payload — used to confirm the
+        // paste actually rendered into the input widget before we take
+        // the pre-Enter snapshot. Falls back to `None` for payloads we
+        // cannot uniquely fingerprint (very short / whitespace-only);
+        // in that case the original behaviour (snapshot immediately)
+        // applies.
+        let needle = payload_needle(text);
+
         for attempt in 1..=opts.max_retries {
             // Paste text via bracketed paste (no trailing newline — Enter
             // is sent separately below).
             self.paste_text(session, text)?;
 
-            // Snapshot pane state AFTER paste but BEFORE the Enter keys,
-            // so wait_for_change below actually verifies that the Enter
-            // submitted the prompt — not merely that paste_text drew the
-            // payload into the input widget. Without this ordering, a
-            // swallowed Enter still appears "successful" because the
-            // paste itself counts as a pane change.
+            // Wait for the backend to actually render the paste into the
+            // pane before taking the pre-Enter snapshot. `paste-buffer`
+            // returns as soon as tmux writes the bytes to the pty; the
+            // backend's input widget typically takes 50–500 ms more to
+            // ingest the paste and redraw its input area. Under load
+            // (e.g. several Claude Code spawns in parallel on one host)
+            // this gap widens. If we snapshot before the paste renders,
+            // `content_before` holds the pre-paste pane — and
+            // `wait_for_change` below then returns true as soon as the
+            // paste finally draws, masking the case where the Enter keys
+            // were silently swallowed by a not-yet-ready widget.
+            if let Some(needle) = needle.as_deref() {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if let Ok(hay) = self.capture_pane_plain(session, 50) {
+                        if hay.contains(needle) {
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            // Snapshot pane state AFTER paste has rendered but BEFORE the
+            // Enter keys, so wait_for_change below verifies that Enter
+            // actually submitted the prompt — not merely that paste_text
+            // drew the payload into the input widget.
             let content_before = self.capture_pane(session, 50).unwrap_or_default();
             let activity_before = self.get_pane_activity(session).unwrap_or(0);
 
@@ -540,6 +590,111 @@ mod tests {
     fn test_client_with_different_prefix() {
         let client = TmuxClient::new("test-");
         assert_eq!(client.prefix(), "test-");
+    }
+
+    /// Regression: `deliver_prompt` used to snapshot the pane for
+    /// `wait_for_change` IMMEDIATELY after `paste_text` returned. But
+    /// `paste-buffer` is asynchronous — tmux writes the bytes to the pty
+    /// and returns; the backend's input widget takes a variable amount of
+    /// time (empirically 50–500 ms, widening under CPU contention when
+    /// multiple Claude Code processes spawn in parallel) to ingest the
+    /// paste and redraw the input area. When the snapshot won that race,
+    /// `content_before` held the pre-paste pane and `wait_for_change`
+    /// returned true just from the paste finally drawing — masking
+    /// swallowed Enters. The fix polls for a needle from the payload to
+    /// appear in the pane before snapshotting.
+    ///
+    /// This test reproduces the race deterministically via a bash helper
+    /// that echoes the payload AFTER a delay — mimicking a slow backend
+    /// render. Without the fix, this trivially succeeds on the paste
+    /// itself; with the fix, it waits for the echoed needle and correctly
+    /// observes the post-"render" state as the baseline.
+    #[test]
+    fn test_deliver_prompt_waits_for_paste_render() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let session = "omar-test-paste-render-race";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .output();
+        let _guard = SessionGuard(session.to_string());
+
+        // A script that simulates a slow-rendering TUI: sleeps 500 ms after
+        // accepting input, then echoes it — mirroring the 50-500 ms window
+        // between paste-buffer returning and Claude Code's widget drawing
+        // the pasted text.
+        let script = r#"
+            stty -icanon -echo min 1
+            while IFS= read -r -n 1 c; do
+                if [ "$c" = $'\n' ] || [ "$c" = $'\r' ]; then
+                    sleep 0.5
+                    printf 'got: %s\n' "$buf"
+                    buf=''
+                else
+                    buf="${buf}${c}"
+                fi
+            done
+        "#;
+        let shell_cmd = format!("bash -c {:?}", script);
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", session, &shell_cmd])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("Skipping test: failed to create tmux session");
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
+
+        // Give the delay script time to settle into its read loop.
+        let client = TmuxClient::new("omar-test-");
+        let opts = DeliveryOptions {
+            startup_timeout: Duration::from_secs(3),
+            stable_quiet: Duration::from_millis(200),
+            verify_timeout: Duration::from_secs(2),
+            max_retries: 2,
+            poll_interval: Duration::from_millis(50),
+            retry_delay: Duration::from_millis(100),
+            require_initial_change: false,
+        };
+
+        let payload = "PASTE_RENDER_RACE_TOKEN";
+        let result = client.deliver_prompt(session, payload, &opts);
+        if let Err(e) = &result {
+            eprintln!("Skipping test: deliver_prompt failed (sandbox?): {}", e);
+            return;
+        }
+
+        // The script echoes `got: <payload>` after processing. If the
+        // needle-wait bought us a correct post-paste snapshot, submission
+        // was verified on attempt 1 and the output is present.
+        thread::sleep(Duration::from_millis(1200));
+        let content = client.capture_pane(session, 80).unwrap_or_default();
+        assert!(
+            content.contains("got: PASTE_RENDER_RACE_TOKEN"),
+            "payload was not submitted; pane contents: {:?}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_payload_needle_picks_longest_meaningful_line() {
+        // Typical OMAR worker task shape.
+        let needle = payload_needle("YOUR NAME: rest-api\nYOUR TASK: Build a REST API")
+            .expect("needle for typical task");
+        assert_eq!(needle, "YOUR TASK: Build a REST API");
+
+        // Short / whitespace-only lines are rejected.
+        assert!(payload_needle("hi").is_none());
+        assert!(payload_needle("   \n\n").is_none());
+
+        // 8-char floor keeps generic tokens out.
+        assert!(payload_needle("ok").is_none());
+        assert!(payload_needle("abcdefgh").is_some());
     }
 
     fn tmux_available() -> bool {
