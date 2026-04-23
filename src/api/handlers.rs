@@ -691,10 +691,7 @@ pub async fn spawn_agent(
         build_agent_command(
             &base_command,
             &prompt_file,
-            &[
-                ("{{TASK}}", task),
-                ("{{EA_ID}}", &ea_id.to_string()),
-            ],
+            &[("{{TASK}}", task), ("{{EA_ID}}", &ea_id.to_string())],
         )
     } else {
         base_command.clone()
