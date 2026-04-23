@@ -739,8 +739,24 @@ fn test_omar_mcp_server_tools_list_via_cli() {
     // spawn_agent is the single spawn-path tool.
     assert!(names.contains(&"spawn_agent"), "names: {:?}", names);
     assert!(names.contains(&"omar_wake_later"), "names: {:?}", names);
-    assert!(names.contains(&"check_task"), "names: {:?}", names);
-    assert!(names.contains(&"complete_task"), "names: {:?}", names);
+    assert!(names.contains(&"kill_agent"), "names: {:?}", names);
+
+    // Task-lifecycle MCP tools are gone in the metadata-only model.
+    assert!(
+        !names.contains(&"check_task"),
+        "check_task should not exist: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"complete_task"),
+        "complete_task should not exist: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"replace_stuck_task_agent"),
+        "replace_stuck_task_agent should not exist: {:?}",
+        names
+    );
 
     // Pre-rework spawn aliases must be gone.
     assert!(
@@ -788,8 +804,10 @@ fn test_omar_mcp_server_tools_list_via_cli() {
         .filter_map(|v| v.as_str())
         .collect();
     assert!(
-        required.contains(&"name") && required.contains(&"project_id"),
-        "spawn_agent required must include name and project_id: {:?}",
+        required.contains(&"name")
+            && required.contains(&"project_id")
+            && required.contains(&"task"),
+        "spawn_agent required must include name, project_id, and task: {:?}",
         required
     );
 }
@@ -808,14 +826,13 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
     let project_name = format!("raw-cmd-{}", suffix);
     let project_id = register_project(home.path(), &project_name);
 
-    // Raw-command form: no `task`, just `command`. task_text should be
-    // auto-populated as "command: <cmd>" so the dashboard row is
-    // self-describing.
+    // Raw-command form still requires explicit dashboard metadata.
     let spawned = server.tool_call(
         "spawn_agent",
         json!({
             "name": name,
             "project_id": project_id,
+            "task": "watch sleep demo",
             "command": "sleep 30",
         }),
     );
@@ -825,7 +842,11 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
         spawned["project_name"].as_str(),
         Some(project_name.as_str())
     );
-    let task_id = spawned["task_id"].as_str().expect("task id").to_string();
+    assert!(
+        spawned.get("task_id").is_none(),
+        "spawn_agent should not return task_id: {}",
+        spawned
+    );
 
     let listed = cli_output(home.path(), &["list"]);
     assert!(
@@ -834,38 +855,36 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
         listed
     );
 
-    // complete_task tears down the session; project stays (stream-4
-    // semantics — projects have their own lifecycle).
-    let completed = server.tool_call(
-        "complete_task",
-        json!({
-            "task_id": task_id,
-            "summary": "raw-command session done",
-        }),
+    let worker_tasks_path = home.path().join(".omar/ea/0/worker_tasks.json");
+    let worker_tasks = fs::read_to_string(&worker_tasks_path).expect("worker_tasks.json");
+    assert!(
+        worker_tasks.contains(&format!("\"omar-agent-0-{}\": \"watch sleep demo\"", name)),
+        "worker_tasks.json should store explicit task metadata: {}",
+        worker_tasks
     );
-    assert_eq!(completed["status"].as_str(), Some("completed"));
+
+    let task_registry_path = home.path().join(".omar/ea/0/task_registry.json");
+    assert!(
+        !task_registry_path.exists(),
+        "task_registry.json should not be created"
+    );
+
+    let summary = server.tool_call("get_agent_summary", json!({ "name": name }));
+    assert_eq!(summary["task"].as_str(), Some("watch sleep demo"));
+
+    let killed = server.tool_call("kill_agent", json!({ "name": name }));
+    assert_eq!(killed["status"].as_str(), Some("killed"));
 
     let listed = cli_output(home.path(), &["list"]);
     assert!(
         !listed.contains(&name),
-        "CLI list should not show completed agent: {}",
+        "CLI list should not show killed agent: {}",
         listed
-    );
-
-    // Project survives complete_task.
-    let projects = server.tool_call("list_projects", json!({}));
-    let projects = projects["projects"].as_array().expect("projects array");
-    assert!(
-        projects
-            .iter()
-            .any(|p| p["name"].as_str() == Some(project_name.as_str())),
-        "project should outlive complete_task: {:?}",
-        projects
     );
 }
 
 #[test]
-fn test_omar_mcp_server_tracked_task_lifecycle_via_cli() {
+fn test_spawn_agent_task_is_metadata_only_via_cli() {
     if !tmux_available() {
         eprintln!("Skipping test: tmux not available");
         return;
@@ -891,80 +910,79 @@ fn test_omar_mcp_server_tracked_task_lifecycle_via_cli() {
             "command": "sleep 30",
         }),
     );
-    let task_id = created["task_id"].as_str().expect("task id").to_string();
     assert_eq!(created["agent_name"].as_str(), Some(agent_name.as_str()));
     assert_eq!(created["project_id"].as_u64(), Some(project_id as u64));
     assert_eq!(
         created["project_name"].as_str(),
         Some(project_name.as_str())
     );
-
-    let checked = server.tool_call("check_task", json!({ "task_id": task_id }));
-    assert_eq!(checked["status"].as_str(), Some("running"));
-    assert_eq!(checked["agent_name"].as_str(), Some(agent_name.as_str()));
-    assert_eq!(
-        checked["project_name"].as_str(),
-        Some(project_name.as_str())
+    assert!(
+        created.get("task_id").is_none(),
+        "spawn_agent should not return task_id: {}",
+        created
     );
-    assert_eq!(checked["agent_exists"].as_bool(), Some(true));
 
     let listed = cli_output(home.path(), &["list"]);
     assert!(
         listed.contains(&agent_name),
-        "CLI list should show tracked-task agent: {}",
+        "CLI list should show spawned agent: {}",
         listed
     );
 
-    let projects = server.tool_call("list_projects", json!({}));
-    let projects = projects["projects"].as_array().expect("projects array");
-    assert!(projects
-        .iter()
-        .any(|project| { project["name"].as_str() == Some(project_name.as_str()) }));
+    let summary = server.tool_call("get_agent_summary", json!({ "name": agent_name }));
+    assert_eq!(summary["task"].as_str(), Some("echo tracked-task-test"));
 
-    // complete_project while the task is still running must fail.
-    let pending = server.request(
-        "tools/call",
-        json!({
-            "name": "complete_project",
-            "arguments": { "project_id": project_id },
-        }),
-    );
-    assert_eq!(
-        pending["result"]["isError"].as_bool(),
-        Some(true),
-        "complete_project should refuse while a task is still running: {}",
-        pending
-    );
-
-    let completed = server.tool_call(
-        "complete_task",
-        json!({
-            "task_id": task_id,
-            "summary": "integration test complete",
-        }),
-    );
-    assert_eq!(completed["status"].as_str(), Some("completed"));
-
-    let listed = cli_output(home.path(), &["list"]);
+    let worker_tasks = fs::read_to_string(home.path().join(".omar/ea/0/worker_tasks.json"))
+        .expect("worker_tasks.json");
     assert!(
-        !listed.contains(&agent_name),
-        "CLI list should not show completed task agent: {}",
-        listed
+        worker_tasks.contains("echo tracked-task-test"),
+        "worker_tasks.json should preserve task text: {}",
+        worker_tasks
     );
 
-    // Stream-4 semantics: complete_task does NOT remove the project.
-    // The project survives until complete_project is called.
+    let task_registry_path = home.path().join(".omar/ea/0/task_registry.json");
+    assert!(
+        !task_registry_path.exists(),
+        "task_registry.json should not be created"
+    );
+
     let projects = server.tool_call("list_projects", json!({}));
     let projects = projects["projects"].as_array().expect("projects array");
     assert!(
         projects
             .iter()
             .any(|project| project["name"].as_str() == Some(project_name.as_str())),
-        "complete_task must not remove the project: {:?}",
+        "project should remain registered: {:?}",
         projects
     );
+}
 
-    // complete_project retires the project once every attached task is done.
+#[test]
+fn test_complete_project_no_longer_blocks_on_running_agent() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let suffix = &Uuid::new_v4().to_string()[..8];
+    let agent_name = format!("project-agent-{}", suffix);
+    let project_name = format!("project-{}", suffix);
+
+    let added = server.tool_call("add_project", json!({ "name": project_name }));
+    let project_id = added["project_id"].as_u64().expect("project id");
+
+    server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": agent_name,
+            "project_id": project_id,
+            "task": "echo running-agent",
+            "command": "sleep 30",
+        }),
+    );
+
     let completed_project =
         server.tool_call("complete_project", json!({ "project_id": project_id }));
     assert_eq!(completed_project["status"].as_str(), Some("completed"));
@@ -973,132 +991,14 @@ fn test_omar_mcp_server_tracked_task_lifecycle_via_cli() {
         Some(project_name.as_str())
     );
 
-    let projects = server.tool_call("list_projects", json!({}));
-    let projects = projects["projects"].as_array().expect("projects array");
+    let listed = cli_output(home.path(), &["list"]);
     assert!(
-        !projects
-            .iter()
-            .any(|project| project["name"].as_str() == Some(project_name.as_str())),
-        "complete_project should remove the project: {:?}",
-        projects
-    );
-}
-
-/// Regression test for the UUID-vs-short-name mismatch bug: `complete_task`
-/// (and `replace_stuck_task_agent`) previously did the read through
-/// `find_task_in` OR `find_task_by_agent_in`, but then wrote back using the
-/// caller's raw `task_id` arg. When the caller passed a short agent name,
-/// the update lookup (which matches on the UUID field) missed, and the
-/// server returned "Task ... disappeared during completion" while leaving
-/// the record un-updated.
-#[test]
-fn test_complete_task_accepts_short_name() {
-    if !tmux_available() {
-        eprintln!("Skipping test: tmux not available");
-        return;
-    }
-
-    let home = tempfile::tempdir().expect("temp home");
-    let mut server = McpCliServer::start(home.path(), "bash");
-    let suffix = &Uuid::new_v4().to_string()[..8];
-    let agent_name = format!("shortname-agent-{}", suffix);
-    let project_name = format!("shortname-project-{}", suffix);
-
-    // Project lifecycle is explicit: add_project first, then spawn_agent.
-    let added = server.tool_call("add_project", json!({ "name": project_name }));
-    let project_id = added["project_id"].as_u64().expect("project id");
-
-    let created = server.tool_call(
-        "spawn_agent",
-        json!({
-            "name": agent_name,
-            "project_id": project_id,
-            "task": "echo short-name-complete-test",
-            "command": "sleep 30",
-        }),
-    );
-    let task_id = created["task_id"].as_str().expect("task id").to_string();
-
-    // Complete using the SHORT NAME — not the UUID. Pre-fix this returned
-    // "disappeared during completion" because the update path compared the
-    // short name against the UUID field.
-    let completed = server.tool_call(
-        "complete_task",
-        json!({
-            "task_id": agent_name,
-            "summary": "completed via short name",
-        }),
-    );
-    assert_eq!(
-        completed["status"].as_str(),
-        Some("completed"),
-        "complete_task via short name should mark record completed: {}",
-        completed
-    );
-    assert_eq!(completed["task_id"].as_str(), Some(task_id.as_str()));
-
-    // Re-check via the UUID: the record is persisted as Completed, not
-    // still Running (which is what the pre-fix bug left behind).
-    let checked = server.tool_call("check_task", json!({ "task_id": task_id }));
-    assert_eq!(checked["status"].as_str(), Some("completed"));
-    assert_eq!(checked["agent_exists"].as_bool(), Some(false));
-}
-
-/// Regression test: MCP `kill_agent` must mark the associated task record as
-/// `Failed` (not leave it Running). Mirror of the `App::kill_selected` fix.
-/// Previously, `kill_agent` killed the tmux session but left the task row
-/// at `Running` with a dead agent — same orphan pattern the complete_task
-/// short-name fix addressed from the other direction.
-#[test]
-fn test_kill_agent_marks_task_failed() {
-    if !tmux_available() {
-        eprintln!("Skipping test: tmux not available");
-        return;
-    }
-    let home = tempfile::tempdir().expect("temp home");
-    let mut server = McpCliServer::start(home.path(), "bash");
-    let suffix = &Uuid::new_v4().to_string()[..8];
-    let agent_name = format!("killed-agent-{}", suffix);
-    let project_name = format!("killed-project-{}", suffix);
-
-    let added = server.tool_call("add_project", json!({ "name": project_name }));
-    let project_id = added["project_id"].as_u64().expect("project id");
-
-    let created = server.tool_call(
-        "spawn_agent",
-        json!({
-            "name": agent_name,
-            "project_id": project_id,
-            "task": "echo kill-agent-test",
-            "command": "sleep 30",
-        }),
-    );
-    let task_id = created["task_id"].as_str().expect("task id").to_string();
-
-    // Session should be up.
-    let before = server.tool_call("check_task", json!({ "task_id": task_id }));
-    assert_eq!(before["status"].as_str(), Some("running"));
-    assert_eq!(before["agent_exists"].as_bool(), Some(true));
-
-    // Kill via MCP tool.
-    let killed = server.tool_call("kill_agent", json!({ "name": agent_name }));
-    assert_eq!(killed["status"].as_str(), Some("killed"));
-    assert_eq!(
-        killed["task_status"].as_str(),
-        Some("failed"),
-        "kill_agent should have flipped the task record to Failed, got {}",
-        killed
+        listed.contains(&agent_name),
+        "project removal should not tear down the running session: {}",
+        listed
     );
 
-    // Verify persistence: record reads back as Failed, not Running.
-    let after = server.tool_call("check_task", json!({ "task_id": task_id }));
-    assert_eq!(
-        after["status"].as_str(),
-        Some("failed"),
-        "task record should be Failed after kill_agent, got {}",
-        after
-    );
-    assert_eq!(after["agent_exists"].as_bool(), Some(false));
+    let _ = server.tool_call("kill_agent", json!({ "name": agent_name }));
 }
 
 /// Regression test for the Claude Code XML-to-JSON coercion workaround:
@@ -1137,7 +1037,11 @@ fn test_integer_fields_accept_strings() {
         "spawn_agent should accept string project_id, got {}",
         created
     );
-    let task_id = created["task_id"].as_str().expect("task id").to_string();
+    assert!(
+        created.get("task_id").is_none(),
+        "spawn_agent should not return task_id: {}",
+        created
+    );
 
     // omar_wake_later delay_seconds also accepts strings.
     let scheduled = server.tool_call(
@@ -1167,27 +1071,19 @@ fn test_integer_fields_accept_strings() {
     let result = resp["result"].clone();
     assert_eq!(
         result["isError"].as_bool(),
-        Some(true),
-        "complete_project with running task should error (not deserialize-reject), got {}",
+        Some(false),
+        "complete_project should accept string project_id, got {}",
         result
     );
-    let err_text = result["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+
+    let listed = cli_output(home.path(), &["list"]);
     assert!(
-        err_text.contains("running task"),
-        "error should reference running task (type coerced past Args), got: {}",
-        err_text
-    );
-    assert!(
-        !err_text.contains("expected usize") && !err_text.contains("invalid type"),
-        "error must NOT be a deserialize rejection, got: {}",
-        err_text
+        listed.contains(&agent_name),
+        "project removal should not kill the running agent: {}",
+        listed
     );
 
-    // Clean up.
-    let _ = server.tool_call("complete_task", json!({ "task_id": task_id }));
+    let _ = server.tool_call("kill_agent", json!({ "name": agent_name }));
 }
 
 /// Test that `deliver_to_tmux` routes messages to EA-scoped session names.

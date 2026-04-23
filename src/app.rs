@@ -11,22 +11,11 @@ use crate::ea::{self, EaId, EaInfo};
 use crate::memory;
 use crate::projects::{self, Project};
 use crate::scheduler::{ScheduledEvent, Scheduler, TickerBuffer};
-use crate::tasks;
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
 /// Shared app state for API access
 pub type SharedApp = App;
-
-/// Wall-clock timestamp in nanoseconds for task-record fields. Duplicates
-/// the private `now_ns` helpers in mcp.rs and scheduler, but keeping it
-/// local avoids widening those modules' public surface just for this.
-fn now_ns_app() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
 
 /// What kind of confirmation the user is being prompted for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,16 +382,6 @@ impl App {
         // Load parent mappings, worker tasks, and build the chain-of-command tree
         self.agent_parents = memory::load_agent_parents_from(&state_dir);
         self.worker_tasks = memory::load_worker_tasks_from(&state_dir);
-        // Augment from task_registry.json so newly-spawned agents always show
-        // their task before worker_tasks.json catches up.
-        for record in tasks::load_tasks_from(&state_dir) {
-            let session = format!(
-                "{}{}",
-                ea::ea_prefix(record.ea_id, &self.base_prefix),
-                record.agent_name
-            );
-            self.worker_tasks.entry(session).or_insert(record.task_text);
-        }
 
         // Cache agent statuses so render and API reads avoid per-frame disk I/O
         {
@@ -920,22 +899,10 @@ impl App {
             let name = agent.session.name.clone();
             let state_dir = self.state_dir();
 
-            // If this agent has a tracked task, mark it Failed before we kill
-            // the session — prevents the same orphan-row pattern that
-            // complete_task / replace_stuck_task_agent guard against.
             let short_name = name
                 .strip_prefix(self.client.prefix())
                 .unwrap_or(&name)
                 .to_string();
-            if let Some(task) = tasks::load_tasks_from(&state_dir)
-                .into_iter()
-                .find(|t| t.agent_name == short_name && t.status == tasks::TaskStatus::Running)
-            {
-                let _ = tasks::update_task_in(&state_dir, &task.task_id, |r| {
-                    r.status = tasks::TaskStatus::Failed;
-                    r.updated_at = now_ns_app();
-                });
-            }
             // Cancel any scheduled events targeting this agent (the outer
             // main-loop handler also cancels; this keeps kill_selected
             // self-contained for any other caller).
@@ -995,42 +962,8 @@ impl App {
             .unwrap_or(&name)
             .to_string();
 
-        // Keep 'n'-spawned agents first-class in the task system: auto-create
-        // (or reuse) a "manual" project for the active EA and record the
-        // spawn as a Running task. Without this, dashboard-spawned agents
-        // are invisible to check_task / complete_task / replace_stuck_task_agent.
         let state_dir = self.state_dir();
-        let (project_id, project_name) = match projects::load_projects_from(&state_dir)
-            .into_iter()
-            .find(|p| p.name == "manual")
-        {
-            Some(p) => (p.id, p.name),
-            None => {
-                let id = projects::add_project_in(&state_dir, "manual")?;
-                (id, "manual".to_string())
-            }
-        };
-        let _ = tasks::add_task_in(
-            &state_dir,
-            tasks::TaskRecord {
-                task_id: uuid::Uuid::new_v4().to_string(),
-                ea_id: self.active_ea,
-                project_id,
-                project_name,
-                agent_name: short_name.clone(),
-                parent_agent: "ea".to_string(),
-                task_text: "dashboard-manual spawn".to_string(),
-                backend: None,
-                model: None,
-                status: tasks::TaskStatus::Running,
-                created_at: now_ns_app(),
-                updated_at: now_ns_app(),
-                replacement_count: 0,
-                previous_agents: Vec::new(),
-                summary: None,
-                last_status: None,
-            },
-        );
+        memory::save_worker_task_in(&state_dir, &name, "dashboard-manual spawn");
 
         self.set_status(format!("Spawned agent: {}", short_name));
         self.refresh()?;
