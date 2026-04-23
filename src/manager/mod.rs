@@ -527,7 +527,6 @@ fn spawn_worker(
         command,
         &prompt_file,
         &[
-            ("{{PARENT_NAME}}", parent_name),
             ("{{TASK}}", &agent.task),
             ("{{EA_ID}}", &ea_id.to_string()),
         ],
@@ -568,7 +567,10 @@ fn spawn_worker(
         false
     };
 
-    let initial_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", agent.name, agent.task);
+    let initial_msg = format!(
+        "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
+        agent.name, parent_name, agent.task
+    );
     let opts = DeliveryOptions {
         startup_timeout: Duration::from_secs(45),
         stable_quiet: Duration::from_millis(800),

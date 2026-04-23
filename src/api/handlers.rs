@@ -692,7 +692,6 @@ pub async fn spawn_agent(
             &base_command,
             &prompt_file,
             &[
-                ("{{PARENT_NAME}}", &prompt_parent_name),
                 ("{{TASK}}", task),
                 ("{{EA_ID}}", &ea_id.to_string()),
             ],
@@ -741,7 +740,10 @@ pub async fn spawn_agent(
     if let Some(ref task) = req.task {
         memory::save_worker_task_in(&state_dir, &session_name, task);
 
-        let user_msg = format!("YOUR NAME: {}\nYOUR TASK: {}", short_name, task);
+        let user_msg = format!(
+            "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
+            short_name, prompt_parent_name, task
+        );
         let client2 = client.clone();
         let session2 = session_name.clone();
         let readiness_markers: Vec<&'static str> = backend_name
