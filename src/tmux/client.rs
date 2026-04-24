@@ -308,18 +308,19 @@ impl TmuxClient {
     ///    transition. If not, clear the input and retry.
     pub fn deliver_prompt(&self, session: &str, text: &str, opts: &DeliveryOptions) -> Result<()> {
         // Per-delivery UUID so a stale sentinel from a previous delivery
-        // cannot false-positive the end-sentinel poll on retry.
+        // cannot false-positive the end-sentinel poll on retry. Full UUID
+        // (not truncated) — collision risk is irrelevant at this length and
+        // there's no cost to the full width.
         let delivery_id = uuid::Uuid::new_v4().simple().to_string();
-        let short_id = &delivery_id[..8];
-        let start_sentinel = format!("<UserPromptBegins:{}>", short_id);
-        let end_sentinel = format!("<UserPromptEnds:{}>", short_id);
+        let start_sentinel = format!("<UserPromptBegins:{}>", delivery_id);
+        let end_sentinel = format!("<UserPromptEnds:{}>", delivery_id);
         let wrapped = format!("{}\n{}\n{}", start_sentinel, text, end_sentinel);
 
         for attempt in 1..=opts.max_retries {
             // Clear any leftover input from a prior attempt. No-op on the
-            // first attempt against a fresh widget.
+            // first attempt against a fresh widget. tmux serializes commands
+            // to the same pane so no sleep is needed before the paste.
             let _ = self.send_keys(session, "C-u");
-            thread::sleep(Duration::from_millis(50));
 
             self.paste_text(session, &wrapped)?;
 
@@ -368,6 +369,11 @@ impl TmuxClient {
                 thread::sleep(opts.retry_delay);
             }
         }
+
+        // Best-effort: clear whatever sentinel-wrapped text the last failed
+        // attempt left in the widget, so the user isn't staring at confusing
+        // leftover input after a delivery failure.
+        let _ = self.send_keys(session, "C-u");
 
         anyhow::bail!(
             "prompt delivery to '{}' was not verified after {} attempt(s)",
@@ -1230,8 +1236,9 @@ mod tests {
     /// This test proves (a) the sentinels wrap the payload, (b) the end
     /// sentinel appears in the pane before submission, (c) the full
     /// submitted text (sentinels + payload) is what the backend receives.
-    /// We verify by reading the bytes that `cat` captures — the file
-    /// contents are exactly what crossed the pty after submit.
+    /// We verify by reading the submitted bytes byte-for-byte via
+    /// `dd bs=1 count=...` — the file contents are exactly what crossed the
+    /// pty after submit.
     #[test]
     fn test_deliver_prompt_wraps_payload_with_sentinels() {
         if !tmux_available() {
@@ -1269,12 +1276,12 @@ mod tests {
         }
         thread::sleep(Duration::from_millis(200));
 
-        // Start a byte-exact reader. Expected bytes = "<UserPromptBegins:ID>\n"
-        // (22 + 8) + "SENTINEL_PAYLOAD_MARKER\n" (24) + "<UserPromptEnds:ID>\n"
-        // (20 + 8) = 82 bytes. Use a large-enough dd count that catches the
-        // full payload regardless of exact sentinel length.
+        // Start a byte-exact reader. Expected wrapped bytes ≈ 125 with the
+        // full 32-char UUID (`<UserPromptBegins:` + 32 + `>` + `\n` + payload
+        // + `\n` + `<UserPromptEnds:` + 32 + `>`). 256 is comfortably above
+        // the ceiling regardless of exact sentinel width.
         let reader_cmd = format!(
-            "stty -icrnl -icanon; dd bs=1 count=120 of={} 2>/dev/null",
+            "stty -icrnl -icanon; dd bs=1 count=256 of={} 2>/dev/null",
             quoted_tmp,
         );
 
@@ -1306,10 +1313,12 @@ mod tests {
         }
 
         // Wait for dd to flush enough bytes for the full wrapped payload.
+        // Floor of 120 comfortably covers begin + payload + start of end
+        // sentinel (enough for the test's `>` terminator to be present).
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if let Ok(meta) = std::fs::metadata(&tmp_path) {
-                if meta.len() >= 70 {
+                if meta.len() >= 120 {
                     break;
                 }
             }
