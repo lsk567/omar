@@ -43,13 +43,18 @@ impl Default for DeliveryOptions {
     }
 }
 
-/// Distinctive prefix of Claude Code's collapsed-paste placeholder. Above a
-/// backend-specific threshold (several KB), Claude Code's input widget
-/// replaces the pasted payload with `[Pasted text #N +M lines]` in the
-/// rendered pane so the sentinel at the tail of the payload never appears
-/// verbatim. `deliver_prompt` treats a new occurrence of this marker as
-/// equivalent proof the paste has ingested into the widget.
-const PASTE_PLACEHOLDER_MARKER: &str = "[Pasted text";
+/// Distinctive prefix of collapsed-paste placeholders used by TUI input
+/// widgets when a paste crosses a per-backend size threshold. Observed
+/// formats:
+/// - Claude Code: `[Pasted text #N +M lines]`
+/// - opencode:    `[Pasted ~N lines]`
+///
+/// The common prefix `[Pasted ` (with trailing space) catches both and
+/// any future vendor that follows the same convention. When the widget
+/// collapses the paste into a placeholder the sentinel at the tail of
+/// the payload never renders verbatim, so `deliver_prompt` treats a new
+/// occurrence of this marker as equivalent proof the paste has ingested.
+const PASTE_PLACEHOLDER_MARKER: &str = "[Pasted ";
 
 /// Returns true when `hay` shows that the most recent paste has rendered.
 /// A paste is considered rendered if EITHER the per-delivery end sentinel
@@ -312,13 +317,14 @@ impl TmuxClient {
     ///    `<UserPromptBegins:{id}>\n{text}\n<UserPromptEnds:{id}>`.
     /// 2. Paste the wrapped text via bracketed paste.
     /// 3. Poll the plain pane capture for either the end sentinel appearing
-    ///    verbatim, OR a new `[Pasted text #N +M lines]` placeholder (vs
-    ///    the pre-paste baseline count). Claude Code collapses pastes that
-    ///    cross its size threshold into the placeholder so the sentinel
-    ///    never renders literally; the placeholder-count delta gives a
-    ///    second proof-of-render that works for both small and large
-    ///    payloads. Stale placeholders already in chat history cannot
-    ///    false-positive because we compare counts, not mere presence.
+    ///    verbatim, OR a new `[Pasted ...]` placeholder (vs the pre-paste
+    ///    baseline count). TUI input widgets (Claude Code, opencode, etc.)
+    ///    collapse pastes that cross their size threshold into a
+    ///    placeholder so the sentinel never renders literally; the
+    ///    placeholder-count delta gives a second proof-of-render that
+    ///    works for both small and large payloads. Stale placeholders
+    ///    already in chat history cannot false-positive because we
+    ///    compare counts, not mere presence.
     /// 4. On render timeout, retry — DO NOT press Enter. The previous
     ///    implementation's bug was firing Enter after a failed-render
     ///    timeout, which submitted a blank widget (or partial payload) and
@@ -597,9 +603,11 @@ mod tests {
     }
 
     /// Covers the two render-proof branches of `paste_rendered` and the
-    /// count-delta invariant that prevents a stale `[Pasted text ...]`
+    /// count-delta invariant that prevents a stale `[Pasted ...]`
     /// placeholder (left in chat history from a prior paste) from
-    /// false-positiving the check.
+    /// false-positiving the check. Also locks in cross-backend format
+    /// coverage — the same predicate must fire for Claude Code's
+    /// `[Pasted text #N +M lines]` AND opencode's `[Pasted ~N lines]`.
     #[test]
     fn test_paste_rendered_matches_sentinel_or_new_placeholder() {
         let sentinel = "<UserPromptEnds:abc12345>";
@@ -611,13 +619,15 @@ mod tests {
             0,
         ));
 
-        // Placeholder appears with no baseline — long-paste path works on
-        // a fresh pane.
+        // Claude Code's format — long-paste path, fresh pane.
         assert!(paste_rendered(
             "╭──╮\n│ [Pasted text #1 +234 lines] │",
             sentinel,
             0,
         ));
+
+        // opencode's format — same predicate must fire.
+        assert!(paste_rendered("│ [Pasted ~5 lines] │", sentinel, 0));
 
         // One placeholder already present at baseline; still just one →
         // no new paste, render not proven.
@@ -628,8 +638,9 @@ mod tests {
         ));
 
         // Baseline had one; capture shows two → new paste did render.
+        // Mix formats to prove the count is backend-agnostic.
         assert!(paste_rendered(
-            "prior: [Pasted text #1 +10 lines]\nnew: [Pasted text #2 +99 lines]",
+            "prior: [Pasted text #1 +10 lines]\nnew: [Pasted ~42 lines]",
             sentinel,
             1,
         ));
