@@ -7,14 +7,26 @@ use std::time::{Duration, Instant};
 
 use super::Session;
 
-/// Options for reliable prompt delivery.
+/// Options for reliable prompt delivery and related readiness helpers.
+///
+/// Note: `deliver_prompt` itself no longer performs a readiness phase —
+/// callers are expected to gate on `wait_for_markers` first. The fields
+/// labelled *(wait_for_stable only)* are therefore ignored by
+/// `deliver_prompt` and retained only for direct callers of
+/// `TmuxClient::wait_for_stable`.
 #[derive(Debug, Clone)]
 pub struct DeliveryOptions {
     /// Max time to wait for the pane to become stable (backend ready).
+    /// *(wait_for_stable only — ignored by `deliver_prompt`.)*
     pub startup_timeout: Duration,
     /// How long the pane must be quiet to be considered "stable".
+    /// *(wait_for_stable only — ignored by `deliver_prompt`.)*
     pub stable_quiet: Duration,
-    /// How long to wait for pane change after paste (activity or content).
+    /// Per-phase timeout inside `deliver_prompt`. Applied TWICE per attempt:
+    /// once waiting for the paste to render (sentinel or new placeholder),
+    /// and once waiting for the post-Enter pane change that confirms
+    /// submission. Worst-case single-attempt wall time is therefore
+    /// approximately `2 * verify_timeout + retry_delay`.
     pub verify_timeout: Duration,
     /// How many full delivery attempts to try before giving up.
     pub max_retries: u32,
@@ -26,6 +38,7 @@ pub struct DeliveryOptions {
     /// (activity timestamp or content) before considering the pane stable.
     /// Useful for freshly spawned sessions where the initial static shell pane
     /// is not necessarily backend-ready yet.
+    /// *(wait_for_stable only — ignored by `deliver_prompt`.)*
     pub require_initial_change: bool,
 }
 
@@ -311,7 +324,10 @@ impl TmuxClient {
     /// (e.g. via `wait_for_markers`) before invoking — this function assumes
     /// the input widget is already live.
     ///
-    /// Strategy (deterministic, no magic sleeps / heuristics):
+    /// Strategy: every load-bearing wait is bounded by an observable
+    /// signal (end sentinel, new placeholder, pane change). The only fixed
+    /// timing is a 50 ms settle after the per-attempt `C-u` clear so the
+    /// widget has committed that state before the subsequent paste.
     ///
     /// 1. Wrap the payload in per-delivery UUID sentinels:
     ///    `<UserPromptBegins:{id}>\n{text}\n<UserPromptEnds:{id}>`.
@@ -1329,11 +1345,16 @@ mod tests {
     /// appear it still pressed Enter, submitting a blank/partial widget and
     /// declaring success from the resulting pane change.
     ///
-    /// This test proves (a) the sentinels wrap the payload, (b) the end
-    /// sentinel appears in the pane before submission, (c) the full
-    /// submitted text (sentinels + payload) is what the backend receives.
-    /// We verify by reading the bytes that `cat` captures — the file
-    /// contents are exactly what crossed the pty after submit.
+    /// This test proves (a) the sentinels wrap the payload and (b) the
+    /// full submitted text (sentinels + payload) is exactly what the
+    /// backend receives. Verification reads the submitted bytes
+    /// byte-for-byte via `dd bs=1 count=...` — the file contents are
+    /// exactly what crossed the pty after submit. The render-before-submit
+    /// ordering is enforced by the `paste_rendered` predicate in
+    /// `deliver_prompt` and covered by the separate
+    /// `test_paste_rendered_matches_sentinel_or_new_placeholder` unit
+    /// test; asserting that ordering against a live pane would require a
+    /// deliberately slow-rendering harness, which we don't maintain.
     #[test]
     fn test_deliver_prompt_wraps_payload_with_sentinels() {
         if !tmux_available() {
@@ -1371,10 +1392,9 @@ mod tests {
         }
         thread::sleep(Duration::from_millis(200));
 
-        // Start a byte-exact reader. Expected bytes = "<UserPromptBegins:ID>\n"
-        // (22 + 8) + "SENTINEL_PAYLOAD_MARKER\n" (24) + "<UserPromptEnds:ID>\n"
-        // (20 + 8) = 82 bytes. Use a large-enough dd count that catches the
-        // full payload regardless of exact sentinel length.
+        // Start a byte-exact reader. dd count is generously sized so it
+        // captures the full sentinel-wrapped payload regardless of the
+        // exact sentinel string lengths.
         let reader_cmd = format!(
             "stty -icrnl -icanon; dd bs=1 count=120 of={} 2>/dev/null",
             quoted_tmp,
