@@ -43,6 +43,27 @@ impl Default for DeliveryOptions {
     }
 }
 
+/// Distinctive prefix of Claude Code's collapsed-paste placeholder. Above a
+/// backend-specific threshold (several KB), Claude Code's input widget
+/// replaces the pasted payload with `[Pasted text #N +M lines]` in the
+/// rendered pane so the sentinel at the tail of the payload never appears
+/// verbatim. `deliver_prompt` treats a new occurrence of this marker as
+/// equivalent proof the paste has ingested into the widget.
+const PASTE_PLACEHOLDER_MARKER: &str = "[Pasted text";
+
+/// Returns true when `hay` shows that the most recent paste has rendered.
+/// A paste is considered rendered if EITHER the per-delivery end sentinel
+/// appears verbatim, OR a new `[Pasted text ...]` placeholder appeared
+/// relative to `baseline_placeholders` (the count observed just before
+/// the paste was issued). The count-delta avoids false positives from
+/// stale placeholders already visible in prior chat history.
+fn paste_rendered(hay: &str, end_sentinel: &str, baseline_placeholders: usize) -> bool {
+    if hay.contains(end_sentinel) {
+        return true;
+    }
+    hay.matches(PASTE_PLACEHOLDER_MARKER).count() > baseline_placeholders
+}
+
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
     prefix: String,
@@ -290,9 +311,15 @@ impl TmuxClient {
     /// 1. Wrap the payload in per-delivery UUID sentinels:
     ///    `<UserPromptBegins:{id}>\n{text}\n<UserPromptEnds:{id}>`.
     /// 2. Paste the wrapped text via bracketed paste.
-    /// 3. Poll the plain pane capture for the end sentinel. Its appearance
-    ///    is definitive proof the full paste has ingested into the widget.
-    /// 4. On end-sentinel timeout, retry — DO NOT press Enter. The previous
+    /// 3. Poll the plain pane capture for either the end sentinel appearing
+    ///    verbatim, OR a new `[Pasted text #N +M lines]` placeholder (vs
+    ///    the pre-paste baseline count). Claude Code collapses pastes that
+    ///    cross its size threshold into the placeholder so the sentinel
+    ///    never renders literally; the placeholder-count delta gives a
+    ///    second proof-of-render that works for both small and large
+    ///    payloads. Stale placeholders already in chat history cannot
+    ///    false-positive because we compare counts, not mere presence.
+    /// 4. On render timeout, retry — DO NOT press Enter. The previous
     ///    implementation's bug was firing Enter after a failed-render
     ///    timeout, which submitted a blank widget (or partial payload) and
     ///    declared success from the resulting pane change.
@@ -321,16 +348,34 @@ impl TmuxClient {
             let _ = self.send_keys(session, "C-u");
             thread::sleep(Duration::from_millis(50));
 
+            // Baseline pane BEFORE paste so the long-paste placeholder
+            // detection below can distinguish a new placeholder from a stale
+            // one already visible in chat history.
+            let baseline_placeholders = self
+                .capture_pane_plain(session, 200)
+                .unwrap_or_default()
+                .matches(PASTE_PLACEHOLDER_MARKER)
+                .count();
+
             self.paste_text(session, &wrapped)?;
 
-            // Wait until the end sentinel appears in the plain capture —
-            // that's definitive proof the whole paste rendered.
+            // Wait until we have proof the paste rendered. Two acceptable
+            // signals:
+            //   (a) the end sentinel appears verbatim — the common case for
+            //       prompts that fit under the backend's "show raw text"
+            //       threshold;
+            //   (b) a NEW paste placeholder appears (count increased vs
+            //       baseline) — Claude Code collapses large pastes into
+            //       `[Pasted text #N +M lines]` so the sentinel never
+            //       renders literally. We compare counts rather than mere
+            //       presence so a stale placeholder from prior chat
+            //       history can't false-positive the check.
             let rendered = {
                 let deadline = Instant::now() + opts.verify_timeout;
                 let mut found = false;
                 while Instant::now() < deadline {
                     if let Ok(hay) = self.capture_pane_plain(session, 200) {
-                        if hay.contains(&end_sentinel) {
+                        if paste_rendered(&hay, &end_sentinel, baseline_placeholders) {
                             found = true;
                             break;
                         }
@@ -549,6 +594,52 @@ mod tests {
     fn test_client_creation() {
         let client = TmuxClient::new("");
         assert_eq!(client.prefix(), "");
+    }
+
+    /// Covers the two render-proof branches of `paste_rendered` and the
+    /// count-delta invariant that prevents a stale `[Pasted text ...]`
+    /// placeholder (left in chat history from a prior paste) from
+    /// false-positiving the check.
+    #[test]
+    fn test_paste_rendered_matches_sentinel_or_new_placeholder() {
+        let sentinel = "<UserPromptEnds:abc12345>";
+
+        // Direct sentinel match — the normal / short-paste path.
+        assert!(paste_rendered(
+            "prompt body <UserPromptEnds:abc12345> trailing",
+            sentinel,
+            0,
+        ));
+
+        // Placeholder appears with no baseline — long-paste path works on
+        // a fresh pane.
+        assert!(paste_rendered(
+            "╭──╮\n│ [Pasted text #1 +234 lines] │",
+            sentinel,
+            0,
+        ));
+
+        // One placeholder already present at baseline; still just one →
+        // no new paste, render not proven.
+        assert!(!paste_rendered(
+            "prior: [Pasted text #1 +10 lines]",
+            sentinel,
+            1,
+        ));
+
+        // Baseline had one; capture shows two → new paste did render.
+        assert!(paste_rendered(
+            "prior: [Pasted text #1 +10 lines]\nnew: [Pasted text #2 +99 lines]",
+            sentinel,
+            1,
+        ));
+
+        // Neither signal present.
+        assert!(!paste_rendered(
+            "just some unrelated pane content",
+            sentinel,
+            0
+        ));
     }
 
     #[test]
