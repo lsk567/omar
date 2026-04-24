@@ -1224,7 +1224,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             // Uses `selected_popup_receiver_name` so the EA pane
                             // normalizes to "ea" — matches the `receiver` field
                             // the scheduler sees (e.g. from Slack bridge).
-                            *popup_receiver.lock().unwrap() = app
+                            *popup_receiver.lock().unwrap_or_else(|err| err.into_inner()) = app
                                 .selected_popup_receiver_name()
                                 .map(|name| (name, app.active_ea));
 
@@ -1288,7 +1288,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
 
                             // Popup closed — clear so events resume delivery
-                            *popup_receiver.lock().unwrap() = None;
+                            *popup_receiver.lock().unwrap_or_else(|err| err.into_inner()) = None;
                         }
                         KeyCode::Char('n') => {
                             if let Err(e) = app.spawn_agent() {

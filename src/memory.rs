@@ -14,6 +14,7 @@ use crate::ea::EaId;
 use crate::projects;
 use crate::scheduler::ScheduledEvent;
 use crate::tmux::TmuxClient;
+use uuid::Uuid;
 
 /// Per-file-type mutexes to serialize concurrent read-modify-write operations.
 /// These are process-global (not per-EA) which is sufficient since all EAs
@@ -29,18 +30,29 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
         .and_then(|c| serde_json::from_str(&c).ok())
 }
 
-/// Write JSON atomically: write to a sibling `.tmp` file then rename into place.
+/// Write JSON atomically: write to a unique sibling temp file then rename into place.
 /// This prevents partial writes from being visible to concurrent readers.
 fn write_json<T: serde::Serialize>(path: &Path, data: &T) {
     if let Ok(json) = serde_json::to_string_pretty(data) {
-        let tmp = path.with_extension("tmp");
-        if fs::write(&tmp, &json).is_ok() {
-            if fs::rename(&tmp, path).is_err() {
-                let _ = fs::remove_file(&tmp);
-            }
-        } else {
+        write_text_atomic(path, &json);
+    }
+}
+
+fn write_text_atomic(path: &Path, text: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let tmp = path.with_file_name(format!(".{}.{}.tmp", file_name, Uuid::new_v4()));
+    if fs::write(&tmp, text).is_ok() {
+        if fs::rename(&tmp, path).is_err() {
             let _ = fs::remove_file(&tmp);
         }
+    } else {
+        let _ = fs::remove_file(&tmp);
     }
 }
 
@@ -146,7 +158,7 @@ pub fn save_agent_status_in(state_dir: &Path, session_name: &str, status: &str) 
     let dir = state_dir.join("status");
     fs::create_dir_all(&dir).ok();
     let path = dir.join(format!("{}.md", session_name));
-    fs::write(&path, status).ok();
+    write_text_atomic(&path, status);
 }
 
 /// Load the memory file contents (empty string if missing)
@@ -262,7 +274,7 @@ pub fn write_memory_to(
 
     let path = state_dir.join("memory.md");
     fs::create_dir_all(state_dir).ok();
-    fs::write(&path, &out).ok();
+    write_text_atomic(&path, &out);
 }
 
 /// Clear runtime/transient EA state that should not leak across dashboard sessions.

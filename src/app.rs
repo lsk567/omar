@@ -206,7 +206,7 @@ impl App {
                 let mut order: Vec<usize> = (0..n).collect();
                 let mut seed = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_nanos() as u64;
                 for i in (1..n).rev() {
                     seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -1725,7 +1725,7 @@ fn next_agent_name(prefix: &str, existing: &std::collections::HashSet<&str>) -> 
         prefix,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs()
     )
 }

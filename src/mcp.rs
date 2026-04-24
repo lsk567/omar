@@ -28,6 +28,7 @@ use crate::tmux::{DeliveryOptions, HealthChecker, TmuxClient};
 
 const JSONRPC_VERSION: &str = "2.0";
 const PROTOCOL_VERSION: &str = "2024-11-05";
+const INITIAL_PROMPT_DELIVERY_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 const SERVER_INSTRUCTIONS: &str = concat!(
     "OMAR provides orchestration tools for executive assistant and worker sessions. ",
     "Search OMAR tools when the task involves agents, projects, scheduled events, ",
@@ -74,6 +75,15 @@ struct ToolCallRequest {
 enum MessageFraming {
     ContentLength,
     JsonLine,
+}
+
+#[derive(Debug)]
+enum McpRead {
+    Request(JsonRpcRequest, MessageFraming),
+    ParseError {
+        message: String,
+        framing: MessageFraming,
+    },
 }
 
 /// Serde helpers that accept either a JSON integer or a JSON string for
@@ -248,6 +258,26 @@ fn append_debug_log(context: &McpLaunchContext, line: &str) {
     }
 }
 
+fn write_text_atomic(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let tmp = path.with_file_name(format!(".{}.{}.tmp", file_name, Uuid::new_v4()));
+    if let Err(err) = fs::write(&tmp, text) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn last_output_line(output: &str) -> String {
     output
         .lines()
@@ -312,6 +342,10 @@ struct FileLock {
 
 impl FileLock {
     fn acquire(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create lock directory {:?}", parent))?;
+        }
         for _ in 0..500 {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
@@ -420,23 +454,33 @@ impl OmarMcpServer {
         let mut reader = BufReader::new(stdin.lock());
         let mut writer = stdout.lock();
 
-        while let Some((request, framing)) = read_message(&mut reader)? {
-            append_debug_log(
-                &self.context,
-                &format!("request method={} id={:?}", request.method, request.id),
-            );
-            let maybe_response = self.handle_request(request);
-            if let Some(response) = maybe_response {
-                append_debug_log(
-                    &self.context,
-                    &format!(
-                        "response id={} has_error={}",
-                        response.id,
-                        response.error.is_some()
-                    ),
-                );
-                write_message(&mut writer, &response, framing)?;
-                writer.flush()?;
+        while let Some(message) = read_message(&mut reader)? {
+            match message {
+                McpRead::Request(request, framing) => {
+                    append_debug_log(
+                        &self.context,
+                        &format!("request method={} id={:?}", request.method, request.id),
+                    );
+                    let maybe_response = self.handle_request(request);
+                    if let Some(response) = maybe_response {
+                        append_debug_log(
+                            &self.context,
+                            &format!(
+                                "response id={} has_error={}",
+                                response.id,
+                                response.error.is_some()
+                            ),
+                        );
+                        write_message(&mut writer, &response, framing)?;
+                        writer.flush()?;
+                    }
+                }
+                McpRead::ParseError { message, framing } => {
+                    append_debug_log(&self.context, &format!("parse_error err={}", message));
+                    let response = error_response(Value::Null, -32700, &message);
+                    write_message(&mut writer, &response, framing)?;
+                    writer.flush()?;
+                }
             }
         }
 
@@ -573,7 +617,7 @@ impl OmarMcpServer {
         &self.scheduler
     }
 
-    fn refresh_memory(&self) -> Result<()> {
+    fn refresh_memory_locked(&self) -> Result<()> {
         let state_dir = self.state_dir();
         let prefix = self.session_prefix();
         let manager_session = self.manager_session();
@@ -834,8 +878,7 @@ impl OmarMcpServer {
             return Err(anyhow!("Agent '{}' not found", args.name));
         }
         memory::save_agent_status_in(state_dir, &session_name, &args.status);
-        drop(_lock);
-        self.refresh_memory()?;
+        self.refresh_memory_locked()?;
         Ok(json!({ "status": "updated" }))
     }
 
@@ -902,13 +945,16 @@ impl OmarMcpServer {
         let session_name = self.qualified_session_name(&agent_name)?;
         memory::save_worker_task_in(state_dir, &session_name, &task_text);
         memory::save_agent_project_in(state_dir, &session_name, project_id);
-        drop(_lock);
-        self.refresh_memory()?;
+        self.refresh_memory_locked()?;
         Ok(json!({
             "project_id": project_id,
             "project_name": project_name,
             "agent_name": agent_name,
             "status": "running",
+            "initial_prompt_delivery": spawn_result
+                .get("initial_prompt_delivery")
+                .cloned()
+                .unwrap_or_else(|| json!("unknown")),
         }))
     }
 
@@ -999,6 +1045,7 @@ impl OmarMcpServer {
         metrics::record_backend_bootstrap(&backend_name);
 
         memory::save_agent_parent_in(state_dir, &session_name, &parent_session);
+        let mut initial_prompt_delivery = "not_applicable".to_string();
         if let Some(task_text) = request.task {
             memory::save_worker_task_in(state_dir, &session_name, &task_text);
             let client2 = client.clone();
@@ -1009,16 +1056,21 @@ impl OmarMcpServer {
             );
             let backend_name2 = backend_name.clone();
             let readiness_markers = crate::tmux::backend_readiness_markers(&backend_name).to_vec();
+            let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
             thread::spawn(move || {
                 let delivery_start = std::time::Instant::now();
-                let _ = if !readiness_markers.is_empty() {
-                    client2.wait_for_markers(
+                let readiness = if !readiness_markers.is_empty() {
+                    let ready = client2.wait_for_markers(
                         &session2,
                         &readiness_markers,
                         Duration::from_secs(45),
                         Duration::from_millis(250),
                     );
-                    Ok(())
+                    if ready {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("backend readiness markers timed out"))
+                    }
                 } else {
                     client2.wait_for_stable(
                         &session2,
@@ -1030,14 +1082,26 @@ impl OmarMcpServer {
                 };
                 let opts = DeliveryOptions::default();
                 let delivery = client2.deliver_prompt(&session2, &first_message, &opts);
+                let delivery_ok = delivery.is_ok();
                 metrics::record_prompt_delivery(
                     ea_id,
                     &session2,
                     &backend_name2,
                     delivery_start.elapsed().as_millis() as u64,
-                    delivery.is_ok(),
+                    delivery_ok,
                 );
+                let status = match (readiness, delivery) {
+                    (Ok(()), Ok(())) => "delivered".to_string(),
+                    (Err(readiness_err), Ok(())) => {
+                        format!("delivered_after_readiness_warning: {}", readiness_err)
+                    }
+                    (_, Err(delivery_err)) => format!("failed: {}", delivery_err),
+                };
+                let _ = delivery_tx.send(status);
             });
+            initial_prompt_delivery = delivery_rx
+                .recv_timeout(INITIAL_PROMPT_DELIVERY_STATUS_TIMEOUT)
+                .unwrap_or_else(|_| "pending_background_delivery".to_string());
         }
 
         metrics::record_agent_spawn(metrics::AgentSpawnMetric {
@@ -1055,6 +1119,7 @@ impl OmarMcpServer {
             "id": short_name,
             "session": session_name,
             "status": "running",
+            "initial_prompt_delivery": initial_prompt_delivery,
         }))
     }
 
@@ -1088,8 +1153,7 @@ impl OmarMcpServer {
             .scheduler()
             .cancel_by_receiver_and_ea(&short_name, self.ea_id());
 
-        drop(_lock);
-        self.refresh_memory()?;
+        self.refresh_memory_locked()?;
         Ok(json!({
             "status": "killed",
             "events_cancelled": events_cancelled,
@@ -1154,7 +1218,9 @@ impl OmarMcpServer {
             ea_id: self.ea_id(),
         };
         self.scheduler().insert(event.clone());
-        self.refresh_memory()?;
+        let state_dir = self.state_dir();
+        let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
+        self.refresh_memory_locked()?;
         Ok(json!({
             "id": event.id,
             "sender": event.sender,
@@ -1192,7 +1258,9 @@ impl OmarMcpServer {
         let scheduler = self.scheduler();
         match scheduler.cancel_if_ea(&args.event_id, self.ea_id()) {
             Ok(event) => {
-                self.refresh_memory()?;
+                let state_dir = self.state_dir();
+                let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
+                self.refresh_memory_locked()?;
                 Ok(json!({
                     "id": event.id,
                     "status": "cancelled",
@@ -1226,8 +1294,9 @@ impl OmarMcpServer {
             return Err(anyhow!("Project name must not be empty"));
         }
         let state_dir = self.state_dir();
+        let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
         let project_id = projects::add_project_in(state_dir, name)?;
-        self.refresh_memory()?;
+        self.refresh_memory_locked()?;
         Ok(json!({
             "project_id": project_id,
             "name": name,
@@ -1242,6 +1311,7 @@ impl OmarMcpServer {
         }
         let args: Args = serde_json::from_value(args)?;
         let state_dir = self.state_dir();
+        let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
         let project = projects::find_project_in(state_dir, args.project_id)
             .ok_or_else(|| anyhow!("Project '{}' not found", args.project_id))?;
         let client = self.client();
@@ -1271,7 +1341,7 @@ impl OmarMcpServer {
                 args.project_id
             ));
         }
-        self.refresh_memory()?;
+        self.refresh_memory_locked()?;
         Ok(json!({
             "project_id": project.id,
             "name": project.name,
@@ -1286,6 +1356,8 @@ impl OmarMcpServer {
         }
         let args: Args = serde_json::from_value(args)?;
         let ea_id = self.ea_id();
+        let state_dir = self.state_dir();
+        let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
         let path = memory::manager_notes_path(&self.context.omar_dir, ea_id);
         let existing = fs::read_to_string(&path).unwrap_or_default();
         let mut out = existing;
@@ -1293,7 +1365,8 @@ impl OmarMcpServer {
             out.push('\n');
         }
         out.push_str(&format!("[{}]\n{}\n", now_rfc3339(), args.text.trim()));
-        fs::write(&path, out)?;
+        write_text_atomic(&path, &out).context("Failed to write manager note")?;
+        self.refresh_memory_locked()?;
         Ok(json!({ "status": "appended", "path": path }))
     }
 
@@ -1346,6 +1419,7 @@ impl OmarMcpServer {
         }
         let args: Args = serde_json::from_value(args)?;
         let state_dir = self.state_dir();
+        let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
         let path = state_dir.join("action_log.jsonl");
         fs::create_dir_all(state_dir).ok();
         let line = serde_json::to_string(&json!({
@@ -1629,7 +1703,7 @@ fn generate_agent_name_in_ea(prefix: &str) -> String {
     format!("{}{}", prefix, &Uuid::new_v4().to_string()[..8])
 }
 
-fn read_message(reader: &mut impl BufRead) -> Result<Option<(JsonRpcRequest, MessageFraming)>> {
+fn read_message(reader: &mut impl BufRead) -> Result<Option<McpRead>> {
     let mut content_length = None;
     loop {
         let mut line = String::new();
@@ -1641,9 +1715,15 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<(JsonRpcRequest, Mes
         // Some clients (including current Claude CLI) send line-delimited JSON-RPC
         // over stdio instead of Content-Length framing.
         if trimmed_line.starts_with('{') {
-            let request = serde_json::from_str::<JsonRpcRequest>(trimmed_line)
-                .context("Invalid JSON line MCP request")?;
-            return Ok(Some((request, MessageFraming::JsonLine)));
+            return Ok(Some(
+                match serde_json::from_str::<JsonRpcRequest>(trimmed_line) {
+                    Ok(request) => McpRead::Request(request, MessageFraming::JsonLine),
+                    Err(err) => McpRead::ParseError {
+                        message: format!("Invalid JSON line MCP request: {}", err),
+                        framing: MessageFraming::JsonLine,
+                    },
+                },
+            ));
         }
         if line.trim().is_empty() {
             break;
@@ -1651,23 +1731,34 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<(JsonRpcRequest, Mes
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if let Some((name, value)) = trimmed.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = Some(
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .context("Invalid Content-Length header")?,
-                );
+                match value.trim().parse::<usize>() {
+                    Ok(length) => content_length = Some(length),
+                    Err(err) => {
+                        return Ok(Some(McpRead::ParseError {
+                            message: format!("Invalid Content-Length header: {}", err),
+                            framing: MessageFraming::ContentLength,
+                        }));
+                    }
+                }
             }
         }
     }
 
-    let length = content_length.ok_or_else(|| anyhow!("Missing Content-Length header"))?;
+    let Some(length) = content_length else {
+        return Ok(Some(McpRead::ParseError {
+            message: "Missing Content-Length header".to_string(),
+            framing: MessageFraming::ContentLength,
+        }));
+    };
     let mut payload = vec![0u8; length];
     reader.read_exact(&mut payload)?;
-    Ok(Some((
-        serde_json::from_slice(&payload)?,
-        MessageFraming::ContentLength,
-    )))
+    Ok(Some(match serde_json::from_slice(&payload) {
+        Ok(request) => McpRead::Request(request, MessageFraming::ContentLength),
+        Err(err) => McpRead::ParseError {
+            message: format!("Invalid JSON MCP request body: {}", err),
+            framing: MessageFraming::ContentLength,
+        },
+    }))
 }
 
 fn write_message(
@@ -2210,7 +2301,9 @@ mod tests {
         );
         let mut reader = BufReader::new(Cursor::new(input.into_bytes()));
         let request = read_message(&mut reader).expect("message should parse");
-        let (request, framing) = request.expect("message should be present");
+        let McpRead::Request(request, framing) = request.expect("message should be present") else {
+            panic!("expected request");
+        };
         assert_eq!(request.method, "ping");
         assert_eq!(request.id, Some(json!(1)));
         assert_eq!(framing, MessageFraming::ContentLength);
@@ -2221,10 +2314,38 @@ mod tests {
         let input = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{}}\n";
         let mut reader = BufReader::new(Cursor::new(input.as_slice()));
         let request = read_message(&mut reader).expect("message should parse");
-        let (request, framing) = request.expect("message should be present");
+        let McpRead::Request(request, framing) = request.expect("message should be present") else {
+            panic!("expected request");
+        };
         assert_eq!(request.method, "initialize");
         assert_eq!(request.id, Some(json!(0)));
         assert_eq!(framing, MessageFraming::JsonLine);
+    }
+
+    #[test]
+    fn read_message_reports_bad_json_without_io_error() {
+        let input = b"{bad json}\n";
+        let mut reader = BufReader::new(Cursor::new(input.as_slice()));
+        let message = read_message(&mut reader).expect("bad json should be a protocol error");
+        let McpRead::ParseError { message, framing } = message.expect("message should be present")
+        else {
+            panic!("expected parse error");
+        };
+        assert_eq!(framing, MessageFraming::JsonLine);
+        assert!(message.contains("Invalid JSON line MCP request"));
+    }
+
+    #[test]
+    fn read_message_reports_missing_content_length_without_io_error() {
+        let input = b"X-Test: nope\r\n\r\n";
+        let mut reader = BufReader::new(Cursor::new(input.as_slice()));
+        let message = read_message(&mut reader).expect("bad framing should be a protocol error");
+        let McpRead::ParseError { message, framing } = message.expect("message should be present")
+        else {
+            panic!("expected parse error");
+        };
+        assert_eq!(framing, MessageFraming::ContentLength);
+        assert!(message.contains("Missing Content-Length"));
     }
 
     #[test]
