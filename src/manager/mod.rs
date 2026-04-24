@@ -177,26 +177,54 @@ fn mcp_ea_dir(context: &McpLaunchContext) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Write `bytes` to `path` with mode 0600 on Unix. Caller-readable only,
-/// because these files embed workdirs and the omar binary path which leak
-/// detail about the user's environment to other accounts on shared hosts.
+/// Atomically write `bytes` to `path` with mode 0600 on Unix.
+///
+/// Caller-readable only, because these files embed workdirs and the omar
+/// binary path which leak detail about the user's environment to other
+/// accounts on shared hosts. These paths are shared by every worker under an
+/// EA, so publishing through a temp file avoids launch-time MCP readers seeing
+/// a truncated JSON file during rapid multi-agent spawns.
 fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if std::fs::read(path).is_ok_and(|current| current == bytes) {
+        return Ok(());
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let tmp = parent.join(format!(".{}.{}.tmp", file_name, Uuid::new_v4()));
+
     #[cfg(unix)]
     {
         use std::fs::OpenOptions;
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(path)?;
-        file.write_all(bytes)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, bytes)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
     }
+
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 fn materialize_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
