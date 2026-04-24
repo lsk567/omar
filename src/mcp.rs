@@ -247,6 +247,10 @@ fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> String {
     "unknown".to_string()
 }
 
+fn supports_initial_prompt_delivery(backend_name: &str) -> bool {
+    backend_name != "unknown"
+}
+
 fn append_debug_log(context: &McpLaunchContext, line: &str) {
     let state_dir = ea::ea_state_dir(context.ea_id, &context.omar_dir);
     if std::fs::create_dir_all(&state_dir).is_err() {
@@ -1012,13 +1016,16 @@ impl OmarMcpServer {
             base_command = format!("{} --model {}", base_command, model);
         }
 
+        let backend_name = infer_backend_name(request.backend.as_deref(), &base_command);
+        let supports_initial_prompt_delivery = supports_initial_prompt_delivery(&backend_name);
+
         let workdir = request
             .workdir
             .unwrap_or_else(|| self.context.default_workdir.clone());
         let has_agent_prompt = matches!(
             request.role.as_deref(),
             Some("project-manager") | Some("agent")
-        ) || request.task.is_some();
+        ) || (request.task.is_some() && supports_initial_prompt_delivery);
         let command = if has_agent_prompt {
             let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
             manager::build_agent_command(
@@ -1041,67 +1048,71 @@ impl OmarMcpServer {
         let tmux_spawn_start = std::time::Instant::now();
         client.new_session(&session_name, &command, Some(&workdir))?;
         let tmux_spawn_ms = tmux_spawn_start.elapsed().as_millis() as u64;
-        let backend_name = infer_backend_name(request.backend.as_deref(), &base_command);
         metrics::record_backend_bootstrap(&backend_name);
 
         memory::save_agent_parent_in(state_dir, &session_name, &parent_session);
         let mut initial_prompt_delivery = "not_applicable".to_string();
         if let Some(task_text) = request.task {
             memory::save_worker_task_in(state_dir, &session_name, &task_text);
-            let client2 = client.clone();
-            let session2 = session_name.clone();
-            let first_message = format!(
-                "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
-                short_name, prompt_parent, task_text
-            );
-            let backend_name2 = backend_name.clone();
-            let readiness_markers = crate::tmux::backend_readiness_markers(&backend_name).to_vec();
-            let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
-            thread::spawn(move || {
-                let delivery_start = std::time::Instant::now();
-                let readiness = if !readiness_markers.is_empty() {
-                    let ready = client2.wait_for_markers(
-                        &session2,
-                        &readiness_markers,
-                        Duration::from_secs(45),
-                        Duration::from_millis(250),
-                    );
-                    if ready {
-                        Ok(())
-                    } else {
-                        Err(anyhow!("backend readiness markers timed out"))
-                    }
-                } else {
-                    client2.wait_for_stable(
-                        &session2,
-                        Duration::from_millis(500),
-                        Duration::from_secs(8),
-                        Duration::from_millis(120),
-                        false,
-                    )
-                };
-                let opts = DeliveryOptions::default();
-                let delivery = client2.deliver_prompt(&session2, &first_message, &opts);
-                let delivery_ok = delivery.is_ok();
-                metrics::record_prompt_delivery(
-                    ea_id,
-                    &session2,
-                    &backend_name2,
-                    delivery_start.elapsed().as_millis() as u64,
-                    delivery_ok,
+            if !supports_initial_prompt_delivery {
+                initial_prompt_delivery = "metadata_only".to_string();
+            } else {
+                let client2 = client.clone();
+                let session2 = session_name.clone();
+                let first_message = format!(
+                    "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
+                    short_name, prompt_parent, task_text
                 );
-                let status = match (readiness, delivery) {
-                    (Ok(()), Ok(())) => "delivered".to_string(),
-                    (Err(readiness_err), Ok(())) => {
-                        format!("delivered_after_readiness_warning: {}", readiness_err)
-                    }
-                    (_, Err(delivery_err)) => format!("failed: {}", delivery_err),
-                };
-                let _ = delivery_tx.send(status);
-            });
-            initial_prompt_delivery = delivery_rx
-                .recv_timeout(INITIAL_PROMPT_DELIVERY_STATUS_TIMEOUT)
-                .unwrap_or_else(|_| "pending_background_delivery".to_string());
+                let backend_name2 = backend_name.clone();
+                let readiness_markers =
+                    crate::tmux::backend_readiness_markers(&backend_name).to_vec();
+                let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
+                thread::spawn(move || {
+                    let delivery_start = std::time::Instant::now();
+                    let readiness = if !readiness_markers.is_empty() {
+                        let ready = client2.wait_for_markers(
+                            &session2,
+                            &readiness_markers,
+                            Duration::from_secs(45),
+                            Duration::from_millis(250),
+                        );
+                        if ready {
+                            Ok(())
+                        } else {
+                            Err(anyhow!("backend readiness markers timed out"))
+                        }
+                    } else {
+                        client2.wait_for_stable(
+                            &session2,
+                            Duration::from_millis(500),
+                            Duration::from_secs(8),
+                            Duration::from_millis(120),
+                            false,
+                        )
+                    };
+                    let opts = DeliveryOptions::default();
+                    let delivery = client2.deliver_prompt(&session2, &first_message, &opts);
+                    let delivery_ok = delivery.is_ok();
+                    metrics::record_prompt_delivery(
+                        ea_id,
+                        &session2,
+                        &backend_name2,
+                        delivery_start.elapsed().as_millis() as u64,
+                        delivery_ok,
+                    );
+                    let status = match (readiness, delivery) {
+                        (Ok(()), Ok(())) => "delivered".to_string(),
+                        (Err(readiness_err), Ok(())) => {
+                            format!("delivered_after_readiness_warning: {}", readiness_err)
+                        }
+                        (_, Err(delivery_err)) => format!("failed: {}", delivery_err),
+                    };
+                    let _ = delivery_tx.send(status);
+                });
+                initial_prompt_delivery = delivery_rx
+                    .recv_timeout(INITIAL_PROMPT_DELIVERY_STATUS_TIMEOUT)
+                    .unwrap_or_else(|_| "pending_background_delivery".to_string());
+            }
         }
 
         metrics::record_agent_spawn(metrics::AgentSpawnMetric {
