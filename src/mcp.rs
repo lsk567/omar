@@ -3,6 +3,7 @@
 //! This replaces the legacy REST surface with a typed MCP tool interface.
 
 use anyhow::{anyhow, Context, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
@@ -294,6 +295,24 @@ fn last_output_line(output: &str) -> String {
         .collect()
 }
 
+fn clean_human_output(output: &str) -> String {
+    static ANSI_RE: OnceLock<Regex> = OnceLock::new();
+    static ESCAPED_ANSI_RE: OnceLock<Regex> = OnceLock::new();
+    static CONTROL_RE: OnceLock<Regex> = OnceLock::new();
+
+    let ansi_re = ANSI_RE.get_or_init(|| {
+        Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))").unwrap()
+    });
+    let escaped_ansi_re =
+        ESCAPED_ANSI_RE.get_or_init(|| Regex::new(r"\\u001b(?:\[[0-?]*[ -/]*[@-~])?").unwrap());
+    let control_re =
+        CONTROL_RE.get_or_init(|| Regex::new(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]").unwrap());
+
+    let output = ansi_re.replace_all(output, "");
+    let output = escaped_ansi_re.replace_all(&output, "");
+    control_re.replace_all(&output, "").to_string()
+}
+
 fn backend_available_from_command(command: &str, fallback_executable: &str) -> bool {
     let executable = command
         .split_whitespace()
@@ -569,7 +588,7 @@ impl OmarMcpServer {
         match result {
             Ok(value) => {
                 append_debug_log(&self.context, &format!("tool_ok name={}", call.name));
-                tool_success(value)
+                tool_success_for(&call.name, value)
             }
             Err(err) => {
                 append_debug_log(
@@ -798,10 +817,12 @@ impl OmarMcpServer {
             .iter()
             .filter(|s| s.name != manager_session)
             .map(|s| {
+                let output =
+                    clean_human_output(&client.capture_pane_plain(&s.name, 50).unwrap_or_default());
                 json!({
                     "id": self.display_name(&s.name),
                     "health": health_from_activity(s.activity, self.context.health_idle_warning),
-                    "last_output": last_output_line(&client.capture_pane(&s.name, 50).unwrap_or_default()),
+                    "last_output": last_output_line(&output),
                 })
             })
             .collect();
@@ -817,8 +838,9 @@ impl OmarMcpServer {
         let client = self.client();
         let session_name = self.qualified_session_name(&args.name)?;
         let output_tail = client
-            .capture_pane(&session_name, 200)
+            .capture_pane_plain(&session_name, 200)
             .map_err(|_| anyhow!("Agent '{}' not found", args.name))?;
+        let output_tail = clean_human_output(&output_tail);
         let activity = client.get_pane_activity(&session_name).unwrap_or_default();
         Ok(json!({
             "id": self.display_name(&session_name),
@@ -1813,14 +1835,75 @@ fn error_response(id: Value, code: i64, message: &str) -> JsonRpcResponse {
 }
 
 fn tool_success(value: Value) -> Value {
+    tool_success_with_text(
+        value.clone(),
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+    )
+}
+
+fn tool_success_for(tool_name: &str, value: Value) -> Value {
+    let text = match tool_name {
+        "get_agent" => format_get_agent_text(&value),
+        "list_agents" => format_list_agents_text(&value),
+        _ => return tool_success(value),
+    };
+    tool_success_with_text(value, text)
+}
+
+fn tool_success_with_text(value: Value, text: String) -> Value {
     json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+            "text": text,
         }],
         "structuredContent": value,
         "isError": false,
     })
+}
+
+fn format_get_agent_text(value: &Value) -> String {
+    let id = value.get("id").and_then(Value::as_str).unwrap_or("unknown");
+    let health = value
+        .get("health")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let last_output = value
+        .get("last_output")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let output_tail = value
+        .get("output_tail")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    format!(
+        "Agent: {id}\nHealth: {health}\nLast output: {last_output}\n\nOutput tail:\n{output_tail}"
+    )
+}
+
+fn format_list_agents_text(value: &Value) -> String {
+    let Some(agents) = value.get("agents").and_then(Value::as_array) else {
+        return serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    };
+    if agents.is_empty() {
+        return "No agents found.".to_string();
+    }
+
+    let mut lines = Vec::with_capacity(agents.len() + 1);
+    lines.push("Agents:".to_string());
+    for agent in agents {
+        let id = agent.get("id").and_then(Value::as_str).unwrap_or("unknown");
+        let health = agent
+            .get("health")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let last_output = agent
+            .get("last_output")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        lines.push(format!("- {id} [{health}] {last_output}"));
+    }
+    lines.join("\n")
 }
 
 fn tool_error(err: anyhow::Error) -> Value {
