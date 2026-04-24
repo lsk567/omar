@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
     info!("omar dir:    {}", config.omar_dir.display());
 
     let slack_client = SlackClient::new(&config.bot_token, &config.app_token);
-    let omar = OmarMcp::new(config.omar_binary.clone());
+    let omar = OmarMcp::new(config.omar_binary.clone(), config.omar_dir.clone());
 
     let bridge = Bridge::new(config, slack_client, omar);
     bridge.run().await?;

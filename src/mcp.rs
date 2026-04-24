@@ -8,18 +8,20 @@ use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::app::AgentInfo;
+use crate::backend_probe;
 use crate::computer;
 use crate::config;
 use crate::ea::{self, EaId};
 use crate::manager::{self, McpLaunchContext};
 use crate::memory;
 use crate::metrics;
+use crate::process::{pid_alive, pid_file_is_stale};
 use crate::projects;
 use crate::scheduler::{self, ScheduledEvent};
 use crate::tmux::{DeliveryOptions, HealthChecker, TmuxClient};
@@ -258,6 +260,14 @@ fn last_output_line(output: &str) -> String {
         .collect()
 }
 
+fn backend_available_from_command(command: &str, fallback_executable: &str) -> bool {
+    let executable = command
+        .split_whitespace()
+        .next()
+        .unwrap_or(fallback_executable);
+    backend_probe::backend_version_probe_succeeds(executable)
+}
+
 #[cfg(test)]
 fn ready_to_complete_tail(output: &str, tail_lines: usize) -> bool {
     output
@@ -296,29 +306,6 @@ struct LockInfo {
     owner: String,
 }
 
-/// Return true if a process with the given PID currently exists. Uses
-/// `kill -0 <pid>`, which is the standard POSIX no-op signal check —
-/// works on Linux, macOS, and BSD without pulling in a libc dep. On
-/// non-Unix platforms, conservatively assume the process is still alive
-/// rather than risk reclaiming a lock we shouldn't.
-fn pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(true)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
-}
-
 struct FileLock {
     path: PathBuf,
 }
@@ -332,6 +319,10 @@ impl FileLock {
                     return Ok(Self { path });
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    if pid_file_is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
@@ -363,10 +354,15 @@ pub fn run_server_from_context_file(path: PathBuf) -> Result<()> {
 /// backend launch and need a default context derived from the current
 /// config + active EA.
 pub fn run_server_with_default_context() -> Result<()> {
-    let omar_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar");
-    let config = crate::config::Config::load(None)
+    let omar_dir = std::env::var_os("OMAR_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".omar")
+        });
+    let config_path = omar_dir.join("config.toml").to_string_lossy().into_owned();
+    let config = crate::config::Config::load(Some(&config_path))
         .with_context(|| format!("Failed to load omar config for {}", omar_dir.display()))?;
     let registered = ea::ensure_default_ea(&omar_dir)?;
     let ea_id = ea::resolve_active_ea(&omar_dir, &registered);
@@ -383,6 +379,10 @@ pub fn run_server_with_default_context() -> Result<()> {
 
 struct OmarMcpServer {
     context: McpLaunchContext,
+    state_dir: PathBuf,
+    session_prefix: String,
+    manager_session: String,
+    scheduler: scheduler::Scheduler,
 }
 
 #[derive(Debug)]
@@ -400,7 +400,18 @@ struct SpawnRequestInternal {
 
 impl OmarMcpServer {
     fn new(context: McpLaunchContext) -> Self {
-        Self { context }
+        let state_dir = ea::ea_state_dir(context.ea_id, &context.omar_dir);
+        let session_prefix = ea::ea_prefix(context.ea_id, &context.session_prefix);
+        let manager_session = ea::ea_manager_session(context.ea_id, &context.session_prefix);
+        let scheduler =
+            scheduler::Scheduler::with_store(scheduler::events_store_path(&context.omar_dir));
+        Self {
+            context,
+            state_dir,
+            session_prefix,
+            manager_session,
+            scheduler,
+        }
     }
 
     fn run(&self) -> Result<()> {
@@ -522,53 +533,51 @@ impl OmarMcpServer {
         }
     }
 
-    fn ea_id(&self) -> Result<EaId> {
-        Ok(self.context.ea_id)
+    fn ea_id(&self) -> EaId {
+        self.context.ea_id
     }
 
-    fn state_dir(&self) -> Result<PathBuf> {
-        Ok(ea::ea_state_dir(self.ea_id()?, &self.context.omar_dir))
+    fn state_dir(&self) -> &Path {
+        &self.state_dir
     }
 
-    fn session_prefix(&self) -> Result<String> {
-        Ok(ea::ea_prefix(self.ea_id()?, &self.context.session_prefix))
+    fn session_prefix(&self) -> &str {
+        &self.session_prefix
     }
 
-    fn manager_session(&self) -> Result<String> {
-        Ok(ea::ea_manager_session(
-            self.ea_id()?,
-            &self.context.session_prefix,
-        ))
+    fn manager_session(&self) -> &str {
+        &self.manager_session
     }
 
     fn qualified_session_name(&self, short_or_full: &str) -> Result<String> {
-        let prefix = self.session_prefix()?;
-        let manager = self.manager_session()?;
-        if short_or_full == manager || short_or_full.starts_with(&prefix) {
+        let prefix = self.session_prefix();
+        let manager = self.manager_session();
+        if short_or_full == manager || short_or_full.starts_with(prefix) {
             Ok(short_or_full.to_string())
         } else {
             Ok(format!("{}{}", prefix, short_or_full))
         }
     }
 
-    fn display_name<'a>(&self, session_name: &'a str) -> Result<&'a str> {
-        let prefix = self.session_prefix()?;
-        Ok(session_name.strip_prefix(&prefix).unwrap_or(session_name))
+    fn display_name<'a>(&self, session_name: &'a str) -> &'a str {
+        session_name
+            .strip_prefix(self.session_prefix())
+            .unwrap_or(session_name)
     }
 
-    fn client(&self) -> Result<TmuxClient> {
-        Ok(TmuxClient::new(self.session_prefix()?))
+    fn client(&self) -> TmuxClient {
+        TmuxClient::new(self.session_prefix())
     }
 
-    fn scheduler(&self) -> scheduler::Scheduler {
-        scheduler::Scheduler::with_store(scheduler::events_store_path(&self.context.omar_dir))
+    fn scheduler(&self) -> &scheduler::Scheduler {
+        &self.scheduler
     }
 
     fn refresh_memory(&self) -> Result<()> {
-        let state_dir = self.state_dir()?;
-        let prefix = self.session_prefix()?;
-        let manager_session = self.manager_session()?;
-        let client = TmuxClient::new(&prefix);
+        let state_dir = self.state_dir();
+        let prefix = self.session_prefix();
+        let manager_session = self.manager_session();
+        let client = TmuxClient::new(prefix);
         let mut checker = HealthChecker::new(client.clone(), self.context.health_idle_warning);
         let sessions = client.list_sessions().unwrap_or_default();
         let mut manager = None;
@@ -587,12 +596,12 @@ impl OmarMcpServer {
             }
         }
         memory::write_memory_to(
-            &state_dir,
+            state_dir,
             &agents,
             manager.as_ref(),
-            &manager_session,
+            manager_session,
             &client,
-            &self.scheduler().list_by_ea(self.ea_id()?),
+            &self.scheduler().list_by_ea(self.ea_id()),
         );
         Ok(())
     }
@@ -603,11 +612,7 @@ impl OmarMcpServer {
             .iter()
             .filter_map(|name| {
                 let command = config::resolve_backend(name).ok()?;
-                let executable = command.split_whitespace().next().unwrap_or(name);
-                let available = Command::new(executable)
-                    .arg("--version")
-                    .output()
-                    .is_ok_and(|output| output.status.success());
+                let available = backend_available_from_command(&command, name);
                 Some(json!({
                     "name": name,
                     "available": available,
@@ -695,6 +700,16 @@ impl OmarMcpServer {
             ea_id: u32,
         }
         let args: Args = serde_json::from_value(args)?;
+        let registry = ea::ensure_default_ea(&self.context.omar_dir)?;
+        if registry.len() <= 1 {
+            return Err(anyhow!(
+                "Cannot delete the only EA; at least one EA must remain"
+            ));
+        }
+        if !registry.iter().any(|ea| ea.id == args.ea_id) {
+            return Err(anyhow!("EA {} not found in registry", args.ea_id));
+        }
+
         let prefix = ea::ea_prefix(args.ea_id, &self.context.session_prefix);
         let manager_session = ea::ea_manager_session(args.ea_id, &self.context.session_prefix);
         let client = TmuxClient::new(&prefix);
@@ -712,7 +727,7 @@ impl OmarMcpServer {
         }
         let state_dir = ea::ea_state_dir(args.ea_id, &self.context.omar_dir);
         if state_dir.exists() {
-            let _ = fs::remove_dir_all(&state_dir);
+            let _ = fs::remove_dir_all(state_dir);
         }
         let notes_path = memory::manager_notes_path(&self.context.omar_dir, args.ea_id);
         if notes_path.exists() {
@@ -728,15 +743,15 @@ impl OmarMcpServer {
     }
 
     fn list_agents(&self) -> Result<Value> {
-        let client = self.client()?;
-        let manager_session = self.manager_session()?;
+        let client = self.client();
+        let manager_session = self.manager_session();
         let sessions = client.list_sessions()?;
         let agents: Vec<Value> = sessions
             .iter()
             .filter(|s| s.name != manager_session)
             .map(|s| {
                 json!({
-                    "id": self.display_name(&s.name).unwrap_or(&s.name),
+                    "id": self.display_name(&s.name),
                     "health": health_from_activity(s.activity, self.context.health_idle_warning),
                     "last_output": last_output_line(&client.capture_pane(&s.name, 50).unwrap_or_default()),
                 })
@@ -751,14 +766,14 @@ impl OmarMcpServer {
             name: String,
         }
         let args: Args = serde_json::from_value(args)?;
-        let client = self.client()?;
+        let client = self.client();
         let session_name = self.qualified_session_name(&args.name)?;
         let output_tail = client
             .capture_pane(&session_name, 200)
             .map_err(|_| anyhow!("Agent '{}' not found", args.name))?;
         let activity = client.get_pane_activity(&session_name).unwrap_or_default();
         Ok(json!({
-            "id": self.display_name(&session_name)?,
+            "id": self.display_name(&session_name),
             "health": health_from_activity(activity, self.context.health_idle_warning),
             "last_output": last_output_line(&output_tail),
             "output_tail": output_tail,
@@ -771,23 +786,23 @@ impl OmarMcpServer {
             name: String,
         }
         let args: Args = serde_json::from_value(args)?;
-        let state_dir = self.state_dir()?;
-        let client = self.client()?;
+        let state_dir = self.state_dir();
+        let client = self.client();
         let session_name = self.qualified_session_name(&args.name)?;
         if !client.has_session(&session_name).unwrap_or(false) {
             return Err(anyhow!("Agent '{}' not found", args.name));
         }
-        let short_name = self.display_name(&session_name)?.to_string();
-        let task = memory::load_worker_tasks_from(&state_dir)
+        let short_name = self.display_name(&session_name).to_string();
+        let task = memory::load_worker_tasks_from(state_dir)
             .remove(&session_name)
             .filter(|text| !text.trim().is_empty());
-        let agent_parents = memory::load_agent_parents_from(&state_dir);
+        let agent_parents = memory::load_agent_parents_from(state_dir);
         let children: Vec<String> = client
             .list_sessions()?
             .into_iter()
             .filter_map(|session| {
                 if agent_parents.get(&session.name) == Some(&session_name) {
-                    Some(self.display_name(&session.name).ok()?.to_string())
+                    Some(self.display_name(&session.name).to_string())
                 } else {
                     None
                 }
@@ -799,7 +814,7 @@ impl OmarMcpServer {
             "id": short_name,
             "health": health,
             "task": task,
-            "status": memory::load_agent_status_in(&state_dir, &session_name),
+            "status": memory::load_agent_status_in(state_dir, &session_name),
             "children": children,
         }))
     }
@@ -811,14 +826,14 @@ impl OmarMcpServer {
             status: String,
         }
         let args: Args = serde_json::from_value(args)?;
-        let state_dir = self.state_dir()?;
-        let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
+        let state_dir = self.state_dir();
+        let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
         let session_name = self.qualified_session_name(&args.name)?;
-        let client = self.client()?;
+        let client = self.client();
         if !client.has_session(&session_name).unwrap_or(false) {
             return Err(anyhow!("Agent '{}' not found", args.name));
         }
-        memory::save_agent_status_in(&state_dir, &session_name, &args.status);
+        memory::save_agent_status_in(state_dir, &session_name, &args.status);
         drop(_lock);
         self.refresh_memory()?;
         Ok(json!({ "status": "updated" }))
@@ -839,15 +854,15 @@ impl OmarMcpServer {
             parent: Option<String>,
         }
         let args: Args = serde_json::from_value(args)?;
-        let state_dir = self.state_dir()?;
+        let state_dir = self.state_dir();
         let lock_wait_start = std::time::Instant::now();
-        let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
+        let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
         let spawn_lock_wait_ms = lock_wait_start.elapsed().as_millis() as u64;
 
         // Project must already exist. Stream 4 owns project creation via
         // `add_project` — this path never auto-creates. Matches the same
         // check stream 4 added on the former create_task entry point.
-        let project = projects::find_project_in(&state_dir, args.project_id).ok_or_else(|| {
+        let project = projects::find_project_in(state_dir, args.project_id).ok_or_else(|| {
             anyhow!(
                 "Project '{}' not found. Call add_project first to register a project.",
                 args.project_id
@@ -885,7 +900,8 @@ impl OmarMcpServer {
             .unwrap_or(&args.name)
             .to_string();
         let session_name = self.qualified_session_name(&agent_name)?;
-        memory::save_worker_task_in(&state_dir, &session_name, &task_text);
+        memory::save_worker_task_in(state_dir, &session_name, &task_text);
+        memory::save_agent_project_in(state_dir, &session_name, project_id);
         drop(_lock);
         self.refresh_memory()?;
         Ok(json!({
@@ -898,33 +914,33 @@ impl OmarMcpServer {
 
     fn spawn_agent_internal(&self, request: SpawnRequestInternal) -> Result<Value> {
         let spawn_start = std::time::Instant::now();
-        let ea_id = self.ea_id()?;
-        let state_dir = self.state_dir()?;
-        let prefix = self.session_prefix()?;
-        let manager_session = self.manager_session()?;
-        let client = self.client()?;
+        let ea_id = self.ea_id();
+        let state_dir = self.state_dir();
+        let prefix = self.session_prefix();
+        let manager_session = self.manager_session();
+        let client = self.client();
 
         let session_name = match request.name.as_deref() {
             Some(n) if !n.trim().is_empty() => {
-                let stripped = n.strip_prefix(&prefix).unwrap_or(n);
+                let stripped = n.strip_prefix(prefix).unwrap_or(n);
                 format!("{}{}", prefix, stripped)
             }
-            _ => generate_agent_name_in_ea(&prefix),
+            _ => generate_agent_name_in_ea(prefix),
         };
-        let short_name = self.display_name(&session_name)?.to_string();
+        let short_name = self.display_name(&session_name).to_string();
         let parent_session = if let Some(parent) = request.parent {
             if parent == "ea" {
-                manager_session.clone()
+                manager_session.to_string()
             } else {
                 self.qualified_session_name(&parent)?
             }
         } else {
-            manager_session.clone()
+            manager_session.to_string()
         };
         let prompt_parent = if parent_session == manager_session {
             "ea".to_string()
         } else {
-            self.display_name(&parent_session)?.to_string()
+            self.display_name(&parent_session).to_string()
         };
 
         if request.backend.is_some() && request.command.is_some() {
@@ -982,12 +998,15 @@ impl OmarMcpServer {
         let backend_name = infer_backend_name(request.backend.as_deref(), &base_command);
         metrics::record_backend_bootstrap(&backend_name);
 
-        memory::save_agent_parent_in(&state_dir, &session_name, &parent_session);
+        memory::save_agent_parent_in(state_dir, &session_name, &parent_session);
         if let Some(task_text) = request.task {
-            memory::save_worker_task_in(&state_dir, &session_name, &task_text);
+            memory::save_worker_task_in(state_dir, &session_name, &task_text);
             let client2 = client.clone();
             let session2 = session_name.clone();
-            let first_message = format!("YOUR NAME: {}\nYOUR TASK: {}", short_name, task_text);
+            let first_message = format!(
+                "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
+                short_name, prompt_parent, task_text
+            );
             let backend_name2 = backend_name.clone();
             let readiness_markers = crate::tmux::backend_readiness_markers(&backend_name).to_vec();
             thread::spawn(move || {
@@ -1045,11 +1064,11 @@ impl OmarMcpServer {
             name: String,
         }
         let args: Args = serde_json::from_value(args)?;
-        let state_dir = self.state_dir()?;
-        let _lock = FileLock::acquire(lock_path_for_state_dir(&state_dir))?;
-        let client = self.client()?;
+        let state_dir = self.state_dir();
+        let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
+        let client = self.client();
         let session_name = self.qualified_session_name(&args.name)?;
-        let manager_session = self.manager_session()?;
+        let manager_session = self.manager_session();
         if session_name == manager_session {
             return Err(anyhow!("Cannot kill manager via MCP"));
         }
@@ -1062,11 +1081,12 @@ impl OmarMcpServer {
             return Err(anyhow!("Cannot kill attached session"));
         }
         client.kill_session(&session_name)?;
-        memory::remove_agent_parent_in(&state_dir, &session_name);
-        let short_name = self.display_name(&session_name)?.to_string();
+        memory::remove_agent_parent_in(state_dir, &session_name);
+        memory::remove_agent_project_in(state_dir, &session_name);
+        let short_name = self.display_name(&session_name).to_string();
         let events_cancelled = self
             .scheduler()
-            .cancel_by_receiver_and_ea(&short_name, self.ea_id()?);
+            .cancel_by_receiver_and_ea(&short_name, self.ea_id());
 
         drop(_lock);
         self.refresh_memory()?;
@@ -1085,7 +1105,7 @@ impl OmarMcpServer {
             enter: bool,
         }
         let args: Args = serde_json::from_value(args)?;
-        let client = self.client()?;
+        let client = self.client();
         let session_name = self.qualified_session_name(&args.name)?;
         if !client.has_session(&session_name).unwrap_or(false) {
             return Err(anyhow!("Agent '{}' not found", args.name));
@@ -1131,7 +1151,7 @@ impl OmarMcpServer {
             payload: args.payload,
             created_at: base,
             recurring_ns,
-            ea_id: self.ea_id()?,
+            ea_id: self.ea_id(),
         };
         self.scheduler().insert(event.clone());
         self.refresh_memory()?;
@@ -1145,7 +1165,7 @@ impl OmarMcpServer {
     }
 
     fn list_events(&self) -> Result<Value> {
-        let mut events = self.scheduler().list_by_ea(self.ea_id()?);
+        let mut events = self.scheduler().list_by_ea(self.ea_id());
         events.sort_by_key(|event| (event.timestamp, event.created_at));
         Ok(json!({
             "events": events.into_iter().map(|event| {
@@ -1170,7 +1190,7 @@ impl OmarMcpServer {
         }
         let args: Args = serde_json::from_value(args)?;
         let scheduler = self.scheduler();
-        match scheduler.cancel_if_ea(&args.event_id, self.ea_id()?) {
+        match scheduler.cancel_if_ea(&args.event_id, self.ea_id()) {
             Ok(event) => {
                 self.refresh_memory()?;
                 Ok(json!({
@@ -1187,8 +1207,8 @@ impl OmarMcpServer {
     }
 
     fn list_projects(&self) -> Result<Value> {
-        let state_dir = self.state_dir()?;
-        let projects: Vec<Value> = projects::load_projects_from(&state_dir)
+        let state_dir = self.state_dir();
+        let projects: Vec<Value> = projects::load_projects_from(state_dir)
             .into_iter()
             .map(|project| json!({ "id": project.id, "name": project.name }))
             .collect();
@@ -1205,8 +1225,8 @@ impl OmarMcpServer {
         if name.is_empty() {
             return Err(anyhow!("Project name must not be empty"));
         }
-        let state_dir = self.state_dir()?;
-        let project_id = projects::add_project_in(&state_dir, name)?;
+        let state_dir = self.state_dir();
+        let project_id = projects::add_project_in(state_dir, name)?;
         self.refresh_memory()?;
         Ok(json!({
             "project_id": project_id,
@@ -1221,10 +1241,30 @@ impl OmarMcpServer {
             project_id: usize,
         }
         let args: Args = serde_json::from_value(args)?;
-        let state_dir = self.state_dir()?;
-        let project = projects::find_project_in(&state_dir, args.project_id)
+        let state_dir = self.state_dir();
+        let project = projects::find_project_in(state_dir, args.project_id)
             .ok_or_else(|| anyhow!("Project '{}' not found", args.project_id))?;
-        let removed = projects::remove_project_in(&state_dir, args.project_id)?;
+        let client = self.client();
+        let active_sessions: Vec<String> = memory::load_agent_projects_from(state_dir)
+            .into_iter()
+            .filter_map(|(session_name, project_id)| {
+                if project_id == args.project_id
+                    && client.has_session(&session_name).unwrap_or(false)
+                {
+                    Some(self.display_name(&session_name).to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !active_sessions.is_empty() {
+            return Err(anyhow!(
+                "Project '{}' still has active agent sessions: {}. Kill or finish those agents before completing the project.",
+                args.project_id,
+                active_sessions.join(", ")
+            ));
+        }
+        let removed = projects::remove_project_in(state_dir, args.project_id)?;
         if !removed {
             return Err(anyhow!(
                 "Project '{}' could not be removed",
@@ -1245,7 +1285,7 @@ impl OmarMcpServer {
             text: String,
         }
         let args: Args = serde_json::from_value(args)?;
-        let ea_id = self.ea_id()?;
+        let ea_id = self.ea_id();
         let path = memory::manager_notes_path(&self.context.omar_dir, ea_id);
         let existing = fs::read_to_string(&path).unwrap_or_default();
         let mut out = existing;
@@ -1305,12 +1345,12 @@ impl OmarMcpServer {
             justification: String,
         }
         let args: Args = serde_json::from_value(args)?;
-        let state_dir = self.state_dir()?;
+        let state_dir = self.state_dir();
         let path = state_dir.join("action_log.jsonl");
-        fs::create_dir_all(&state_dir).ok();
+        fs::create_dir_all(state_dir).ok();
         let line = serde_json::to_string(&json!({
             "timestamp": now_rfc3339(),
-            "ea_id": self.ea_id()?,
+            "ea_id": self.ea_id(),
             "agent_name": args.agent_name,
             "action": args.action,
             "justification": args.justification,
@@ -1388,7 +1428,7 @@ impl OmarMcpServer {
             agent: String,
         }
         let args: Args = serde_json::from_value(args)?;
-        let owner = format!("{}:{}", self.ea_id()?, args.agent);
+        let owner = format!("{}:{}", self.ea_id(), args.agent);
         let path = self.computer_lock_path();
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             // Write the payload on the handle returned by `create_new` so
@@ -1455,7 +1495,7 @@ impl OmarMcpServer {
             agent: String,
         }
         let args: Args = serde_json::from_value(args)?;
-        let owner = format!("{}:{}", self.ea_id()?, args.agent);
+        let owner = format!("{}:{}", self.ea_id(), args.agent);
         let held = self.read_computer_lock();
         match held {
             Some(ref info) if info.owner == owner => {
@@ -1468,7 +1508,7 @@ impl OmarMcpServer {
     }
 
     fn verify_computer_lock(&self, agent: &str) -> Result<()> {
-        let expected = format!("{}:{}", self.ea_id()?, agent);
+        let expected = format!("{}:{}", self.ea_id(), agent);
         match self.read_computer_lock() {
             Some(info) if info.owner == expected => Ok(()),
             Some(info) => Err(anyhow!("Computer is locked by '{}'", info.owner)),
@@ -1578,7 +1618,7 @@ impl OmarMcpServer {
 fn generate_agent_name_in_ea(prefix: &str) -> String {
     for i in 1..1000 {
         let name = format!("{}{}", prefix, i);
-        let result = Command::new("tmux")
+        let result = crate::tmux::tmux_command()
             .args(["has-session", "-t", &name])
             .output();
         match result {
@@ -1692,7 +1732,9 @@ fn tool_error(err: anyhow::Error) -> Value {
 }
 
 fn tool_definitions() -> Vec<Value> {
-    vec![
+    static TOOLS: OnceLock<Vec<Value>> = OnceLock::new();
+    TOOLS
+        .get_or_init(|| vec![
         tool(
             "list_backends",
             "List installed OMAR backends.",
@@ -1831,11 +1873,11 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "complete_project",
-            "Remove a project from the registry.",
+            "Remove a project from the registry after its tracked agents are no longer running.",
             json!({
                 "type":"object",
                 "properties":{
-                    "project_id":{"type":"integer","description":"Project id from add_project or list_projects."}
+                    "project_id":{"type":"integer","description":"Project id from add_project or list_projects. Fails while tracked agents for this project are still running."}
                 },
                 "required":["project_id"]
             }),
@@ -1985,7 +2027,8 @@ fn tool_definitions() -> Vec<Value> {
             "Read mouse position.",
             json!({"type":"object","properties":{}}),
         ),
-    ]
+        ])
+        .clone()
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -2051,6 +2094,83 @@ mod tests {
         assert!(server
             .slack_reply(json!({"channel": "C1", "text": ""}))
             .is_err());
+    }
+
+    #[test]
+    fn delete_ea_rejects_only_ea_before_destructive_cleanup() {
+        let context = test_context();
+        let server = OmarMcpServer::new(context.clone());
+        ea::ensure_default_ea(&context.omar_dir).unwrap();
+        let state_dir = ea::ea_state_dir(0, &context.omar_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("sentinel.txt"), "keep").unwrap();
+
+        let result = server.delete_ea(json!({ "ea_id": 0 }));
+
+        assert!(result.is_err());
+        assert!(
+            state_dir.join("sentinel.txt").exists(),
+            "delete_ea must not remove state before rejecting only EA"
+        );
+        assert_eq!(ea::load_registry(&context.omar_dir).len(), 1);
+    }
+
+    #[test]
+    fn delete_ea_rejects_unknown_ea_before_destructive_cleanup() {
+        let context = test_context();
+        let server = OmarMcpServer::new(context.clone());
+        ea::ensure_default_ea(&context.omar_dir).unwrap();
+        ea::register_ea(&context.omar_dir, "Second", None).unwrap();
+        let bogus_state_dir = ea::ea_state_dir(99, &context.omar_dir);
+        std::fs::create_dir_all(&bogus_state_dir).unwrap();
+        std::fs::write(bogus_state_dir.join("sentinel.txt"), "keep").unwrap();
+
+        let result = server.delete_ea(json!({ "ea_id": 99 }));
+
+        assert!(result.is_err());
+        assert!(
+            bogus_state_dir.join("sentinel.txt").exists(),
+            "delete_ea must not remove state for an unknown EA"
+        );
+        assert_eq!(ea::load_registry(&context.omar_dir).len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lock_reclaims_stale_pid_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp-state.lock");
+        std::fs::write(&path, u32::MAX.to_string()).unwrap();
+
+        let lock = FileLock::acquire(path.clone()).expect("stale lock should be reclaimed");
+
+        assert!(path.exists());
+        drop(lock);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_backends_probe_treats_hanging_command_as_unavailable() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        let temp = tempfile::tempdir().unwrap();
+        let slow = temp.path().join("slow-backend");
+        fs::write(&slow, "#!/bin/sh\nsleep 5\n").unwrap();
+        let mut perms = fs::metadata(&slow).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&slow, perms).unwrap();
+
+        let start = Instant::now();
+        let available = backend_available_from_command(slow.to_str().unwrap(), "slow-backend");
+
+        assert!(!available);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "list_backends should not block indefinitely on backend --version"
+        );
     }
 
     #[test]

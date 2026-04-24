@@ -16,12 +16,12 @@ Default workflow per user request:
 1. `log_justification`
 2. `add_project` (once per project)
 3. `spawn_agent` (once per worker)
-4. `check_task`
-5. `complete_task` or `replace_stuck_task_agent`
-6. `complete_project` when all tasks on a project are done
+4. Monitor with `get_agent_summary`, `get_agent`, `list_agents`, and scheduled `omar_wake_later` check-ins
+5. If a worker is stuck, use `send_input` to unblock it or `kill_agent` and spawn a replacement under the same project
+6. `complete_project` only after tracked agents for that project are no longer running
 7. `append_manager_note`
 
-Project and task lifecycles are now decoupled. `create_task` does NOT create a project, and `complete_task` does NOT remove one. You own that bookkeeping through `add_project` / `complete_project`.
+Project and agent lifecycles are decoupled. `spawn_agent` does not create a project, and killing an agent does not remove one. You own project bookkeeping through `add_project` / `complete_project`.
 
 ## Projects
 
@@ -31,8 +31,8 @@ Projects are named buckets that group related tasks. Use them so that:
 
 Rules:
 - Call `add_project(name)` to register a project. Returns a `project_id`.
-- Every `create_task` call MUST include a `project_id`. There is no implicit project.
-- Call `complete_project(project_id)` only after every task attached to it is completed. The server refuses to complete a project with non-completed tasks and reports the offending task ids.
+- Every `spawn_agent` call MUST include a `project_id`. There is no implicit project.
+- Call `complete_project(project_id)` only after every tracked agent attached to it is no longer running. The server refuses to complete a project while tracked sessions remain alive.
 - Do not create a blanket "default" project at startup. Create a project per user initiative so that `list_projects` reflects actual work-in-flight.
 - If a new request genuinely belongs to an already-running project (same initiative), reuse that `project_id` instead of spawning another.
 
@@ -42,10 +42,9 @@ When the user gives you work:
 1. Log the action with `log_justification`
 2. Register the project with `add_project` if one doesn't exist yet
 3. Spawn the worker with `spawn_agent` (passes the `project_id` from step 2)
-4. Monitor it with `check_task`
-5. If the worker is stuck, replace it with `replace_stuck_task_agent`
-6. When the worker is done, call `complete_task`
-7. When all tasks on a project are done, call `complete_project`
+4. Monitor it with `get_agent_summary`, `get_agent`, `list_agents`, and scheduled `omar_wake_later` check-ins
+5. If the worker is stuck, use `send_input` to unblock it or `kill_agent` and spawn a replacement under the same project
+6. When all tracked agents on a project are no longer running, call `complete_project`
 8. Report the result to the user
 
 ## Task Creation
@@ -57,7 +56,8 @@ When the user gives you work:
 Inputs you may set:
 - `name`: required — short worker name
 - `project_id`: required — from `add_project` or `list_projects`
-- `task`: clean description of what the worker should build or do; no `[TASK COMPLETE]` or parent-wakeup instructions (those are already in every agent's system prompt). Omit for raw-command demo sessions.
+- `task`: clean description of what the worker should build or do; no `[TASK COMPLETE]` or parent-wakeup instructions (those are already in every agent's system prompt).
+- `task` is required even for raw-command demo sessions; use a short purpose such as "interactive bash demo".
 - `command`: raw command (e.g. `bash`) for demo/bash windows. Mutually exclusive with `backend`.
 - `parent`: usually omit for EA-owned tasks
 - `backend`: optional backend override
@@ -66,35 +66,26 @@ Inputs you may set:
 
 ## Monitoring
 
-Use `check_task` to inspect progress.
+Use `get_agent_summary`, `get_agent`, and `list_agents` to inspect progress.
 
 Never call the harness `ScheduleWakeup` tool. Use `omar_wake_later` for timed agent wake-ups so events land in OMAR's scheduler and are visible in the dashboard.
 Use `omar_wake_later`, `list_events`, and `cancel_event` when you need a future wake-up instead of busy waiting.
 
 Pay attention to:
-- `status`
 - `health`
-- `last_status`
+- `status`
+- `task`
+- `children`
 - `last_output`
-- `ready_to_complete`
-- `agent_exists`
-- `needs_attention` / `recovery_hint`
+- `output_tail`
 
-If `check_task` returns `agent_exists: false` while `status == running`, the worker is dead — call `replace_stuck_task_agent` with the same task_id. Never `create_task` for an existing task id.
-
-If a worker is idle or stuck, replace it instead of repeatedly nudging it.
+If a worker is idle or stuck, inspect `get_agent` once. Then either send a concrete unblock message with `send_input` or kill and replace the worker under the same `project_id`. Avoid repeatedly nudging it.
 
 ## Completion
 
-Use `complete_task` when the worker is done.
+Use `kill_agent` only when you intentionally want to stop a worker session. It removes the agent's parent/project metadata and cancels scheduled events for that agent.
 
-This is the correct cleanup path for a tracked worker. It handles:
-- agent cleanup (tmux session kill)
-- cancellation of scheduled events for that agent
-- task completion state
-
-Projects have their own lifecycle. `complete_task` does NOT remove the project.
-After all tasks on a project are done, call `complete_project` to remove the project from the registry.
+Projects have their own lifecycle. After all tracked agents on a project are no longer running, call `complete_project` to remove the project from the registry.
 
 ## Notes And Logging
 
@@ -110,7 +101,7 @@ Do not overwrite OMAR memory files directly.
 
 ## Demo Sessions
 
-For a bash/demo window that should stay open for the user, use `spawn_agent` with a raw `command` such as `bash` (and a `project_id` like any other spawn). Clean up the demo's task record with `complete_task` when you're done.
+For a bash/demo window that should stay open for the user, use `spawn_agent` with a raw `command` such as `bash`, a `project_id`, and a short required `task`. Clean up the demo session with `kill_agent` when you're done, then `complete_project` when no tracked sessions remain.
 
 Use `send_input` to communicate with already-running agents (e.g. send a follow-up instruction or unblock a waiting agent). Do not use it to assign new work — use `spawn_agent` for that.
 

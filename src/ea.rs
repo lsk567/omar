@@ -220,6 +220,9 @@ pub fn unregister_ea(base_dir: &Path, ea_id: EaId) -> anyhow::Result<()> {
     if eas.len() <= 1 {
         anyhow::bail!("Cannot delete the only EA; at least one EA must remain");
     }
+    if !eas.iter().any(|e| e.id == ea_id) {
+        anyhow::bail!("EA {} not found in registry", ea_id);
+    }
     eas.retain(|e| e.id != ea_id);
     save_registry(base_dir, &eas)
 }
@@ -243,32 +246,6 @@ fn save_registry(base_dir: &Path, eas: &[EaInfo]) -> anyhow::Result<()> {
     fs::write(&tmp, &json)?;
     fs::rename(&tmp, &path)?;
     Ok(())
-}
-
-/// Clear persisted EA registry/state so each dashboard run starts fresh.
-/// This removes:
-/// - eas.json (EA registry)
-/// - active_ea
-/// - ea_next_id
-/// - ea/ (per-EA state directories)
-/// - manager_notes_ea*.md
-pub fn clear_registry_and_state(base_dir: &Path) {
-    let _ = fs::remove_file(base_dir.join("eas.json"));
-    let _ = fs::remove_file(base_dir.join("active_ea"));
-    let _ = fs::remove_file(base_dir.join("ea_next_id"));
-    let _ = fs::remove_dir_all(base_dir.join("ea"));
-
-    if let Ok(entries) = fs::read_dir(base_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if name.starts_with("manager_notes_ea") && name.ends_with(".md") {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
 }
 
 /// Migrate legacy state files from ~/.omar/ to ~/.omar/ea/0/
@@ -313,20 +290,18 @@ pub fn migrate_legacy_state(omar_dir: &Path) {
 
 /// Migrate legacy tmux sessions to EA 0 naming.
 pub fn migrate_legacy_sessions(base_prefix: &str) {
-    use std::process::Command;
-
     // Rename manager: omar-agent-ea -> omar-agent-ea-0
     let old_manager = format!("{}ea", base_prefix);
     let new_manager = ea_manager_session(0, base_prefix);
     if old_manager != new_manager {
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["rename-session", "-t", &old_manager, &new_manager])
             .output();
     }
 
     // Rename agents: omar-agent-{name} -> omar-agent-0-{name}
     let new_prefix = ea_prefix(0, base_prefix);
-    if let Ok(output) = Command::new("tmux")
+    if let Ok(output) = crate::tmux::tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
     {
@@ -339,7 +314,7 @@ pub fn migrate_legacy_sessions(base_prefix: &str) {
             {
                 let short = name.strip_prefix(base_prefix).unwrap_or(name);
                 let new_name = format!("{}{}", new_prefix, short);
-                let _ = Command::new("tmux")
+                let _ = crate::tmux::tmux_command()
                     .args(["rename-session", "-t", name, &new_name])
                     .output();
             }
@@ -490,6 +465,19 @@ mod tests {
         let result = unregister_ea(dir.path(), id1);
         assert!(result.is_err(), "should reject deleting the last EA");
         assert!(result.unwrap_err().to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn test_unregister_unknown_ea_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        register_ea(dir.path(), "Alpha", None).unwrap();
+        register_ea(dir.path(), "Beta", None).unwrap();
+
+        let result = unregister_ea(dir.path(), 99);
+
+        assert!(result.is_err(), "should reject unknown EA id");
+        assert!(result.unwrap_err().to_string().contains("not found"));
+        assert_eq!(load_registry(dir.path()).len(), 2);
     }
 
     #[test]

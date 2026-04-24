@@ -2,7 +2,7 @@ pub mod event;
 
 pub use event::ScheduledEvent;
 
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,6 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 use crate::ea;
+use crate::process::pid_file_is_stale;
 use crate::tmux::DeliveryOptions;
 
 /// A ticker message with its creation time.
@@ -108,8 +109,16 @@ impl StoreLock {
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Ok(Self { path }),
+                Ok(mut file) => {
+                    use std::io::Write;
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(Self { path });
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if pid_file_is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(err) => return Err(err),
@@ -185,21 +194,7 @@ impl Scheduler {
         self.store_path.is_some()
     }
 
-    pub fn sync_from_store(&self) {
-        let Some(store_path) = self.store_path.as_ref() else {
-            return;
-        };
-        let Ok(_store_lock) = StoreLock::acquire(store_lock_path(store_path)) else {
-            return;
-        };
-        let mut queue = BinaryHeap::new();
-        for event in load_events_from_store(store_path) {
-            queue.push(event);
-        }
-        *self.queue.lock().unwrap() = queue;
-    }
-
-    fn with_queue<R>(
+    fn transaction<R>(
         &self,
         persist: bool,
         f: impl FnOnce(&mut BinaryHeap<ScheduledEvent>) -> R,
@@ -212,7 +207,7 @@ impl Scheduler {
                 // Scheduler would otherwise take down the whole process.
                 // Consequence on a write op: the change only lands in the
                 // in-memory heap and will be overwritten by the next
-                // successful `with_queue` (which reloads from disk), so the
+                // successful `transaction` (which reloads from disk), so the
                 // event is effectively lost if the dashboard restarts or
                 // another writer succeeds first. Still preferable to a crash.
                 let _store_lock = match StoreLock::acquire(store_lock_path(store_path)) {
@@ -255,7 +250,7 @@ impl Scheduler {
     }
 
     pub fn insert(&self, event: ScheduledEvent) {
-        self.with_queue(true, |queue| {
+        self.transaction(true, |queue| {
             queue.push(event);
         });
         // `notify_one` stores a permit so the event loop wakes up even if it
@@ -271,7 +266,7 @@ impl Scheduler {
     ///   Err(true)  if found but ea_id doesn't match (event stays in queue)
     ///   Err(false) if not found
     pub fn cancel_if_ea(&self, event_id: &str, ea_id: u32) -> Result<ScheduledEvent, bool> {
-        let result = self.with_queue(true, |queue| {
+        let result = self.transaction(true, |queue| {
             let events: Vec<ScheduledEvent> = queue.drain().collect();
             let mut cancelled = None;
             let mut wrong_ea = false;
@@ -300,14 +295,14 @@ impl Scheduler {
 
     /// List events for a specific EA only.
     pub fn list_by_ea(&self, ea_id: u32) -> Vec<ScheduledEvent> {
-        self.with_queue(false, |queue| {
+        self.transaction(false, |queue| {
             queue.iter().filter(|e| e.ea_id == ea_id).cloned().collect()
         })
     }
 
     /// Cancel all events for a specific EA. Returns the number cancelled.
     pub fn cancel_by_ea(&self, ea_id: u32) -> usize {
-        let count = self.with_queue(true, |queue| {
+        let count = self.transaction(true, |queue| {
             let events: Vec<ScheduledEvent> = queue.drain().collect();
             let mut count = 0;
             let mut remaining = BinaryHeap::new();
@@ -328,7 +323,7 @@ impl Scheduler {
     /// Cancel all events for a given receiver within a specific EA only.
     /// Fix V5: EA-scoped receiver cancellation prevents cross-EA event leaks.
     pub fn cancel_by_receiver_and_ea(&self, receiver: &str, ea_id: u32) -> usize {
-        let count = self.with_queue(true, |queue| {
+        let count = self.transaction(true, |queue| {
             let events: Vec<ScheduledEvent> = queue.drain().collect();
             let mut count = 0;
             let mut remaining = BinaryHeap::new();
@@ -348,8 +343,9 @@ impl Scheduler {
 
     /// Pop all events matching the given receiver, EA, and timestamp.
     /// Fix V7: EA-scoped batching prevents cross-EA event delivery.
+    #[cfg(test)]
     pub fn pop_batch(&self, receiver: &str, ea_id: u32, timestamp: u64) -> Vec<ScheduledEvent> {
-        let batch = self.with_queue(true, |queue| {
+        let batch = self.transaction(true, |queue| {
             let events: Vec<ScheduledEvent> = queue.drain().collect();
             let mut batch = Vec::new();
             let mut remaining = BinaryHeap::new();
@@ -365,6 +361,104 @@ impl Scheduler {
         });
         self.notify.notify_waiters();
         batch
+    }
+
+    fn next_timestamp(&self) -> Option<u64> {
+        self.transaction(false, |queue| queue.peek().map(|event| event.timestamp))
+    }
+
+    fn take_due_deliveries(&self, popup_receiver: &PopupReceiver) -> Vec<DueDelivery> {
+        self.transaction(true, |queue| {
+            let Some(earliest_ts) = queue.peek().map(|event| event.timestamp) else {
+                return Vec::new();
+            };
+            if earliest_ts > now_ns() {
+                return Vec::new();
+            }
+
+            let mut remaining = BinaryHeap::new();
+            let mut groups: Vec<((String, u32), Vec<ScheduledEvent>)> = Vec::new();
+            let mut group_indices: HashMap<(String, u32), usize> = HashMap::new();
+
+            for event in queue.drain() {
+                if event.timestamp == earliest_ts {
+                    let key = (event.receiver.clone(), event.ea_id);
+                    let idx = *group_indices.entry(key.clone()).or_insert_with(|| {
+                        groups.push((key, Vec::new()));
+                        groups.len() - 1
+                    });
+                    groups[idx].1.push(event);
+                } else {
+                    remaining.push(event);
+                }
+            }
+
+            const MAX_EVENTS_PER_EA_PER_TICK: usize = 10;
+            let mut ea_delivery_count: HashMap<u32, usize> = HashMap::new();
+            let mut deliveries = Vec::new();
+
+            for ((receiver, ea_id), batch) in groups {
+                let delivered_so_far = *ea_delivery_count.get(&ea_id).unwrap_or(&0);
+                if delivered_so_far >= MAX_EVENTS_PER_EA_PER_TICK {
+                    for event in batch {
+                        remaining.push(event);
+                    }
+                    continue;
+                }
+
+                if should_defer_for_popup(popup_receiver, &receiver, ea_id) {
+                    let defer_until = now_ns() + POPUP_DEFER_NS;
+                    for mut event in batch {
+                        event.timestamp = defer_until;
+                        remaining.push(event);
+                    }
+                    deliveries.push(DueDelivery {
+                        receiver,
+                        ea_id,
+                        timestamp: earliest_ts,
+                        batch: Vec::new(),
+                        deferred_for_popup: true,
+                    });
+                    continue;
+                }
+
+                let remaining_quota = MAX_EVENTS_PER_EA_PER_TICK - delivered_so_far;
+                let (batch, deferred_batch) = split_batch_for_quota(batch, remaining_quota);
+                for event in deferred_batch {
+                    remaining.push(event);
+                }
+                if batch.is_empty() {
+                    continue;
+                }
+
+                *ea_delivery_count.entry(ea_id).or_insert(0) += batch.len();
+                for event in &batch {
+                    if let Some(interval) = event.recurring_ns {
+                        let now = now_ns();
+                        remaining.push(ScheduledEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            sender: event.sender.clone(),
+                            receiver: event.receiver.clone(),
+                            timestamp: now + interval,
+                            payload: event.payload.clone(),
+                            created_at: now,
+                            recurring_ns: Some(interval),
+                            ea_id: event.ea_id,
+                        });
+                    }
+                }
+                deliveries.push(DueDelivery {
+                    receiver,
+                    ea_id,
+                    timestamp: earliest_ts,
+                    batch,
+                    deferred_for_popup: false,
+                });
+            }
+
+            *queue = remaining;
+            deliveries
+        })
     }
 }
 
@@ -444,6 +538,14 @@ pub fn new_popup_receiver() -> PopupReceiver {
 /// no unbounded fan-out, one event stays one event.
 pub(crate) const POPUP_DEFER_NS: u64 = 30_000_000_000;
 
+struct DueDelivery {
+    receiver: String,
+    ea_id: u32,
+    timestamp: u64,
+    batch: Vec<ScheduledEvent>,
+    deferred_for_popup: bool,
+}
+
 /// Decide whether to defer an event for `(receiver, ea_id)` because the user
 /// has an agent popup open on that exact pane. Scoped per-EA so same-named
 /// workers in other EAs deliver as normal.
@@ -484,11 +586,7 @@ pub async fn run_event_loop(
 ) {
     let external_poll_interval = std::time::Duration::from_millis(500);
     loop {
-        scheduler.sync_from_store();
-        let next_ts = {
-            let queue = scheduler.queue.lock().unwrap();
-            queue.peek().map(|e| e.timestamp)
-        };
+        let next_ts = scheduler.next_timestamp();
 
         match next_ts {
             None => {
@@ -517,83 +615,25 @@ pub async fn run_event_loop(
                     }
                 }
 
-                // Deliver all events at the earliest timestamp, grouped by receiver.
-                let earliest_ts = {
-                    let queue = scheduler.queue.lock().unwrap();
-                    match queue.peek() {
-                        Some(e) if e.timestamp <= now_ns() => e.timestamp,
-                        _ => continue,
-                    }
-                };
-
-                // Fix V7: Collect (receiver, ea_id) pairs — not just receivers.
-                // This prevents cross-EA event batching where events for same-named
-                // agents in different EAs would be merged and delivered to only one EA.
-                let receiver_ea_pairs: Vec<(String, u32)> = {
-                    let queue = scheduler.queue.lock().unwrap();
-                    let mut seen: Vec<(String, u32)> = Vec::new();
-                    for ev in queue.iter() {
-                        if ev.timestamp == earliest_ts {
-                            let pair = (ev.receiver.clone(), ev.ea_id);
-                            if !seen.contains(&pair) {
-                                seen.push(pair);
-                            }
-                        }
-                    }
-                    seen
-                };
-
-                // Per-EA fairness cap: process at most this many events per EA per tick.
-                // If an EA has a burst of events, the excess stays in the queue for the
-                // next iteration so other EAs are not starved.
-                const MAX_EVENTS_PER_EA_PER_TICK: usize = 10;
-                let mut ea_delivery_count: std::collections::HashMap<u32, usize> =
-                    std::collections::HashMap::new();
-
-                for (receiver, ea_id) in &receiver_ea_pairs {
-                    // Enforce per-EA delivery cap.
-                    let delivered_so_far = *ea_delivery_count.get(ea_id).unwrap_or(&0);
-                    if delivered_so_far >= MAX_EVENTS_PER_EA_PER_TICK {
-                        // Leave remaining events for this EA in the queue for the next tick.
-                        continue;
-                    }
-
-                    // If the user has a popup open for this receiver, defer the
-                    // due batch by POPUP_DEFER_NS. The same batch keeps being
-                    // re-queued on each tick — no duplication, no growth — and
-                    // it just keeps re-deferring until the popup closes.
-                    if should_defer_for_popup(&popup_receiver, receiver, *ea_id) {
-                        let batch = scheduler.pop_batch(receiver, *ea_id, earliest_ts);
-                        for mut ev in batch {
-                            ev.timestamp = now_ns() + POPUP_DEFER_NS;
-                            scheduler.insert(ev);
-                        }
+                for delivery in scheduler.take_due_deliveries(&popup_receiver) {
+                    let receiver = delivery.receiver;
+                    let ea_id = delivery.ea_id;
+                    if delivery.deferred_for_popup {
                         ticker.push(format!("deferred event(s) for {} (popup open)", receiver));
                         continue;
                     }
+                    let batch = delivery.batch;
+                    if batch.is_empty() {
+                        continue;
+                    }
 
-                    let batch = scheduler.pop_batch(receiver, *ea_id, earliest_ts);
-                    if batch.is_empty() {
-                        continue;
-                    }
-                    let remaining_quota = MAX_EVENTS_PER_EA_PER_TICK - delivered_so_far;
-                    let (batch, deferred_batch) = split_batch_for_quota(batch, remaining_quota);
-                    for ev in deferred_batch {
-                        scheduler.insert(ev);
-                    }
-                    if batch.is_empty() {
-                        continue;
-                    }
-                    // Track events delivered for this EA this tick.
-                    *ea_delivery_count.entry(*ea_id).or_insert(0) += batch.len();
-                    let message = format_delivery(&batch, earliest_ts);
+                    let message = format_delivery(&batch, delivery.timestamp);
                     let receiver_name = receiver.clone();
                     let base_prefix_clone = base_prefix.clone();
                     let ticker_clone = ticker.clone();
-                    let ea = *ea_id;
                     let delivery_result = tokio::task::spawn_blocking(move || {
                         deliver_to_tmux(
-                            ea,
+                            ea_id,
                             &receiver_name,
                             &message,
                             &base_prefix_clone,
@@ -608,24 +648,7 @@ pub async fn run_event_loop(
                         ));
                     }
 
-                    // Re-insert recurring events with a fresh timestamp and ID
-                    for ev in &batch {
-                        if let Some(interval) = ev.recurring_ns {
-                            let next = ScheduledEvent {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                sender: ev.sender.clone(),
-                                receiver: ev.receiver.clone(),
-                                timestamp: now_ns() + interval,
-                                payload: ev.payload.clone(),
-                                created_at: now_ns(),
-                                recurring_ns: Some(interval),
-                                ea_id: ev.ea_id,
-                            };
-                            scheduler.insert(next);
-                        }
-                    }
-
-                    let lag_ns = now_ns().saturating_sub(earliest_ts);
+                    let lag_ns = now_ns().saturating_sub(delivery.timestamp);
                     let lag_ms = lag_ns as f64 / 1_000_000.0;
                     ticker.push(format!(
                         "delivered {} event(s) to {}, lag={:.2}ms",
@@ -1224,5 +1247,26 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].payload, "persist me");
         assert_eq!(events[0].receiver, "alice");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_scheduler_reclaims_stale_store_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = events_store_path(dir.path());
+        let lock_path = store_lock_path(&store_path);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, u32::MAX.to_string()).unwrap();
+
+        let sched = Scheduler::with_store(store_path);
+        let mut ev = make_event("alice", "manager", 100, "persist after stale lock");
+        ev.ea_id = 7;
+        sched.insert(ev);
+
+        assert!(
+            !lock_path.exists(),
+            "stale scheduler lock should be reclaimed and cleaned up"
+        );
+        assert_eq!(sched.list_by_ea(7).len(), 1);
     }
 }

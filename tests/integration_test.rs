@@ -9,15 +9,34 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::Command;
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
 const TEST_PREFIX: &str = "omar-test-";
+static TEST_TMUX_SERVER: OnceLock<String> = OnceLock::new();
+
+fn test_tmux_server() -> &'static str {
+    TEST_TMUX_SERVER.get_or_init(|| format!("omar-test-{}", Uuid::new_v4()))
+}
+
+fn tmux_command() -> Command {
+    let mut cmd = Command::new("tmux");
+    cmd.args(["-L", test_tmux_server()]);
+    cmd
+}
+
+fn omar_command(home: &Path) -> Command {
+    let mut cmd = Command::new(omar_bin());
+    cmd.env("HOME", home)
+        .env("OMAR_TMUX_SERVER", test_tmux_server());
+    cmd
+}
 
 /// Helper to run tmux commands
 fn tmux(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args(args)
         .output()
         .map_err(|e| format!("Failed to run tmux: {}", e))?;
@@ -27,7 +46,10 @@ fn tmux(args: &[&str]) -> Result<String, String> {
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // "no server running" is not an error for cleanup
-        if stderr.contains("no server running") || stderr.contains("no sessions") {
+        if stderr.contains("no server running")
+            || stderr.contains("no sessions")
+            || stderr.contains("error connecting to")
+        {
             Ok(String::new())
         } else {
             Err(stderr.to_string())
@@ -45,7 +67,7 @@ fn cleanup_session(session_name: &str) {
 
 /// Check if tmux is available
 fn tmux_available() -> bool {
-    Command::new("tmux")
+    tmux_command()
         .arg("-V")
         .output()
         .map(|o| o.status.success())
@@ -57,9 +79,8 @@ fn omar_bin() -> &'static str {
 }
 
 fn bootstrap_cli_home(home: &Path) {
-    let output = Command::new(omar_bin())
+    let output = omar_command(home)
         .arg("list")
-        .env("HOME", home)
         .output()
         .expect("Failed to bootstrap omar home");
     assert!(
@@ -95,13 +116,12 @@ impl McpCliServer {
         )
         .expect("write MCP context");
 
-        let mut child = Command::new(omar_bin())
+        let mut child = omar_command(home)
             .args([
                 "mcp-server",
                 "--context-file",
                 context_path.to_str().expect("utf8 context path"),
             ])
-            .env("HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -202,9 +222,8 @@ fn read_mcp_response(reader: &mut BufReader<ChildStdout>) -> Value {
 }
 
 fn cli_output(home: &Path, args: &[&str]) -> String {
-    let output = Command::new(omar_bin())
+    let output = omar_command(home)
         .args(args)
-        .env("HOME", home)
         .output()
         .unwrap_or_else(|err| panic!("Failed to run omar {:?}: {}", args, err));
     assert!(
@@ -368,7 +387,7 @@ fn test_has_session() {
     cleanup_session(&session_name);
 
     // Check non-existent session
-    let result = Command::new("tmux")
+    let result = tmux_command()
         .args(["has-session", "-t", &session_name])
         .output()
         .unwrap();
@@ -379,7 +398,7 @@ fn test_has_session() {
     thread::sleep(Duration::from_millis(100));
 
     // Check existing session
-    let result = Command::new("tmux")
+    let result = tmux_command()
         .args(["has-session", "-t", &session_name])
         .output()
         .unwrap();
@@ -452,7 +471,7 @@ fn test_spawn_custom_command() {
     thread::sleep(Duration::from_millis(300));
 
     // Verify session is running
-    let check = Command::new("tmux")
+    let check = tmux_command()
         .args(["has-session", "-t", &session_name])
         .output()
         .unwrap();
@@ -509,9 +528,8 @@ fn test_omar_list_empty() {
     // race against other tests that bootstrap their own omar dir.
     let home = tempfile::tempdir().expect("temp home");
 
-    let output = Command::new(omar_bin())
+    let output = omar_command(home.path())
         .arg("list")
-        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar list");
 
@@ -537,9 +555,8 @@ fn test_omar_spawn_and_kill() {
     let agent_name = format!("test-spawn-{}", &Uuid::new_v4().to_string()[..8]);
 
     // Spawn a new agent.
-    let output = Command::new(omar_bin())
+    let output = omar_command(home.path())
         .args(["spawn", "-n", &agent_name, "-c", "sleep 60"])
-        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar spawn");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -559,16 +576,15 @@ fn test_omar_spawn_and_kill() {
         .map(ToString::to_string)
         .unwrap_or_else(|| panic!("Expected a spawned session ending with {:?}", suffix));
 
-    let result = Command::new("tmux")
+    let result = tmux_command()
         .args(["has-session", "-t", &full_session])
         .output()
         .unwrap();
     assert!(result.status.success(), "Session should exist after spawn");
 
     // `list` should show the agent (displayed without prefix).
-    let output = Command::new(omar_bin())
+    let output = omar_command(home.path())
         .arg("list")
-        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar list");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -579,9 +595,8 @@ fn test_omar_spawn_and_kill() {
     );
 
     // Kill the agent (short name).
-    let output = Command::new(omar_bin())
+    let output = omar_command(home.path())
         .args(["kill", &agent_name])
-        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar kill");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -593,7 +608,7 @@ fn test_omar_spawn_and_kill() {
 
     // Verify session is gone.
     thread::sleep(Duration::from_millis(100));
-    let result = Command::new("tmux")
+    let result = tmux_command()
         .args(["has-session", "-t", &full_session])
         .output()
         .unwrap();
@@ -607,7 +622,7 @@ fn test_omar_spawn_and_kill() {
 fn test_omar_event_cli_roundtrip() {
     let home = tempfile::tempdir().expect("temp home");
 
-    let output = Command::new(omar_bin())
+    let output = omar_command(home.path())
         .args([
             "--ea",
             "Default",
@@ -622,7 +637,6 @@ fn test_omar_event_cli_roundtrip() {
             "--in-seconds",
             "60",
         ])
-        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar event schedule");
     assert!(
@@ -643,9 +657,8 @@ fn test_omar_event_cli_roundtrip() {
         .trim()
         .to_string();
 
-    let output = Command::new(omar_bin())
+    let output = omar_command(home.path())
         .args(["--ea", "Default", "event", "list"])
-        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar event list");
     assert!(
@@ -660,9 +673,8 @@ fn test_omar_event_cli_roundtrip() {
         stdout
     );
 
-    let output = Command::new(omar_bin())
+    let output = omar_command(home.path())
         .args(["--ea", "Default", "event", "cancel", &event_id])
-        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar event cancel");
     assert!(
@@ -677,9 +689,8 @@ fn test_omar_event_cli_roundtrip() {
         stdout
     );
 
-    let output = Command::new(omar_bin())
+    let output = omar_command(home.path())
         .args(["--ea", "Default", "event", "list"])
-        .env("HOME", home.path())
         .output()
         .expect("Failed to run omar event list after cancel");
     assert!(
@@ -697,9 +708,9 @@ fn test_omar_event_cli_roundtrip() {
 
 /// Register a project by writing directly to the EA's tasks.md file.
 ///
-/// `spawn_agent` now requires an existing `project_id`. Stream 4 owns the
-/// `add_project` MCP tool (not yet landed in this branch), so tests
-/// register projects via the same on-disk format that `projects.rs` uses.
+/// `spawn_agent` now requires an existing `project_id`. This helper is only
+/// used by legacy-path tests that need to pre-seed on-disk project state
+/// without exercising `add_project`.
 /// Format: one numbered line `N. Project name`; IDs are not renumbered.
 fn register_project(home: &Path, project_name: &str) -> usize {
     let tasks_md = home.join(".omar/ea/0/tasks.md");
@@ -863,6 +874,14 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
         worker_tasks
     );
 
+    let agent_projects_path = home.path().join(".omar/ea/0/agent_projects.json");
+    let agent_projects = fs::read_to_string(&agent_projects_path).expect("agent_projects.json");
+    assert!(
+        agent_projects.contains(&format!("\"omar-agent-0-{}\": {}", name, project_id)),
+        "agent_projects.json should store project ownership: {}",
+        agent_projects
+    );
+
     let task_registry_path = home.path().join(".omar/ea/0/task_registry.json");
     assert!(
         !task_registry_path.exists(),
@@ -874,6 +893,12 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
 
     let killed = server.tool_call("kill_agent", json!({ "name": name }));
     assert_eq!(killed["status"].as_str(), Some("killed"));
+    let agent_projects = fs::read_to_string(&agent_projects_path).expect("agent_projects.json");
+    assert!(
+        !agent_projects.contains(&format!("\"omar-agent-0-{}\"", name)),
+        "kill_agent should remove project ownership: {}",
+        agent_projects
+    );
 
     let listed = cli_output(home.path(), &["list"]);
     assert!(
@@ -958,7 +983,7 @@ fn test_spawn_agent_task_is_metadata_only_via_cli() {
 }
 
 #[test]
-fn test_complete_project_no_longer_blocks_on_running_agent() {
+fn test_complete_project_blocks_on_running_agent() {
     if !tmux_available() {
         eprintln!("Skipping test: tmux not available");
         return;
@@ -983,6 +1008,37 @@ fn test_complete_project_no_longer_blocks_on_running_agent() {
         }),
     );
 
+    let resp = server.request(
+        "tools/call",
+        json!({
+            "name": "complete_project",
+            "arguments": { "project_id": project_id },
+        }),
+    );
+    let result = resp["result"].clone();
+    assert_eq!(
+        result["isError"].as_bool(),
+        Some(true),
+        "complete_project should block while tracked agent runs: {}",
+        result
+    );
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("still has active agent sessions"),
+        "unexpected error: {}",
+        result
+    );
+
+    let listed = cli_output(home.path(), &["list"]);
+    assert!(
+        listed.contains(&agent_name),
+        "blocked project completion should not tear down the running session: {}",
+        listed
+    );
+
+    let _ = server.tool_call("kill_agent", json!({ "name": agent_name }));
     let completed_project =
         server.tool_call("complete_project", json!({ "project_id": project_id }));
     assert_eq!(completed_project["status"].as_str(), Some("completed"));
@@ -990,15 +1046,6 @@ fn test_complete_project_no_longer_blocks_on_running_agent() {
         completed_project["name"].as_str(),
         Some(project_name.as_str())
     );
-
-    let listed = cli_output(home.path(), &["list"]);
-    assert!(
-        listed.contains(&agent_name),
-        "project removal should not tear down the running session: {}",
-        listed
-    );
-
-    let _ = server.tool_call("kill_agent", json!({ "name": agent_name }));
 }
 
 /// Regression test for the Claude Code XML-to-JSON coercion workaround:
@@ -1058,9 +1105,8 @@ fn test_integer_fields_accept_strings() {
         scheduled
     );
 
-    // complete_project accepts string project_id too (but will block because
-    // the spawned task is still running; we just want to prove the type
-    // coerces). Use `request` directly to observe the isError envelope.
+    // complete_project accepts string project_id too; with a running tracked
+    // worker it should type-coerce successfully and then block on lifecycle.
     let resp = server.request(
         "tools/call",
         json!({
@@ -1071,8 +1117,16 @@ fn test_integer_fields_accept_strings() {
     let result = resp["result"].clone();
     assert_eq!(
         result["isError"].as_bool(),
-        Some(false),
-        "complete_project should accept string project_id, got {}",
+        Some(true),
+        "complete_project should accept string project_id and then lifecycle-block, got {}",
+        result
+    );
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("still has active agent sessions"),
+        "unexpected error: {}",
         result
     );
 

@@ -14,7 +14,7 @@ use crate::scheduler::{ScheduledEvent, Scheduler, TickerBuffer};
 use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
 
-/// Shared app state for API access
+/// Shared app state for dashboard and control surfaces.
 pub type SharedApp = App;
 
 /// What kind of confirmation the user is being prompted for.
@@ -22,7 +22,7 @@ pub type SharedApp = App;
 pub enum ConfirmAction {
     /// Kill the selected agent
     Kill,
-    /// Quit omar (kills EA)
+    /// Quit the dashboard while leaving EA sessions and persisted state intact.
     Quit,
     /// Delete the currently active EA (blocked only if it is the last one)
     DeleteEa,
@@ -136,27 +136,29 @@ pub struct App {
 
 impl App {
     pub fn new(config: &Config, ticker: TickerBuffer, scheduler: Arc<Scheduler>) -> Self {
-        let base_prefix = config.dashboard.session_prefix.clone();
         let omar_dir = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".omar");
+
+        Self::new_with_omar_dir(config, ticker, scheduler, omar_dir)
+    }
+
+    fn new_with_omar_dir(
+        config: &Config,
+        ticker: TickerBuffer,
+        scheduler: Arc<Scheduler>,
+        omar_dir: PathBuf,
+    ) -> Self {
+        let base_prefix = config.dashboard.session_prefix.clone();
 
         // Run legacy migration (files + tmux sessions)
         ea::migrate_legacy_state(&omar_dir);
         ea::migrate_legacy_sessions(&base_prefix);
 
-        // Start each dashboard session with a fresh EA registry/state.
-        ea::clear_registry_and_state(&omar_dir);
-
         let registered_eas = ea::ensure_default_ea(&omar_dir).unwrap_or_else(|e| {
             eprintln!("warn: ensure default EA: {}", e);
             ea::load_registry(&omar_dir)
         });
-        // Reset per-run transient EA data so stale hierarchy/status/task state
-        // does not leak from previous dashboard sessions.
-        for ea_info in &registered_eas {
-            memory::clear_runtime_state_in(&ea::ea_state_dir(ea_info.id, &omar_dir));
-        }
         let active_ea = ea::resolve_active_ea(&omar_dir, &registered_eas);
 
         // EA-scoped prefix and manager session
@@ -250,6 +252,14 @@ impl App {
         ea::ea_prefix(self.active_ea, &self.base_prefix)
     }
 
+    fn short_session_name<'a>(&self, session_name: &'a str) -> &'a str {
+        let active_prefix = self.active_session_prefix();
+        session_name
+            .strip_prefix(&active_prefix)
+            .or_else(|| session_name.strip_prefix(&self.base_prefix))
+            .unwrap_or(session_name)
+    }
+
     /// True when any popup or input overlay is active.
     pub fn has_popup(&self) -> bool {
         self.show_help
@@ -281,14 +291,11 @@ impl App {
             }
         }
 
-        let manager_session = self.manager_session_name();
-
         // Ensure manager exists
         self.ensure_manager()?;
 
         // Get all sessions (used for both active EA state and multi-EA CoC sidebar)
         let all_sessions = self.client.list_all_sessions()?;
-        let sessions = all_sessions.clone();
         // Only snapshot health for OMAR-owned sessions. Every EA session name
         // starts with `base_prefix` (e.g. "omar-agent-") and the manager is
         // `<base_prefix>ea-<id>` — so the prefix check covers both agents and
@@ -306,28 +313,31 @@ impl App {
             );
         }
 
-        // Separate manager from other agents, filtering out non-EA sessions
-        let mut manager_session_found = None;
-        let mut other_sessions = Vec::new();
-
-        for session in sessions {
-            if session.name == manager_session {
-                manager_session_found = Some(session);
-            } else if session.name == DASHBOARD_SESSION {
-                // Skip the dashboard's own tmux session
+        let mut managers_by_ea: HashMap<EaId, Session> = HashMap::new();
+        let mut agents_by_ea: HashMap<EaId, Vec<Session>> = HashMap::new();
+        for session in &all_sessions {
+            if session.name == DASHBOARD_SESSION
+                || (!self.base_prefix.is_empty() && !session.name.starts_with(&self.base_prefix))
+            {
                 continue;
-            } else {
-                let session_prefix = self.active_session_prefix();
-                if !session_prefix.is_empty() && !session.name.starts_with(&session_prefix) {
-                    // Skip sessions that don't match the active EA's prefix
-                    continue;
+            }
+            let Some(rest) = session.name.strip_prefix(&self.base_prefix) else {
+                continue;
+            };
+            if let Some(id) = rest
+                .strip_prefix("ea-")
+                .and_then(|raw| raw.parse::<EaId>().ok())
+            {
+                managers_by_ea.insert(id, session.clone());
+            } else if let Some((raw_id, _)) = rest.split_once('-') {
+                if let Ok(id) = raw_id.parse::<EaId>() {
+                    agents_by_ea.entry(id).or_default().push(session.clone());
                 }
-                other_sessions.push(session);
             }
         }
 
         // Update manager info
-        self.manager = manager_session_found.map(|session| {
+        self.manager = managers_by_ea.get(&self.active_ea).cloned().map(|session| {
             let health_info = health_snapshot
                 .get(&session.name)
                 .cloned()
@@ -345,7 +355,10 @@ impl App {
         // the popup view (tmux display-popup + attach), the agent session
         // becomes "attached" but is still a valid agent. Filtering attached
         // sessions would cause the API to return "not found" for that agent.
-        self.agents = other_sessions
+        self.agents = agents_by_ea
+            .get(&self.active_ea)
+            .cloned()
+            .unwrap_or_default()
             .into_iter()
             .map(|session| {
                 let health_info = health_snapshot
@@ -413,37 +426,36 @@ impl App {
             let ea_state_dir = ea::ea_state_dir(ea_info.id, &self.omar_dir);
             let ea_parents = memory::load_agent_parents_from(&ea_state_dir);
 
-            let mut manager_info = None;
-            let mut ea_agents = Vec::new();
-
-            for session in &all_sessions {
-                if session.name == DASHBOARD_SESSION {
-                    continue;
+            let manager_info = managers_by_ea.get(&ea_info.id).cloned().map(|session| {
+                let health_info = health_snapshot
+                    .get(&session.name)
+                    .cloned()
+                    .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
+                let health = health_info.state;
+                AgentInfo {
+                    session,
+                    health,
+                    health_info,
                 }
-                if session.name == ea_manager {
+            });
+            let ea_agents: Vec<AgentInfo> = agents_by_ea
+                .get(&ea_info.id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|session| {
                     let health_info = health_snapshot
                         .get(&session.name)
                         .cloned()
                         .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
                     let health = health_info.state;
-                    manager_info = Some(AgentInfo {
+                    AgentInfo {
                         session: session.clone(),
                         health,
                         health_info,
-                    });
-                } else if !ea_prefix.is_empty() && session.name.starts_with(&ea_prefix) {
-                    let health_info = health_snapshot
-                        .get(&session.name)
-                        .cloned()
-                        .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
-                    let health = health_info.state;
-                    ea_agents.push(AgentInfo {
-                        session: session.clone(),
-                        health,
-                        health_info,
-                    });
-                }
-            }
+                    }
+                })
+                .collect();
 
             let mut nodes = build_tree(
                 &ea_agents,
@@ -649,17 +661,12 @@ impl App {
             if *session == manager_session {
                 continue; // Already added EA
             }
-            let short = session
-                .strip_prefix(&self.config.dashboard.session_prefix)
-                .unwrap_or(session);
+            let short = self.short_session_name(session);
             crumbs.push(short.to_string());
         }
         // Add current focus parent if not EA
         if self.focus_parent != manager_session {
-            let short = self
-                .focus_parent
-                .strip_prefix(&self.config.dashboard.session_prefix)
-                .unwrap_or(&self.focus_parent);
+            let short = self.short_session_name(&self.focus_parent);
             crumbs.push(short.to_string());
         }
         crumbs
@@ -697,9 +704,7 @@ impl App {
         // the user spawns one.
         self.manager_selected = self.focus_child_indices.is_empty();
 
-        let short = session_name
-            .strip_prefix(&self.config.dashboard.session_prefix)
-            .unwrap_or(&session_name);
+        let short = self.short_session_name(&session_name);
         self.set_status(format!("Viewing: {}", short));
     }
 
@@ -982,10 +987,7 @@ impl App {
         let state_dir = self.state_dir();
         memory::save_agent_parent_in(&state_dir, &name, &self.focus_parent);
 
-        let short_name = name
-            .strip_prefix(&self.config.dashboard.session_prefix)
-            .unwrap_or(&name)
-            .to_string();
+        let short_name = self.short_session_name(&name).to_string();
 
         let state_dir = self.state_dir();
         memory::save_worker_task_in(&state_dir, &name, "dashboard-manual spawn");
@@ -1021,28 +1023,17 @@ impl App {
         }
 
         // Collect names of agents with auth failures
-        let prefix = &self.config.dashboard.session_prefix;
         let mut failed_agents: Vec<String> = Vec::new();
 
         if let Some(ref mgr) = self.manager {
             if mgr.health_info.auth_failure {
-                let short = mgr
-                    .session
-                    .name
-                    .strip_prefix(prefix)
-                    .unwrap_or(&mgr.session.name);
-                failed_agents.push(short.to_string());
+                failed_agents.push(self.short_session_name(&mgr.session.name).to_string());
             }
         }
 
         for agent in &self.agents {
             if agent.health_info.auth_failure {
-                let short = agent
-                    .session
-                    .name
-                    .strip_prefix(prefix)
-                    .unwrap_or(&agent.session.name);
-                failed_agents.push(short.to_string());
+                failed_agents.push(self.short_session_name(&agent.session.name).to_string());
             }
         }
 
@@ -1050,7 +1041,7 @@ impl App {
             return false;
         }
 
-        let watchdog_session = format!("{}watchdog", prefix);
+        let watchdog_session = format!("{}watchdog", self.client.prefix());
 
         // Skip if watchdog already exists
         if self.client.has_session(&watchdog_session).unwrap_or(false) {
@@ -1212,6 +1203,24 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
     /// Complete (remove) a project by id and update memory (EA-scoped)
     pub fn complete_project(&mut self, id: usize) {
         let state_dir = self.state_dir();
+        let active_sessions: Vec<String> = memory::load_agent_projects_from(&state_dir)
+            .into_iter()
+            .filter_map(|(session_name, project_id)| {
+                if project_id == id && self.client.has_session(&session_name).unwrap_or(false) {
+                    Some(session_name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !active_sessions.is_empty() {
+            self.set_status(format!(
+                "Project {} still has active agents: {}",
+                id,
+                active_sessions.join(", ")
+            ));
+            return;
+        }
         let _ = projects::remove_project_in(&state_dir, id);
         self.projects = projects::load_projects_from(&state_dir);
         let manager_session = self.manager_session_name();
@@ -1724,10 +1733,43 @@ fn next_agent_name(prefix: &str, existing: &std::collections::HashSet<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        AgentConfig, DashboardConfig, HealthConfig, MetricsConfig, WatchdogConfig,
+    };
+    use crate::projects;
+    use crate::scheduler;
     use crate::tmux::{HealthInfo, HealthState, Session};
+    use std::sync::{Mutex, MutexGuard};
 
     /// Manager session name used in tests (EA 0 with "omar-agent-" prefix)
     const TEST_MANAGER: &str = "omar-agent-ea-0";
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct HomeEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeEnvGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
 
     fn make_agent(name: &str, health: HealthState) -> AgentInfo {
         AgentInfo {
@@ -1744,6 +1786,248 @@ mod tests {
                 auth_failure: false,
             },
         }
+    }
+
+    fn test_config_with_prefix(session_prefix: String) -> Config {
+        Config {
+            dashboard: DashboardConfig {
+                session_prefix,
+                ..DashboardConfig::default()
+            },
+            health: HealthConfig::default(),
+            agent: AgentConfig {
+                default_command: "true".to_string(),
+                default_workdir: ".".to_string(),
+            },
+            watchdog: WatchdogConfig::default(),
+            metrics: MetricsConfig::default(),
+        }
+    }
+
+    #[test]
+    fn app_startup_resumes_existing_registry_and_preserves_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let omar_dir = dir.path().join(".omar");
+        let ea0_dir = ea::ea_state_dir(0, &omar_dir);
+        let ea1_dir = ea::ea_state_dir(1, &omar_dir);
+        std::fs::create_dir_all(ea0_dir.join("status")).unwrap();
+        std::fs::create_dir_all(ea1_dir.join("status")).unwrap();
+
+        let registry = vec![
+            EaInfo {
+                id: 0,
+                name: "Primary".to_string(),
+                description: Some("existing default".to_string()),
+                created_at: 10,
+            },
+            EaInfo {
+                id: 1,
+                name: "Research".to_string(),
+                description: Some("existing second ea".to_string()),
+                created_at: 11,
+            },
+        ];
+        std::fs::write(
+            omar_dir.join("eas.json"),
+            serde_json::to_string_pretty(&registry).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(omar_dir.join("active_ea"), "1").unwrap();
+        std::fs::write(omar_dir.join("ea_next_id"), "42").unwrap();
+        std::fs::write(
+            memory::manager_notes_path(&omar_dir, 1),
+            "persisted manager note",
+        )
+        .unwrap();
+
+        std::fs::write(
+            ea1_dir.join("worker_tasks.json"),
+            r#"{"omar-test-worker":"resume this task"}"#,
+        )
+        .unwrap();
+        std::fs::write(ea1_dir.join("tasks.md"), "7. Persisted project\n").unwrap();
+        std::fs::write(
+            ea1_dir.join("task_registry.json"),
+            r#"{"legacy":"registry entry"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ea1_dir.join("agent_parents.json"),
+            r#"{"omar-test-worker":"omar-test-parent"}"#,
+        )
+        .unwrap();
+        std::fs::write(ea1_dir.join("memory.md"), "manager resume context").unwrap();
+        std::fs::write(ea1_dir.join("status/omar-test-worker.md"), "stale status").unwrap();
+
+        let scheduler = Arc::new(Scheduler::with_store(scheduler::events_store_path(
+            &omar_dir,
+        )));
+        scheduler.insert(ScheduledEvent {
+            id: "persisted-event".to_string(),
+            sender: "ea".to_string(),
+            receiver: "worker".to_string(),
+            timestamp: 123,
+            payload: "wake later".to_string(),
+            created_at: 100,
+            recurring_ns: Some(5_000_000_000),
+            ea_id: 1,
+        });
+
+        let config = test_config_with_prefix(format!("omar-test-resume-{}-", uuid::Uuid::new_v4()));
+        let app = App::new_with_omar_dir(
+            &config,
+            TickerBuffer::new(),
+            scheduler.clone(),
+            omar_dir.clone(),
+        );
+
+        assert_eq!(app.active_ea, 1);
+        assert_eq!(
+            app.registered_eas
+                .iter()
+                .map(|ea| (ea.id, ea.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "Primary"), (1, "Research")]
+        );
+        assert_eq!(
+            std::fs::read_to_string(omar_dir.join("active_ea")).unwrap(),
+            "1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(omar_dir.join("ea_next_id")).unwrap(),
+            "42"
+        );
+        assert_eq!(
+            std::fs::read_to_string(memory::manager_notes_path(&omar_dir, 1)).unwrap(),
+            "persisted manager note"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea1_dir.join("worker_tasks.json")).unwrap(),
+            r#"{"omar-test-worker":"resume this task"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea1_dir.join("tasks.md")).unwrap(),
+            "7. Persisted project\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea1_dir.join("task_registry.json")).unwrap(),
+            r#"{"legacy":"registry entry"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea1_dir.join("agent_parents.json")).unwrap(),
+            r#"{"omar-test-worker":"omar-test-parent"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea1_dir.join("memory.md")).unwrap(),
+            "manager resume context"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea1_dir.join("status/omar-test-worker.md")).unwrap(),
+            "stale status"
+        );
+        assert_eq!(scheduler.list_by_ea(1).len(), 1);
+        assert!(
+            std::fs::read_to_string(scheduler::events_store_path(&omar_dir))
+                .unwrap()
+                .contains("wake later")
+        );
+    }
+
+    #[test]
+    fn app_startup_from_home_loads_config_and_preserves_runtime_state() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = HomeEnvGuard::set(dir.path());
+
+        let omar_dir = dir.path().join(".omar");
+        let ea0_dir = ea::ea_state_dir(0, &omar_dir);
+        std::fs::create_dir_all(ea0_dir.join("status")).unwrap();
+        std::fs::write(
+            omar_dir.join("config.toml"),
+            r#"
+[dashboard]
+session_prefix = "omar-agent-"
+
+[agent]
+default_command = "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
+default_workdir = "."
+"#,
+        )
+        .unwrap();
+        ea::ensure_default_ea(&omar_dir).unwrap();
+        projects::save_projects_to(
+            &ea0_dir,
+            &[projects::Project {
+                id: 3,
+                name: "Keep project".to_string(),
+            }],
+        )
+        .unwrap();
+        std::fs::write(
+            ea0_dir.join("worker_tasks.json"),
+            r#"{"omar-agent-0-worker":"keep task"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ea0_dir.join("agent_parents.json"),
+            r#"{"omar-agent-0-worker":"omar-agent-ea"}"#,
+        )
+        .unwrap();
+        std::fs::write(ea0_dir.join("memory.md"), "keep memory").unwrap();
+        std::fs::write(ea0_dir.join("task_registry.json"), r#"{"task":"registry"}"#).unwrap();
+        std::fs::write(ea0_dir.join("status/omar-agent-0-worker.md"), "keep status").unwrap();
+
+        let scheduler = Arc::new(Scheduler::with_store(scheduler::events_store_path(
+            &omar_dir,
+        )));
+        scheduler.insert(ScheduledEvent {
+            id: "home-event".to_string(),
+            sender: "ea".to_string(),
+            receiver: "worker".to_string(),
+            timestamp: 456,
+            payload: "home wake".to_string(),
+            created_at: 123,
+            recurring_ns: None,
+            ea_id: 0,
+        });
+
+        let config = Config::load(None).unwrap();
+        let app = App::new(&config, TickerBuffer::new(), scheduler.clone());
+
+        assert_eq!(
+            app.default_command(),
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea0_dir.join("tasks.md")).unwrap(),
+            "3. Keep project\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea0_dir.join("worker_tasks.json")).unwrap(),
+            r#"{"omar-agent-0-worker":"keep task"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea0_dir.join("agent_parents.json")).unwrap(),
+            r#"{"omar-agent-0-worker":"omar-agent-ea"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea0_dir.join("memory.md")).unwrap(),
+            "keep memory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea0_dir.join("task_registry.json")).unwrap(),
+            r#"{"task":"registry"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(ea0_dir.join("status/omar-agent-0-worker.md")).unwrap(),
+            "keep status"
+        );
+        assert_eq!(scheduler.list_by_ea(0).len(), 1);
+        assert!(
+            std::fs::read_to_string(scheduler::events_store_path(&omar_dir))
+                .unwrap()
+                .contains("home wake")
+        );
     }
 
     // ── build_agent_groups tests ──

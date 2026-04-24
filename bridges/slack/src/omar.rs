@@ -1,7 +1,6 @@
 //! MCP stdio client for talking to the OMAR MCP server.
 //!
-//! The bridge spawns `omar mcp-server` (no `--context-file` — the server
-//! builds a default context from the user's config and active EA) and
+//! The bridge spawns `omar mcp-server` and
 //! exchanges JSON-RPC messages over the child's stdio. Line-delimited
 //! framing is used; the omar server accepts both that and Content-Length,
 //! line-delimited is simpler here.
@@ -12,9 +11,11 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct McpClient {
     child: Child,
@@ -28,9 +29,10 @@ impl McpClient {
     /// `omar_binary` is the path to the omar executable (resolved by the
     /// caller — typically next to the bridge binary, falling back to
     /// `omar` on PATH).
-    pub async fn start(omar_binary: &PathBuf) -> Result<Self> {
+    pub async fn start(omar_binary: &PathBuf, omar_dir: &std::path::Path) -> Result<Self> {
         let mut child = Command::new(omar_binary)
             .arg("mcp-server")
+            .env("OMAR_DIR", omar_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Inherit stderr so the MCP server's log lines (config errors,
@@ -177,20 +179,22 @@ impl Drop for McpClient {
 /// Slack messages to a permanently-broken connection.
 pub struct OmarMcp {
     omar_binary: PathBuf,
+    omar_dir: PathBuf,
     client: Option<McpClient>,
 }
 
 impl OmarMcp {
-    pub fn new(omar_binary: PathBuf) -> Self {
+    pub fn new(omar_binary: PathBuf, omar_dir: PathBuf) -> Self {
         Self {
             omar_binary,
+            omar_dir,
             client: None,
         }
     }
 
     async fn client_mut(&mut self) -> Result<&mut McpClient> {
         if self.client.is_none() {
-            let client = McpClient::start(&self.omar_binary).await?;
+            let client = McpClient::start(&self.omar_binary, &self.omar_dir).await?;
             self.client = Some(client);
         }
         Ok(self.client.as_mut().unwrap())
@@ -203,19 +207,32 @@ impl OmarMcp {
             "receiver": "ea",
             "payload": payload,
         });
-        if let Err(e) = self.try_call("omar_wake_later", args.clone()).await {
+        if let Err(e) = self
+            .try_call_with_timeout("omar_wake_later", args.clone())
+            .await
+        {
             warn!(
                 "MCP omar_wake_later failed ({}); restarting MCP server and retrying",
                 e
             );
             self.client = None;
-            self.try_call("omar_wake_later", args).await?;
+            self.try_call_with_timeout("omar_wake_later", args).await?;
         }
         Ok(())
     }
 
-    async fn try_call(&mut self, name: &str, args: Value) -> Result<Value> {
-        self.client_mut().await?.call_tool(name, args).await
+    async fn try_call_with_timeout(&mut self, name: &str, args: Value) -> Result<Value> {
+        match timeout(MCP_CALL_TIMEOUT, async {
+            self.client_mut().await?.call_tool(name, args).await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.client = None;
+                Err(anyhow!("MCP call '{}' timed out", name))
+            }
+        }
     }
 
     /// Best-effort startup probe so the bridge logs whether the MCP server

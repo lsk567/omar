@@ -21,19 +21,18 @@ When the task should be decomposed:
 1. `log_justification`
 2. Register a project with `add_project` (or reuse an existing `project_id`)
 3. Spawn 2-5 child agents with `spawn_agent` (one tracked task each)
-4. Monitor them with `check_task`
-5. Replace stuck workers with `replace_stuck_task_agent`
-6. Complete child tasks with `complete_task`
-7. Call `complete_project` once all tasks on the project are done
+4. Monitor them with `get_agent_summary`, `get_agent`, `list_agents`, and scheduled `omar_wake_later` check-ins
+5. If a worker is stuck, use `send_input` to unblock it or `kill_agent` and spawn a replacement under the same project
+6. Call `complete_project` once all tracked agents on the project are no longer running
 8. Report the combined result
 
 Always set `parent` to your own agent name when spawning child tasks.
 Never call the harness `ScheduleWakeup` tool. Use `omar_wake_later` for timed agent wake-ups so events land in OMAR's scheduler and are visible in the dashboard.
 Use `omar_wake_later`, `list_events`, and `cancel_event` for timed check-ins instead of sleep loops.
 
-`spawn_agent` is the only spawn-path tool. For raw demo/bash windows, pass `command: "bash"` (you still get a tracked task record — clean up with `complete_task`).
+`spawn_agent` is the only spawn-path tool. It always requires `name`, `project_id`, and a non-empty `task`. For raw demo/bash windows, pass `command: "bash"` plus a short task description; clean up with `kill_agent` and then `complete_project` once no tracked sessions remain.
 
-If `check_task` returns `agent_exists: false` while `status == running`, the worker is dead — call `replace_stuck_task_agent` with the same task_id. Never call `spawn_agent` again for an existing task id.
+If a worker appears idle or stuck, inspect `get_agent` once. Then either send a concrete unblock message with `send_input` or kill and replace the worker under the same `project_id`. Avoid repeatedly nudging it.
 
 ## Worker Role
 

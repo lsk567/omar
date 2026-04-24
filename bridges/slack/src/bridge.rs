@@ -135,17 +135,23 @@ impl Bridge {
 /// file in place so the next poll retries. Survives bridge restarts —
 /// anything queued while the bridge was down is drained on the next run.
 async fn run_outbox_watcher(outbox_dir: PathBuf, slack: Arc<Mutex<SlackClient>>, max_len: usize) {
-    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    const MIN_POLL_INTERVAL: Duration = Duration::from_millis(500);
+    const MAX_IDLE_INTERVAL: Duration = Duration::from_secs(5);
+    let mut poll_interval = MIN_POLL_INTERVAL;
     loop {
-        drain_outbox_once(&outbox_dir, &slack, max_len).await;
-        tokio::time::sleep(POLL_INTERVAL).await;
+        if drain_outbox_once(&outbox_dir, &slack, max_len).await {
+            poll_interval = MIN_POLL_INTERVAL;
+        } else {
+            poll_interval = (poll_interval * 2).min(MAX_IDLE_INTERVAL);
+        }
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
-async fn drain_outbox_once(outbox_dir: &Path, slack: &Mutex<SlackClient>, max_len: usize) {
+async fn drain_outbox_once(outbox_dir: &Path, slack: &Mutex<SlackClient>, max_len: usize) -> bool {
     let entries = match std::fs::read_dir(outbox_dir) {
         Ok(entries) => entries,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     // Collect first, then sort by name — MCP tool writes `<ts_ns>-<uuid>.json`
@@ -156,6 +162,9 @@ async fn drain_outbox_once(outbox_dir: &Path, slack: &Mutex<SlackClient>, max_le
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
         .collect();
     paths.sort();
+    if paths.is_empty() {
+        return false;
+    }
 
     for path in paths {
         let content = match std::fs::read_to_string(&path) {
@@ -200,4 +209,5 @@ async fn drain_outbox_once(outbox_dir: &Path, slack: &Mutex<SlackClient>, max_le
             }
         }
     }
+    true
 }

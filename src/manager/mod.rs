@@ -73,6 +73,10 @@ fn sed_escape(s: &str) -> String {
         .replace('\'', "'\\''")
 }
 
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
     Claude,
@@ -232,9 +236,12 @@ fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
         context_file.display().to_string(),
     ])
     .ok()?;
+    let command_arg = format!("mcp_servers.omar.command={}", command);
+    let args_arg = format!("mcp_servers.omar.args={}", args);
     Some(format!(
-        "-c 'mcp_servers.omar.command={}' -c 'mcp_servers.omar.args={}'",
-        command, args
+        "-c {} -c {}",
+        shell_single_quote(&command_arg),
+        shell_single_quote(&args_arg)
     ))
 }
 
@@ -243,11 +250,11 @@ fn gemini_mcp_bootstrap(base_command: &str, context: &McpLaunchContext) -> Optio
     let context_file = materialize_mcp_context_file(context)?;
     let gemini_exec =
         backend_token(base_command, BackendKind::Gemini).unwrap_or_else(|| "gemini".to_string());
-    let server_exe = server_exe.display().to_string();
-    let context_file = context_file.display().to_string();
+    let server_exe = shell_single_quote(&server_exe.display().to_string());
+    let context_file = shell_single_quote(&context_file.display().to_string());
     Some(format!(
         "({gemini} mcp remove omar >/dev/null 2>&1 || true; \
-         {gemini} mcp add -s user omar '{server}' mcp-server --context-file '{context}' >/dev/null 2>&1 || true)",
+         {gemini} mcp add -s user omar {server} mcp-server --context-file {context} >/dev/null 2>&1 || true)",
         gemini = gemini_exec,
         server = server_exe,
         context = context_file
@@ -382,16 +389,17 @@ pub fn build_agent_command(
     substitutions: &[(&str, &str)],
     mcp_context: &McpLaunchContext,
 ) -> String {
-    let path_str = prompt_file.display();
+    let path_str = prompt_file.display().to_string();
+    let prompt_path = shell_single_quote(&path_str);
     let shell_expr = if substitutions.is_empty() {
-        format!("$(cat '{}')", path_str)
+        format!("$(cat {})", prompt_path)
     } else {
         let sed_script: String = substitutions
             .iter()
             .map(|(pat, repl)| format!("s|{}|{}|g", pat, sed_escape(repl)))
             .collect::<Vec<_>>()
             .join("; ");
-        format!("$(sed '{}' '{}')", sed_script, path_str)
+        format!("$(sed '{}' {})", sed_script, prompt_path)
     };
 
     // Per-backend MCP wiring. Each helper returns None only on an IO-level
@@ -402,10 +410,10 @@ pub fn build_agent_command(
     match detect_backend(base_command) {
         Some(BackendKind::Claude) => match materialize_claude_mcp_config(mcp_context) {
             Some(mcp_config) => format!(
-                "{} --system-prompt \"{}\" --mcp-config '{}'",
+                "{} --system-prompt \"{}\" --mcp-config {}",
                 base_command,
                 shell_expr,
-                mcp_config.display()
+                shell_single_quote(&mcp_config.display().to_string())
             ),
             None => format!("{} --system-prompt \"{}\"", base_command, shell_expr),
         },
@@ -441,8 +449,8 @@ pub fn build_agent_command(
         }
         Some(BackendKind::Opencode) => match opencode_config_env(mcp_context) {
             Some(config) => format!(
-                "OPENCODE_CONFIG_CONTENT='{}' {} --prompt \"{}\"",
-                config.replace('\'', "'\\''"),
+                "OPENCODE_CONFIG_CONTENT={} {} --prompt \"{}\"",
+                shell_single_quote(&config),
                 base_command,
                 shell_expr
             ),

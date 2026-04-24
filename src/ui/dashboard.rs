@@ -1243,7 +1243,7 @@ fn render_help_popup(frame: &mut Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  Q           Quit"),
+        Line::from("  Q           Quit dashboard"),
         Line::from("  ←/→, h/l   Switch panel (sidebar ↔ main)"),
         Line::from("  ↑/↓, j/k   Move selection up/down"),
         Line::from("  Tab         Drill into selected agent"),
@@ -1293,8 +1293,8 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
         ConfirmAction::Quit => (
             " Confirm Quit ",
             "Quit omar?",
-            "This will kill ALL EA sessions and agents.".to_string(),
-            "Press z to walk away instead.".to_string(),
+            "EA sessions and agents will keep running.".to_string(),
+            "Set OMAR_KILL_SESSIONS_ON_EXIT=1 only for destructive cleanup.".to_string(),
             50,
         ),
         ConfirmAction::DeleteEa => {

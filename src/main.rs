@@ -1,4 +1,5 @@
 mod app;
+mod backend_probe;
 mod computer;
 mod config;
 mod ea;
@@ -8,6 +9,7 @@ mod mcp;
 mod memory;
 mod metrics;
 mod panic_hook;
+mod process;
 mod projects;
 mod scheduler;
 mod tmux;
@@ -37,7 +39,7 @@ use tokio::sync::Mutex;
 use app::App;
 use config::Config;
 use event::{AppEvent, EventHandler};
-use tmux::TmuxClient;
+use tmux::{tmux_command, TmuxClient};
 
 /// Tmux session name used when omar auto-launches into tmux
 pub const DASHBOARD_SESSION: &str = "omar-dashboard";
@@ -205,7 +207,7 @@ async fn async_main() -> Result<()> {
     }
     if cli.spawn_metrics {
         config.metrics.spawn_metrics_enabled = true;
-        config.save();
+        config.save_to_path(&Config::resolve_path(cli.config.as_deref()));
     }
     metrics::configure(config.metrics.spawn_metrics_enabled);
     let omar_dir = omar_dir();
@@ -545,7 +547,7 @@ fn relaunch_in_tmux() -> Result<()> {
     // Preserve a live dashboard across detach/reattach cycles.
     // Only kill the session if attach fails, which indicates a stale tmux session.
     if client.has_session(DASHBOARD_SESSION)? {
-        let status = std::process::Command::new("tmux")
+        let status = tmux_command()
             .args(["-2", "attach-session", "-t", DASHBOARD_SESSION])
             .status();
 
@@ -560,7 +562,7 @@ fn relaunch_in_tmux() -> Result<()> {
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let mut cmd = std::process::Command::new("tmux");
+    let mut cmd = tmux_command();
     // Force 256-color mode when launching the dashboard session.
     cmd.arg("-2");
     cmd.args(["new-session", "-s", DASHBOARD_SESSION]);
@@ -626,10 +628,7 @@ fn tmux_setup_needed() -> bool {
     for &(opt, cmd, _) in TMUX_RECOMMENDED {
         // Extract expected value from the command string (last word)
         let expected = cmd.split_whitespace().last().unwrap_or("on");
-        if let Ok(out) = std::process::Command::new("tmux")
-            .args(["show-options", "-gv", opt])
-            .output()
-        {
+        if let Ok(out) = tmux_command().args(["show-options", "-gv", opt]).output() {
             let val = String::from_utf8_lossy(&out.stdout);
             if val.trim() != expected {
                 return true;
@@ -656,7 +655,7 @@ fn setup_tmux() -> Result<()> {
         // Check runtime value — even if the line is in the config,
         // a later conflicting line may override it.
         let expected = line.split_whitespace().last().unwrap_or("on");
-        let runtime_ok = std::process::Command::new("tmux")
+        let runtime_ok = tmux_command()
             .args(["show-options", "-gv", opt])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == expected)
@@ -712,7 +711,7 @@ fn setup_tmux() -> Result<()> {
     // Apply settings directly to the running tmux server.
     // source-file alone isn't reliable because earlier conflicting lines
     // in the config (e.g., oh-my-tmux sets mouse off) can override ours.
-    let tmux_running = std::process::Command::new("tmux")
+    let tmux_running = tmux_command()
         .args(["list-sessions"])
         .output()
         .map(|o| o.status.success())
@@ -722,7 +721,7 @@ fn setup_tmux() -> Result<()> {
         for (line, _) in &to_add {
             // Each line is a full tmux command (e.g. "set -g mouse on")
             let args: Vec<&str> = line.split_whitespace().collect();
-            let _ = std::process::Command::new("tmux").args(&args).status();
+            let _ = tmux_command().args(&args).status();
         }
         println!("✓ Applied to ~/.tmux.conf and running tmux server.");
     } else {
@@ -1332,9 +1331,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         // Detach from tmux — dashboard + agents keep running
                         KeyCode::Char('z') if std::env::var("TMUX").is_ok() => {
-                            let _ = std::process::Command::new("tmux")
-                                .args(["detach-client"])
-                                .status();
+                            let _ = tmux_command().args(["detach-client"]).status();
                         }
                         KeyCode::Char('S') => {
                             app.show_settings = true;
@@ -1369,17 +1366,21 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         app.check_auth_failures(&app_ticker);
                     }
 
-                    // Keep system_state.md in sync with live state (EA-scoped)
-                    let state_dir = app.state_dir();
-                    let manager_session = app.manager_session_name();
-                    memory::write_memory_to(
-                        &state_dir,
-                        &app.agents,
-                        app.manager.as_ref(),
-                        &manager_session,
-                        app.client(),
-                        &app.scheduled_events,
-                    );
+                    // Keep system_state.md reasonably fresh without capturing
+                    // the manager pane and rewriting JSON on every dashboard
+                    // tick. State-changing actions still write immediately.
+                    if tick_count.is_multiple_of(3) && !app.has_popup() {
+                        let state_dir = app.state_dir();
+                        let manager_session = app.manager_session_name();
+                        memory::write_memory_to(
+                            &state_dir,
+                            &app.agents,
+                            app.manager.as_ref(),
+                            &manager_session,
+                            app.client(),
+                            &app.scheduled_events,
+                        );
+                    }
                 }
                 AppEvent::TickerScroll => {
                     let mut app = shared_app.lock().await;
@@ -1416,9 +1417,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // Kill ALL OMAR EA sessions on quit (managers + workers), even if
-    // registry and tmux are temporarily out of sync.
-    {
+    // Leaving the dashboard should be resumable: managers, workers, and their
+    // persisted state stay alive. Operators can still opt into the old
+    // destructive shutdown behavior explicitly for local cleanup.
+    if should_kill_sessions_on_exit() {
         let app = shared_app.lock().await;
         let client = TmuxClient::new("");
         let base_prefix = app.base_prefix.clone();
@@ -1445,9 +1447,48 @@ async fn run_dashboard(config: Config) -> Result<()> {
     Ok(())
 }
 
+fn should_kill_sessions_on_exit() -> bool {
+    std::env::var_os("OMAR_KILL_SESSIONS_ON_EXIT").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     /// Regression: `extended-keys always` forces tmux to emit modify-other-keys
     /// sequences to every client, including omar's dashboard, which doesn't
@@ -1470,5 +1511,24 @@ mod tests {
              in the dashboard (see tests comment)",
             value
         );
+    }
+
+    #[test]
+    fn dashboard_exit_preserves_sessions_by_default() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::unset("OMAR_KILL_SESSIONS_ON_EXIT");
+
+        assert!(
+            !should_kill_sessions_on_exit(),
+            "dashboard exit must be resumable by default"
+        );
+    }
+
+    #[test]
+    fn dashboard_exit_session_kill_is_explicit_opt_in() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set("OMAR_KILL_SESSIONS_ON_EXIT", "1");
+
+        assert!(should_kill_sessions_on_exit());
     }
 }

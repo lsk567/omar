@@ -93,10 +93,11 @@ computer_mouse({"agent": "debug", "action": "click", "x": 400, "y": 300})
   })
   ```
 
-- Clean up test agents with `complete_task` (recommended — tears down the session and marks the task done) or `kill_agent` (leaves the task record behind):
+- Clean up test agents with `kill_agent`, then call `complete_project` after no tracked sessions remain:
 
   ```
-  complete_task({"task_id": "test-agent"})
+  kill_agent({"name": "test-agent"})
+  complete_project({"project_id": 1})
   ```
 
 ## Cleanup

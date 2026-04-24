@@ -305,6 +305,6 @@ When running, the OMAR dashboard shows all 15 agents with their backends:
 ## Tips
 
 - Leaf workers may finish before their siblings — level-3 leads should wait for both.
-- If a worker stalls, the lead above should notice and `replace_stuck_task_agent` is NOT used here (no kills). Instead, send a nudge via `omar_wake_later`.
+- If a worker stalls, the lead above should notice; do not kill it in this demo. Instead, send a nudge via `omar_wake_later`.
 - `cursor-tests` needs the other modules to exist first — it may need to wait or write tests against expected interfaces.
 - The root's final `npm test` is the integration check that validates everything works together.

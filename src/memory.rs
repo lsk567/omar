@@ -20,6 +20,7 @@ use crate::tmux::TmuxClient;
 /// run in the same process and operate on separate state_dir paths.
 static WORKER_TASKS_LOCK: Mutex<()> = Mutex::new(());
 static AGENT_PARENTS_LOCK: Mutex<()> = Mutex::new(());
+static AGENT_PROJECTS_LOCK: Mutex<()> = Mutex::new(());
 
 /// Generic JSON helpers
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
@@ -62,6 +63,42 @@ pub fn load_worker_tasks_from(state_dir: &Path) -> HashMap<String, String> {
 fn load_worker_tasks_inner(state_dir: &Path) -> HashMap<String, String> {
     let path = state_dir.join("worker_tasks.json");
     read_json(&path).unwrap_or_default()
+}
+
+/// Save an agent->project mapping (upsert)
+pub fn save_agent_project_in(state_dir: &Path, session: &str, project_id: usize) {
+    let path = state_dir.join("agent_projects.json");
+    let _guard = AGENT_PROJECTS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut projects = load_agent_projects_inner(state_dir);
+    projects.insert(session.to_string(), project_id);
+    write_json(&path, &projects);
+}
+
+/// Load all agent->project mappings for an EA
+pub fn load_agent_projects_from(state_dir: &Path) -> HashMap<String, usize> {
+    let _guard = AGENT_PROJECTS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    load_agent_projects_inner(state_dir)
+}
+
+/// Inner (lock-free) loader — only call while holding `AGENT_PROJECTS_LOCK`.
+fn load_agent_projects_inner(state_dir: &Path) -> HashMap<String, usize> {
+    let path = state_dir.join("agent_projects.json");
+    read_json(&path).unwrap_or_default()
+}
+
+/// Remove an agent->project mapping
+pub fn remove_agent_project_in(state_dir: &Path, session: &str) {
+    let path = state_dir.join("agent_projects.json");
+    let _guard = AGENT_PROJECTS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut projects = load_agent_projects_inner(state_dir);
+    projects.remove(session);
+    write_json(&path, &projects);
 }
 
 /// Save a child->parent mapping (upsert)
@@ -142,15 +179,12 @@ pub fn write_memory_to(
 ) {
     let project_list = projects::load_projects_from(state_dir);
 
-    // Hold the lock across read-modify-write of worker_tasks.json.
+    // Read task metadata without pruning. Session discovery can lag tmux
+    // creation during large fan-outs; pruning here can erase valid tasks.
+    // Explicit kill/delete paths own cleanup.
     let worker_tasks = {
         let _guard = WORKER_TASKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut tasks = load_worker_tasks_inner(state_dir);
-        // Clean up stale entries (sessions that no longer exist for this EA)
-        let active_sessions: Vec<String> = agents.iter().map(|a| a.session.name.clone()).collect();
-        tasks.retain(|k, _| active_sessions.contains(k));
-        write_json(&state_dir.join("worker_tasks.json"), &tasks);
-        tasks
+        load_worker_tasks_inner(state_dir)
     };
 
     let mut out = String::from("# OMAR State\n\n");
@@ -232,11 +266,10 @@ pub fn write_memory_to(
 }
 
 /// Clear runtime/transient EA state that should not leak across dashboard sessions.
-/// Keeps durable artifacts such as projects and manager notes intact.
+/// Keeps durable artifacts such as projects, task metadata, hierarchy, memory,
+/// scheduled events, and manager notes intact so the dashboard can resume.
+#[cfg(test)]
 pub fn clear_runtime_state_in(state_dir: &Path) {
-    let _ = fs::remove_file(state_dir.join("agent_parents.json"));
-    let _ = fs::remove_file(state_dir.join("worker_tasks.json"));
-    let _ = fs::remove_file(state_dir.join("memory.md"));
     let _ = fs::remove_dir_all(state_dir.join("status"));
     let _ = fs::create_dir_all(state_dir.join("status"));
 }
@@ -280,6 +313,39 @@ mod tests {
         assert_eq!(load_manager_notes(dir.path(), 3), "EA 3 notes");
         // EA 0 does NOT see EA 3's notes
         assert!(load_manager_notes(dir.path(), 0).is_empty());
+    }
+
+    #[test]
+    fn clear_runtime_state_only_removes_status_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+        std::fs::create_dir_all(state_dir.join("status")).unwrap();
+        std::fs::write(state_dir.join("status/omar-agent-0-worker.md"), "stale").unwrap();
+        std::fs::write(state_dir.join("worker_tasks.json"), r#"{"worker":"task"}"#).unwrap();
+        std::fs::write(state_dir.join("agent_parents.json"), r#"{"worker":"ea"}"#).unwrap();
+        std::fs::write(state_dir.join("agent_projects.json"), r#"{"worker":1}"#).unwrap();
+        std::fs::write(state_dir.join("memory.md"), "resume context").unwrap();
+
+        clear_runtime_state_in(state_dir);
+
+        assert!(state_dir.join("status").is_dir());
+        assert!(!state_dir.join("status/omar-agent-0-worker.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join("worker_tasks.json")).unwrap(),
+            r#"{"worker":"task"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join("agent_parents.json")).unwrap(),
+            r#"{"worker":"ea"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join("agent_projects.json")).unwrap(),
+            r#"{"worker":1}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join("memory.md")).unwrap(),
+            "resume context"
+        );
     }
 
     #[test]

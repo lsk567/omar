@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::backend_probe;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -127,9 +129,7 @@ fn default_error_patterns() -> Vec<String> {
 /// Detect which agent command is available on the system.
 /// Checks PATH for the supported first-class backends, falling back to `claude`.
 fn detect_agent_command() -> String {
-    use std::process::Command;
-
-    for (binary, command) in [
+    detect_agent_command_from(&[
         ("claude", "claude --dangerously-skip-permissions"),
         (
             "codex",
@@ -138,18 +138,15 @@ fn detect_agent_command() -> String {
         ("cursor", "cursor agent --yolo"),
         ("gemini", "gemini --yolo"),
         ("opencode", "opencode"),
-    ] {
-        if Command::new(binary)
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
-            return command.to_string();
-        }
-    }
+    ])
+    .unwrap_or_else(|| "claude --dangerously-skip-permissions".to_string())
+}
 
-    // Fallback to claude even if not found (user may install it later)
-    "claude --dangerously-skip-permissions".to_string()
+fn detect_agent_command_from(candidates: &[(&str, &str)]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|(binary, _)| backend_probe::backend_version_probe_succeeds(binary))
+        .map(|(_, command)| (*command).to_string())
 }
 
 fn default_command() -> String {
@@ -259,7 +256,7 @@ impl Config {
 
         if !expanded_path.exists() {
             let config = Self::default();
-            config.save();
+            config.save_to_path(&expanded_path);
             return Ok(config);
         }
 
@@ -271,12 +268,16 @@ impl Config {
 
     /// Save config to its default path (~/.omar/config.toml)
     pub fn save(&self) {
-        let path = Self::default_path();
+        self.save_to_path(&Self::default_path());
+    }
+
+    /// Save config to a specific path.
+    pub fn save_to_path(&self, path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         if let Ok(contents) = toml::to_string_pretty(self) {
-            std::fs::write(&path, contents).ok();
+            std::fs::write(path, contents).ok();
         }
     }
 
@@ -372,9 +373,41 @@ sidebar_right = false
             cmd.contains("claude")
                 || cmd.contains("codex")
                 || cmd.contains("cursor")
+                || cmd.contains("gemini")
                 || cmd.contains("opencode"),
             "Unexpected default command: {}",
             cmd
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_agent_command_skips_hanging_probe() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let slow = temp.path().join("slow-agent");
+        let fast = temp.path().join("fast-agent");
+        fs::write(&slow, "#!/bin/sh\nsleep 5\n").unwrap();
+        fs::write(&fast, "#!/bin/sh\nexit 0\n").unwrap();
+        for path in [&slow, &fast] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        let start = Instant::now();
+        let cmd = detect_agent_command_from(&[
+            (slow.to_str().unwrap(), "slow command"),
+            (fast.to_str().unwrap(), "fast command"),
+        ]);
+
+        assert_eq!(cmd.as_deref(), Some("fast command"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "hanging probe should be skipped after the bounded timeout"
         );
     }
 
@@ -504,5 +537,18 @@ spawn_metrics_enabled = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.metrics.spawn_metrics_enabled);
+    }
+
+    #[test]
+    fn test_load_missing_custom_path_writes_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.toml");
+
+        let _config = Config::load(Some(path.to_str().unwrap())).unwrap();
+
+        assert!(
+            path.exists(),
+            "missing explicit config path should be created"
+        );
     }
 }
