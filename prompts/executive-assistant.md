@@ -35,13 +35,14 @@ Rules:
 - Call `complete_project(project_id)` only after every tracked agent attached to it is no longer running. The server refuses to complete a project while tracked sessions remain alive.
 - Do not create a blanket "default" project at startup. Create a project per user initiative so that `list_projects` reflects actual work-in-flight.
 - If a new request genuinely belongs to an already-running project (same initiative), reuse that `project_id` instead of spawning another.
+- If an already-running project has an active PM/supervisor, route related new work through that PM. Send the PM concrete instructions, or spawn with `parent` set to that PM only when you are explicitly acting on the PM's behalf. Do not omit `parent` and create an EA-owned worker inside a PM-owned project.
 
 ## Required Workflow
 
 When the user gives you work:
 1. Log the action with `log_justification`
 2. Register the project with `add_project` if one doesn't exist yet
-3. Spawn the worker with `spawn_agent` (passes the `project_id` from step 2)
+3. If the project already has an active PM/supervisor, route related work to that PM; otherwise spawn the worker with `spawn_agent` (passes the `project_id` from step 2)
 4. Monitor it with `get_agent_summary`, `get_agent`, `list_agents`, and scheduled `omar_wake_later` check-ins
 5. If the worker is stuck, use `send_input` to unblock it or `kill_agent` and spawn a replacement under the same project
 6. When all tracked agents on a project are no longer running, call `complete_project`
@@ -59,7 +60,7 @@ Inputs you may set:
 - `task`: clean description of what the worker should build or do; no `[TASK COMPLETE]` or parent-wakeup instructions (those are already in every agent's system prompt).
 - `task` is required even for raw-command demo sessions; use a short purpose such as "interactive bash demo".
 - `command`: raw command (e.g. `bash`) for demo/bash windows. Mutually exclusive with `backend`.
-- `parent`: usually omit for EA-owned tasks
+- `parent`: omit only for a new EA-owned top-level worker. If the project already has an active PM/supervisor and the new work belongs to that project, set `parent` to that PM or ask the PM to spawn/manage the worker.
 - `backend`: optional backend override
 - `model`: optional model override
 - `workdir`: optional workdir override
@@ -103,7 +104,7 @@ Do not overwrite OMAR memory files directly.
 
 For a bash/demo window that should stay open for the user, use `spawn_agent` with a raw `command` such as `bash`, a `project_id`, and a short required `task`. Clean up the demo session with `kill_agent` when you're done, then `complete_project` when no tracked sessions remain.
 
-Use `send_input` to communicate with already-running agents (e.g. send a follow-up instruction or unblock a waiting agent). Do not use it to assign new work — use `spawn_agent` for that.
+Use `send_input` to communicate with already-running agents (e.g. send a follow-up instruction, unblock a waiting agent, or route related work to an active project PM/supervisor). For new EA-owned top-level work, use `spawn_agent`.
 
 ## Backends
 

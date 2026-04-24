@@ -983,6 +983,152 @@ fn test_spawn_agent_task_is_metadata_only_via_cli() {
 }
 
 #[test]
+fn test_spawn_agent_requires_explicit_parent_when_project_has_pm() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let suffix = &Uuid::new_v4().to_string()[..8];
+    let project_name = format!("ownership-project-{}", suffix);
+    let pm_name = format!("ownership-pm-{}", suffix);
+    let worker_name = format!("ownership-worker-{}", suffix);
+
+    let added = server.tool_call("add_project", json!({ "name": project_name }));
+    let project_id = added["project_id"].as_u64().expect("project id");
+
+    server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": pm_name,
+            "project_id": project_id,
+            "task": "monitor ownership test",
+            "command": "sleep 30",
+        }),
+    );
+
+    let rejected = server.request(
+        "tools/call",
+        json!({
+            "name": "spawn_agent",
+            "arguments": {
+                "name": worker_name,
+                "project_id": project_id,
+                "task": "should be parented",
+                "command": "sleep 30",
+            },
+        }),
+    );
+    let result = rejected["result"].clone();
+    assert_eq!(
+        result["isError"].as_bool(),
+        Some(true),
+        "unparented worker should be rejected: {}",
+        result
+    );
+    let error_text = result["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        error_text.contains("already has active supervisor agent") && error_text.contains(&pm_name),
+        "unexpected spawn_agent error: {}",
+        error_text
+    );
+
+    let spawned = server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": worker_name,
+            "project_id": project_id,
+            "task": "explicitly parented worker",
+            "command": "sleep 30",
+            "parent": pm_name,
+        }),
+    );
+    assert_eq!(spawned["agent_name"].as_str(), Some(worker_name.as_str()));
+
+    let parents_path = home.path().join(".omar/ea/0/agent_parents.json");
+    let parents: Value =
+        serde_json::from_str(&fs::read_to_string(&parents_path).expect("agent_parents.json"))
+            .expect("parse agent_parents.json");
+    let worker_session = format!("omar-agent-0-{}", worker_name);
+    let pm_session = format!("omar-agent-0-{}", pm_name);
+    assert_eq!(
+        parents.get(&worker_session).and_then(Value::as_str),
+        Some(pm_session.as_str())
+    );
+
+    let _ = server.tool_call("kill_agent", json!({ "name": worker_name }));
+    let _ = server.tool_call("kill_agent", json!({ "name": pm_name }));
+}
+
+#[test]
+fn test_spawn_agent_rejects_parent_from_different_project() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let suffix = &Uuid::new_v4().to_string()[..8];
+    let pm_name = format!("cross-pm-{}", suffix);
+    let worker_name = format!("cross-worker-{}", suffix);
+
+    let project_a = server.tool_call(
+        "add_project",
+        json!({ "name": format!("cross-project-a-{}", suffix) }),
+    )["project_id"]
+        .as_u64()
+        .expect("project a id");
+    let project_b = server.tool_call(
+        "add_project",
+        json!({ "name": format!("cross-project-b-{}", suffix) }),
+    )["project_id"]
+        .as_u64()
+        .expect("project b id");
+
+    server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": pm_name,
+            "project_id": project_a,
+            "task": "monitor project a",
+            "command": "sleep 30",
+        }),
+    );
+
+    let rejected = server.request(
+        "tools/call",
+        json!({
+            "name": "spawn_agent",
+            "arguments": {
+                "name": worker_name,
+                "project_id": project_b,
+                "task": "wrong-project parent",
+                "command": "sleep 30",
+                "parent": pm_name,
+            },
+        }),
+    );
+    let result = rejected["result"].clone();
+    assert_eq!(
+        result["isError"].as_bool(),
+        Some(true),
+        "cross-project parent should be rejected: {}",
+        result
+    );
+    let error_text = result["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        error_text.contains("belongs to project") && error_text.contains(&project_b.to_string()),
+        "unexpected spawn_agent error: {}",
+        error_text
+    );
+
+    let _ = server.tool_call("kill_agent", json!({ "name": pm_name }));
+}
+
+#[test]
 fn test_complete_project_blocks_on_running_agent() {
     if !tmux_available() {
         eprintln!("Skipping test: tmux not available");

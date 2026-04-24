@@ -248,6 +248,18 @@ fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> String {
     "unknown".to_string()
 }
 
+fn looks_like_supervisor_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    tokens
+        .iter()
+        .any(|token| matches!(*token, "pm" | "supervisor"))
+        || tokens.windows(2).any(|pair| pair == ["project", "manager"])
+}
+
 fn supports_initial_prompt_delivery(backend_name: &str) -> bool {
     backend_name != "unknown"
 }
@@ -951,6 +963,14 @@ impl OmarMcpServer {
         // `task` is metadata for the dashboard and the agent prompt.
         let task_text = task.clone();
 
+        let parent = match args.parent.as_deref().map(str::trim) {
+            Some("") => return Err(anyhow!("spawn_agent parent must not be empty")),
+            Some(parent) => Some(parent.to_string()),
+            None => None,
+        };
+
+        self.validate_spawn_parent(project_id, parent.as_deref())?;
+
         let spawn_result = self.spawn_agent_internal(SpawnRequestInternal {
             name: Some(args.name.clone()),
             task: Some(task),
@@ -959,7 +979,7 @@ impl OmarMcpServer {
             backend: args.backend.clone(),
             model: args.model.clone(),
             role: None,
-            parent: args.parent.clone(),
+            parent,
             spawn_lock_wait_ms,
         })?;
 
@@ -982,6 +1002,72 @@ impl OmarMcpServer {
                 .cloned()
                 .unwrap_or_else(|| json!("unknown")),
         }))
+    }
+
+    fn validate_spawn_parent(&self, project_id: usize, parent: Option<&str>) -> Result<()> {
+        let client = self.client();
+        let agent_projects = memory::load_agent_projects_from(self.state_dir());
+        if let Some(parent) = parent {
+            if parent == "ea" {
+                return Ok(());
+            }
+            let parent_session = self.qualified_session_name(parent)?;
+            if !client.has_session(&parent_session).unwrap_or(false) {
+                return Err(anyhow!(
+                    "Parent agent '{}' is not running. Use an active parent in project '{}' or pass parent='ea' for an intentional EA-owned worker.",
+                    parent,
+                    project_id
+                ));
+            }
+            match agent_projects.get(&parent_session) {
+                Some(parent_project_id) if *parent_project_id == project_id => Ok(()),
+                Some(parent_project_id) => Err(anyhow!(
+                    "Parent agent '{}' belongs to project '{}', but spawn_agent was called for project '{}'. Use a parent from the same project or pass parent='ea' for an intentional EA-owned worker.",
+                    parent,
+                    parent_project_id,
+                    project_id
+                )),
+                None => Err(anyhow!(
+                    "Parent agent '{}' is not attached to a project. Use a tracked parent in project '{}' or pass parent='ea' for an intentional EA-owned worker.",
+                    parent,
+                    project_id
+                )),
+            }
+        } else {
+            let supervisors = self.active_project_supervisors(project_id, &agent_projects);
+            if supervisors.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "Project '{}' already has active supervisor agent(s): {}. Set parent to the supervisor, ask the supervisor to spawn/manage the worker, or pass parent='ea' for an intentional EA-owned worker.",
+                    project_id,
+                    supervisors.join(", ")
+                ))
+            }
+        }
+    }
+
+    fn active_project_supervisors(
+        &self,
+        project_id: usize,
+        agent_projects: &std::collections::HashMap<String, usize>,
+    ) -> Vec<String> {
+        let client = self.client();
+        let mut supervisors = Vec::new();
+        for (session_name, session_project_id) in agent_projects {
+            if *session_project_id != project_id {
+                continue;
+            }
+            let short_name = self.display_name(session_name);
+            if !looks_like_supervisor_name(short_name) {
+                continue;
+            }
+            if client.has_session(session_name).unwrap_or(false) {
+                supervisors.push(short_name.to_string());
+            }
+        }
+        supervisors.sort();
+        supervisors
     }
 
     fn spawn_agent_internal(&self, request: SpawnRequestInternal) -> Result<Value> {
@@ -2013,7 +2099,7 @@ fn tool_definitions() -> Vec<Value> {
                     "backend":{"type":"string","description":"One of: 'claude', 'codex', 'cursor', 'opencode', 'gemini'. Mutually exclusive with command."},
                     "model":{"type":"string"},
                     "workdir":{"type":"string"},
-                    "parent":{"type":"string","description":"Your own agent name for hierarchy tracking. Omit if the EA is the direct parent."}
+                    "parent":{"type":"string","description":"Parent agent name for hierarchy tracking. Omit only for new EA-owned top-level work; if the project already has an active PM/supervisor, set this to that supervisor or explicitly pass 'ea' for intentional EA-owned work."}
                 },
                 "required":["name","project_id","task"]
             }),
