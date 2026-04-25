@@ -23,6 +23,8 @@ pub struct McpLaunchContext {
     pub default_command: String,
     pub default_workdir: String,
     pub health_idle_warning: i64,
+    #[serde(default)]
+    pub tmux_server: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +77,13 @@ fn sed_escape(s: &str) -> String {
 
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn current_tmux_server() -> Option<String> {
+    std::env::var("OMAR_TMUX_SERVER")
+        .ok()
+        .map(|server| server.trim().to_string())
+        .filter(|server| !server.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,6 +580,7 @@ pub fn start_manager(
             default_command: command.to_string(),
             default_workdir: options.default_workdir.clone(),
             health_idle_warning: options.health_idle_warning,
+            tmux_server: current_tmux_server(),
         },
     );
 
@@ -869,6 +879,7 @@ fn spawn_worker(
             default_command: command.to_string(),
             default_workdir: ".".to_string(),
             health_idle_warning: 15,
+            tmux_server: current_tmux_server(),
         },
     );
 
@@ -955,6 +966,7 @@ mod tests {
             default_command: "claude".to_string(),
             default_workdir: ".".to_string(),
             health_idle_warning: 15,
+            tmux_server: None,
         }
     }
 
@@ -1142,6 +1154,7 @@ mod tests {
                 default_command: "claude".to_string(),
                 default_workdir: ".".to_string(),
                 health_idle_warning: 15,
+                tmux_server: None,
             },
         );
 

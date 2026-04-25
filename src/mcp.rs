@@ -415,7 +415,16 @@ pub fn run_server_from_context_file(path: PathBuf) -> Result<()> {
             .with_context(|| format!("Failed to read MCP context file {}", path.display()))?,
     )
     .with_context(|| format!("Failed to parse MCP context file {}", path.display()))?;
+    apply_context_environment(&context);
     OmarMcpServer::new(context).run()
+}
+
+fn apply_context_environment(context: &McpLaunchContext) {
+    if let Some(server) = context.tmux_server.as_deref() {
+        if !server.trim().is_empty() {
+            std::env::set_var("OMAR_TMUX_SERVER", server);
+        }
+    }
 }
 
 /// Run an MCP server without a pre-built context file. Used by peer
@@ -442,6 +451,10 @@ pub fn run_server_with_default_context() -> Result<()> {
         default_command: config.agent.default_command,
         default_workdir: config.agent.default_workdir,
         health_idle_warning: config.health.idle_warning,
+        tmux_server: std::env::var("OMAR_TMUX_SERVER")
+            .ok()
+            .map(|server| server.trim().to_string())
+            .filter(|server| !server.is_empty()),
     };
     OmarMcpServer::new(context).run()
 }
@@ -2314,6 +2327,34 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn test_context() -> McpLaunchContext {
         McpLaunchContext {
@@ -2323,7 +2364,23 @@ mod tests {
             default_command: "claude".to_string(),
             default_workdir: ".".to_string(),
             health_idle_warning: 15,
+            tmux_server: None,
         }
+    }
+
+    #[test]
+    fn context_environment_restores_tmux_server() {
+        let _lock = env_lock();
+        let _guard = EnvVarGuard::unset("OMAR_TMUX_SERVER");
+        let mut context = test_context();
+        context.tmux_server = Some("isolated-test-server".to_string());
+
+        apply_context_environment(&context);
+
+        assert_eq!(
+            std::env::var("OMAR_TMUX_SERVER").as_deref(),
+            Ok("isolated-test-server")
+        );
     }
 
     #[test]

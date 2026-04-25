@@ -44,6 +44,8 @@ use tmux::{tmux_command, TmuxClient};
 /// Tmux session name used when omar auto-launches into tmux
 pub const DASHBOARD_SESSION: &str = "omar-dashboard";
 
+const TMUX_SETUP_WARNING: &str = "⚠ tmux not configured for omar — run 'omar setup-tmux' to fix";
+
 #[derive(Parser)]
 #[command(name = "omar", about = "Agent dashboard for tmux", version)]
 struct Cli {
@@ -599,6 +601,16 @@ const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
     ),
 ];
 
+#[cfg(target_os = "macos")]
+const TMUX_PLATFORM_RECOMMENDED: &[(&str, &str, &str)] = &[(
+    "copy-command",
+    "set -g copy-command pbcopy",
+    "copy tmux selections to the macOS clipboard",
+)];
+
+#[cfg(not(target_os = "macos"))]
+const TMUX_PLATFORM_RECOMMENDED: &[(&str, &str, &str)] = &[];
+
 /// Additional raw lines that need to appear in tmux.conf (checked by substring).
 const TMUX_EXTRA_LINES: &[(&str, &str, &str)] = &[
     (
@@ -625,7 +637,10 @@ const TMUX_EXTRA_LINES: &[(&str, &str, &str)] = &[
 
 /// Check if any recommended tmux settings are missing.
 fn tmux_setup_needed() -> bool {
-    for &(opt, cmd, _) in TMUX_RECOMMENDED {
+    for &(opt, cmd, _) in TMUX_RECOMMENDED
+        .iter()
+        .chain(TMUX_PLATFORM_RECOMMENDED.iter())
+    {
         // Extract expected value from the command string (last word)
         let expected = cmd.split_whitespace().last().unwrap_or("on");
         if let Ok(out) = tmux_command().args(["show-options", "-gv", opt]).output() {
@@ -636,6 +651,14 @@ fn tmux_setup_needed() -> bool {
         }
     }
     false
+}
+
+fn sync_tmux_setup_warning(app: &mut app::App) {
+    if tmux_setup_needed() {
+        app.set_persistent_warning(TMUX_SETUP_WARNING);
+    } else {
+        app.clear_persistent_warning_if(TMUX_SETUP_WARNING);
+    }
 }
 
 /// Interactive tmux configuration setup.
@@ -651,7 +674,10 @@ fn setup_tmux() -> Result<()> {
     // Collect missing settings
     let mut to_add: Vec<(&str, &str)> = Vec::new();
 
-    for &(opt, line, desc) in TMUX_RECOMMENDED {
+    for &(opt, line, desc) in TMUX_RECOMMENDED
+        .iter()
+        .chain(TMUX_PLATFORM_RECOMMENDED.iter())
+    {
         // Check runtime value — even if the line is in the config,
         // a later conflicting line may override it.
         let expected = line.split_whitespace().last().unwrap_or("on");
@@ -920,10 +946,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
     }
 
     // Warn if tmux config is missing recommended settings
-    if tmux_setup_needed() {
-        shared_app.lock().await.set_persistent_warning(
-            "⚠ tmux not configured for omar — run 'omar setup-tmux' to fix",
-        );
+    {
+        let mut app = shared_app.lock().await;
+        sync_tmux_setup_warning(&mut app);
     }
 
     // Initial refresh
@@ -1348,6 +1373,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     tick_count += 1;
                     if tick_count.is_multiple_of(30) {
                         app.quote_index = app.quote_index.wrapping_add(1);
+                        sync_tmux_setup_warning(&mut app);
                     }
 
                     // Fix V2: EA-scoped events instead of global list
@@ -1510,6 +1536,20 @@ mod tests {
             "extended-keys must be `on`, not `{}` — `always` breaks Shift+Tab \
              in the dashboard (see tests comment)",
             value
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tmux_macos_copy_command_uses_pbcopy() {
+        let entry = TMUX_PLATFORM_RECOMMENDED
+            .iter()
+            .find(|(opt, _, _)| *opt == "copy-command")
+            .expect("macOS setup must configure tmux copy-command");
+        let value = entry.1.split_whitespace().last().unwrap_or("");
+        assert_eq!(
+            value, "pbcopy",
+            "tmux copy-command should pipe native tmux selections into the macOS clipboard"
         );
     }
 

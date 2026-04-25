@@ -516,6 +516,10 @@ impl App {
                 default_command: self.default_command.clone(),
                 default_workdir: self.default_workdir.clone(),
                 health_idle_warning: self.health_threshold,
+                tmux_server: std::env::var("OMAR_TMUX_SERVER")
+                    .ok()
+                    .map(|server| server.trim().to_string())
+                    .filter(|server| !server.is_empty()),
             },
         );
 
@@ -1067,6 +1071,10 @@ impl App {
                 default_command: self.default_command.clone(),
                 default_workdir: self.default_workdir.clone(),
                 health_idle_warning: self.health_threshold,
+                tmux_server: std::env::var("OMAR_TMUX_SERVER")
+                    .ok()
+                    .map(|server| server.trim().to_string())
+                    .filter(|server| !server.is_empty()),
             },
         );
 
@@ -1130,6 +1138,17 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         self.persistent_warning = Some(msg.clone());
         self.status_message = Some(msg);
         self.status_set_at = None; // persistent warnings don't expire
+    }
+
+    /// Clear a specific persistent warning without disturbing unrelated warnings.
+    pub fn clear_persistent_warning_if(&mut self, msg: &str) {
+        if self.persistent_warning.as_deref() == Some(msg) {
+            self.persistent_warning = None;
+            if self.status_message.as_deref() == Some(msg) {
+                self.status_message = None;
+                self.status_set_at = None;
+            }
+        }
     }
 
     /// Clear status message if it has expired (3 seconds).
