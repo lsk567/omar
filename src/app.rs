@@ -1140,6 +1140,14 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         self.status_set_at = None; // persistent warnings don't expire
     }
 
+    /// Set a warning only when no unrelated persistent warning is active.
+    pub fn set_persistent_warning_if_clear_or_same(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        if self.persistent_warning.is_none() || self.persistent_warning.as_deref() == Some(&msg) {
+            self.set_persistent_warning(msg);
+        }
+    }
+
     /// Clear a specific persistent warning without disturbing unrelated warnings.
     pub fn clear_persistent_warning_if(&mut self, msg: &str) {
         if self.persistent_warning.as_deref() == Some(msg) {
@@ -1805,6 +1813,25 @@ mod tests {
                 auth_failure: false,
             },
         }
+    }
+
+    #[test]
+    fn persistent_warning_set_if_clear_or_same_preserves_unrelated_warning() {
+        let config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
+        let scheduler = Arc::new(Scheduler::new());
+        let mut app = App::new(&config, TickerBuffer::new(), scheduler);
+
+        app.set_persistent_warning_if_clear_or_same("tmux setup missing");
+        assert_eq!(
+            app.persistent_warning.as_deref(),
+            Some("tmux setup missing")
+        );
+        assert_eq!(app.status_message.as_deref(), Some("tmux setup missing"));
+
+        app.set_persistent_warning("auth failure");
+        app.set_persistent_warning_if_clear_or_same("tmux setup missing");
+        assert_eq!(app.persistent_warning.as_deref(), Some("auth failure"));
+        assert_eq!(app.status_message.as_deref(), Some("auth failure"));
     }
 
     fn test_config_with_prefix(session_prefix: String) -> Config {

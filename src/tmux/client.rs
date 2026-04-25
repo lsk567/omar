@@ -109,8 +109,10 @@ fn exact_session_target(target: &str) -> String {
 fn exact_pane_target(target: &str) -> String {
     if target.contains(':') || target.contains('.') {
         target.to_string()
-    } else {
+    } else if target.starts_with('=') {
         format!("{target}:")
+    } else {
+        format!("={target}:")
     }
 }
 
@@ -725,7 +727,11 @@ mod tests {
         );
         assert_eq!(exact_session_target("=already-exact"), "=already-exact");
         assert_eq!(exact_session_target("session:1.0"), "session:1.0");
-        assert_eq!(exact_pane_target("omar-agent-0-gx-r"), "omar-agent-0-gx-r:");
+        assert_eq!(
+            exact_pane_target("omar-agent-0-gx-r"),
+            "=omar-agent-0-gx-r:"
+        );
+        assert_eq!(exact_pane_target("=already-exact"), "=already-exact:");
         assert_eq!(exact_pane_target("session:1.0"), "session:1.0");
     }
 
@@ -842,6 +848,10 @@ mod tests {
         assert!(
             !client.has_session(prefix_only).unwrap(),
             "tmux prefix target matching must not make {prefix_only} resolve to {existing}"
+        );
+        assert!(
+            client.send_keys(prefix_only, "C-l").is_err(),
+            "pane targets must also avoid tmux prefix matching"
         );
     }
 

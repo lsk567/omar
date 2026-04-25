@@ -655,7 +655,7 @@ fn tmux_setup_needed() -> bool {
 
 fn sync_tmux_setup_warning(app: &mut app::App) {
     if tmux_setup_needed() {
-        app.set_persistent_warning(TMUX_SETUP_WARNING);
+        app.set_persistent_warning_if_clear_or_same(TMUX_SETUP_WARNING);
     } else {
         app.clear_persistent_warning_if(TMUX_SETUP_WARNING);
     }
