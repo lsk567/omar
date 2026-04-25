@@ -32,12 +32,10 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 const INITIAL_PROMPT_DELIVERY_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 const SERVER_INSTRUCTIONS: &str = concat!(
     "OMAR provides orchestration tools for executive assistant and worker sessions. ",
-    "Search OMAR tools when the task involves agents, projects, scheduled events, ",
-    "manager notes, action logs, or computer control. ",
-    "Use spawn_agent for delegated work, ",
-    "append_manager_note for persistent manager notes, ",
-    "log_justification before state-changing operations, ",
-    "and omar_wake_later/list_events/cancel_event instead of sleep loops."
+    "Use these tools for agent delegation, project tracking, scheduled wake-ups, ",
+    "manager notes, action logs, Slack replies, and shared computer control. ",
+    "Prefer tool descriptions for exact parameters, side effects, retry behavior, ",
+    "and common failure modes."
 );
 
 #[derive(Debug, Deserialize)]
@@ -2021,87 +2019,93 @@ fn tool_definitions() -> Vec<Value> {
         .get_or_init(|| vec![
         tool(
             "list_backends",
-            "List installed OMAR backends.",
-            json!({"type":"object","properties":{}}),
+            "List installed OMAR agent backends and their commands. Use before choosing a backend/model override when availability is unclear. Read-only and safe to retry.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
             "list_eas",
-            "List registered EAs.",
-            json!({"type":"object","properties":{}}),
+            "List registered Executive Assistants (EAs) visible to this OMAR state directory. Read-only and safe to retry.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
             "get_active_ea",
-            "Get the EA currently selected on disk (the dashboard pointer).",
-            json!({"type":"object","properties":{}}),
+            "Get the EA currently selected on disk for dashboard/CLI defaults. This MCP server remains pinned to its launch EA, so this is informational for this session. Read-only and safe to retry.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
             "switch_ea",
-            "Switch the persisted active-EA pointer the dashboard reads. Does not affect this MCP server's own pinned EA context.",
+            "Switch the persisted active-EA pointer read by the dashboard and future default CLI operations. Side effect: writes the active EA selection on disk. Does not change this MCP server's pinned EA context. Safe to retry with the same ea_id; fails if the EA does not exist.",
             json!({
                 "type":"object",
                 "properties":{"ea_id":{"type":"integer"}},
-                "required":["ea_id"]
+                "required":["ea_id"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "create_ea",
-            "Create a new EA.",
+            "Create a new EA registry entry and state directory. Use when a distinct team/context should own its own agents, projects, notes, and scheduled events. Side effect: persists a new EA. Not idempotent; retrying can create duplicates with the same name. Fails on invalid or empty names.",
             json!({
                 "type":"object",
                 "properties":{
                     "name":{"type":"string"},
                     "description":{"type":"string"}
                 },
-                "required":["name"]
+                "required":["name"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "delete_ea",
-            "Delete an EA and its sessions.",
+            "Delete an EA, kill its sessions, remove its state, and cancel its scheduled events. Use only for intentional cleanup. Destructive and not retry-safe after success. Fails if this is the only remaining EA or the EA id is unknown.",
             json!({
                 "type":"object",
                 "properties":{"ea_id":{"type":"integer"}},
-                "required":["ea_id"]
+                "required":["ea_id"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "list_agents",
-            "List agents in the current EA.",
-            json!({"type":"object","properties":{}}),
+            "List running agents in this MCP server's EA with health and last-output summary. Use for monitoring and straggler discovery. Read-only and safe to retry.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
             "get_agent",
-            "Get detailed agent output.",
+            "Get detailed output tail for one running agent. Use to inspect a stuck or completed-looking worker before deciding whether to send input, wait, or kill it. Read-only and safe to retry. Fails if the agent is not running in this EA.",
             json!({
                 "type":"object",
                 "properties":{"name":{"type":"string","description":"Short agent name without the session prefix."}},
-                "required":["name"]
+                "required":["name"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "get_agent_summary",
-            "Get agent task and child summary.",
+            "Get one agent's tracked task, self-reported status, health, and child-agent summary without the full output tail. Use for lightweight monitoring. Read-only and safe to retry. Fails if the agent is not running in this EA.",
             json!({
                 "type":"object",
                 "properties":{"name":{"type":"string","description":"Short agent name without the session prefix."}},
-                "required":["name"]
+                "required":["name"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "update_agent_status",
-            "Update self-reported agent status.",
+            "Update a running agent's one-line dashboard status. Use after meaningful milestones or when blocked. Side effect: writes status metadata for display/recovery. Safe to retry with the same status; later calls replace the displayed status. Fails if the agent name is invalid or not tracked.",
             json!({
                 "type":"object",
                 "properties":{
                     "name":{"type":"string","description":"Your own agent name."},
-                    "status":{"type":"string","description":"One-line status shown in the dashboard (e.g. 'Writing auth module — 60% done')."}
+                    "status":{"type":"string","description":"One-line status shown in the dashboard, e.g. 'Writing auth module - 60% done'."}
                 },
-                "required":["name","status"]
+                "required":["name","status"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "spawn_agent",
-            "Spawn an agent session. `task` is required so the dashboard and prompt always show the assigned work; session lifecycle is controlled separately via session tools.",
+            "Spawn one tracked agent session in the current EA. Use for delegated work, PM/worker decomposition, or raw demo/bash windows. Requires an existing project_id; call list_projects/add_project first because spawn_agent never auto-creates projects. Side effects: creates a tmux session, records task/project/parent metadata, and delivers the initial task prompt unless command starts a raw session. Not retry-safe with the same name after success; retry only after checking list_agents/get_agent. Common failures: project not found, duplicate agent name, invalid parent/project relationship, backend unavailable, or both backend and command set.",
             json!({
                 "type":"object",
                 "properties":{
@@ -2109,120 +2113,129 @@ fn tool_definitions() -> Vec<Value> {
                     "project_id":{"type":"integer","description":"Existing project id from add_project or list_projects. Required — spawn_agent does not auto-create projects."},
                     "task":{"type":"string","description":"Delivered to the agent as their initial task and shown in the dashboard. What to build or do — no [TASK COMPLETE] or parent-wakeup instructions; those are already in every agent's system prompt."},
                     "command":{"type":"string","description":"Raw command to run instead of a backend agent (e.g. 'bash' for a demo window). Mutually exclusive with backend."},
-                    "backend":{"type":"string","description":"One of: 'claude', 'codex', 'cursor', 'opencode', 'gemini'. Mutually exclusive with command."},
-                    "model":{"type":"string"},
-                    "workdir":{"type":"string"},
-                    "parent":{"type":"string","description":"Parent agent name for hierarchy tracking. Omit only for new EA-owned top-level work; if the project already has an active PM/supervisor, set this to that supervisor or explicitly pass 'ea' for intentional EA-owned work."}
+                    "backend":{"type":"string","enum":["claude","codex","cursor","opencode","gemini"],"description":"Backend agent command to launch. Mutually exclusive with command."},
+                    "model":{"type":"string","description":"Optional backend model override. Allowed characters are alphanumeric plus '-', '_', '.', '/'."},
+                    "workdir":{"type":"string","description":"Working directory for the new session. Defaults to this MCP server's launch workdir."},
+                    "parent":{"type":"string","description":"Parent agent name for hierarchy tracking. Omit only for new EA-owned top-level work; use your own name for child tasks. Pass 'ea' only for intentional EA-owned work."}
                 },
-                "required":["name","project_id","task"]
+                "required":["name","project_id","task"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "kill_agent",
-            "Kill an agent session.",
+            "Kill a running worker/demo agent in this EA. Use for intentional cleanup, abandoned work, or replacement after inspection. Side effects: kills the tmux session, removes parent/project metadata, and cancels scheduled events for that agent. Not retry-safe after success; a second call fails because the agent no longer exists. Cannot kill the EA manager or attached sessions.",
             json!({
                 "type":"object",
                 "properties":{"name":{"type":"string"}},
-                "required":["name"]
+                "required":["name"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "send_input",
-            "Send input to an agent/demo session.",
+            "Send text to a running agent or raw demo session. Use for follow-up instructions, concrete unblocking messages, or demo commands. Side effect: injects text into the target tmux pane and optionally presses Enter. Not generally retry-safe because duplicate input may execute twice. Fails if the target agent is not running.",
             json!({
                 "type":"object",
                 "properties":{
-                    "name":{"type":"string"},
-                    "text":{"type":"string"},
-                    "enter":{"type":"boolean"}
+                    "name":{"type":"string","description":"Short target agent/session name."},
+                    "text":{"type":"string","description":"Literal text to send."},
+                    "enter":{"type":"boolean","description":"Whether to press Enter after text. Defaults to false."}
                 },
-                "required":["name","text"]
+                "required":["name","text"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "list_projects",
-            "List projects in the current EA.",
-            json!({"type":"object","properties":{}}),
+            "List tracked projects in this EA. Use before spawning agents to reuse an existing project when the work belongs to the same initiative. Read-only and safe to retry.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
             "add_project",
-            "Register a new project. Returns the new project_id for use with spawn_agent. Projects group related tasks; they are no longer auto-created or auto-removed by the task lifecycle.",
+            "Register a new project bucket in the current EA and return its project_id for spawn_agent. Use once per user initiative or reusable workstream. Side effect: persists project metadata. Not idempotent; retrying can create duplicate project names, so call list_projects after uncertain results. Projects are not auto-created or auto-removed by agent lifecycle.",
             json!({
                 "type":"object",
                 "properties":{
                     "name":{"type":"string","description":"Short project label."}
                 },
-                "required":["name"]
+                "required":["name"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "complete_project",
-            "Remove a project from the registry after its tracked agents are no longer running.",
+            "Remove a project from the current EA registry after its tracked agents are no longer running. Use when a user initiative is complete or intentionally abandoned. Side effect: deletes project metadata only; it does not kill agents. Not retry-safe after success because the project is gone. Fails if tracked agents are still running or project_id is unknown.",
             json!({
                 "type":"object",
                 "properties":{
                     "project_id":{"type":"integer","description":"Project id from add_project or list_projects. Fails while tracked agents for this project are still running."}
                 },
-                "required":["project_id"]
+                "required":["project_id"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "omar_wake_later",
-            "Schedule a timed wake-up or message for an agent or the EA. Use this for ALL timed agent wake-ups — do NOT use the harness `ScheduleWakeup` tool; events must land in OMAR's scheduler so they appear in the dashboard and survive restarts. Use this to wake your parent after [TASK COMPLETE] — set receiver to your parent's name, payload to `[CHILD COMPLETE] {your_name}: {summary}`, delay_seconds: 0.",
+            "Schedule a timed wake-up/message for an agent or the EA using OMAR's persistent scheduler. Use for all timed OMAR check-ins, parent completion notifications, and future nudges instead of sleep loops or external harness wakeups. Side effect: creates a scheduled event visible in the dashboard and durable across restarts. Not retry-safe unless duplicate delivery is acceptable; use list_events/cancel_event after uncertain results. For immediate parent notification after completion, set receiver to the parent name, payload to '[CHILD COMPLETE] {your_name}: {summary}', and delay_seconds to 0.",
             json!({
                 "type":"object",
                 "properties":{
                     "receiver":{"type":"string","description":"Target agent short name, or 'ea' for the Executive Assistant."},
                     "payload":{"type":"string","description":"Message text injected into the receiver's session."},
-                    "sender":{"type":"string"},
+                    "sender":{"type":"string","description":"Optional sender label. Defaults to 'ea'."},
                     "delay_seconds":{"type":"integer","description":"Deliver this many seconds from now. Preferred over timestamp_ns for simplicity."},
                     "timestamp_ns":{"type":"integer","description":"Absolute logical timestamp in nanoseconds. Use delay_seconds instead unless you need precise coordination."},
                     "delay_ns":{"type":"integer","description":"Deliver this many nanoseconds from now. Use for sub-second precision."},
                     "recurring_seconds":{"type":"integer","description":"Auto-reschedule every N seconds after each delivery (cron job)."},
                     "recurring_ns":{"type":"integer","description":"Auto-reschedule every N nanoseconds after each delivery."}
                 },
-                "required":["receiver","payload"]
+                "required":["receiver","payload"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "list_events",
-            "List scheduled events in the current EA.",
-            json!({"type":"object","properties":{}}),
+            "List scheduled events in the current EA. Use to audit pending wake-ups, avoid duplicate timers, or find an event to cancel. Read-only and safe to retry.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
             "cancel_event",
-            "Cancel a scheduled event by id.",
+            "Cancel a scheduled event in this EA by id. Use to remove stale wake-ups or duplicate timers. Side effect: deletes the event if it belongs to this EA. Not retry-safe after success; a second call reports not found. Fails if the event id is unknown or belongs to another EA.",
             json!({
                 "type":"object",
                 "properties":{"event_id":{"type":"string"}},
-                "required":["event_id"]
+                "required":["event_id"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "append_manager_note",
-            "Append text to the current EA manager notes file.",
+            "Append durable text to the current EA manager notes file. Use for project/agent mappings, completed-work summaries, user preferences, and recovery context. Side effect: appends to notes on disk; retrying duplicates the note. Do not use to overwrite OMAR memory files.",
             json!({
                 "type":"object",
                 "properties":{"text":{"type":"string"}},
-                "required":["text"]
+                "required":["text"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "log_justification",
-            "Write a structured action log entry.",
+            "Write a structured action log entry before significant state-changing OMAR actions. Use to record why spawning, killing, sending input, scheduling, or project changes support the user goal. Side effect: appends JSONL audit data; retrying duplicates the entry.",
             json!({
                 "type":"object",
                 "properties":{
                     "agent_name":{"type":"string","description":"Your own agent name."},
-                    "action":{"type":"string"},
+                    "action":{"type":"string","description":"Short label for the action being justified."},
                     "justification":{"type":"string","description":"Why this action serves the user's goal."}
                 },
-                "required":["agent_name","action","justification"]
+                "required":["agent_name","action","justification"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "slack_reply",
-            "Queue a reply to a Slack thread. The omar-slack-bridge peer picks it up and posts to Slack. Use the channel and thread_ts values provided in the inbound [SLACK MESSAGE] event.",
+            "Queue a reply for the omar-slack-bridge to post to Slack. Use only in response to a Slack-originated request and pass channel/thread_ts from the inbound [SLACK MESSAGE] event. Side effect: writes an outbox file that the bridge may post. Not retry-safe because duplicate files can post duplicate messages. Fails if channel or text is empty.",
             json!({
                 "type":"object",
                 "properties":{
@@ -2230,35 +2243,38 @@ fn tool_definitions() -> Vec<Value> {
                     "thread_ts":{"type":"string","description":"From the inbound [SLACK MESSAGE] event. Omit to start a new thread."},
                     "text":{"type":"string"}
                 },
-                "required":["channel","text"]
+                "required":["channel","text"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "computer_status",
-            "Check desktop control availability.",
-            json!({"type":"object","properties":{}}),
+            "Check shared desktop-control availability and dependency status. Use before acquiring the computer lock or diagnosing GUI automation failures. Read-only and safe to retry.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
             "computer_lock_acquire",
-            "Acquire the computer control lock.",
+            "Acquire the shared computer-control lock for one agent. Use before screenshots, mouse, or keyboard actions. Side effect: records lock ownership. Safe to retry only by the current holder; fails if another agent holds the lock.",
             json!({
                 "type":"object",
                 "properties":{"agent":{"type":"string","description":"Your own agent name. Only one agent may hold the lock at a time."}},
-                "required":["agent"]
+                "required":["agent"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "computer_lock_release",
-            "Release the computer control lock.",
+            "Release the shared computer-control lock. Use when done with GUI automation or when blocked. Side effect: clears lock ownership. Safe to retry only after checking state; fails if the named agent does not hold the lock.",
             json!({
                 "type":"object",
                 "properties":{"agent":{"type":"string","description":"Your own agent name. Must match the name that acquired the lock."}},
-                "required":["agent"]
+                "required":["agent"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "computer_screenshot",
-            "Take a screenshot while holding the lock.",
+            "Take a screenshot while holding the computer-control lock. Use to inspect GUI state before mouse/keyboard actions. Read-only but requires the lock; safe to retry. Fails if the agent does not hold the lock or screenshot dependencies are unavailable.",
             json!({
                 "type":"object",
                 "properties":{
@@ -2266,50 +2282,53 @@ fn tool_definitions() -> Vec<Value> {
                     "max_width":{"type":"integer","description":"Resize screenshot to at most this width in pixels."},
                     "max_height":{"type":"integer","description":"Resize screenshot to at most this height in pixels."}
                 },
-                "required":["agent"]
+                "required":["agent"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "computer_mouse",
-            "Perform a mouse action while holding the lock.",
+            "Perform a mouse action while holding the computer-control lock. Use only after a recent screenshot/coordinate check. Side effect: moves/clicks/drags/scrolls the real desktop and can affect user state. Not generally retry-safe. Fails if the agent does not hold the lock or required coordinates for the action are missing.",
             json!({
                 "type":"object",
                 "properties":{
                     "agent":{"type":"string","description":"Your own agent name — proves you hold the lock."},
-                    "action":{"type":"string","description":"One of: 'move', 'click', 'double_click', 'drag', 'scroll'."},
+                    "action":{"type":"string","enum":["move","click","double_click","drag","scroll"],"description":"Mouse action to perform."},
                     "x":{"type":"integer","description":"X coordinate in pixels."},
                     "y":{"type":"integer","description":"Y coordinate in pixels."},
                     "button":{"type":"integer","description":"Mouse button: 1=left, 2=middle, 3=right. Defaults to 1."},
                     "to_x":{"type":"integer","description":"Drag destination X (drag action only)."},
                     "to_y":{"type":"integer","description":"Drag destination Y (drag action only)."},
-                    "scroll_direction":{"type":"string","description":"'up' or 'down' (scroll action only)."},
+                    "scroll_direction":{"type":"string","enum":["up","down"],"description":"Scroll direction (scroll action only)."},
                     "scroll_amount":{"type":"integer","description":"Number of scroll steps (scroll action only)."}
                 },
-                "required":["agent","action","x","y"]
+                "required":["agent","action","x","y"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "computer_keyboard",
-            "Perform a keyboard action while holding the lock.",
+            "Perform a keyboard action while holding the computer-control lock. Use to type text or press key combinations in the active GUI target. Side effect: sends real keyboard input and can submit forms/commands. Not generally retry-safe. Fails if the agent does not hold the lock.",
             json!({
                 "type":"object",
                 "properties":{
                     "agent":{"type":"string","description":"Your own agent name — proves you hold the lock."},
-                    "action":{"type":"string","description":"'type' to type a string, 'key' to press a key combination (e.g. 'ctrl+c', 'Return')."},
+                    "action":{"type":"string","enum":["type","key"],"description":"'type' to type a string, 'key' to press a key combination."},
                     "text":{"type":"string","description":"Text to type, or key combination to press."}
                 },
-                "required":["agent","action","text"]
+                "required":["agent","action","text"],
+                "additionalProperties":false
             }),
         ),
         tool(
             "computer_screen_size",
-            "Read screen size.",
-            json!({"type":"object","properties":{}}),
+            "Read the current desktop screen size. Use to interpret screenshot coordinates. Read-only and safe to retry.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
             "computer_mouse_position",
-            "Read mouse position.",
-            json!({"type":"object","properties":{}}),
+            "Read the current mouse cursor position. Use for coordinate debugging during GUI automation. Read-only and safe to retry.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         ])
         .clone()
