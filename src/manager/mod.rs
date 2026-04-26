@@ -38,6 +38,15 @@ const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
 const PROMPT_AGENT: &str = include_str!("../../prompts/agent.md");
 const PROMPT_WATCHDOG: &str = include_str!("../../prompts/watchdog.md");
 
+// Backend-native wake/reminder tools bypass OMAR's durable, EA-scoped scheduler.
+// Deny these names where a backend exposes per-session tool controls.
+const BACKEND_NATIVE_WAKE_TOOLS: &[&str] = &[
+    "ScheduleWakeup",
+    "TaskReminder",
+    "task_reminder",
+    "scheduled_tasks",
+];
+
 /// Embedded prompt files, keyed by filename.
 const EMBEDDED_PROMPTS: &[(&str, &str)] = &[
     ("executive-assistant.md", PROMPT_EA),
@@ -77,6 +86,10 @@ fn sed_escape(s: &str) -> String {
 
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn backend_native_wake_tools_csv() -> String {
+    BACKEND_NATIVE_WAKE_TOOLS.join(",")
 }
 
 fn current_tmux_server() -> Option<String> {
@@ -276,10 +289,29 @@ fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
     let command_arg = format!("mcp_servers.omar.command={}", command);
     let args_arg = format!("mcp_servers.omar.args={}", args);
     Some(format!(
-        "-c {} -c {}",
+        "--disable scheduled_tasks -c {} -c {}",
         shell_single_quote(&command_arg),
         shell_single_quote(&args_arg)
     ))
+}
+
+fn materialize_gemini_wake_policy(context: &McpLaunchContext) -> Option<PathBuf> {
+    let dir = mcp_ea_dir(context)?;
+    let path = dir.join("gemini-deny-native-wake.toml");
+    let mut policy = String::new();
+    for tool in BACKEND_NATIVE_WAKE_TOOLS {
+        policy.push_str(&format!(
+            r#"[[rule]]
+toolName = "{tool}"
+decision = "deny"
+priority = 999
+denyMessage = "Use the OMAR MCP tool omar_wake_later instead."
+
+"#
+        ));
+    }
+    write_private_file(&path, policy.as_bytes()).ok()?;
+    Some(path)
 }
 
 fn gemini_mcp_bootstrap(base_command: &str, context: &McpLaunchContext) -> Option<String> {
@@ -313,6 +345,15 @@ fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
                     context_file.display().to_string()
                 ]
             }
+        },
+        "tools": {
+            "ScheduleWakeup": false,
+            "TaskReminder": false,
+            "task_reminder": false,
+            "scheduled_tasks": false
+        },
+        "permission": {
+            "doom_loop": "deny"
         }
     });
     Some(config.to_string())
@@ -414,11 +455,11 @@ fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
 /// - `substitutions`: `(pattern, replacement)` pairs for sed; empty = use `cat`
 ///
 /// Detects backend from `base_command`:
-///   - claude  → `--system-prompt "$(cat '<path>')"`
-///   - codex   → `-c "developer_instructions='''$(cat '<path>')'''"`
+///   - claude  → `--system-prompt "$(cat '<path>')"` plus native wake-tool denylist
+///   - codex   → `-c "developer_instructions='''$(cat '<path>')'''"` plus scheduled-task disable
 ///   - cursor  → positional arg `"Load the <path> file and follow the instructions."`
-///   - gemini  → `-i "$(cat '<path>')"`
-///   - opencode → `--prompt "$(cat '<path>')"`
+///   - gemini  → `-i "$(cat '<path>')"` plus native wake-tool deny policy
+///   - opencode → `--prompt "$(cat '<path>')"` plus native wake-tool deny config
 ///   - unknown → returns `base_command` unchanged
 pub fn build_agent_command(
     base_command: &str,
@@ -447,10 +488,11 @@ pub fn build_agent_command(
     match detect_backend(base_command) {
         Some(BackendKind::Claude) => match materialize_claude_mcp_config(mcp_context) {
             Some(mcp_config) => format!(
-                "{} --system-prompt \"{}\" --mcp-config {}",
+                "{} --system-prompt \"{}\" --mcp-config {} --disallowedTools {}",
                 base_command,
                 shell_expr,
-                shell_single_quote(&mcp_config.display().to_string())
+                shell_single_quote(&mcp_config.display().to_string()),
+                shell_single_quote(&backend_native_wake_tools_csv())
             ),
             None => format!("{} --system-prompt \"{}\"", base_command, shell_expr),
         },
@@ -468,6 +510,9 @@ pub fn build_agent_command(
         Some(BackendKind::Cursor) => {
             let rendered = materialize_prompt_file(prompt_file, substitutions);
             let _ = ensure_cursor_mcp_config(mcp_context);
+            // Cursor Agent currently exposes no per-session tool deny flag in
+            // interactive mode; the prompt-level wake policy is the enforcement
+            // mechanism for this backend.
             format!(
                 "{} --approve-mcps \"Load the '{}' file and follow the instructions.\"",
                 base_command,
@@ -479,6 +524,13 @@ pub fn build_agent_command(
                 "TERM=xterm-256color {} --allowed-mcp-server-names omar -i \"{}\"",
                 base_command, shell_expr
             );
+            if let Some(policy) = materialize_gemini_wake_policy(mcp_context) {
+                cmd = format!(
+                    "{} --policy {}",
+                    cmd,
+                    shell_single_quote(&policy.display().to_string())
+                );
+            }
             if let Some(setup) = gemini_mcp_bootstrap(base_command, mcp_context) {
                 cmd = format!("{}; {}", setup, cmd);
             }
@@ -971,6 +1023,16 @@ mod tests {
     }
 
     #[test]
+    fn embedded_prompts_forbid_backend_native_wake_tools() {
+        for prompt in [PROMPT_EA, PROMPT_AGENT] {
+            assert!(prompt.contains("MUST use the OMAR MCP tool `omar_wake_later`"));
+            assert!(prompt.contains("ScheduleWakeup"));
+            assert!(prompt.contains("scheduled tasks"));
+            assert!(prompt.contains("If a non-OMAR wake/reminder tool is visible, ignore it"));
+        }
+    }
+
+    #[test]
     fn test_build_agent_command_claude() {
         let dir = tempfile::tempdir().unwrap();
         let cmd = build_agent_command(
@@ -984,6 +1046,8 @@ mod tests {
             "unexpected claude command: {cmd}"
         );
         assert!(cmd.contains("--mcp-config"));
+        assert!(cmd.contains("--disallowedTools"));
+        assert!(cmd.contains("ScheduleWakeup,TaskReminder,task_reminder,scheduled_tasks"));
     }
 
     #[test]
@@ -1000,6 +1064,7 @@ mod tests {
         ));
         assert!(cmd.contains("mcp_servers.omar.command"));
         assert!(cmd.contains("mcp_servers.omar.args"));
+        assert!(cmd.contains("--disable scheduled_tasks"));
     }
 
     #[test]
@@ -1027,9 +1092,14 @@ mod tests {
         assert!(cmd.contains("gemini mcp remove omar"));
         assert!(cmd.contains("gemini mcp add -s user omar"));
         assert!(cmd.contains("mcp-server --context-file"));
+        assert!(cmd.contains("--policy"));
         assert!(cmd.contains(
             "TERM=xterm-256color gemini --yolo --allowed-mcp-server-names omar -i \"$(cat '/tmp/prompts/ea.md')\""
         ));
+        let policy = dir.path().join("mcp/ea-0/gemini-deny-native-wake.toml");
+        let policy = std::fs::read_to_string(policy).unwrap();
+        assert!(policy.contains("toolName = \"ScheduleWakeup\""));
+        assert!(policy.contains("decision = \"deny\""));
     }
 
     #[test]
@@ -1044,6 +1114,8 @@ mod tests {
         assert!(cmd.contains("OPENCODE_CONFIG_CONTENT="));
         assert!(cmd.contains("\"mcp\""));
         assert!(cmd.contains("\"omar\""));
+        assert!(cmd.contains("\"doom_loop\":\"deny\""));
+        assert!(cmd.contains("\"ScheduleWakeup\":false"));
         assert!(cmd.contains("--prompt \"$(cat '/tmp/prompts/pm.md')\""));
     }
 
