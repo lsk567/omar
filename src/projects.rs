@@ -6,8 +6,10 @@
 
 use anyhow::Result;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use uuid::Uuid;
 
 /// Mutex to serialize concurrent read-modify-write on tasks.md.
 /// Same pattern as WORKER_TASKS_LOCK in memory.rs.
@@ -72,7 +74,21 @@ pub fn save_projects_to(state_dir: &Path, projects: &[Project]) -> Result<()> {
     } else {
         format!("{}\n", content)
     };
-    fs::write(&path, content)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tasks.md");
+    let tmp = path.with_file_name(format!(".{}.{}.tmp", file_name, Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    if let Err(err) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -87,6 +103,13 @@ pub fn add_project_in(state_dir: &Path, name: &str) -> Result<usize> {
     });
     save_projects_to(state_dir, &projects)?;
     Ok(id)
+}
+
+/// Find a project by id. None if not present.
+pub fn find_project_in(state_dir: &Path, id: usize) -> Option<Project> {
+    load_projects_from(state_dir)
+        .into_iter()
+        .find(|p| p.id == id)
 }
 
 /// Remove a project by id from an EA, returns whether it was found

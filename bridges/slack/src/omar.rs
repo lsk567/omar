@@ -1,325 +1,244 @@
-#![allow(dead_code)]
+//! MCP stdio client for talking to the OMAR MCP server.
+//!
+//! The bridge spawns `omar mcp-server` and
+//! exchanges JSON-RPC messages over the child's stdio. Line-delimited
+//! framing is used; the omar server accepts both that and Content-Length,
+//! line-delimited is simpler here.
 
-use anyhow::{Context, Result};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use anyhow::{anyhow, Context, Result};
+use serde_json::{json, Value};
+use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
-/// Client for the OMAR HTTP API (localhost:9876).
-///
-/// All agent/event/project endpoints are EA-scoped under `/api/ea/{ea_id}/...`
-/// (see `src/api/mod.rs`). Global endpoints like `/api/health` are unscoped.
-#[derive(Clone)]
-pub struct OmarClient {
-    client: Client,
-    base_url: String,
-    ea_id: u32,
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+
+pub struct McpClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
 }
 
-// -- Request/Response models matching OMAR's api/models.rs --
+impl McpClient {
+    /// Spawn `omar mcp-server` and complete the initialize handshake.
+    /// `omar_binary` is the path to the omar executable (resolved by the
+    /// caller — typically next to the bridge binary, falling back to
+    /// `omar` on PATH).
+    pub async fn start(omar_binary: &PathBuf, omar_dir: &std::path::Path) -> Result<Self> {
+        let mut child = Command::new(omar_binary)
+            .arg("mcp-server")
+            .env("OMAR_DIR", omar_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Inherit stderr so the MCP server's log lines (config errors,
+            // EA resolution failures) surface in the bridge's log.
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("Failed to spawn {:?} mcp-server", omar_binary))?;
 
-#[derive(Debug, Serialize)]
-pub struct SpawnAgentRequest {
-    pub name: String,
-    pub task: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workdir: Option<String>,
-}
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("mcp-server child has no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("mcp-server child has no stdout"))?;
+        let stdout = BufReader::new(stdout);
 
-#[derive(Debug, Deserialize)]
-pub struct SpawnAgentResponse {
-    pub id: String,
-    pub status: String,
-    #[serde(default)]
-    pub session: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AgentDetail {
-    pub id: String,
-    pub health: String,
-    #[serde(default)]
-    pub output: Option<String>,
-    #[serde(default)]
-    pub task: Option<String>,
-    #[serde(default)]
-    pub status: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SendInputRequest {
-    pub text: String,
-    #[serde(default)]
-    pub enter: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AgentListItem {
-    pub id: String,
-    pub health: String,
-    #[serde(default)]
-    pub task: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ErrorResponse {
-    pub error: String,
-}
-
-impl OmarClient {
-    /// Create a new client bound to a specific EA id. All agent/event/project
-    /// endpoints will be routed to `/api/ea/{ea_id}/...`.
-    pub fn new(base_url: &str, ea_id: u32) -> Self {
-        Self {
-            client: Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            ea_id,
-        }
-    }
-
-    /// Build an EA-scoped URL. `suffix` must start with `/` (e.g. `/events`,
-    /// `/agents/foo`). The result has the form
-    /// `{base}/api/ea/{ea_id}{suffix}`.
-    pub fn ea_url(&self, suffix: &str) -> String {
-        // Enforce the invariant in release builds too — a missing leading
-        // slash would produce `/api/ea/0agents` and 404 silently.
-        assert!(
-            suffix.starts_with('/'),
-            "ea_url suffix must start with '/': {}",
-            suffix
-        );
-        format!("{}/api/ea/{}{}", self.base_url, self.ea_id, suffix)
-    }
-
-    /// Build a global (non-EA-scoped) API URL — used for `/api/health` and
-    /// similar manager-wide endpoints.
-    pub fn global_url(&self, suffix: &str) -> String {
-        assert!(
-            suffix.starts_with('/'),
-            "global_url suffix must start with '/': {}",
-            suffix
-        );
-        format!("{}/api{}", self.base_url, suffix)
-    }
-
-    /// Check if OMAR API is reachable.
-    pub async fn health_check(&self) -> Result<bool> {
-        let resp = self.client.get(self.global_url("/health")).send().await?;
-        Ok(resp.status().is_success())
-    }
-
-    /// Spawn a new OMAR agent.
-    pub async fn spawn_agent(&self, req: &SpawnAgentRequest) -> Result<SpawnAgentResponse> {
-        let resp = self
-            .client
-            .post(self.ea_url("/agents"))
-            .json(req)
-            .send()
-            .await
-            .context("Failed to spawn OMAR agent")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to spawn agent ({}): {}", status, body);
-        }
-
-        resp.json().await.context("Failed to parse spawn response")
-    }
-
-    /// Get agent details including recent output.
-    pub async fn get_agent(&self, name: &str) -> Result<Option<AgentDetail>> {
-        let resp = self
-            .client
-            .get(self.ea_url(&format!("/agents/{}", name)))
-            .send()
-            .await
-            .context("Failed to get OMAR agent")?;
-
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to get agent ({}): {}", status, body);
-        }
-
-        let detail = resp.json().await.context("Failed to parse agent detail")?;
-        Ok(Some(detail))
-    }
-
-    /// Send input text to an agent's tmux session.
-    pub async fn send_input(&self, name: &str, text: &str) -> Result<()> {
-        let req = SendInputRequest {
-            text: text.to_string(),
-            enter: true,
+        let mut client = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
         };
+        client.initialize().await?;
+        Ok(client)
+    }
 
-        let resp = self
-            .client
-            .post(self.ea_url(&format!("/agents/{}/send", name)))
-            .json(&req)
-            .send()
-            .await
-            .context("Failed to send input to OMAR agent")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!(
-                "Failed to send input to agent {} ({}): {}",
-                name, status, body
-            );
-        } else {
-            debug!("Sent input to agent {}", name);
-        }
-
+    async fn initialize(&mut self) -> Result<()> {
+        let result = self
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "omar-slack-bridge",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    }
+                }),
+            )
+            .await?;
+        debug!(
+            "MCP initialize ok: server={}",
+            result
+                .get("serverInfo")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>")
+        );
         Ok(())
     }
 
-    /// List all agents.
-    pub async fn list_agents(&self) -> Result<Vec<AgentListItem>> {
-        let resp = self
-            .client
-            .get(self.ea_url("/agents"))
-            .send()
+    /// Send a JSON-RPC request and read the matching response.
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let mut line = serde_json::to_vec(&req)?;
+        line.push(b'\n');
+        self.stdin
+            .write_all(&line)
             .await
-            .context("Failed to list OMAR agents")?;
+            .context("Failed to write MCP request")?;
+        self.stdin
+            .flush()
+            .await
+            .context("Failed to flush MCP stdin")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to list agents ({}): {}", status, body);
+        // omar's server replies with a single line in line-delimited mode.
+        let mut buf = String::new();
+        let n = self
+            .stdout
+            .read_line(&mut buf)
+            .await
+            .context("Failed to read MCP response")?;
+        if n == 0 {
+            return Err(anyhow!("MCP server closed stdout unexpectedly"));
         }
+        let resp: Value = serde_json::from_str(buf.trim())
+            .with_context(|| format!("Invalid JSON in MCP response: {}", buf.trim()))?;
 
-        // OMAR returns { agents: [...], manager: ... }
-        let body: serde_json::Value = resp.json().await?;
-        let agents: Vec<AgentListItem> = if let Some(arr) = body.get("agents") {
-            serde_json::from_value(arr.clone()).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        Ok(agents)
+        if resp.get("id").and_then(|v| v.as_u64()) != Some(id) {
+            return Err(anyhow!(
+                "MCP response id mismatch (wanted {}, got {})",
+                id,
+                resp.get("id").cloned().unwrap_or(Value::Null)
+            ));
+        }
+        if let Some(err) = resp.get("error") {
+            return Err(anyhow!(
+                "MCP server error: {}",
+                err.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+            ));
+        }
+        resp.get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("MCP response missing 'result'"))
     }
 
-    /// Post an event to the OMAR event queue.
-    pub async fn post_event(&self, sender: &str, receiver: &str, payload: &str) -> Result<()> {
-        // Use current time in nanoseconds for immediate delivery
-        let timestamp_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+    /// Call a tool and return the `structuredContent` on success.
+    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        let result = self
+            .request("tools/call", json!({"name": name, "arguments": arguments}))
+            .await?;
+        if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+            let msg = result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown tool error");
+            return Err(anyhow!("tool {} failed: {}", name, msg));
+        }
+        Ok(result
+            .get("structuredContent")
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+}
 
-        let body = serde_json::json!({
-            "sender": sender,
-            "receiver": receiver,
-            "timestamp": timestamp_ns,
+impl Drop for McpClient {
+    fn drop(&mut self) {
+        // Best-effort cleanup of the child process. Tokio's Child does not
+        // kill on drop by default; an orphaned `omar mcp-server` would
+        // leak if the bridge panics.
+        let _ = self.child.start_kill();
+    }
+}
+
+/// A lazy, self-reconnecting MCP client. Every call to `post_slack_event`
+/// attempts to use the existing child; if the child has died (stdout EOF,
+/// write failure), the next call transparently respawns. The bridge keeps
+/// running across transient MCP-server crashes without losing inbound
+/// Slack messages to a permanently-broken connection.
+pub struct OmarMcp {
+    omar_binary: PathBuf,
+    omar_dir: PathBuf,
+    client: Option<McpClient>,
+}
+
+impl OmarMcp {
+    pub fn new(omar_binary: PathBuf, omar_dir: PathBuf) -> Self {
+        Self {
+            omar_binary,
+            omar_dir,
+            client: None,
+        }
+    }
+
+    async fn client_mut(&mut self) -> Result<&mut McpClient> {
+        if self.client.is_none() {
+            let client = McpClient::start(&self.omar_binary, &self.omar_dir).await?;
+            self.client = Some(client);
+        }
+        Ok(self.client.as_mut().unwrap())
+    }
+
+    /// Post an inbound Slack message to the EA's event queue.
+    pub async fn post_slack_event(&mut self, payload: &str) -> Result<()> {
+        let args = json!({
+            "sender": "slack-bridge",
+            "receiver": "ea",
             "payload": payload,
         });
-
-        let resp = self
-            .client
-            .post(self.ea_url("/events"))
-            .json(&body)
-            .send()
+        if let Err(e) = self
+            .try_call_with_timeout("omar_wake_later", args.clone())
             .await
-            .context("Failed to post event to OMAR")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to post event ({}): {}", status, body_text);
+        {
+            warn!(
+                "MCP omar_wake_later failed ({}); restarting MCP server and retrying",
+                e
+            );
+            self.client = None;
+            self.try_call_with_timeout("omar_wake_later", args).await?;
         }
-
-        debug!(
-            "Posted event to '{}': {}...",
-            receiver,
-            &payload[..80.min(payload.len())]
-        );
         Ok(())
     }
 
-    /// Kill an agent.
-    pub async fn kill_agent(&self, name: &str) -> Result<()> {
-        let resp = self
-            .client
-            .delete(self.ea_url(&format!("/agents/{}", name)))
-            .send()
-            .await
-            .context("Failed to kill OMAR agent")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!("Failed to kill agent {} ({}): {}", name, status, body);
+    async fn try_call_with_timeout(&mut self, name: &str, args: Value) -> Result<Value> {
+        match timeout(MCP_CALL_TIMEOUT, async {
+            self.client_mut().await?.call_tool(name, args).await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.client = None;
+                Err(anyhow!("MCP call '{}' timed out", name))
+            }
         }
+    }
 
+    /// Best-effort startup probe so the bridge logs whether the MCP server
+    /// is reachable before any Slack traffic arrives.
+    pub async fn health_check(&mut self) -> Result<()> {
+        self.client_mut().await?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ea_url_uses_ea_prefix_for_zero_ea_id() {
-        let c = OmarClient::new("http://127.0.0.1:9876", 0);
-        assert_eq!(c.ea_url("/events"), "http://127.0.0.1:9876/api/ea/0/events");
-        assert_eq!(c.ea_url("/agents"), "http://127.0.0.1:9876/api/ea/0/agents");
-        assert_eq!(
-            c.ea_url("/agents/foo"),
-            "http://127.0.0.1:9876/api/ea/0/agents/foo"
-        );
-        assert_eq!(
-            c.ea_url("/agents/foo/send"),
-            "http://127.0.0.1:9876/api/ea/0/agents/foo/send"
-        );
-    }
-
-    #[test]
-    fn ea_url_respects_custom_ea_id() {
-        let c = OmarClient::new("http://127.0.0.1:9876", 3);
-        assert_eq!(c.ea_url("/events"), "http://127.0.0.1:9876/api/ea/3/events");
-    }
-
-    #[test]
-    fn ea_url_trims_trailing_slash_from_base() {
-        let c = OmarClient::new("http://127.0.0.1:9876/", 0);
-        // No double slash between base and /api
-        assert_eq!(c.ea_url("/events"), "http://127.0.0.1:9876/api/ea/0/events");
-    }
-
-    #[test]
-    fn global_url_is_not_ea_scoped() {
-        let c = OmarClient::new("http://127.0.0.1:9876", 0);
-        assert_eq!(c.global_url("/health"), "http://127.0.0.1:9876/api/health");
-    }
-
-    /// Regression guard: before PR #61 the client posted to `/api/events`
-    /// and `/api/agents`. The OMAR server now expects `/api/ea/{id}/...`.
-    /// If this invariant ever regresses, Slack @mentions silently 404 again.
-    #[test]
-    fn no_pre_multi_ea_endpoints_leak_through() {
-        let c = OmarClient::new("http://127.0.0.1:9876", 0);
-        for suffix in ["/events", "/agents", "/agents/some-name"] {
-            let url = c.ea_url(suffix);
-            assert!(
-                url.contains("/api/ea/"),
-                "URL should contain /api/ea/: {}",
-                url
-            );
-            // Make sure we didn't accidentally build `/api/events` etc.
-            assert!(
-                !url.contains("/api/events") && !url.contains("/api/agents"),
-                "URL must not use pre-multi-EA path: {}",
-                url
-            );
-        }
     }
 }

@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::backend_probe;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -16,10 +18,10 @@ pub struct Config {
     pub agent: AgentConfig,
 
     #[serde(default)]
-    pub api: ApiConfig,
+    pub watchdog: WatchdogConfig,
 
     #[serde(default)]
-    pub watchdog: WatchdogConfig,
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,21 +74,6 @@ pub struct AgentConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiConfig {
-    /// Whether to enable the HTTP API
-    #[serde(default = "default_api_enabled")]
-    pub enabled: bool,
-
-    /// Host to bind to
-    #[serde(default = "default_api_host")]
-    pub host: String,
-
-    /// Port to listen on
-    #[serde(default = "default_api_port")]
-    pub port: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchdogConfig {
     /// Command to run the watchdog agent (empty = watchdog disabled).
     /// Should be an untrusted/free backend — no secrets will be passed.
@@ -101,6 +88,13 @@ pub struct WatchdogConfig {
     /// Slack channel ID for watchdog alerts (empty = no Slack alerts)
     #[serde(default)]
     pub slack_channel: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Enable global spawn metrics sink at ~/.omar/metrics/spawn_metrics.jsonl
+    #[serde(default)]
+    pub spawn_metrics_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -135,9 +129,7 @@ fn default_error_patterns() -> Vec<String> {
 /// Detect which agent command is available on the system.
 /// Checks PATH for the supported first-class backends, falling back to `claude`.
 fn detect_agent_command() -> String {
-    use std::process::Command;
-
-    for (binary, command) in [
+    detect_agent_command_from(&[
         ("claude", "claude --dangerously-skip-permissions"),
         (
             "codex",
@@ -146,18 +138,15 @@ fn detect_agent_command() -> String {
         ("cursor", "cursor agent --yolo"),
         ("gemini", "gemini --yolo"),
         ("opencode", "opencode"),
-    ] {
-        if Command::new(binary)
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
-            return command.to_string();
-        }
-    }
+    ])
+    .unwrap_or_else(|| "claude --dangerously-skip-permissions".to_string())
+}
 
-    // Fallback to claude even if not found (user may install it later)
-    "claude --dangerously-skip-permissions".to_string()
+fn detect_agent_command_from(candidates: &[(&str, &str)]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|(binary, _)| backend_probe::backend_version_probe_succeeds(binary))
+        .map(|(_, command)| (*command).to_string())
 }
 
 fn default_command() -> String {
@@ -203,18 +192,6 @@ fn default_auth_failure_patterns() -> Vec<String> {
     ]
 }
 
-fn default_api_enabled() -> bool {
-    true
-}
-
-fn default_api_host() -> String {
-    "127.0.0.1".to_string()
-}
-
-fn default_api_port() -> u16 {
-    9876
-}
-
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
@@ -246,16 +223,6 @@ impl Default for AgentConfig {
     }
 }
 
-impl Default for ApiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_api_enabled(),
-            host: default_api_host(),
-            port: default_api_port(),
-        }
-    }
-}
-
 impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
@@ -275,16 +242,21 @@ impl Config {
             .join("config.toml")
     }
 
-    /// Load config from file. Creates default config at ~/.omar/config.toml on first run.
-    pub fn load(path: Option<&str>) -> Result<Self> {
-        let expanded_path = match path {
+    /// Resolve a config path from CLI input, expanding `~/`.
+    pub fn resolve_path(path: Option<&str>) -> PathBuf {
+        match path {
             Some(p) => expand_tilde(p),
             None => Self::default_path(),
-        };
+        }
+    }
+
+    /// Load config from file. Creates default config at ~/.omar/config.toml on first run.
+    pub fn load(path: Option<&str>) -> Result<Self> {
+        let expanded_path = Self::resolve_path(path);
 
         if !expanded_path.exists() {
             let config = Self::default();
-            config.save();
+            config.save_to_path(&expanded_path);
             return Ok(config);
         }
 
@@ -296,12 +268,16 @@ impl Config {
 
     /// Save config to its default path (~/.omar/config.toml)
     pub fn save(&self) {
-        let path = Self::default_path();
+        self.save_to_path(&Self::default_path());
+    }
+
+    /// Save config to a specific path.
+    pub fn save_to_path(&self, path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         if let Ok(contents) = toml::to_string_pretty(self) {
-            std::fs::write(&path, contents).ok();
+            std::fs::write(path, contents).ok();
         }
     }
 
@@ -357,6 +333,7 @@ mod tests {
         assert!(config.dashboard.sidebar_right);
         assert_eq!(config.health.idle_warning, 15);
         assert_eq!(config.health.idle_critical, 300);
+        assert!(!config.metrics.spawn_metrics_enabled);
     }
 
     #[test]
@@ -396,9 +373,41 @@ sidebar_right = false
             cmd.contains("claude")
                 || cmd.contains("codex")
                 || cmd.contains("cursor")
+                || cmd.contains("gemini")
                 || cmd.contains("opencode"),
             "Unexpected default command: {}",
             cmd
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_agent_command_skips_hanging_probe() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let slow = temp.path().join("slow-agent");
+        let fast = temp.path().join("fast-agent");
+        fs::write(&slow, "#!/bin/sh\nsleep 5\n").unwrap();
+        fs::write(&fast, "#!/bin/sh\nexit 0\n").unwrap();
+        for path in [&slow, &fast] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        let start = Instant::now();
+        let cmd = detect_agent_command_from(&[
+            (slow.to_str().unwrap(), "slow command"),
+            (fast.to_str().unwrap(), "fast command"),
+        ]);
+
+        assert_eq!(cmd.as_deref(), Some("fast command"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "hanging probe should be skipped after the bounded timeout"
         );
     }
 
@@ -518,5 +527,28 @@ default_command = "claude --dangerously-skip-permissions"
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.watchdog.command.is_empty());
         assert!(!config.watchdog.auth_failure_patterns.is_empty());
+    }
+
+    #[test]
+    fn test_parse_metrics_config() {
+        let toml = r#"
+[metrics]
+spawn_metrics_enabled = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.metrics.spawn_metrics_enabled);
+    }
+
+    #[test]
+    fn test_load_missing_custom_path_writes_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.toml");
+
+        let _config = Config::load(Some(path.to_str().unwrap())).unwrap();
+
+        assert!(
+            path.exists(),
+            "missing explicit config path should be created"
+        );
     }
 }

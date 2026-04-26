@@ -87,6 +87,35 @@ pub struct TmuxClient {
     prefix: String,
 }
 
+pub fn tmux_command() -> Command {
+    let mut cmd = Command::new("tmux");
+    if let Ok(server) = std::env::var("OMAR_TMUX_SERVER") {
+        let server = server.trim();
+        if !server.is_empty() {
+            cmd.args(["-L", server]);
+        }
+    }
+    cmd
+}
+
+fn exact_session_target(target: &str) -> String {
+    if target.starts_with('=') || target.contains(':') || target.contains('.') {
+        target.to_string()
+    } else {
+        format!("={target}")
+    }
+}
+
+fn exact_pane_target(target: &str) -> String {
+    if target.contains(':') || target.contains('.') {
+        target.to_string()
+    } else if target.starts_with('=') {
+        format!("{target}:")
+    } else {
+        format!("={target}:")
+    }
+}
+
 impl TmuxClient {
     pub fn new(prefix: impl Into<String>) -> Self {
         Self {
@@ -99,15 +128,20 @@ impl TmuxClient {
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(args)
             .output()
             .context("Failed to execute tmux - is tmux installed?")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // "no server running" is not an error for list-sessions
-            if stderr.contains("no server running") || stderr.contains("no sessions") {
+            // "no server running" is not an error for list-sessions.
+            // Other tmux commands must surface failures to callers.
+            if args.first() == Some(&"list-sessions")
+                && (stderr.contains("no server running")
+                    || stderr.contains("no sessions")
+                    || stderr.contains("error connecting to"))
+            {
                 return Ok(String::new());
             }
             anyhow::bail!("tmux error: {}", stderr);
@@ -181,11 +215,12 @@ impl TmuxClient {
     /// Capture the last N lines of a pane's output, including ANSI escape
     /// sequences (suitable for display in a colored dashboard).
     pub fn capture_pane(&self, target: &str, lines: i32) -> Result<String> {
+        let target = exact_pane_target(target);
         self.run(&[
             "capture-pane",
             "-e",
             "-t",
-            target,
+            &target,
             "-p",
             "-S",
             &(-lines).to_string(),
@@ -197,10 +232,11 @@ impl TmuxClient {
     /// its banner as `Claude<ESC>[0m <ESC>[1mCode`, so a raw ANSI capture
     /// would *not* contain the contiguous string "Claude Code".
     pub fn capture_pane_plain(&self, target: &str, lines: i32) -> Result<String> {
+        let target = exact_pane_target(target);
         self.run(&[
             "capture-pane",
             "-t",
-            target,
+            &target,
             "-p",
             "-S",
             &(-lines).to_string(),
@@ -216,7 +252,8 @@ impl TmuxClient {
     /// the window. Since OMAR worker sessions always have exactly one window
     /// and one pane, window-level granularity is equivalent to pane-level.
     pub fn get_pane_activity(&self, target: &str) -> Result<i64> {
-        let output = self.run(&["display-message", "-t", target, "-p", "#{window_activity}"])?;
+        let target = exact_pane_target(target);
+        let output = self.run(&["display-message", "-t", &target, "-p", "#{window_activity}"])?;
         output
             .trim()
             .parse()
@@ -225,7 +262,8 @@ impl TmuxClient {
 
     /// Send keys to a pane
     pub fn send_keys(&self, target: &str, keys: &str) -> Result<()> {
-        self.run(&["send-keys", "-t", target, keys])?;
+        let target = exact_pane_target(target);
+        self.run(&["send-keys", "-t", &target, keys])?;
         Ok(())
     }
 
@@ -238,8 +276,9 @@ impl TmuxClient {
     pub const LARGE_PAYLOAD_THRESHOLD: usize = 2048;
 
     pub fn send_keys_literal(&self, target: &str, text: &str) -> Result<()> {
+        let target = exact_pane_target(target);
         if text.len() < Self::LARGE_PAYLOAD_THRESHOLD {
-            self.run(&["send-keys", "-t", target, "-l", text])?;
+            self.run(&["send-keys", "-t", &target, "-l", text])?;
         } else {
             // Write to a temp file, load into tmux buffer, paste, then clean up.
             // This avoids passing large text as a command-line argument.
@@ -251,7 +290,7 @@ impl TmuxClient {
                 .context("Temp file path is not valid UTF-8")?;
             self.run(&["load-buffer", path_str])?;
             std::fs::remove_file(&tmp_path).ok(); // best-effort cleanup
-            self.run(&["paste-buffer", "-t", target])?;
+            self.run(&["paste-buffer", "-t", &target])?;
         }
         Ok(())
     }
@@ -276,10 +315,11 @@ impl TmuxClient {
     /// tmux 3.2a (Ubuntu 22.04); newer tmux builds on macOS appear to mask
     /// this but `-r` makes behavior identical across versions.
     pub fn paste_text(&self, target: &str, text: &str) -> Result<()> {
+        let target = exact_pane_target(target);
         let buffer_name = format!("omar-paste-{}", uuid::Uuid::new_v4());
 
         // Load text into a uniquely-named tmux buffer via stdin.
-        let child = Command::new("tmux")
+        let child = tmux_command()
             .args(["load-buffer", "-b", &buffer_name, "-"])
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -309,7 +349,7 @@ impl TmuxClient {
             "-b",
             &buffer_name,
             "-t",
-            target,
+            &target,
             "-d",
             "-p",
             "-r",
@@ -419,7 +459,8 @@ impl TmuxClient {
             let content_before = self.capture_pane(session, 50).unwrap_or_default();
             let activity_before = self.get_pane_activity(session).unwrap_or(0);
 
-            self.run(&["send-keys", "-t", session, "-H", "0d"])?;
+            let target = exact_pane_target(session);
+            self.run(&["send-keys", "-t", &target, "-H", "0d"])?;
 
             if self.wait_for_change(
                 session,
@@ -558,14 +599,16 @@ impl TmuxClient {
 
     /// Kill a session
     pub fn kill_session(&self, name: &str) -> Result<()> {
-        self.run(&["kill-session", "-t", name])?;
+        let target = exact_session_target(name);
+        self.run(&["kill-session", "-t", &target])?;
         Ok(())
     }
 
     /// Check if a session exists
     pub fn has_session(&self, name: &str) -> Result<bool> {
-        let result = Command::new("tmux")
-            .args(["has-session", "-t", name])
+        let target = exact_session_target(name);
+        let result = tmux_command()
+            .args(["has-session", "-t", &target])
             .output()
             .context("Failed to execute tmux")?;
 
@@ -574,8 +617,9 @@ impl TmuxClient {
 
     /// Attach to a session (blocks until detached)
     pub fn attach_session(&self, session: &str) -> Result<()> {
-        Command::new("tmux")
-            .args(["attach-session", "-t", session])
+        let target = exact_session_target(session);
+        tmux_command()
+            .args(["attach-session", "-t", &target])
             .status()
             .context("Failed to attach to tmux session")?;
         Ok(())
@@ -583,7 +627,7 @@ impl TmuxClient {
 
     /// Open a popup attached to a session
     pub fn attach_popup(&self, session: &str, width: &str, height: &str) -> Result<()> {
-        Command::new("tmux")
+        tmux_command()
             .args([
                 "display-popup",
                 "-E",
@@ -591,7 +635,7 @@ impl TmuxClient {
                 width,
                 "-h",
                 height,
-                &format!("tmux attach -t {}", session),
+                &format!("tmux attach -t {}", exact_session_target(session)),
             ])
             .status()
             .context("Failed to open tmux popup")?;
@@ -600,7 +644,7 @@ impl TmuxClient {
 
     /// Check if tmux server is running
     pub fn is_server_running(&self) -> bool {
-        Command::new("tmux")
+        tmux_command()
             .args(["list-sessions"])
             .output()
             .map(|o| o.status.success())
@@ -675,8 +719,24 @@ mod tests {
         assert_eq!(client.prefix(), "test-");
     }
 
+    #[test]
+    fn test_exact_target_prefixes_plain_session_names() {
+        assert_eq!(
+            exact_session_target("omar-agent-0-gx-r"),
+            "=omar-agent-0-gx-r"
+        );
+        assert_eq!(exact_session_target("=already-exact"), "=already-exact");
+        assert_eq!(exact_session_target("session:1.0"), "session:1.0");
+        assert_eq!(
+            exact_pane_target("omar-agent-0-gx-r"),
+            "=omar-agent-0-gx-r:"
+        );
+        assert_eq!(exact_pane_target("=already-exact"), "=already-exact:");
+        assert_eq!(exact_pane_target("session:1.0"), "session:1.0");
+    }
+
     fn tmux_available() -> bool {
-        Command::new("tmux")
+        tmux_command()
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -687,7 +747,7 @@ mod tests {
     struct SessionGuard(String);
     impl Drop for SessionGuard {
         fn drop(&mut self) {
-            let _ = Command::new("tmux")
+            let _ = tmux_command()
                 .args(["kill-session", "-t", &self.0])
                 .output();
         }
@@ -711,12 +771,12 @@ mod tests {
         }
 
         let session = "omar-test-deliver-prompt";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
 
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session])
             .status()
             .map(|s| s.success())
@@ -760,6 +820,42 @@ mod tests {
     }
 
     #[test]
+    fn test_has_session_uses_exact_target_not_tmux_prefix_match() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let existing = "omar-test-prefix-root";
+        let prefix_only = "omar-test-prefix-r";
+        let _ = tmux_command()
+            .args(["kill-session", "-t", existing])
+            .output();
+        let _guard = SessionGuard(existing.to_string());
+
+        let ok = tmux_command()
+            .args(["new-session", "-d", "-s", existing, "sleep", "60"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("Skipping test: failed to create tmux session");
+            return;
+        }
+
+        let client = TmuxClient::new("omar-test-");
+        assert!(client.has_session(existing).unwrap());
+        assert!(
+            !client.has_session(prefix_only).unwrap(),
+            "tmux prefix target matching must not make {prefix_only} resolve to {existing}"
+        );
+        assert!(
+            client.send_keys(prefix_only, "C-l").is_err(),
+            "pane targets must also avoid tmux prefix matching"
+        );
+    }
+
+    #[test]
     fn test_wait_for_stable_returns_on_idle_pane() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -767,12 +863,12 @@ mod tests {
         }
 
         let session = "omar-test-wait-stable";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
 
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session])
             .status()
             .map(|s| s.success())
@@ -811,12 +907,12 @@ mod tests {
         }
 
         let session = "omar-test-wait-markers";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
 
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session])
             .status()
             .map(|s| s.success())
@@ -845,12 +941,12 @@ mod tests {
         }
 
         let session = "omar-test-deliver-multiline";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
 
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session])
             .status()
             .map(|s| s.success())
@@ -909,12 +1005,12 @@ mod tests {
         }
 
         let session = "omar-test-pane-activity";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
 
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session])
             .status()
             .map(|s| s.success())
@@ -961,12 +1057,12 @@ mod tests {
         }
 
         let session = "omar-test-ansi-marker";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
 
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session])
             .status()
             .map(|s| s.success())
@@ -1021,12 +1117,12 @@ mod tests {
         }
 
         let session = "omar-test-deliver-after-markers";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
 
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session])
             .status()
             .map(|s| s.success())
@@ -1108,12 +1204,12 @@ mod tests {
         }
 
         let session = "omar-test-wait-markers-all";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
 
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session])
             .status()
             .map(|s| s.success())
@@ -1175,12 +1271,12 @@ mod tests {
         }
 
         let session = "omar-test-claude-glyph-marker";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
 
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session])
             .status()
             .map(|s| s.success())
@@ -1241,7 +1337,7 @@ mod tests {
         }
 
         let session = "omar-test-paste-preserves-lf";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
@@ -1268,7 +1364,7 @@ mod tests {
         // Start with an rc-less, non-login shell so users' rc files can't
         // break session startup on CI runners with unusual setups.
         let shell_cmd = "/bin/bash --norc --noprofile -i";
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session, shell_cmd])
             .status()
             .map(|s| s.success())
@@ -1363,7 +1459,7 @@ mod tests {
         }
 
         let session = "omar-test-deliver-sentinels";
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["kill-session", "-t", session])
             .output();
         let _guard = SessionGuard(session.to_string());
@@ -1381,7 +1477,7 @@ mod tests {
         let _tmp_guard = TempPathGuard(tmp_path.clone());
 
         let shell_cmd = "/bin/bash --norc --noprofile -i";
-        let ok = Command::new("tmux")
+        let ok = tmux_command()
             .args(["new-session", "-d", "-s", session, shell_cmd])
             .status()
             .map(|s| s.success())

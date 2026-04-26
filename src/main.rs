@@ -1,12 +1,15 @@
-mod api;
 mod app;
+mod backend_probe;
 mod computer;
 mod config;
 mod ea;
 mod event;
 mod manager;
+mod mcp;
 mod memory;
+mod metrics;
 mod panic_hook;
+mod process;
 mod projects;
 mod scheduler;
 mod tmux;
@@ -36,10 +39,12 @@ use tokio::sync::Mutex;
 use app::App;
 use config::Config;
 use event::{AppEvent, EventHandler};
-use tmux::TmuxClient;
+use tmux::{tmux_command, TmuxClient};
 
 /// Tmux session name used when omar auto-launches into tmux
 pub const DASHBOARD_SESSION: &str = "omar-dashboard";
+
+const TMUX_SETUP_WARNING: &str = "⚠ tmux not configured for omar — run 'omar setup-tmux' to fix";
 
 #[derive(Parser)]
 #[command(name = "omar", about = "Agent dashboard for tmux", version)]
@@ -58,6 +63,10 @@ struct Cli {
     /// EA to target by id or name [default: active EA]
     #[arg(long, global = true)]
     ea: Option<String>,
+
+    /// Enable global spawn metrics logging sink
+    #[arg(long, global = true)]
+    spawn_metrics: bool,
 }
 
 #[derive(Subcommand)]
@@ -99,6 +108,22 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ManagerAction>,
     },
+
+    /// Manage scheduled events for the target EA
+    Event {
+        #[command(subcommand)]
+        action: EventAction,
+    },
+
+    /// Start the OMAR MCP server over stdio
+    McpServer {
+        /// Path to a serialized MCP server context JSON file. When omitted,
+        /// the server builds a default context from the current config and
+        /// active EA — used by peer processes (e.g. the Slack bridge) that
+        /// aren't spawned by a specific backend launch.
+        #[arg(long)]
+        context_file: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -107,6 +132,53 @@ enum ManagerAction {
     Start,
     /// Run in orchestration mode (interactive)
     Orchestrate,
+}
+
+#[derive(Subcommand)]
+enum EventAction {
+    /// Schedule an event for an agent or the EA
+    Schedule {
+        /// Receiver name ("ea" for the manager)
+        #[arg(long)]
+        receiver: String,
+
+        /// Event payload text
+        #[arg(long)]
+        payload: String,
+
+        /// Sender label shown in the delivered message
+        #[arg(long)]
+        sender: Option<String>,
+
+        /// Absolute trigger timestamp in nanoseconds since epoch
+        #[arg(long)]
+        at_ns: Option<u64>,
+
+        /// Relative delay in seconds from now
+        #[arg(long)]
+        in_seconds: Option<u64>,
+
+        /// Relative delay in nanoseconds from now
+        #[arg(long)]
+        in_ns: Option<u64>,
+
+        /// Recurrence interval in seconds
+        #[arg(long)]
+        every_seconds: Option<u64>,
+
+        /// Recurrence interval in nanoseconds
+        #[arg(long)]
+        every_ns: Option<u64>,
+    },
+
+    /// List scheduled events for the target EA
+    List,
+
+    /// Cancel a scheduled event by id
+    Cancel {
+        /// Event id
+        id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -135,6 +207,11 @@ async fn async_main() -> Result<()> {
         config.agent.default_command =
             config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
     }
+    if cli.spawn_metrics {
+        config.metrics.spawn_metrics_enabled = true;
+        config.save_to_path(&Config::resolve_path(cli.config.as_deref()));
+    }
+    metrics::configure(config.metrics.spawn_metrics_enabled);
     let omar_dir = omar_dir();
 
     if let Some(ref selector) = cli.ea {
@@ -166,7 +243,12 @@ async fn async_main() -> Result<()> {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
             let client =
                 TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
-            kill_agent(&client, &name)
+            kill_agent(
+                &client,
+                &name,
+                &scheduler::Scheduler::with_store(scheduler::events_store_path(&omar_dir)),
+                target.id,
+            )
         }
         Some(Commands::SetupTmux) => setup_tmux(),
         Some(Commands::Manager { action }) => {
@@ -181,6 +263,10 @@ async fn async_main() -> Result<()> {
                     &target.name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
+                    &manager::ManagerRuntimeOptions {
+                        default_workdir: config.agent.default_workdir.clone(),
+                        health_idle_warning: config.health.idle_warning,
+                    },
                 ),
                 Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(
                     &client,
@@ -189,9 +275,47 @@ async fn async_main() -> Result<()> {
                     &target.name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
+                    &manager::ManagerRuntimeOptions {
+                        default_workdir: config.agent.default_workdir.clone(),
+                        health_idle_warning: config.health.idle_warning,
+                    },
                 ),
             }
         }
+        Some(Commands::Event { action }) => {
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let scheduler =
+                scheduler::Scheduler::with_store(scheduler::events_store_path(&omar_dir));
+            match action {
+                EventAction::Schedule {
+                    receiver,
+                    payload,
+                    sender,
+                    at_ns,
+                    in_seconds,
+                    in_ns,
+                    every_seconds,
+                    every_ns,
+                } => schedule_cli_event(
+                    &scheduler,
+                    target.id,
+                    receiver,
+                    payload,
+                    sender,
+                    at_ns,
+                    in_seconds,
+                    in_ns,
+                    every_seconds,
+                    every_ns,
+                ),
+                EventAction::List => list_cli_events(&scheduler, target.id),
+                EventAction::Cancel { id } => cancel_cli_event(&scheduler, target.id, &id),
+            }
+        }
+        Some(Commands::McpServer { context_file }) => match context_file {
+            Some(path) => mcp::run_server_from_context_file(PathBuf::from(path)),
+            None => mcp::run_server_with_default_context(),
+        },
         None => {
             if std::env::var("TMUX").is_err() {
                 relaunch_in_tmux()
@@ -307,7 +431,12 @@ fn spawn_agent(
     Ok(())
 }
 
-fn kill_agent(client: &TmuxClient, name: &str) -> Result<()> {
+fn kill_agent(
+    client: &TmuxClient,
+    name: &str,
+    scheduler: &scheduler::Scheduler,
+    ea_id: ea::EaId,
+) -> Result<()> {
     let full_name = format!("{}{}", client.prefix(), name);
 
     if !client.has_session(&full_name)? {
@@ -315,8 +444,93 @@ fn kill_agent(client: &TmuxClient, name: &str) -> Result<()> {
     }
 
     client.kill_session(&full_name)?;
+    let _ = scheduler.cancel_by_receiver_and_ea(name, ea_id);
     println!("Killed agent: {}", name);
     Ok(())
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos() as u64
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_cli_event(
+    scheduler: &scheduler::Scheduler,
+    ea_id: ea::EaId,
+    receiver: String,
+    payload: String,
+    sender: Option<String>,
+    at_ns: Option<u64>,
+    in_seconds: Option<u64>,
+    in_ns: Option<u64>,
+    every_seconds: Option<u64>,
+    every_ns: Option<u64>,
+) -> Result<()> {
+    let base = now_ns();
+    let delay_ns = scheduler::combine_seconds_and_ns(in_seconds, in_ns).unwrap_or(0);
+    let timestamp = at_ns.unwrap_or_else(|| base.saturating_add(delay_ns));
+    let recurring_ns = scheduler::combine_seconds_and_ns(every_seconds, every_ns);
+
+    let event = scheduler::ScheduledEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        sender: sender.unwrap_or_else(|| "ea".to_string()),
+        receiver,
+        timestamp,
+        payload,
+        created_at: base,
+        recurring_ns,
+        ea_id,
+    };
+    scheduler.insert(event.clone());
+    println!(
+        "Scheduled event: {} -> {} at {}",
+        event.sender, event.receiver, event.timestamp
+    );
+    println!("Event id: {}", event.id);
+    Ok(())
+}
+
+fn list_cli_events(scheduler: &scheduler::Scheduler, ea_id: ea::EaId) -> Result<()> {
+    let mut events = scheduler.list_by_ea(ea_id);
+    if events.is_empty() {
+        println!("No scheduled events found for EA {}", ea_id);
+        return Ok(());
+    }
+    events.sort_by_key(|event| (event.timestamp, event.created_at));
+    println!(
+        "{:<36} {:<14} {:<14} {:<18} {:<12} PAYLOAD",
+        "ID", "SENDER", "RECEIVER", "TIMESTAMP_NS", "RECURRING"
+    );
+    println!("{}", "-".repeat(120));
+    for event in events {
+        let recurring = event
+            .recurring_ns
+            .map(|ns| ns.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<36} {:<14} {:<14} {:<18} {:<12} {}",
+            event.id, event.sender, event.receiver, event.timestamp, recurring, event.payload
+        );
+    }
+    Ok(())
+}
+
+fn cancel_cli_event(
+    scheduler: &scheduler::Scheduler,
+    ea_id: ea::EaId,
+    event_id: &str,
+) -> Result<()> {
+    match scheduler.cancel_if_ea(event_id, ea_id) {
+        Ok(event) => {
+            println!("Cancelled event: {}", event.id);
+            Ok(())
+        }
+        Err(true) => anyhow::bail!("Event '{}' belongs to a different EA", event_id),
+        Err(false) => anyhow::bail!("Event '{}' not found", event_id),
+    }
 }
 
 /// Re-launch omar inside a tmux session.
@@ -335,7 +549,7 @@ fn relaunch_in_tmux() -> Result<()> {
     // Preserve a live dashboard across detach/reattach cycles.
     // Only kill the session if attach fails, which indicates a stale tmux session.
     if client.has_session(DASHBOARD_SESSION)? {
-        let status = std::process::Command::new("tmux")
+        let status = tmux_command()
             .args(["-2", "attach-session", "-t", DASHBOARD_SESSION])
             .status();
 
@@ -350,7 +564,7 @@ fn relaunch_in_tmux() -> Result<()> {
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let mut cmd = std::process::Command::new("tmux");
+    let mut cmd = tmux_command();
     // Force 256-color mode when launching the dashboard session.
     cmd.arg("-2");
     cmd.args(["new-session", "-s", DASHBOARD_SESSION]);
@@ -387,6 +601,16 @@ const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
     ),
 ];
 
+#[cfg(target_os = "macos")]
+const TMUX_PLATFORM_RECOMMENDED: &[(&str, &str, &str)] = &[(
+    "copy-command",
+    "set -g copy-command pbcopy",
+    "copy tmux selections to the macOS clipboard",
+)];
+
+#[cfg(not(target_os = "macos"))]
+const TMUX_PLATFORM_RECOMMENDED: &[(&str, &str, &str)] = &[];
+
 /// Additional raw lines that need to appear in tmux.conf (checked by substring).
 const TMUX_EXTRA_LINES: &[(&str, &str, &str)] = &[
     (
@@ -413,13 +637,13 @@ const TMUX_EXTRA_LINES: &[(&str, &str, &str)] = &[
 
 /// Check if any recommended tmux settings are missing.
 fn tmux_setup_needed() -> bool {
-    for &(opt, cmd, _) in TMUX_RECOMMENDED {
+    for &(opt, cmd, _) in TMUX_RECOMMENDED
+        .iter()
+        .chain(TMUX_PLATFORM_RECOMMENDED.iter())
+    {
         // Extract expected value from the command string (last word)
         let expected = cmd.split_whitespace().last().unwrap_or("on");
-        if let Ok(out) = std::process::Command::new("tmux")
-            .args(["show-options", "-gv", opt])
-            .output()
-        {
+        if let Ok(out) = tmux_command().args(["show-options", "-gv", opt]).output() {
             let val = String::from_utf8_lossy(&out.stdout);
             if val.trim() != expected {
                 return true;
@@ -427,6 +651,14 @@ fn tmux_setup_needed() -> bool {
         }
     }
     false
+}
+
+fn sync_tmux_setup_warning(app: &mut app::App) {
+    if tmux_setup_needed() {
+        app.set_persistent_warning_if_clear_or_same(TMUX_SETUP_WARNING);
+    } else {
+        app.clear_persistent_warning_if(TMUX_SETUP_WARNING);
+    }
 }
 
 /// Interactive tmux configuration setup.
@@ -442,11 +674,14 @@ fn setup_tmux() -> Result<()> {
     // Collect missing settings
     let mut to_add: Vec<(&str, &str)> = Vec::new();
 
-    for &(opt, line, desc) in TMUX_RECOMMENDED {
+    for &(opt, line, desc) in TMUX_RECOMMENDED
+        .iter()
+        .chain(TMUX_PLATFORM_RECOMMENDED.iter())
+    {
         // Check runtime value — even if the line is in the config,
         // a later conflicting line may override it.
         let expected = line.split_whitespace().last().unwrap_or("on");
-        let runtime_ok = std::process::Command::new("tmux")
+        let runtime_ok = tmux_command()
             .args(["show-options", "-gv", opt])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == expected)
@@ -502,7 +737,7 @@ fn setup_tmux() -> Result<()> {
     // Apply settings directly to the running tmux server.
     // source-file alone isn't reliable because earlier conflicting lines
     // in the config (e.g., oh-my-tmux sets mouse off) can override ours.
-    let tmux_running = std::process::Command::new("tmux")
+    let tmux_running = tmux_command()
         .args(["list-sessions"])
         .output()
         .map(|o| o.status.success())
@@ -512,7 +747,7 @@ fn setup_tmux() -> Result<()> {
         for (line, _) in &to_add {
             // Each line is a full tmux command (e.g. "set -g mouse on")
             let args: Vec<&str> = line.split_whitespace().collect();
-            let _ = std::process::Command::new("tmux").args(&args).status();
+            let _ = tmux_command().args(&args).status();
         }
         println!("✓ Applied to ~/.tmux.conf and running tmux server.");
     } else {
@@ -646,10 +881,22 @@ async fn run_dashboard(config: Config) -> Result<()> {
         std::env::remove_var("NO_COLOR");
     }
 
+    // Best-effort cleanup of pre-0.3 MCP context files left behind in
+    // `/tmp/omar-mcp/`. Current builds write to `~/.omar/mcp/ea-<id>/`.
+    // Runs only from the dashboard entry point; `omar mcp-server` is
+    // spawned by live backends and must not touch their context files.
+    let legacy_tmp = std::env::temp_dir().join("omar-mcp");
+    if legacy_tmp.is_dir() {
+        let _ = std::fs::remove_dir_all(&legacy_tmp);
+    }
+
     // Create the ticker buffer and scheduler, then spawn the event loop
     let ticker = scheduler::TickerBuffer::new();
     let app_ticker = ticker.clone();
-    let scheduler = Arc::new(scheduler::Scheduler::new());
+    let omar_dir = omar_dir();
+    let scheduler = Arc::new(scheduler::Scheduler::with_store(
+        scheduler::events_store_path(&omar_dir),
+    ));
     let popup_receiver = scheduler::new_popup_receiver();
     let base_prefix = config.dashboard.session_prefix.clone();
     tokio::spawn(scheduler::run_event_loop(
@@ -659,36 +906,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
         base_prefix,
     ));
 
-    // Create SINGLE shared App instance (fixes V1: Two-App Problem / BUG-C2).
-    // Both the API server and dashboard operate on the same App via Arc<Mutex<App>>.
+    // Create SINGLE shared App instance for the dashboard/runtime state.
     let shared_app = Arc::new(Mutex::new(App::new(
         &config,
         ticker.clone(),
         scheduler.clone(),
     )));
-
-    // Start API server if enabled
-    if config.api.enabled {
-        let api_config = config.api.clone();
-        let (base_prefix, omar_dir) = {
-            let app_guard = shared_app.lock().await;
-            (app_guard.base_prefix.clone(), app_guard.omar_dir.clone())
-        };
-        let api_state = Arc::new(api::handlers::ApiState {
-            app: shared_app.clone(), // Same Arc — single source of truth
-            scheduler: scheduler.clone(),
-            computer_lock: computer::new_lock(),
-            base_prefix,
-            omar_dir,
-            health_idle_warning: config.health.idle_warning,
-            spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
-        });
-        tokio::spawn(async move {
-            if let Err(e) = api::start_server(api_state, &api_config).await {
-                eprintln!("API server error: {}", e);
-            }
-        });
-    }
 
     // Spawn Slack bridge if configured
     let mut slack_bridge = spawn_slack_bridge();
@@ -723,10 +946,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
     }
 
     // Warn if tmux config is missing recommended settings
-    if tmux_setup_needed() {
-        shared_app.lock().await.set_persistent_warning(
-            "⚠ tmux not configured for omar — run 'omar setup-tmux' to fix",
-        );
+    {
+        let mut app = shared_app.lock().await;
+        sync_tmux_setup_warning(&mut app);
     }
 
     // Initial refresh
@@ -1027,7 +1249,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             // Uses `selected_popup_receiver_name` so the EA pane
                             // normalizes to "ea" — matches the `receiver` field
                             // the scheduler sees (e.g. from Slack bridge).
-                            *popup_receiver.lock().unwrap() = app
+                            *popup_receiver.lock().unwrap_or_else(|err| err.into_inner()) = app
                                 .selected_popup_receiver_name()
                                 .map(|name| (name, app.active_ea));
 
@@ -1091,7 +1313,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
 
                             // Popup closed — clear so events resume delivery
-                            *popup_receiver.lock().unwrap() = None;
+                            *popup_receiver.lock().unwrap_or_else(|err| err.into_inner()) = None;
                         }
                         KeyCode::Char('n') => {
                             if let Err(e) = app.spawn_agent() {
@@ -1134,9 +1356,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         // Detach from tmux — dashboard + agents keep running
                         KeyCode::Char('z') if std::env::var("TMUX").is_ok() => {
-                            let _ = std::process::Command::new("tmux")
-                                .args(["detach-client"])
-                                .status();
+                            let _ = tmux_command().args(["detach-client"]).status();
                         }
                         KeyCode::Char('S') => {
                             app.show_settings = true;
@@ -1153,6 +1373,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     tick_count += 1;
                     if tick_count.is_multiple_of(30) {
                         app.quote_index = app.quote_index.wrapping_add(1);
+                        sync_tmux_setup_warning(&mut app);
                     }
 
                     // Fix V2: EA-scoped events instead of global list
@@ -1171,17 +1392,21 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         app.check_auth_failures(&app_ticker);
                     }
 
-                    // Keep system_state.md in sync with live state (EA-scoped)
-                    let state_dir = app.state_dir();
-                    let manager_session = app.manager_session_name();
-                    memory::write_memory_to(
-                        &state_dir,
-                        &app.agents,
-                        app.manager.as_ref(),
-                        &manager_session,
-                        app.client(),
-                        &app.scheduled_events,
-                    );
+                    // Keep system_state.md reasonably fresh without capturing
+                    // the manager pane and rewriting JSON on every dashboard
+                    // tick. State-changing actions still write immediately.
+                    if tick_count.is_multiple_of(3) && !app.has_popup() {
+                        let state_dir = app.state_dir();
+                        let manager_session = app.manager_session_name();
+                        memory::write_memory_to(
+                            &state_dir,
+                            &app.agents,
+                            app.manager.as_ref(),
+                            &manager_session,
+                            app.client(),
+                            &app.scheduled_events,
+                        );
+                    }
                 }
                 AppEvent::TickerScroll => {
                     let mut app = shared_app.lock().await;
@@ -1218,9 +1443,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // Kill ALL OMAR EA sessions on quit (managers + workers), even if
-    // registry and tmux are temporarily out of sync.
-    {
+    // Leaving the dashboard should be resumable: managers, workers, and their
+    // persisted state stay alive. Operators can still opt into the old
+    // destructive shutdown behavior explicitly for local cleanup.
+    if should_kill_sessions_on_exit() {
         let app = shared_app.lock().await;
         let client = TmuxClient::new("");
         let base_prefix = app.base_prefix.clone();
@@ -1247,9 +1473,48 @@ async fn run_dashboard(config: Config) -> Result<()> {
     Ok(())
 }
 
+fn should_kill_sessions_on_exit() -> bool {
+    std::env::var_os("OMAR_KILL_SESSIONS_ON_EXIT").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     /// Regression: `extended-keys always` forces tmux to emit modify-other-keys
     /// sequences to every client, including omar's dashboard, which doesn't
@@ -1272,5 +1537,38 @@ mod tests {
              in the dashboard (see tests comment)",
             value
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tmux_macos_copy_command_uses_pbcopy() {
+        let entry = TMUX_PLATFORM_RECOMMENDED
+            .iter()
+            .find(|(opt, _, _)| *opt == "copy-command")
+            .expect("macOS setup must configure tmux copy-command");
+        let value = entry.1.split_whitespace().last().unwrap_or("");
+        assert_eq!(
+            value, "pbcopy",
+            "tmux copy-command should pipe native tmux selections into the macOS clipboard"
+        );
+    }
+
+    #[test]
+    fn dashboard_exit_preserves_sessions_by_default() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::unset("OMAR_KILL_SESSIONS_ON_EXIT");
+
+        assert!(
+            !should_kill_sessions_on_exit(),
+            "dashboard exit must be resumable by default"
+        );
+    }
+
+    #[test]
+    fn dashboard_exit_session_kill_is_explicit_opt_in() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set("OMAR_KILL_SESSIONS_ON_EXIT", "1");
+
+        assert!(should_kill_sessions_on_exit());
     }
 }

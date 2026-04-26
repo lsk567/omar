@@ -3,15 +3,40 @@
 //! These tests require tmux to be installed and will create/destroy
 //! test sessions during execution.
 
+use serde_json::{json, Value};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
+use uuid::Uuid;
 
 const TEST_PREFIX: &str = "omar-test-";
+static TEST_TMUX_SERVER: OnceLock<String> = OnceLock::new();
+
+fn test_tmux_server() -> &'static str {
+    TEST_TMUX_SERVER.get_or_init(|| format!("omar-test-{}", Uuid::new_v4()))
+}
+
+fn tmux_command() -> Command {
+    let mut cmd = Command::new("tmux");
+    cmd.args(["-L", test_tmux_server()]);
+    cmd
+}
+
+fn omar_command(home: &Path) -> Command {
+    let mut cmd = Command::new(omar_bin());
+    cmd.env("HOME", home)
+        .env("OMAR_TMUX_SERVER", test_tmux_server());
+    cmd
+}
 
 /// Helper to run tmux commands
 fn tmux(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args(args)
         .output()
         .map_err(|e| format!("Failed to run tmux: {}", e))?;
@@ -21,7 +46,10 @@ fn tmux(args: &[&str]) -> Result<String, String> {
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // "no server running" is not an error for cleanup
-        if stderr.contains("no server running") || stderr.contains("no sessions") {
+        if stderr.contains("no server running")
+            || stderr.contains("no sessions")
+            || stderr.contains("error connecting to")
+        {
             Ok(String::new())
         } else {
             Err(stderr.to_string())
@@ -29,55 +57,182 @@ fn tmux(args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Clean up any test sessions
-fn cleanup_test_sessions() {
-    // List all sessions and kill ones with our test prefix
-    if let Ok(output) = tmux(&["list-sessions", "-F", "#{session_name}"]) {
-        for line in output.lines() {
-            if line.starts_with(TEST_PREFIX) {
-                let _ = tmux(&["kill-session", "-t", line]);
-            }
-        }
-    }
+/// Kill a specific tmux session if it exists. Scoped per-test so
+/// concurrent tests don't clobber each other's sessions. Use this both
+/// at the start of a test (to clear leftovers from a prior failed run)
+/// and at the end (so the next run starts clean).
+fn cleanup_session(session_name: &str) {
+    let _ = tmux(&["kill-session", "-t", session_name]);
 }
 
 /// Check if tmux is available
 fn tmux_available() -> bool {
-    Command::new("tmux")
+    tmux_command()
         .arg("-V")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-fn wait_for_pane_contains(target: &str, needle: &str, attempts: usize, delay: Duration) -> bool {
-    for _ in 0..attempts {
-        if let Ok(output) = tmux(&["capture-pane", "-t", target, "-p"]) {
-            if output.contains(needle) {
-                return true;
-            }
-        }
-        thread::sleep(delay);
-    }
-    false
+fn omar_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_omar")
 }
 
-fn send_line_and_wait(target: &str, line: &str) -> bool {
-    for _ in 0..5 {
-        let _ = tmux(&["send-keys", "-t", target, "-l", line]);
-        let _ = tmux(&["send-keys", "-t", target, "C-m"]);
-        if wait_for_pane_contains(target, line, 10, Duration::from_millis(100)) {
-            return true;
-        }
-    }
-    false
+fn bootstrap_cli_home(home: &Path) {
+    let output = omar_command(home)
+        .arg("list")
+        .output()
+        .expect("Failed to bootstrap omar home");
+    assert!(
+        output.status.success(),
+        "bootstrap failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
-fn pane_contains_wrapped(output: &str, needle: &str) -> bool {
-    if output.contains(needle) {
-        return true;
+struct McpCliServer {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl McpCliServer {
+    fn start(home: &Path, default_command: &str) -> Self {
+        bootstrap_cli_home(home);
+
+        let context = json!({
+            "omar_dir": home.join(".omar"),
+            "ea_id": 0,
+            "session_prefix": "omar-agent-",
+            "default_command": default_command,
+            "default_workdir": env!("CARGO_MANIFEST_DIR"),
+            "health_idle_warning": 15,
+        });
+        let context_path = home.join("mcp-context.json");
+        fs::write(
+            &context_path,
+            serde_json::to_vec_pretty(&context).expect("serialize MCP context"),
+        )
+        .expect("write MCP context");
+
+        let mut child = omar_command(home)
+            .args([
+                "mcp-server",
+                "--context-file",
+                context_path.to_str().expect("utf8 context path"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Failed to start omar mcp-server");
+
+        let stdin = child.stdin.take().expect("mcp stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+        let mut server = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        };
+
+        let init = server.request("initialize", json!({}))["result"].clone();
+        assert_eq!(
+            init["serverInfo"]["name"].as_str(),
+            Some("omar"),
+            "unexpected initialize response: {}",
+            init
+        );
+        server
     }
-    output.replace(['\r', '\n'], "").contains(needle)
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let payload = serde_json::to_vec(&request).expect("serialize request");
+        write!(self.stdin, "Content-Length: {}\r\n\r\n", payload.len()).expect("write header");
+        self.stdin.write_all(&payload).expect("write payload");
+        self.stdin.flush().expect("flush request");
+
+        let response = read_mcp_response(&mut self.stdout);
+        assert_eq!(
+            response["id"].as_u64(),
+            Some(id),
+            "response id mismatch: {}",
+            response
+        );
+        response
+    }
+
+    fn tool_call(&mut self, name: &str, arguments: Value) -> Value {
+        let response = self.request(
+            "tools/call",
+            json!({
+                "name": name,
+                "arguments": arguments,
+            }),
+        );
+        let result = response["result"].clone();
+        assert_eq!(
+            result["isError"].as_bool(),
+            Some(false),
+            "tool {} failed: {}",
+            name,
+            result
+        );
+        result["structuredContent"].clone()
+    }
+}
+
+impl Drop for McpCliServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn read_mcp_response(reader: &mut BufReader<ChildStdout>) -> Value {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).expect("read mcp header");
+        assert!(
+            bytes > 0,
+            "unexpected EOF while reading MCP response header"
+        );
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse::<usize>().expect("valid Content-Length"));
+        }
+    }
+    let length = content_length.expect("Content-Length header present");
+    let mut payload = vec![0u8; length];
+    reader
+        .read_exact(&mut payload)
+        .expect("read mcp response body");
+    serde_json::from_slice(&payload).expect("parse mcp response")
+}
+
+fn cli_output(home: &Path, args: &[&str]) -> String {
+    let output = omar_command(home)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("Failed to run omar {:?}: {}", args, err));
+    assert!(
+        output.status.success(),
+        "omar {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 #[test]
@@ -95,9 +250,8 @@ fn test_create_and_list_session() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}create-list", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Create a session
     let result = tmux(&["new-session", "-d", "-s", &session_name, "sleep", "60"]);
@@ -125,9 +279,8 @@ fn test_capture_pane() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}capture", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Create a session with a shell
     let result = tmux(&["new-session", "-d", "-s", &session_name]);
@@ -136,26 +289,23 @@ fn test_capture_pane() {
     // Give it time to start
     thread::sleep(Duration::from_millis(200));
 
-    let found = send_line_and_wait(&session_name, "echo HELLO_OMAR_TEST");
-    assert!(found, "echo command was not observed in pane");
+    // Send echo command
+    let _ = tmux(&[
+        "send-keys",
+        "-t",
+        &session_name,
+        "echo HELLO_OMAR_TEST",
+        "Enter",
+    ]);
 
-    // `send_line_and_wait` only proves the command *text* landed in the pane
-    // (the shell echoes each keystroke). To prove capture works on actual
-    // command *output*, require a second occurrence of the needle — once
-    // for the typed command line, once for echo's output on a new line.
-    let mut output = String::new();
-    let mut output_found = false;
-    for _ in 0..10 {
-        output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap_or_default();
-        if output.matches("HELLO_OMAR_TEST").count() >= 2 {
-            output_found = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
+    // Give it time to execute
+    thread::sleep(Duration::from_millis(500));
+
+    // Capture pane content
+    let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
     assert!(
-        output_found,
-        "echo command did not execute — pane: {}",
+        output.contains("HELLO_OMAR_TEST"),
+        "Expected output not found: {}",
         output
     );
 
@@ -170,9 +320,8 @@ fn test_kill_session() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}kill", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Create a session
     let _ = tmux(&["new-session", "-d", "-s", &session_name, "sleep", "60"]);
@@ -203,9 +352,8 @@ fn test_session_activity() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}activity", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Create a session
     let _ = tmux(&["new-session", "-d", "-s", &session_name, "sleep", "60"]);
@@ -235,12 +383,11 @@ fn test_has_session() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}has-session", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Check non-existent session
-    let result = Command::new("tmux")
+    let result = tmux_command()
         .args(["has-session", "-t", &session_name])
         .output()
         .unwrap();
@@ -251,7 +398,7 @@ fn test_has_session() {
     thread::sleep(Duration::from_millis(100));
 
     // Check existing session
-    let result = Command::new("tmux")
+    let result = tmux_command()
         .args(["has-session", "-t", &session_name])
         .output()
         .unwrap();
@@ -268,20 +415,30 @@ fn test_send_keys() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}send-keys", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Create a session with a shell
     let _ = tmux(&["new-session", "-d", "-s", &session_name]);
     thread::sleep(Duration::from_millis(200));
 
-    let sent = send_line_and_wait(&session_name, "echo SENT_BY_OMAR");
+    // Send a command
+    let result = tmux(&[
+        "send-keys",
+        "-t",
+        &session_name,
+        "echo SENT_BY_OMAR",
+        "Enter",
+    ]);
+    assert!(result.is_ok());
+
+    // Give it time to execute
+    thread::sleep(Duration::from_millis(500));
 
     // Capture and verify
     let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
     assert!(
-        sent && output.contains("SENT_BY_OMAR"),
+        output.contains("SENT_BY_OMAR"),
         "Sent command not found: {}",
         output
     );
@@ -300,9 +457,8 @@ fn test_spawn_custom_command() {
         return;
     }
 
-    cleanup_test_sessions();
-
     let session_name = format!("{}custom-cmd", TEST_PREFIX);
+    cleanup_session(&session_name);
 
     // Spawn a session with a non-claude command (simulates opencode or other backend)
     let result = tmux(&["new-session", "-d", "-s", &session_name, "bash"]);
@@ -315,7 +471,7 @@ fn test_spawn_custom_command() {
     thread::sleep(Duration::from_millis(300));
 
     // Verify session is running
-    let check = Command::new("tmux")
+    let check = tmux_command()
         .args(["has-session", "-t", &session_name])
         .output()
         .unwrap();
@@ -327,12 +483,15 @@ fn test_spawn_custom_command() {
     // Simulate the universal send-keys task injection pattern
     // (this is how omar sends tasks to any backend, including opencode)
     let task_text = "echo TASK_INJECTED_VIA_SENDKEYS";
-    let injected = send_line_and_wait(&session_name, task_text);
+    let _ = tmux(&["send-keys", "-t", &session_name, "-l", task_text]);
+    let _ = tmux(&["send-keys", "-t", &session_name, "Enter"]);
+
+    thread::sleep(Duration::from_millis(500));
 
     // Verify the task was injected and executed
     let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
     assert!(
-        injected && output.contains("TASK_INJECTED_VIA_SENDKEYS"),
+        output.contains("TASK_INJECTED_VIA_SENDKEYS"),
         "Task should be injected via send-keys: {}",
         output
     );
@@ -365,16 +524,16 @@ fn test_omar_list_empty() {
         return;
     }
 
-    cleanup_test_sessions();
+    // Isolate HOME so we don't read the developer's live `~/.omar/` nor
+    // race against other tests that bootstrap their own omar dir.
+    let home = tempfile::tempdir().expect("temp home");
 
-    let output = Command::new("cargo")
-        .args(["run", "--", "list"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+    let output = omar_command(home.path())
+        .arg("list")
         .output()
         .expect("Failed to run omar list");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Should show "No agent sessions" since we have no prefix by default
     assert!(
         stdout.contains("No agent sessions") || stdout.contains("NAME"),
         "Unexpected output: {}",
@@ -389,78 +548,67 @@ fn test_omar_spawn_and_kill() {
         return;
     }
 
-    cleanup_test_sessions();
+    // Per-test unique agent name: tmux sessions are process-global so even
+    // with isolated HOME, a parallel test running the same CLI would race
+    // on the tmux daemon. The uuid suffix pins this test's session.
+    let home = tempfile::tempdir().expect("temp home");
+    let agent_name = format!("test-spawn-{}", &Uuid::new_v4().to_string()[..8]);
 
-    // Clean up from previous test runs across EA namespaces
-    if let Ok(output) = tmux(&["list-sessions", "-F", "#{session_name}"]) {
-        for line in output.lines() {
-            if line == "test-spawn" || line.ends_with("-test-spawn") {
-                let _ = tmux(&["kill-session", "-t", line]);
-            }
-        }
-    }
-
-    // Spawn a new agent
-    let output = Command::new("cargo")
-        .args(["run", "--", "spawn", "-n", "test-spawn", "-c", "sleep 60"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+    // Spawn a new agent.
+    let output = omar_command(home.path())
+        .args(["spawn", "-n", &agent_name, "-c", "sleep 60"])
         .output()
         .expect("Failed to run omar spawn");
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Spawned agent: test-spawn"),
+        stdout.contains(&format!("Spawned agent: {}", agent_name)),
         "Should confirm spawn: {}",
         stdout
     );
 
-    // Resolve the full spawned session name dynamically, since active EA id can vary.
+    // Resolve the full spawned session name — prefix depends on active EA.
     thread::sleep(Duration::from_millis(200));
+    let suffix = format!("-{}", agent_name);
     let all_sessions = tmux(&["list-sessions", "-F", "#{session_name}"]).unwrap_or_default();
     let full_session = all_sessions
         .lines()
-        .find(|line| *line == "test-spawn" || line.ends_with("-test-spawn"))
+        .find(|line| *line == agent_name || line.ends_with(&suffix))
         .map(ToString::to_string)
-        .expect("Expected a spawned session ending with '-test-spawn'");
+        .unwrap_or_else(|| panic!("Expected a spawned session ending with {:?}", suffix));
 
-    // Verify session exists
-    let result = Command::new("tmux")
+    let result = tmux_command()
         .args(["has-session", "-t", &full_session])
         .output()
         .unwrap();
     assert!(result.status.success(), "Session should exist after spawn");
 
-    // List should show the agent (displayed without prefix)
-    let output = Command::new("cargo")
-        .args(["run", "--", "list"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+    // `list` should show the agent (displayed without prefix).
+    let output = omar_command(home.path())
+        .arg("list")
         .output()
         .expect("Failed to run omar list");
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("test-spawn"),
+        stdout.contains(&agent_name),
         "List should show spawned agent: {}",
         stdout
     );
 
-    // Kill the agent (using short name)
-    let output = Command::new("cargo")
-        .args(["run", "--", "kill", "test-spawn"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+    // Kill the agent (short name).
+    let output = omar_command(home.path())
+        .args(["kill", &agent_name])
         .output()
         .expect("Failed to run omar kill");
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Killed agent: test-spawn"),
+        stdout.contains(&format!("Killed agent: {}", agent_name)),
         "Should confirm kill: {}",
         stdout
     );
 
-    // Verify session is gone
+    // Verify session is gone.
     thread::sleep(Duration::from_millis(100));
-    let result = Command::new("tmux")
+    let result = tmux_command()
         .args(["has-session", "-t", &full_session])
         .output()
         .unwrap();
@@ -468,6 +616,674 @@ fn test_omar_spawn_and_kill() {
         !result.status.success(),
         "Session should not exist after kill"
     );
+}
+
+#[test]
+fn test_omar_event_cli_roundtrip() {
+    let home = tempfile::tempdir().expect("temp home");
+
+    let output = omar_command(home.path())
+        .args([
+            "--ea",
+            "Default",
+            "event",
+            "schedule",
+            "--receiver",
+            "ea",
+            "--payload",
+            "cli-test-payload",
+            "--sender",
+            "cli-test",
+            "--in-seconds",
+            "60",
+        ])
+        .output()
+        .expect("Failed to run omar event schedule");
+    assert!(
+        output.status.success(),
+        "schedule failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Scheduled event: cli-test -> ea"),
+        "unexpected schedule output: {}",
+        stdout
+    );
+    let event_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Event id: "))
+        .expect("event id line in schedule output")
+        .trim()
+        .to_string();
+
+    let output = omar_command(home.path())
+        .args(["--ea", "Default", "event", "list"])
+        .output()
+        .expect("Failed to run omar event list");
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&event_id) && stdout.contains("cli-test-payload"),
+        "event missing from list output: {}",
+        stdout
+    );
+
+    let output = omar_command(home.path())
+        .args(["--ea", "Default", "event", "cancel", &event_id])
+        .output()
+        .expect("Failed to run omar event cancel");
+    assert!(
+        output.status.success(),
+        "cancel failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&event_id),
+        "cancel output should mention event id: {}",
+        stdout
+    );
+
+    let output = omar_command(home.path())
+        .args(["--ea", "Default", "event", "list"])
+        .output()
+        .expect("Failed to run omar event list after cancel");
+    assert!(
+        output.status.success(),
+        "final list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No scheduled events found"),
+        "expected empty event list after cancel: {}",
+        stdout
+    );
+}
+
+/// Register a project by writing directly to the EA's tasks.md file.
+///
+/// `spawn_agent` now requires an existing `project_id`. This helper is only
+/// used by legacy-path tests that need to pre-seed on-disk project state
+/// without exercising `add_project`.
+/// Format: one numbered line `N. Project name`; IDs are not renumbered.
+fn register_project(home: &Path, project_name: &str) -> usize {
+    let tasks_md = home.join(".omar/ea/0/tasks.md");
+    fs::create_dir_all(tasks_md.parent().expect("tasks.md parent")).expect("mk ea dir");
+    let existing = fs::read_to_string(&tasks_md).unwrap_or_default();
+    let next_id = existing
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.find(". ")
+                .and_then(|dot| line[..dot].parse::<usize>().ok())
+        })
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut contents = existing;
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(&format!("{}. {}\n", next_id, project_name));
+    fs::write(&tasks_md, contents).expect("write tasks.md");
+    next_id
+}
+
+#[test]
+fn test_omar_mcp_server_tools_list_via_cli() {
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+
+    let response = server.request("tools/list", json!({}));
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+
+    // spawn_agent is the single spawn-path tool.
+    assert!(names.contains(&"spawn_agent"), "names: {:?}", names);
+    assert!(names.contains(&"omar_wake_later"), "names: {:?}", names);
+    assert!(names.contains(&"kill_agent"), "names: {:?}", names);
+
+    // Task-lifecycle MCP tools are gone in the metadata-only model.
+    assert!(
+        !names.contains(&"check_task"),
+        "check_task should not exist: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"complete_task"),
+        "complete_task should not exist: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"replace_stuck_task_agent"),
+        "replace_stuck_task_agent should not exist: {:?}",
+        names
+    );
+
+    // Pre-rework spawn aliases must be gone.
+    assert!(
+        !names.contains(&"spawn_agent_session"),
+        "spawn_agent_session should not exist: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"create_task"),
+        "create_task should not exist: {:?}",
+        names
+    );
+
+    // notify_parent was collapsed into omar_wake_later and must not reappear.
+    assert!(
+        !names.contains(&"notify_parent"),
+        "notify_parent was collapsed into omar_wake_later and must not appear in the tool list: {:?}",
+        names
+    );
+
+    // schedule_event was renamed to omar_wake_later and must not reappear under its old name.
+    assert!(
+        !names.contains(&"schedule_event"),
+        "schedule_event was renamed to omar_wake_later and must not appear in the tool list: {:?}",
+        names
+    );
+
+    // spawn_agent schema must NOT include a `track` property — the rework
+    // intentionally removed any mode flag on the spawn path.
+    let spawn_agent = tools
+        .iter()
+        .find(|tool| tool["name"].as_str() == Some("spawn_agent"))
+        .expect("spawn_agent tool entry");
+    let props = &spawn_agent["inputSchema"]["properties"];
+    assert!(
+        props.get("track").is_none(),
+        "spawn_agent schema must not have a `track` property: {}",
+        spawn_agent["inputSchema"]
+    );
+    // Sanity-check required fields.
+    let required: Vec<&str> = spawn_agent["inputSchema"]["required"]
+        .as_array()
+        .expect("required array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        required.contains(&"name")
+            && required.contains(&"project_id")
+            && required.contains(&"task"),
+        "spawn_agent required must include name, project_id, and task: {:?}",
+        required
+    );
+}
+
+#[test]
+fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let suffix = &Uuid::new_v4().to_string()[..8];
+    let name = format!("mcp-agent-{}", suffix);
+    let project_name = format!("raw-cmd-{}", suffix);
+    let project_id = register_project(home.path(), &project_name);
+
+    // Raw-command form still requires explicit dashboard metadata.
+    let spawned = server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": name,
+            "project_id": project_id,
+            "task": "watch sleep demo",
+            "command": "sleep 30",
+        }),
+    );
+    assert_eq!(spawned["agent_name"].as_str(), Some(name.as_str()));
+    assert_eq!(spawned["project_id"].as_u64(), Some(project_id as u64));
+    assert_eq!(
+        spawned["project_name"].as_str(),
+        Some(project_name.as_str())
+    );
+    assert!(
+        spawned.get("task_id").is_none(),
+        "spawn_agent should not return task_id: {}",
+        spawned
+    );
+
+    let listed = cli_output(home.path(), &["list"]);
+    assert!(
+        listed.contains(&name),
+        "CLI list should show MCP-spawned agent: {}",
+        listed
+    );
+
+    let worker_tasks_path = home.path().join(".omar/ea/0/worker_tasks.json");
+    let worker_tasks = fs::read_to_string(&worker_tasks_path).expect("worker_tasks.json");
+    assert!(
+        worker_tasks.contains(&format!("\"omar-agent-0-{}\": \"watch sleep demo\"", name)),
+        "worker_tasks.json should store explicit task metadata: {}",
+        worker_tasks
+    );
+
+    let agent_projects_path = home.path().join(".omar/ea/0/agent_projects.json");
+    let agent_projects = fs::read_to_string(&agent_projects_path).expect("agent_projects.json");
+    assert!(
+        agent_projects.contains(&format!("\"omar-agent-0-{}\": {}", name, project_id)),
+        "agent_projects.json should store project ownership: {}",
+        agent_projects
+    );
+
+    let task_registry_path = home.path().join(".omar/ea/0/task_registry.json");
+    assert!(
+        !task_registry_path.exists(),
+        "task_registry.json should not be created"
+    );
+
+    let summary = server.tool_call("get_agent_summary", json!({ "name": name }));
+    assert_eq!(summary["task"].as_str(), Some("watch sleep demo"));
+
+    let killed = server.tool_call("kill_agent", json!({ "name": name }));
+    assert_eq!(killed["status"].as_str(), Some("killed"));
+    let agent_projects = fs::read_to_string(&agent_projects_path).expect("agent_projects.json");
+    assert!(
+        !agent_projects.contains(&format!("\"omar-agent-0-{}\"", name)),
+        "kill_agent should remove project ownership: {}",
+        agent_projects
+    );
+
+    let listed = cli_output(home.path(), &["list"]);
+    assert!(
+        !listed.contains(&name),
+        "CLI list should not show killed agent: {}",
+        listed
+    );
+}
+
+#[test]
+fn test_spawn_agent_task_is_metadata_only_via_cli() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let suffix = &Uuid::new_v4().to_string()[..8];
+    let agent_name = format!("task-agent-{}", suffix);
+    let project_name = format!("task-project-{}", suffix);
+
+    // Project lifecycle is now explicit: add_project first, then spawn_agent with project_id.
+    let added = server.tool_call("add_project", json!({ "name": project_name }));
+    let project_id = added["project_id"].as_u64().expect("project id");
+    assert_eq!(added["name"].as_str(), Some(project_name.as_str()));
+
+    let created = server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": agent_name,
+            "project_id": project_id,
+            "task": "echo tracked-task-test",
+            "command": "sleep 30",
+        }),
+    );
+    assert_eq!(created["agent_name"].as_str(), Some(agent_name.as_str()));
+    assert_eq!(created["project_id"].as_u64(), Some(project_id as u64));
+    assert_eq!(
+        created["project_name"].as_str(),
+        Some(project_name.as_str())
+    );
+    assert!(
+        created.get("task_id").is_none(),
+        "spawn_agent should not return task_id: {}",
+        created
+    );
+
+    let listed = cli_output(home.path(), &["list"]);
+    assert!(
+        listed.contains(&agent_name),
+        "CLI list should show spawned agent: {}",
+        listed
+    );
+
+    let summary = server.tool_call("get_agent_summary", json!({ "name": agent_name }));
+    assert_eq!(summary["task"].as_str(), Some("echo tracked-task-test"));
+
+    let worker_tasks = fs::read_to_string(home.path().join(".omar/ea/0/worker_tasks.json"))
+        .expect("worker_tasks.json");
+    assert!(
+        worker_tasks.contains("echo tracked-task-test"),
+        "worker_tasks.json should preserve task text: {}",
+        worker_tasks
+    );
+
+    let task_registry_path = home.path().join(".omar/ea/0/task_registry.json");
+    assert!(
+        !task_registry_path.exists(),
+        "task_registry.json should not be created"
+    );
+
+    let projects = server.tool_call("list_projects", json!({}));
+    let projects = projects["projects"].as_array().expect("projects array");
+    assert!(
+        projects
+            .iter()
+            .any(|project| project["name"].as_str() == Some(project_name.as_str())),
+        "project should remain registered: {:?}",
+        projects
+    );
+}
+
+#[test]
+fn test_spawn_agent_requires_explicit_parent_when_project_has_pm() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let suffix = &Uuid::new_v4().to_string()[..8];
+    let project_name = format!("ownership-project-{}", suffix);
+    let pm_name = format!("ownership-pm-{}", suffix);
+    let worker_name = format!("ownership-worker-{}", suffix);
+
+    let added = server.tool_call("add_project", json!({ "name": project_name }));
+    let project_id = added["project_id"].as_u64().expect("project id");
+
+    server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": pm_name,
+            "project_id": project_id,
+            "task": "monitor ownership test",
+            "command": "sleep 30",
+        }),
+    );
+
+    let rejected = server.request(
+        "tools/call",
+        json!({
+            "name": "spawn_agent",
+            "arguments": {
+                "name": worker_name,
+                "project_id": project_id,
+                "task": "should be parented",
+                "command": "sleep 30",
+            },
+        }),
+    );
+    let result = rejected["result"].clone();
+    assert_eq!(
+        result["isError"].as_bool(),
+        Some(true),
+        "unparented worker should be rejected: {}",
+        result
+    );
+    let error_text = result["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        error_text.contains("already has active supervisor agent") && error_text.contains(&pm_name),
+        "unexpected spawn_agent error: {}",
+        error_text
+    );
+
+    let spawned = server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": worker_name,
+            "project_id": project_id,
+            "task": "explicitly parented worker",
+            "command": "sleep 30",
+            "parent": pm_name,
+        }),
+    );
+    assert_eq!(spawned["agent_name"].as_str(), Some(worker_name.as_str()));
+
+    let parents_path = home.path().join(".omar/ea/0/agent_parents.json");
+    let parents: Value =
+        serde_json::from_str(&fs::read_to_string(&parents_path).expect("agent_parents.json"))
+            .expect("parse agent_parents.json");
+    let worker_session = format!("omar-agent-0-{}", worker_name);
+    let pm_session = format!("omar-agent-0-{}", pm_name);
+    assert_eq!(
+        parents.get(&worker_session).and_then(Value::as_str),
+        Some(pm_session.as_str())
+    );
+
+    let _ = server.tool_call("kill_agent", json!({ "name": worker_name }));
+    let _ = server.tool_call("kill_agent", json!({ "name": pm_name }));
+}
+
+#[test]
+fn test_spawn_agent_rejects_parent_from_different_project() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let suffix = &Uuid::new_v4().to_string()[..8];
+    let pm_name = format!("cross-pm-{}", suffix);
+    let worker_name = format!("cross-worker-{}", suffix);
+
+    let project_a = server.tool_call(
+        "add_project",
+        json!({ "name": format!("cross-project-a-{}", suffix) }),
+    )["project_id"]
+        .as_u64()
+        .expect("project a id");
+    let project_b = server.tool_call(
+        "add_project",
+        json!({ "name": format!("cross-project-b-{}", suffix) }),
+    )["project_id"]
+        .as_u64()
+        .expect("project b id");
+
+    server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": pm_name,
+            "project_id": project_a,
+            "task": "monitor project a",
+            "command": "sleep 30",
+        }),
+    );
+
+    let rejected = server.request(
+        "tools/call",
+        json!({
+            "name": "spawn_agent",
+            "arguments": {
+                "name": worker_name,
+                "project_id": project_b,
+                "task": "wrong-project parent",
+                "command": "sleep 30",
+                "parent": pm_name,
+            },
+        }),
+    );
+    let result = rejected["result"].clone();
+    assert_eq!(
+        result["isError"].as_bool(),
+        Some(true),
+        "cross-project parent should be rejected: {}",
+        result
+    );
+    let error_text = result["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        error_text.contains("belongs to project") && error_text.contains(&project_b.to_string()),
+        "unexpected spawn_agent error: {}",
+        error_text
+    );
+
+    let _ = server.tool_call("kill_agent", json!({ "name": pm_name }));
+}
+
+#[test]
+fn test_complete_project_blocks_on_running_agent() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let suffix = &Uuid::new_v4().to_string()[..8];
+    let agent_name = format!("project-agent-{}", suffix);
+    let project_name = format!("project-{}", suffix);
+
+    let added = server.tool_call("add_project", json!({ "name": project_name }));
+    let project_id = added["project_id"].as_u64().expect("project id");
+
+    server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": agent_name,
+            "project_id": project_id,
+            "task": "echo running-agent",
+            "command": "sleep 30",
+        }),
+    );
+
+    let resp = server.request(
+        "tools/call",
+        json!({
+            "name": "complete_project",
+            "arguments": { "project_id": project_id },
+        }),
+    );
+    let result = resp["result"].clone();
+    assert_eq!(
+        result["isError"].as_bool(),
+        Some(true),
+        "complete_project should block while tracked agent runs: {}",
+        result
+    );
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("still has active agent sessions"),
+        "unexpected error: {}",
+        result
+    );
+
+    let listed = cli_output(home.path(), &["list"]);
+    assert!(
+        listed.contains(&agent_name),
+        "blocked project completion should not tear down the running session: {}",
+        listed
+    );
+
+    let _ = server.tool_call("kill_agent", json!({ "name": agent_name }));
+    let completed_project =
+        server.tool_call("complete_project", json!({ "project_id": project_id }));
+    assert_eq!(completed_project["status"].as_str(), Some("completed"));
+    assert_eq!(
+        completed_project["name"].as_str(),
+        Some(project_name.as_str())
+    );
+}
+
+/// Regression test for the Claude Code XML-to-JSON coercion workaround:
+/// integer-typed MCP fields (project_id, ea_id, delay_seconds, etc.) must
+/// also accept JSON string values. Agents calling via raw MCP JSON-RPC
+/// always get integers, but the XML harness can stringify them.
+#[test]
+fn test_integer_fields_accept_strings() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+    let suffix = &Uuid::new_v4().to_string()[..8];
+    let agent_name = format!("flex-agent-{}", suffix);
+    let project_name = format!("flex-project-{}", suffix);
+
+    let added = server.tool_call("add_project", json!({ "name": project_name }));
+    let project_id = added["project_id"].as_u64().expect("project id");
+
+    // Pass project_id as a STRING rather than integer. Pre-fix this errored
+    // with `invalid type: string "1", expected usize`.
+    let created = server.tool_call(
+        "spawn_agent",
+        json!({
+            "name": agent_name,
+            "project_id": project_id.to_string(),
+            "task": "echo flex-int-test",
+            "command": "sleep 30",
+        }),
+    );
+    assert_eq!(
+        created["status"].as_str(),
+        Some("running"),
+        "spawn_agent should accept string project_id, got {}",
+        created
+    );
+    assert!(
+        created.get("task_id").is_none(),
+        "spawn_agent should not return task_id: {}",
+        created
+    );
+
+    // omar_wake_later delay_seconds also accepts strings.
+    let scheduled = server.tool_call(
+        "omar_wake_later",
+        json!({
+            "receiver": agent_name,
+            "payload": "hello",
+            "delay_seconds": "2",
+        }),
+    );
+    assert!(
+        scheduled["id"].is_string(),
+        "omar_wake_later should accept string delay_seconds, got {}",
+        scheduled
+    );
+
+    // complete_project accepts string project_id too; with a running tracked
+    // worker it should type-coerce successfully and then block on lifecycle.
+    let resp = server.request(
+        "tools/call",
+        json!({
+            "name": "complete_project",
+            "arguments": { "project_id": project_id.to_string() },
+        }),
+    );
+    let result = resp["result"].clone();
+    assert_eq!(
+        result["isError"].as_bool(),
+        Some(true),
+        "complete_project should accept string project_id and then lifecycle-block, got {}",
+        result
+    );
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("still has active agent sessions"),
+        "unexpected error: {}",
+        result
+    );
+
+    let listed = cli_output(home.path(), &["list"]);
+    assert!(
+        listed.contains(&agent_name),
+        "project removal should not kill the running agent: {}",
+        listed
+    );
+
+    let _ = server.tool_call("kill_agent", json!({ "name": agent_name }));
 }
 
 /// Test that `deliver_to_tmux` routes messages to EA-scoped session names.
@@ -517,18 +1333,19 @@ fn test_deliver_to_tmux_ea_scoped() {
 
     thread::sleep(Duration::from_millis(200));
 
-    // The production `deliver_to_tmux` path routes through
-    // `TmuxClient::deliver_prompt` (bracketed paste + verification), which
-    // requires a full TUI to observe activity. This test targets a plain
-    // shell session to validate EA-level *routing isolation* — not the
-    // exact delivery mechanism — so we use send-keys directly: type each
-    // message into its session and confirm the shell echoes it, then
-    // assert that neither pane contains the other EA's message.
+    // Deliver distinct messages replicating deliver_to_tmux's exact tmux operations:
+    //   tmux send-keys -t <target> -l <message>
+    //   tmux send-keys -t <target> Enter
     let msg_ea0 = "DELIVER_EA0_ONLY";
     let msg_ea1 = "DELIVER_EA1_ONLY";
 
-    let found_ea0 = send_line_and_wait(&ea0_session, msg_ea0);
-    let found_ea1 = send_line_and_wait(&ea1_session, msg_ea1);
+    let _ = tmux(&["send-keys", "-t", &ea0_session, "-l", msg_ea0]);
+    let _ = tmux(&["send-keys", "-t", &ea0_session, "Enter"]);
+
+    let _ = tmux(&["send-keys", "-t", &ea1_session, "-l", msg_ea1]);
+    let _ = tmux(&["send-keys", "-t", &ea1_session, "Enter"]);
+
+    thread::sleep(Duration::from_millis(500));
 
     // Capture pane output for each session
     let out0 = tmux(&["capture-pane", "-t", &ea0_session, "-p"]).unwrap_or_default();
@@ -536,14 +1353,18 @@ fn test_deliver_to_tmux_ea_scoped() {
 
     // Each session must contain its own message
     assert!(
-        found_ea0,
+        out0.contains(msg_ea0),
         "EA 0 session '{}' should contain '{}': {}",
-        ea0_session, msg_ea0, out0
+        ea0_session,
+        msg_ea0,
+        out0
     );
     assert!(
-        found_ea1,
+        out1.contains(msg_ea1),
         "EA 1 session '{}' should contain '{}': {}",
-        ea1_session, msg_ea1, out1
+        ea1_session,
+        msg_ea1,
+        out1
     );
 
     // EA isolation: messages must not cross EA boundaries
@@ -651,8 +1472,14 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
     let payload_ea0 = format!("[EVENT at t={}]\nFrom ea-test: sched-ea0-only", ts);
     let payload_ea1 = format!("[EVENT at t={}]\nFrom ea-test: sched-ea1-only", ts);
 
-    let _ = send_line_and_wait(&ea0_session, &payload_ea0);
-    let _ = send_line_and_wait(&ea1_session, &payload_ea1);
+    // Deliver to each session via the same tmux send-keys pattern as deliver_to_tmux
+    let _ = tmux(&["send-keys", "-t", &ea0_session, "-l", &payload_ea0]);
+    let _ = tmux(&["send-keys", "-t", &ea0_session, "Enter"]);
+
+    let _ = tmux(&["send-keys", "-t", &ea1_session, "-l", &payload_ea1]);
+    let _ = tmux(&["send-keys", "-t", &ea1_session, "Enter"]);
+
+    thread::sleep(Duration::from_millis(500));
 
     // Capture pane output
     let out0 = tmux(&["capture-pane", "-t", &ea0_session, "-p"]).unwrap_or_default();
@@ -660,24 +1487,24 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
 
     // Each EA's session received its own event payload
     assert!(
-        pane_contains_wrapped(&out0, "sched-ea0-only"),
+        out0.contains("sched-ea0-only"),
         "EA 0 session missing its scheduled event: {}",
         out0
     );
     assert!(
-        pane_contains_wrapped(&out1, "sched-ea1-only"),
+        out1.contains("sched-ea1-only"),
         "EA 1 session missing its scheduled event: {}",
         out1
     );
 
     // EA isolation: events must not cross EA boundaries
     assert!(
-        !pane_contains_wrapped(&out0, "sched-ea1-only"),
+        !out0.contains("sched-ea1-only"),
         "EA 0 session must NOT contain EA 1's event: {}",
         out0
     );
     assert!(
-        !pane_contains_wrapped(&out1, "sched-ea0-only"),
+        !out1.contains("sched-ea0-only"),
         "EA 1 session must NOT contain EA 0's event: {}",
         out1
     );

@@ -2,13 +2,20 @@ pub mod event;
 
 pub use event::ScheduledEvent;
 
-use std::collections::{BinaryHeap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 use crate::ea;
+use crate::process::pid_file_is_stale;
 use crate::tmux::DeliveryOptions;
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
 
 /// A ticker message with its creation time.
 struct TickerEntry {
@@ -31,7 +38,7 @@ impl TickerBuffer {
 
     /// Push a new message into the ticker. Caps at 50 entries.
     pub fn push(&self, msg: impl Into<String>) {
-        let mut buf = self.entries.lock().unwrap();
+        let mut buf = lock_recover(&self.entries);
         if buf.len() >= 50 {
             buf.pop_front();
         }
@@ -44,7 +51,7 @@ impl TickerBuffer {
     /// Return the joined ticker content, filtering entries older than `ttl`.
     /// Does NOT prune the buffer — old entries remain for `latest()` / debug console.
     pub fn render(&self, ttl: std::time::Duration) -> String {
-        let buf = self.entries.lock().unwrap();
+        let buf = lock_recover(&self.entries);
         let now = Instant::now();
         buf.iter()
             .filter(|e| now.duration_since(e.created_at) < ttl)
@@ -55,7 +62,7 @@ impl TickerBuffer {
 
     /// Return the last `n` messages regardless of age (for debug console).
     pub fn latest(&self, n: usize) -> Vec<String> {
-        let buf = self.entries.lock().unwrap();
+        let buf = lock_recover(&self.entries);
         buf.iter()
             .rev()
             .take(n)
@@ -74,21 +81,184 @@ fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
+/// Combine an optional `seconds` and optional `extra_ns` duration into a
+/// single nanosecond count, saturating on overflow. Returns `None` only
+/// when both inputs are absent — callers that want a default (e.g. "no
+/// delay means 0") should `.unwrap_or(0)`. Shared between the CLI and
+/// MCP event-scheduling paths so the arithmetic has one definition.
+pub fn combine_seconds_and_ns(seconds: Option<u64>, extra_ns: Option<u64>) -> Option<u64> {
+    match (seconds, extra_ns) {
+        (Some(s), Some(n)) => Some(s.saturating_mul(1_000_000_000).saturating_add(n)),
+        (Some(s), None) => Some(s.saturating_mul(1_000_000_000)),
+        (None, Some(n)) => Some(n),
+        (None, None) => None,
+    }
+}
+
 pub struct Scheduler {
     queue: Mutex<BinaryHeap<ScheduledEvent>>,
     notify: Notify,
+    store_path: Option<PathBuf>,
+}
+
+struct StoreLock {
+    path: PathBuf,
+}
+
+impl StoreLock {
+    fn acquire(path: PathBuf) -> std::io::Result<Self> {
+        for _ in 0..500 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if pid_file_is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("Timed out waiting for scheduler lock {:?}", path),
+        ))
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub fn events_store_path(omar_dir: &Path) -> PathBuf {
+    omar_dir.join("scheduled_events.json")
+}
+
+fn store_lock_path(store_path: &Path) -> PathBuf {
+    store_path.with_extension("lock")
+}
+
+fn load_events_from_store(store_path: &Path) -> Vec<ScheduledEvent> {
+    fs::read_to_string(store_path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn save_events_to_store(store_path: &Path, queue: &BinaryHeap<ScheduledEvent>) {
+    let mut events: Vec<ScheduledEvent> = queue.iter().cloned().collect();
+    events.sort_by_key(|event| (event.timestamp, event.created_at));
+    if let Some(parent) = store_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let tmp = store_path.with_extension("tmp");
+    if let Ok(content) = serde_json::to_string_pretty(&events) {
+        if fs::write(&tmp, content).is_ok() {
+            let _ = fs::rename(&tmp, store_path);
+        } else {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
 }
 
 impl Scheduler {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(BinaryHeap::new()),
             notify: Notify::new(),
+            store_path: None,
+        }
+    }
+
+    pub fn with_store(store_path: PathBuf) -> Self {
+        let mut queue = BinaryHeap::new();
+        for event in load_events_from_store(&store_path) {
+            queue.push(event);
+        }
+        Self {
+            queue: Mutex::new(queue),
+            notify: Notify::new(),
+            store_path: Some(store_path),
+        }
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.store_path.is_some()
+    }
+
+    fn transaction<R>(
+        &self,
+        persist: bool,
+        f: impl FnOnce(&mut BinaryHeap<ScheduledEvent>) -> R,
+    ) -> R {
+        match &self.store_path {
+            Some(store_path) => {
+                // If the on-disk lock can't be acquired (stuck peer, slow FS),
+                // degrade to an in-memory operation rather than panicking the
+                // caller — the event loop or any other thread holding a live
+                // Scheduler would otherwise take down the whole process.
+                // Consequence on a write op: the change only lands in the
+                // in-memory heap and will be overwritten by the next
+                // successful `transaction` (which reloads from disk), so the
+                // event is effectively lost if the dashboard restarts or
+                // another writer succeeds first. Still preferable to a crash.
+                let _store_lock = match StoreLock::acquire(store_lock_path(store_path)) {
+                    Ok(lock) => lock,
+                    Err(err) => {
+                        if persist {
+                            eprintln!(
+                                "scheduler: WARNING: failed to acquire store lock ({}); \
+                                 write applied to in-memory cache only — NOT persisted to disk \
+                                 and may be lost on restart",
+                                err
+                            );
+                        } else {
+                            eprintln!(
+                                "scheduler: failed to acquire store lock ({}); \
+                                 read returned from (potentially stale) in-memory cache",
+                                err
+                            );
+                        }
+                        let mut queue = lock_recover(&self.queue);
+                        return f(&mut queue);
+                    }
+                };
+                let mut queue = BinaryHeap::new();
+                for event in load_events_from_store(store_path) {
+                    queue.push(event);
+                }
+                let result = f(&mut queue);
+                if persist {
+                    save_events_to_store(store_path, &queue);
+                }
+                *lock_recover(&self.queue) = queue;
+                result
+            }
+            None => {
+                let mut queue = lock_recover(&self.queue);
+                f(&mut queue)
+            }
         }
     }
 
     pub fn insert(&self, event: ScheduledEvent) {
-        self.queue.lock().unwrap().push(event);
+        self.transaction(true, |queue| {
+            queue.push(event);
+        });
+        // `notify_one` stores a permit so the event loop wakes up even if it
+        // isn't currently parked on `notified().await`.
         self.notify.notify_one();
     }
 
@@ -100,87 +270,199 @@ impl Scheduler {
     ///   Err(true)  if found but ea_id doesn't match (event stays in queue)
     ///   Err(false) if not found
     pub fn cancel_if_ea(&self, event_id: &str, ea_id: u32) -> Result<ScheduledEvent, bool> {
-        let mut queue = self.queue.lock().unwrap();
-        let events: Vec<ScheduledEvent> = queue.drain().collect();
-        let mut cancelled = None;
-        let mut wrong_ea = false;
-        let mut remaining = BinaryHeap::new();
-        for ev in events {
-            if ev.id == event_id && cancelled.is_none() {
-                if ev.ea_id == ea_id {
-                    cancelled = Some(ev);
+        let result = self.transaction(true, |queue| {
+            let events: Vec<ScheduledEvent> = queue.drain().collect();
+            let mut cancelled = None;
+            let mut wrong_ea = false;
+            let mut remaining = BinaryHeap::new();
+            for ev in events {
+                if ev.id == event_id && cancelled.is_none() {
+                    if ev.ea_id == ea_id {
+                        cancelled = Some(ev);
+                    } else {
+                        wrong_ea = true;
+                        remaining.push(ev);
+                    }
                 } else {
-                    wrong_ea = true;
-                    remaining.push(ev); // put it back — wrong EA
+                    remaining.push(ev);
                 }
-            } else {
-                remaining.push(ev);
             }
-        }
-        *queue = remaining;
-        match cancelled {
-            Some(ev) => Ok(ev),
-            None => Err(wrong_ea),
-        }
+            *queue = remaining;
+            match cancelled {
+                Some(ev) => Ok(ev),
+                None => Err(wrong_ea),
+            }
+        });
+        self.notify.notify_waiters();
+        result
     }
 
     /// List events for a specific EA only.
     pub fn list_by_ea(&self, ea_id: u32) -> Vec<ScheduledEvent> {
-        let queue = self.queue.lock().unwrap();
-        queue.iter().filter(|e| e.ea_id == ea_id).cloned().collect()
+        self.transaction(false, |queue| {
+            queue.iter().filter(|e| e.ea_id == ea_id).cloned().collect()
+        })
     }
 
     /// Cancel all events for a specific EA. Returns the number cancelled.
     pub fn cancel_by_ea(&self, ea_id: u32) -> usize {
-        let mut queue = self.queue.lock().unwrap();
-        let events: Vec<ScheduledEvent> = queue.drain().collect();
-        let mut count = 0;
-        let mut remaining = BinaryHeap::new();
-        for ev in events {
-            if ev.ea_id == ea_id {
-                count += 1;
-            } else {
-                remaining.push(ev);
+        let count = self.transaction(true, |queue| {
+            let events: Vec<ScheduledEvent> = queue.drain().collect();
+            let mut count = 0;
+            let mut remaining = BinaryHeap::new();
+            for ev in events {
+                if ev.ea_id == ea_id {
+                    count += 1;
+                } else {
+                    remaining.push(ev);
+                }
             }
-        }
-        *queue = remaining;
+            *queue = remaining;
+            count
+        });
+        self.notify.notify_waiters();
         count
     }
 
     /// Cancel all events for a given receiver within a specific EA only.
     /// Fix V5: EA-scoped receiver cancellation prevents cross-EA event leaks.
     pub fn cancel_by_receiver_and_ea(&self, receiver: &str, ea_id: u32) -> usize {
-        let mut queue = self.queue.lock().unwrap();
-        let events: Vec<ScheduledEvent> = queue.drain().collect();
-        let mut count = 0;
-        let mut remaining = BinaryHeap::new();
-        for ev in events {
-            if ev.receiver == receiver && ev.ea_id == ea_id {
-                count += 1;
-            } else {
-                remaining.push(ev);
+        let count = self.transaction(true, |queue| {
+            let events: Vec<ScheduledEvent> = queue.drain().collect();
+            let mut count = 0;
+            let mut remaining = BinaryHeap::new();
+            for ev in events {
+                if ev.receiver == receiver && ev.ea_id == ea_id {
+                    count += 1;
+                } else {
+                    remaining.push(ev);
+                }
             }
-        }
-        *queue = remaining;
+            *queue = remaining;
+            count
+        });
+        self.notify.notify_waiters();
         count
     }
 
     /// Pop all events matching the given receiver, EA, and timestamp.
     /// Fix V7: EA-scoped batching prevents cross-EA event delivery.
+    #[cfg(test)]
     pub fn pop_batch(&self, receiver: &str, ea_id: u32, timestamp: u64) -> Vec<ScheduledEvent> {
-        let mut queue = self.queue.lock().unwrap();
-        let events: Vec<ScheduledEvent> = queue.drain().collect();
-        let mut batch = Vec::new();
-        let mut remaining = BinaryHeap::new();
-        for ev in events {
-            if ev.receiver == receiver && ev.ea_id == ea_id && ev.timestamp == timestamp {
-                batch.push(ev);
-            } else {
-                remaining.push(ev);
+        let batch = self.transaction(true, |queue| {
+            let events: Vec<ScheduledEvent> = queue.drain().collect();
+            let mut batch = Vec::new();
+            let mut remaining = BinaryHeap::new();
+            for ev in events {
+                if ev.receiver == receiver && ev.ea_id == ea_id && ev.timestamp == timestamp {
+                    batch.push(ev);
+                } else {
+                    remaining.push(ev);
+                }
             }
-        }
-        *queue = remaining;
+            *queue = remaining;
+            batch
+        });
+        self.notify.notify_waiters();
         batch
+    }
+
+    fn next_timestamp(&self) -> Option<u64> {
+        self.transaction(false, |queue| queue.peek().map(|event| event.timestamp))
+    }
+
+    fn take_due_deliveries(&self, popup_receiver: &PopupReceiver) -> Vec<DueDelivery> {
+        self.transaction(true, |queue| {
+            let Some(earliest_ts) = queue.peek().map(|event| event.timestamp) else {
+                return Vec::new();
+            };
+            if earliest_ts > now_ns() {
+                return Vec::new();
+            }
+
+            let mut remaining = BinaryHeap::new();
+            let mut groups: Vec<((String, u32), Vec<ScheduledEvent>)> = Vec::new();
+            let mut group_indices: HashMap<(String, u32), usize> = HashMap::new();
+
+            for event in queue.drain() {
+                if event.timestamp == earliest_ts {
+                    let key = (event.receiver.clone(), event.ea_id);
+                    let idx = *group_indices.entry(key.clone()).or_insert_with(|| {
+                        groups.push((key, Vec::new()));
+                        groups.len() - 1
+                    });
+                    groups[idx].1.push(event);
+                } else {
+                    remaining.push(event);
+                }
+            }
+
+            const MAX_EVENTS_PER_EA_PER_TICK: usize = 10;
+            let mut ea_delivery_count: HashMap<u32, usize> = HashMap::new();
+            let mut deliveries = Vec::new();
+
+            for ((receiver, ea_id), batch) in groups {
+                let delivered_so_far = *ea_delivery_count.get(&ea_id).unwrap_or(&0);
+                if delivered_so_far >= MAX_EVENTS_PER_EA_PER_TICK {
+                    for event in batch {
+                        remaining.push(event);
+                    }
+                    continue;
+                }
+
+                if should_defer_for_popup(popup_receiver, &receiver, ea_id) {
+                    let defer_until = now_ns() + POPUP_DEFER_NS;
+                    for mut event in batch {
+                        event.timestamp = defer_until;
+                        remaining.push(event);
+                    }
+                    deliveries.push(DueDelivery {
+                        receiver,
+                        ea_id,
+                        timestamp: earliest_ts,
+                        batch: Vec::new(),
+                        deferred_for_popup: true,
+                    });
+                    continue;
+                }
+
+                let remaining_quota = MAX_EVENTS_PER_EA_PER_TICK - delivered_so_far;
+                let (batch, deferred_batch) = split_batch_for_quota(batch, remaining_quota);
+                for event in deferred_batch {
+                    remaining.push(event);
+                }
+                if batch.is_empty() {
+                    continue;
+                }
+
+                *ea_delivery_count.entry(ea_id).or_insert(0) += batch.len();
+                for event in &batch {
+                    if let Some(interval) = event.recurring_ns {
+                        let now = now_ns();
+                        remaining.push(ScheduledEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            sender: event.sender.clone(),
+                            receiver: event.receiver.clone(),
+                            timestamp: now + interval,
+                            payload: event.payload.clone(),
+                            created_at: now,
+                            recurring_ns: Some(interval),
+                            ea_id: event.ea_id,
+                        });
+                    }
+                }
+                deliveries.push(DueDelivery {
+                    receiver,
+                    ea_id,
+                    timestamp: earliest_ts,
+                    batch,
+                    deferred_for_popup: false,
+                });
+            }
+
+            *queue = remaining;
+            deliveries
+        })
     }
 }
 
@@ -260,6 +542,14 @@ pub fn new_popup_receiver() -> PopupReceiver {
 /// no unbounded fan-out, one event stays one event.
 pub(crate) const POPUP_DEFER_NS: u64 = 30_000_000_000;
 
+struct DueDelivery {
+    receiver: String,
+    ea_id: u32,
+    timestamp: u64,
+    batch: Vec<ScheduledEvent>,
+    deferred_for_popup: bool,
+}
+
 /// Decide whether to defer an event for `(receiver, ea_id)` because the user
 /// has an agent popup open on that exact pane. Scoped per-EA so same-named
 /// workers in other EAs deliver as normal.
@@ -274,7 +564,7 @@ pub(crate) fn should_defer_for_popup(
 ) -> bool {
     popup_receiver
         .lock()
-        .unwrap()
+        .unwrap_or_else(|err| err.into_inner())
         .as_ref()
         .is_some_and(|(r, eid)| *eid == ea_id && receivers_match(r, receiver))
 }
@@ -298,111 +588,56 @@ pub async fn run_event_loop(
     popup_receiver: PopupReceiver,
     base_prefix: String,
 ) {
+    let external_poll_interval = std::time::Duration::from_millis(500);
     loop {
-        let next_ts = {
-            let queue = scheduler.queue.lock().unwrap();
-            queue.peek().map(|e| e.timestamp)
-        };
+        let next_ts = scheduler.next_timestamp();
 
         match next_ts {
             None => {
-                // No events — wait for a notification.
-                scheduler.notify.notified().await;
+                if scheduler.is_persistent() {
+                    tokio::time::sleep(external_poll_interval).await;
+                } else {
+                    scheduler.notify.notified().await;
+                }
                 continue;
             }
             Some(ts) => {
                 let now = now_ns();
                 if ts > now {
                     let sleep_ns = ts - now;
-                    let duration = std::time::Duration::from_nanos(sleep_ns);
+                    let mut duration = std::time::Duration::from_nanos(sleep_ns);
+                    if scheduler.is_persistent() {
+                        duration = duration.min(external_poll_interval);
+                    }
                     tokio::select! {
                         _ = tokio::time::sleep(duration) => {
-                            // Timer fired — fall through to delivery.
+                            continue;
                         }
                         _ = scheduler.notify.notified() => {
-                            // Queue changed — re-check from the top.
                             continue;
                         }
                     }
                 }
 
-                // Deliver all events at the earliest timestamp, grouped by receiver.
-                let earliest_ts = {
-                    let queue = scheduler.queue.lock().unwrap();
-                    match queue.peek() {
-                        Some(e) if e.timestamp <= now_ns() => e.timestamp,
-                        _ => continue,
-                    }
-                };
-
-                // Fix V7: Collect (receiver, ea_id) pairs — not just receivers.
-                // This prevents cross-EA event batching where events for same-named
-                // agents in different EAs would be merged and delivered to only one EA.
-                let receiver_ea_pairs: Vec<(String, u32)> = {
-                    let queue = scheduler.queue.lock().unwrap();
-                    let mut seen: Vec<(String, u32)> = Vec::new();
-                    for ev in queue.iter() {
-                        if ev.timestamp == earliest_ts {
-                            let pair = (ev.receiver.clone(), ev.ea_id);
-                            if !seen.contains(&pair) {
-                                seen.push(pair);
-                            }
-                        }
-                    }
-                    seen
-                };
-
-                // Per-EA fairness cap: process at most this many events per EA per tick.
-                // If an EA has a burst of events, the excess stays in the queue for the
-                // next iteration so other EAs are not starved.
-                const MAX_EVENTS_PER_EA_PER_TICK: usize = 10;
-                let mut ea_delivery_count: std::collections::HashMap<u32, usize> =
-                    std::collections::HashMap::new();
-
-                for (receiver, ea_id) in &receiver_ea_pairs {
-                    // Enforce per-EA delivery cap.
-                    let delivered_so_far = *ea_delivery_count.get(ea_id).unwrap_or(&0);
-                    if delivered_so_far >= MAX_EVENTS_PER_EA_PER_TICK {
-                        // Leave remaining events for this EA in the queue for the next tick.
-                        continue;
-                    }
-
-                    // If the user has a popup open for this receiver, defer the
-                    // due batch by POPUP_DEFER_NS. The same batch keeps being
-                    // re-queued on each tick — no duplication, no growth — and
-                    // it just keeps re-deferring until the popup closes.
-                    if should_defer_for_popup(&popup_receiver, receiver, *ea_id) {
-                        let batch = scheduler.pop_batch(receiver, *ea_id, earliest_ts);
-                        for mut ev in batch {
-                            ev.timestamp = now_ns() + POPUP_DEFER_NS;
-                            scheduler.insert(ev);
-                        }
+                for delivery in scheduler.take_due_deliveries(&popup_receiver) {
+                    let receiver = delivery.receiver;
+                    let ea_id = delivery.ea_id;
+                    if delivery.deferred_for_popup {
                         ticker.push(format!("deferred event(s) for {} (popup open)", receiver));
                         continue;
                     }
+                    let batch = delivery.batch;
+                    if batch.is_empty() {
+                        continue;
+                    }
 
-                    let batch = scheduler.pop_batch(receiver, *ea_id, earliest_ts);
-                    if batch.is_empty() {
-                        continue;
-                    }
-                    let remaining_quota = MAX_EVENTS_PER_EA_PER_TICK - delivered_so_far;
-                    let (batch, deferred_batch) = split_batch_for_quota(batch, remaining_quota);
-                    for ev in deferred_batch {
-                        scheduler.insert(ev);
-                    }
-                    if batch.is_empty() {
-                        continue;
-                    }
-                    // Track events delivered for this EA this tick.
-                    *ea_delivery_count.entry(*ea_id).or_insert(0) += batch.len();
-                    let message = format_delivery(&batch, earliest_ts);
+                    let message = format_delivery(&batch, delivery.timestamp);
                     let receiver_name = receiver.clone();
                     let base_prefix_clone = base_prefix.clone();
                     let ticker_clone = ticker.clone();
-                    let ea = *ea_id;
                     let delivery_result = tokio::task::spawn_blocking(move || {
                         deliver_to_tmux(
-                            ea,
+                            ea_id,
                             &receiver_name,
                             &message,
                             &base_prefix_clone,
@@ -417,24 +652,7 @@ pub async fn run_event_loop(
                         ));
                     }
 
-                    // Re-insert recurring events with a fresh timestamp and ID
-                    for ev in &batch {
-                        if let Some(interval) = ev.recurring_ns {
-                            let next = ScheduledEvent {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                sender: ev.sender.clone(),
-                                receiver: ev.receiver.clone(),
-                                timestamp: now_ns() + interval,
-                                payload: ev.payload.clone(),
-                                created_at: now_ns(),
-                                recurring_ns: Some(interval),
-                                ea_id: ev.ea_id,
-                            };
-                            scheduler.insert(next);
-                        }
-                    }
-
-                    let lag_ns = now_ns().saturating_sub(earliest_ts);
+                    let lag_ns = now_ns().saturating_sub(delivery.timestamp);
                     let lag_ms = lag_ns as f64 / 1_000_000.0;
                     ticker.push(format!(
                         "delivered {} event(s) to {}, lag={:.2}ms",
@@ -1016,5 +1234,43 @@ mod tests {
             "event must still be deferred; delta={}s",
             delta_secs
         );
+    }
+
+    #[test]
+    fn test_persistent_scheduler_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = events_store_path(dir.path());
+        let sched = Scheduler::with_store(store_path.clone());
+
+        let mut ev = make_event("alice", "manager", 100, "persist me");
+        ev.ea_id = 7;
+        sched.insert(ev);
+
+        let reloaded = Scheduler::with_store(store_path);
+        let events = reloaded.list_by_ea(7);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload, "persist me");
+        assert_eq!(events[0].receiver, "alice");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_scheduler_reclaims_stale_store_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = events_store_path(dir.path());
+        let lock_path = store_lock_path(&store_path);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, u32::MAX.to_string()).unwrap();
+
+        let sched = Scheduler::with_store(store_path);
+        let mut ev = make_event("alice", "manager", 100, "persist after stale lock");
+        ev.ea_id = 7;
+        sched.insert(ev);
+
+        assert!(
+            !lock_path.exists(),
+            "stale scheduler lock should be reclaimed and cleaned up"
+        );
+        assert_eq!(sched.list_by_ea(7).len(), 1);
     }
 }
