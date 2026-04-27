@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -613,6 +613,26 @@ impl TmuxClient {
             .context("Failed to execute tmux")?;
 
         Ok(result.status.success())
+    }
+
+    /// Find a session by exact name.
+    pub fn get_session(&self, name: &str) -> Result<Option<Session>> {
+        let target = exact_session_target(name);
+        let sessions = self.list_sessions()?;
+        Ok(sessions
+            .into_iter()
+            .find(|session| exact_session_target(&session.name) == target))
+    }
+
+    /// Ensure the session exists and is not currently attached.
+    pub fn ensure_session_not_attached(&self, name: &str) -> Result<Session> {
+        let session = self
+            .get_session(name)?
+            .ok_or_else(|| anyhow!("Session '{}' not found", name))?;
+        if session.attached {
+            anyhow::bail!("Cannot kill attached session")
+        }
+        Ok(session)
     }
 
     /// Attach to a session (blocks until detached)

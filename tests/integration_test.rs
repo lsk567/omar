@@ -188,6 +188,17 @@ impl McpCliServer {
         );
         result["structuredContent"].clone()
     }
+
+    fn tool_call_result(&mut self, name: &str, arguments: Value) -> Value {
+        self.request(
+            "tools/call",
+            json!({
+                "name": name,
+                "arguments": arguments,
+            }),
+        )["result"]
+            .clone()
+    }
 }
 
 impl Drop for McpCliServer {
@@ -233,6 +244,69 @@ fn cli_output(home: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn tmux_has_session(session_name: &str) -> bool {
+    tmux_command()
+        .args(["has-session", "-t", session_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn tmux_session_attached(session_name: &str) -> bool {
+    let output = match tmux_command()
+        .args(["list-sessions", "-F", "#{session_name}|#{session_attached}"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('|'))
+        .find_map(|(name, attached)| {
+            if name == session_name {
+                Some(attached == "1")
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false)
+}
+
+fn script_available() -> bool {
+    Command::new("script")
+        .arg("--help")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn attach_session_in_tmux_background(session_name: &str) -> Option<Child> {
+    if script_available() {
+        Command::new("script")
+            .args([
+                "-qec",
+                &format!(
+                    "tmux -L {} attach-session -t {}",
+                    test_tmux_server(),
+                    session_name
+                ),
+                "/dev/null",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+    } else {
+        None
+    }
 }
 
 #[test]
@@ -615,6 +689,168 @@ fn test_omar_spawn_and_kill() {
     assert!(
         !result.status.success(),
         "Session should not exist after kill"
+    );
+}
+
+#[test]
+fn test_mcp_delete_ea_refuses_attached_session() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+    if !script_available() {
+        eprintln!("Skipping test: script utility unavailable");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let mut server = McpCliServer::start(home.path(), "bash");
+
+    let created = server.tool_call("create_ea", json!({ "name": "attached-ea" }));
+    let ea_id = created["id"].as_u64().expect("created EA id") as u32;
+
+    let ea_dir = home.path().join(format!(".omar/ea/{}", ea_id));
+    std::fs::create_dir_all(&ea_dir).expect("ea state dir");
+    std::fs::write(ea_dir.join("sentinel.txt"), b"keep").expect("state sentinel");
+
+    let session_name = format!("omar-agent-{}-attached-delete", ea_id);
+    tmux(&["new-session", "-d", "-s", &session_name, "sleep", "600"])
+        .expect("Failed to create attached worker session");
+
+    let mut attachment = match attach_session_in_tmux_background(&session_name) {
+        Some(child) => child,
+        None => {
+            eprintln!("Skipping test: script utility unavailable");
+            return;
+        }
+    };
+    thread::sleep(Duration::from_millis(300));
+
+    let delete = server.tool_call_result("delete_ea", json!({ "ea_id": ea_id }));
+    assert_eq!(delete["isError"].as_bool(), Some(true));
+    let err = delete["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        err.contains("Cannot delete EA")
+            || err.contains("Cannot delete attached")
+            || err.contains("Cannot delete attached session"),
+        "expected attached guard error: {}",
+        err
+    );
+    assert!(
+        ea_dir.join("sentinel.txt").exists(),
+        "delete_ea should not remove state on attached refusal"
+    );
+    assert!(
+        tmux_has_session(&session_name),
+        "attached worker session should remain after refused delete"
+    );
+
+    attachment
+        .kill()
+        .expect("failed to stop attached script harness");
+    attachment
+        .wait()
+        .expect("failed to wait attached script harness");
+
+    thread::sleep(Duration::from_millis(200));
+    let _ = server.tool_call("delete_ea", json!({ "ea_id": ea_id }));
+    assert!(
+        !tmux_has_session(&session_name),
+        "attached worker session should be removed after detached delete"
+    );
+    assert!(
+        !ea_dir.exists(),
+        "EA state should be removed after successful delete"
+    );
+}
+
+#[test]
+fn test_omar_kill_refuses_attached_session() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+    if !script_available() {
+        eprintln!("Skipping test: script utility unavailable");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+    let agent_name = format!("kill-attached-{}", &Uuid::new_v4().to_string()[..8]);
+    let session_name = format!("{}{}", "omar-agent-0-", agent_name);
+    let spawn_output = omar_command(home.path())
+        .args(["spawn", "-n", &agent_name, "-c", "sleep 600"])
+        .output()
+        .expect("Failed to run omar spawn");
+    assert!(
+        spawn_output.status.success(),
+        "omar spawn failed: {}",
+        String::from_utf8_lossy(&spawn_output.stderr)
+    );
+    assert!(
+        tmux_has_session(&session_name),
+        "expected spawned session to exist"
+    );
+
+    thread::sleep(Duration::from_millis(300));
+
+    let mut attachment = match attach_session_in_tmux_background(&session_name) {
+        Some(child) => child,
+        None => {
+            eprintln!("Skipping test: script utility unavailable");
+            return;
+        }
+    };
+    thread::sleep(Duration::from_millis(400));
+    let mut attached = false;
+    for _ in 0..10 {
+        if tmux_session_attached(&session_name) {
+            attached = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(attached, "session should be attached before kill");
+
+    let output = omar_command(home.path())
+        .args(["kill", agent_name.as_str()])
+        .output()
+        .expect("Failed to run omar kill");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "kill must fail for attached session"
+    );
+    assert!(
+        stderr.contains("Cannot kill attached session")
+            || stdout.contains("Cannot kill attached session"),
+        "expected attached guard error: stdout={stdout} stderr={stderr}"
+    );
+
+    assert!(
+        tmux_has_session(&session_name),
+        "attached session must remain after refused kill"
+    );
+
+    attachment
+        .kill()
+        .expect("failed to stop attached script harness");
+    attachment
+        .wait()
+        .expect("failed to wait attached script harness");
+
+    thread::sleep(Duration::from_millis(200));
+
+    let _ = omar_command(home.path())
+        .args(["kill", &agent_name])
+        .output()
+        .expect("Failed to run omar kill");
+
+    assert!(
+        !tmux_has_session(&session_name),
+        "session should be removed after detached kill"
     );
 }
 

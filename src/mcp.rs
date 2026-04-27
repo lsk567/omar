@@ -804,15 +804,30 @@ impl OmarMcpServer {
         let manager_session = ea::ea_manager_session(args.ea_id, &self.context.session_prefix);
         let client = TmuxClient::new(&prefix);
         let sessions = client.list_sessions().unwrap_or_default();
-        let mut killed = 0usize;
-        for session in sessions {
+        let all_sessions = client.list_all_sessions().unwrap_or_default();
+        let mut session_names = Vec::new();
+        for session in &sessions {
             if session.name != manager_session {
-                let _ = client.kill_session(&session.name);
-                killed += 1;
+                session_names.push(session.name.clone());
             }
         }
-        if client.has_session(&manager_session).unwrap_or(false) {
-            let _ = client.kill_session(&manager_session);
+        let manager_present = all_sessions
+            .iter()
+            .any(|session| session.name == manager_session);
+        if manager_present {
+            session_names.push(manager_session.clone());
+        }
+        for session_name in &session_names {
+            if all_sessions
+                .iter()
+                .any(|session| session.name == *session_name && session.attached)
+            {
+                return Err(anyhow!("Cannot delete attached session"));
+            }
+        }
+        let mut killed = 0usize;
+        for session_name in session_names {
+            let _ = client.kill_session(&session_name);
             killed += 1;
         }
         let state_dir = ea::ea_state_dir(args.ea_id, &self.context.omar_dir);
@@ -1267,14 +1282,7 @@ impl OmarMcpServer {
         if session_name == manager_session {
             return Err(anyhow!("Cannot kill manager via MCP"));
         }
-        let session = client
-            .list_sessions()?
-            .into_iter()
-            .find(|session| session.name == session_name)
-            .ok_or_else(|| anyhow!("Agent '{}' not found", args.name))?;
-        if session.attached {
-            return Err(anyhow!("Cannot kill attached session"));
-        }
+        let _session = client.ensure_session_not_attached(&session_name)?;
         client.kill_session(&session_name)?;
         memory::remove_agent_parent_in(state_dir, &session_name);
         memory::remove_agent_project_in(state_dir, &session_name);
@@ -2480,6 +2488,137 @@ mod tests {
             "delete_ea must not remove state for an unknown EA"
         );
         assert_eq!(ea::load_registry(&context.omar_dir).len(), 2);
+    }
+
+    #[test]
+    fn delete_ea_rejects_attached_manager_before_worker_cleanup() {
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        if !std::process::Command::new("script")
+            .arg("--help")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: script not available");
+            return;
+        }
+
+        let _lock = env_lock();
+        let _guard = EnvVarGuard::unset("OMAR_TMUX_SERVER");
+        let tmux_server = format!("omar-mcp-delete-manager-{}", Uuid::new_v4());
+        let mut context = test_context();
+        context.tmux_server = Some(tmux_server.clone());
+        apply_context_environment(&context);
+
+        let server = OmarMcpServer::new(context.clone());
+        ea::ensure_default_ea(&context.omar_dir).unwrap();
+        let attached_ea = ea::register_ea(&context.omar_dir, "attached-mcp-manager", None).unwrap();
+        let state_dir = ea::ea_state_dir(attached_ea, &context.omar_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("sentinel.txt"), b"keep").unwrap();
+
+        let worker_session = format!(
+            "{}mcp-attached",
+            ea::ea_prefix(attached_ea, &context.session_prefix)
+        );
+        let manager_session = ea::ea_manager_session(attached_ea, &context.session_prefix);
+
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "new-session",
+                "-d",
+                "-s",
+                &worker_session,
+                "sleep",
+                "600",
+            ])
+            .status()
+            .expect("create worker session");
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "new-session",
+                "-d",
+                "-s",
+                &manager_session,
+                "sleep",
+                "600",
+            ])
+            .status()
+            .expect("create manager session");
+
+        let mut attachment = std::process::Command::new("script")
+            .args([
+                "-qec",
+                &format!(
+                    "tmux -L {} attach-session -t {}",
+                    tmux_server, manager_session
+                ),
+                "/dev/null",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("attach manager session");
+
+        let has_session = |name: &str| -> bool {
+            std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "has-session", "-t", name])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        };
+
+        let result = server.delete_ea(json!({ "ea_id": attached_ea }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Cannot delete attached session",
+            "expected attached guard error"
+        );
+        assert!(
+            has_session(&worker_session),
+            "attached manager should not delete worker sessions"
+        );
+        assert!(
+            has_session(&manager_session),
+            "attached manager should remain after refusal"
+        );
+        assert!(
+            state_dir.join("sentinel.txt").exists(),
+            "delete_ea should preserve state on attached refusal"
+        );
+
+        attachment.kill().expect("failed to stop script harness");
+        attachment.wait().expect("failed to wait script harness");
+
+        let result = server.delete_ea(json!({ "ea_id": attached_ea }));
+        assert!(result.is_ok(), "delete should succeed after detach");
+        assert!(
+            !has_session(&worker_session),
+            "worker session should be removed after successful delete"
+        );
+        assert!(
+            !has_session(&manager_session),
+            "manager session should be removed after successful delete"
+        );
+        assert!(
+            !state_dir.exists(),
+            "EA state should be removed after successful delete"
+        );
     }
 
     #[cfg(unix)]

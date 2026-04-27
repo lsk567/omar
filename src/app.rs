@@ -894,7 +894,11 @@ impl App {
         let manager_session = self.manager_session_name();
         if let Some(agent) = self.selected_agent() {
             // Safety: don't kill attached sessions (user's terminal)
-            if agent.session.attached {
+            if self
+                .client
+                .ensure_session_not_attached(&agent.session.name)
+                .is_err()
+            {
                 self.set_status("Cannot kill attached session");
                 self.pending_confirm = None;
                 return Ok(());
@@ -1388,21 +1392,34 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         let ea_client = TmuxClient::new(&ea_prefix);
 
         let sessions = ea_client.list_sessions()?;
-        let mut worker_sessions = Vec::new();
+        let all_sessions = ea_client.list_all_sessions()?;
+        let mut sessions_to_delete = Vec::new();
         for session in sessions {
             if session.name != manager_session {
-                worker_sessions.push(session.name);
+                sessions_to_delete.push(session.name);
+            }
+        }
+        let manager_present = all_sessions
+            .iter()
+            .any(|session| session.name == manager_session);
+        if manager_present {
+            sessions_to_delete.push(manager_session.clone());
+        }
+
+        for session_name in &sessions_to_delete {
+            if all_sessions
+                .iter()
+                .any(|session| session.name == *session_name && session.attached)
+            {
+                self.set_status("Cannot delete attached session");
+                self.pending_confirm = None;
+                return Ok(());
             }
         }
 
         // Transactional delete: cleanup must succeed before registry mutation.
-        for session_name in &worker_sessions {
+        for session_name in &sessions_to_delete {
             ea_client.kill_session(session_name)?;
-        }
-
-        // Kill manager session
-        if ea_client.has_session(&manager_session)? {
-            ea_client.kill_session(&manager_session)?;
         }
 
         // Remove state directory
@@ -1437,7 +1454,7 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         self.set_status(format!(
             "Deleted EA {} ({} workers, {} events)",
             ea_id,
-            worker_sessions.len(),
+            sessions_to_delete.len(),
             events_cancelled
         ));
         self.pending_confirm = None;
@@ -1798,6 +1815,27 @@ mod tests {
         }
     }
 
+    struct TmuxServerEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TmuxServerEnvGuard {
+        fn set(server: &str) -> Self {
+            let previous = std::env::var_os("OMAR_TMUX_SERVER");
+            std::env::set_var("OMAR_TMUX_SERVER", server);
+            Self { previous }
+        }
+    }
+
+    impl Drop for TmuxServerEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var("OMAR_TMUX_SERVER", value),
+                None => std::env::remove_var("OMAR_TMUX_SERVER"),
+            }
+        }
+    }
+
     fn make_agent(name: &str, health: HealthState) -> AgentInfo {
         AgentInfo {
             session: Session {
@@ -1848,6 +1886,38 @@ mod tests {
             watchdog: WatchdogConfig::default(),
             metrics: MetricsConfig::default(),
         }
+    }
+
+    fn tmux_session_attached(server: &str, session_name: &str) -> bool {
+        let output = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                server,
+                "list-sessions",
+                "-F",
+                "#{session_name}|#{session_attached}",
+            ])
+            .output()
+            .ok();
+        let output = match output {
+            Some(output) => output,
+            None => return false,
+        };
+        if !output.status.success() {
+            return false;
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split_once('|'))
+            .find_map(|(name, attached)| {
+                if name == session_name {
+                    Some(attached == "1")
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false)
     }
 
     #[test]
@@ -2587,6 +2657,264 @@ default_workdir = "."
         assert_eq!(tree.len(), 2);
         assert_eq!(tree[1].name, "api");
         assert_eq!(tree[1].depth, 1);
+    }
+
+    #[test]
+    fn test_delete_ea_refuses_attached_session() {
+        let _env_lock = env_lock();
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        if !std::process::Command::new("script")
+            .arg("--help")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: script not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = HomeEnvGuard::set(dir.path());
+        let tmux_server = format!("omar-app-delete-{}", uuid::Uuid::new_v4());
+        let _tmux = TmuxServerEnvGuard::set(&tmux_server);
+        let config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
+
+        let state_dir = dir.path().join(".omar");
+        ea::ensure_default_ea(&state_dir).expect("ensure default ea");
+        let attached_ea = ea::register_ea(&state_dir, "attached-ea", None).expect("register ea");
+
+        let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
+
+        let worker_session = format!(
+            "{}app-attached",
+            ea::ea_prefix(attached_ea, &config.dashboard.session_prefix)
+        );
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "new-session",
+                "-d",
+                "-s",
+                &worker_session,
+                "sleep",
+                "600",
+            ])
+            .status()
+            .expect("create worker session");
+
+        let mut attach = std::process::Command::new("script")
+            .args([
+                "-qec",
+                &format!(
+                    "tmux -L {} attach-session -t {}",
+                    tmux_server, worker_session
+                ),
+                "/dev/null",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("attach harness");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = app.delete_ea(attached_ea);
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Cannot delete attached session")
+        );
+
+        assert!(
+            std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "has-session", "-t", &worker_session])
+                .status()
+                .map(|o| o.success())
+                .unwrap_or(false),
+            "attached session should remain after refused delete"
+        );
+
+        attach.kill().expect("stop attach harness");
+        attach.wait().expect("wait attach harness");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        app.delete_ea(attached_ea).expect("delete after detach");
+        assert!(
+            !std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "has-session", "-t", &worker_session])
+                .status()
+                .map(|o| o.success())
+                .unwrap_or(false),
+            "session should be removed after delete"
+        );
+    }
+
+    #[test]
+    fn test_delete_ea_refuses_attached_manager_session() {
+        let _env_lock = env_lock();
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        if !std::process::Command::new("script")
+            .arg("--help")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: script not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = HomeEnvGuard::set(dir.path());
+        let tmux_server = format!("omar-app-manager-delete-{}", uuid::Uuid::new_v4());
+        let _tmux = TmuxServerEnvGuard::set(&tmux_server);
+        let config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
+
+        let state_root = dir.path().join(".omar");
+        let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
+
+        let attached_ea = app
+            .create_ea("attached-manager-ea".to_string(), None)
+            .expect("register ea");
+        let state_dir = ea::ea_state_dir(attached_ea, &state_root);
+        std::fs::create_dir_all(&state_dir).expect("create ea state");
+        std::fs::write(state_dir.join("sentinel.txt"), b"keep").expect("state sentinel");
+
+        let manager_session = ea::ea_manager_session(attached_ea, &config.dashboard.session_prefix);
+        let worker_session = format!(
+            "{}app-attached-manager",
+            ea::ea_prefix(attached_ea, &config.dashboard.session_prefix)
+        );
+
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "new-session",
+                "-d",
+                "-s",
+                &worker_session,
+                "sleep",
+                "600",
+            ])
+            .status()
+            .expect("create worker session");
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "new-session",
+                "-d",
+                "-s",
+                &manager_session,
+                "sleep",
+                "600",
+            ])
+            .status()
+            .expect("create attached manager session");
+
+        let mut attachment = std::process::Command::new("script")
+            .args([
+                "-qec",
+                &format!(
+                    "tmux -L {} attach-session -t {}",
+                    tmux_server, manager_session
+                ),
+                "/dev/null",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("attach manager");
+
+        for _ in 0..10 {
+            if tmux_session_attached(&tmux_server, &manager_session) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !tmux_session_attached(&tmux_server, &manager_session) {
+            attachment.kill().expect("stop attach harness");
+            attachment.wait().expect("wait attach harness");
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "kill-session", "-t", &worker_session])
+                .status();
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "kill-session", "-t", &manager_session])
+                .status();
+            eprintln!("Skipping test: failed to attach manager session");
+            return;
+        }
+        let _ = app.delete_ea(attached_ea);
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Cannot delete attached session")
+        );
+        assert!(
+            std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "has-session", "-t", &worker_session])
+                .status()
+                .map(|o| o.success())
+                .unwrap_or(false),
+            "worker session should remain when manager is attached"
+        );
+        assert!(
+            std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "has-session", "-t", &manager_session])
+                .status()
+                .map(|o| o.success())
+                .unwrap_or(false),
+            "manager session should remain when manager is attached"
+        );
+        assert!(
+            state_dir.join("sentinel.txt").exists(),
+            "delete_ea should not remove state on attached manager"
+        );
+
+        attachment.kill().expect("stop attach harness");
+        attachment.wait().expect("wait attach harness");
+
+        app.delete_ea(attached_ea).expect("delete after detach");
+        assert!(
+            !std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "has-session", "-t", &worker_session])
+                .status()
+                .map(|o| o.success())
+                .unwrap_or(false),
+            "worker session should be removed after detached delete"
+        );
+        assert!(
+            !std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "has-session", "-t", &manager_session])
+                .status()
+                .map(|o| o.success())
+                .unwrap_or(false),
+            "manager session should be removed after detached delete"
+        );
+        assert!(
+            !state_dir.exists(),
+            "EA state should be removed after successful delete"
+        );
     }
 
     // ── filter_sessions tests ──

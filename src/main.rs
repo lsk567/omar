@@ -439,9 +439,7 @@ fn kill_agent(
 ) -> Result<()> {
     let full_name = format!("{}{}", client.prefix(), name);
 
-    if !client.has_session(&full_name)? {
-        anyhow::bail!("Session '{}' not found", name);
-    }
+    let _ = client.ensure_session_not_attached(&full_name)?;
 
     client.kill_session(&full_name)?;
     let _ = scheduler.cancel_by_receiver_and_ea(name, ea_id);
