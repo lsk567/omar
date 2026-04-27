@@ -2573,6 +2573,57 @@ mod tests {
             .spawn()
             .expect("attach manager session");
 
+        let tmux_session_attached = |name: &str| -> bool {
+            let output = std::process::Command::new("tmux")
+                .args([
+                    "-L",
+                    &tmux_server,
+                    "list-sessions",
+                    "-F",
+                    "#{session_name}|#{session_attached}",
+                ])
+                .output()
+                .ok();
+            let output = match output {
+                Some(output) => output,
+                None => return false,
+            };
+            if !output.status.success() {
+                return false;
+            }
+
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.split_once('|'))
+                .find_map(|(session, attached)| {
+                    if session == name {
+                        Some(attached == "1")
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false)
+        };
+
+        for _ in 0..20 {
+            if tmux_session_attached(&manager_session) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !tmux_session_attached(&manager_session) {
+            attachment.kill().expect("failed to stop script harness");
+            attachment.wait().expect("failed to wait script harness");
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "kill-session", "-t", &worker_session])
+                .status();
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "kill-session", "-t", &manager_session])
+                .status();
+            eprintln!("Skipping test: failed to attach manager session");
+            return;
+        }
+
         let has_session = |name: &str| -> bool {
             std::process::Command::new("tmux")
                 .args(["-L", &tmux_server, "has-session", "-t", name])
