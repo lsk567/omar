@@ -120,6 +120,25 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn popup_attach_command(target: &str) -> String {
+    let tmux_server = std::env::var("OMAR_TMUX_SERVER")
+        .ok()
+        .map(|server| server.trim().to_string())
+        .filter(|server| !server.is_empty());
+    popup_attach_command_with_server(target, tmux_server.as_deref())
+}
+
+fn popup_attach_command_with_server(target: &str, tmux_server: Option<&str>) -> String {
+    let mut command = String::from("env -u TMUX tmux");
+    if let Some(server) = tmux_server {
+        command.push_str(" -L ");
+        command.push_str(&shell_single_quote(server));
+    }
+    command.push_str(" attach-session -t ");
+    command.push_str(&shell_single_quote(target));
+    command
+}
+
 impl TmuxClient {
     pub fn new(prefix: impl Into<String>) -> Self {
         Self {
@@ -681,7 +700,7 @@ impl TmuxClient {
     /// Open a popup attached to a session
     pub fn attach_popup(&self, session: &str, width: &str, height: &str) -> Result<()> {
         let target = exact_session_target(session);
-        let command = format!("tmux attach -t {}", shell_single_quote(&target));
+        let command = popup_attach_command(&target);
         let status = tmux_command()
             .args(["display-popup", "-E", "-w", width, "-h", height, &command])
             .status()
@@ -789,6 +808,22 @@ mod tests {
     fn test_shell_single_quote_keeps_exact_tmux_target_literal() {
         assert_eq!(shell_single_quote("=omar-agent-ea-0"), "'=omar-agent-ea-0'");
         assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn test_popup_attach_command_unsets_nested_tmux_and_quotes_target() {
+        assert_eq!(
+            popup_attach_command_with_server("=omar-agent-ea-0", None),
+            "env -u TMUX tmux attach-session -t '=omar-agent-ea-0'"
+        );
+    }
+
+    #[test]
+    fn test_popup_attach_command_preserves_custom_tmux_server() {
+        assert_eq!(
+            popup_attach_command_with_server("=omar-agent-ea-0", Some("omar-test-server")),
+            "env -u TMUX tmux -L 'omar-test-server' attach-session -t '=omar-agent-ea-0'"
+        );
     }
 
     fn tmux_available() -> bool {
