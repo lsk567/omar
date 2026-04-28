@@ -289,7 +289,7 @@ fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
     let command_arg = format!("mcp_servers.omar.command={}", command);
     let args_arg = format!("mcp_servers.omar.args={}", args);
     Some(format!(
-        "--disable scheduled_tasks -c {} -c {}",
+        "-c features.scheduled_tasks=false -c {} -c {}",
         shell_single_quote(&command_arg),
         shell_single_quote(&args_arg)
     ))
@@ -1067,7 +1067,7 @@ mod tests {
         ));
         assert!(cmd.contains("mcp_servers.omar.command"));
         assert!(cmd.contains("mcp_servers.omar.args"));
-        assert!(cmd.contains("--disable scheduled_tasks"));
+        assert!(cmd.contains("-c features.scheduled_tasks=false"));
     }
 
     #[test]
