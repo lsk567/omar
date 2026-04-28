@@ -116,6 +116,10 @@ fn exact_pane_target(target: &str) -> String {
     }
 }
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 impl TmuxClient {
     pub fn new(prefix: impl Into<String>) -> Self {
         Self {
@@ -647,18 +651,15 @@ impl TmuxClient {
 
     /// Open a popup attached to a session
     pub fn attach_popup(&self, session: &str, width: &str, height: &str) -> Result<()> {
-        tmux_command()
-            .args([
-                "display-popup",
-                "-E",
-                "-w",
-                width,
-                "-h",
-                height,
-                &format!("tmux attach -t {}", exact_session_target(session)),
-            ])
+        let target = exact_session_target(session);
+        let command = format!("tmux attach -t {}", shell_single_quote(&target));
+        let status = tmux_command()
+            .args(["display-popup", "-E", "-w", width, "-h", height, &command])
             .status()
             .context("Failed to open tmux popup")?;
+        if !status.success() {
+            anyhow::bail!("tmux popup exited with status {}", status);
+        }
         Ok(())
     }
 
@@ -753,6 +754,12 @@ mod tests {
         );
         assert_eq!(exact_pane_target("=already-exact"), "=already-exact:");
         assert_eq!(exact_pane_target("session:1.0"), "session:1.0");
+    }
+
+    #[test]
+    fn test_shell_single_quote_keeps_exact_tmux_target_literal() {
+        assert_eq!(shell_single_quote("=omar-agent-ea-0"), "'=omar-agent-ea-0'");
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
     }
 
     fn tmux_available() -> bool {
