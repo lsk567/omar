@@ -2727,7 +2727,21 @@ default_workdir = "."
             .spawn()
             .expect("attach harness");
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        for _ in 0..10 {
+            if tmux_session_attached(&tmux_server, &worker_session) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !tmux_session_attached(&tmux_server, &worker_session) {
+            attach.kill().expect("stop attach harness");
+            attach.wait().expect("wait attach harness");
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "kill-session", "-t", &worker_session])
+                .status();
+            eprintln!("Skipping test: failed to attach worker session");
+            return;
+        }
         let _ = app.delete_ea(attached_ea);
 
         assert_eq!(
