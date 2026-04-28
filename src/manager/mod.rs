@@ -614,9 +614,12 @@ pub fn start_manager(
 
     // Check if manager already exists
     if client.has_session(&session)? {
-        println!("Manager session already exists. Attaching...");
-        client.attach_session(&session)?;
-        return Ok(());
+        if client.session_has_live_pane(&session)? {
+            println!("Manager session already exists. Attaching...");
+            client.attach_session(&session)?;
+            return Ok(());
+        }
+        client.kill_session(&session)?;
     }
 
     // Build command with EA system prompt + memory baked in

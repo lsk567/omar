@@ -489,7 +489,10 @@ impl App {
     fn ensure_manager(&mut self) -> Result<()> {
         let manager_session = self.manager_session_name();
         if self.client.has_session(&manager_session)? {
-            return Ok(());
+            if self.client.session_has_live_pane(&manager_session)? {
+                return Ok(());
+            }
+            self.client.kill_session(&manager_session)?;
         }
 
         // Reload registry on cache miss so we have the latest EA names
@@ -1782,7 +1785,7 @@ mod tests {
     };
     use crate::projects;
     use crate::scheduler;
-    use crate::tmux::{HealthInfo, HealthState, Session};
+    use crate::tmux::{HealthInfo, HealthState, Session, TmuxClient};
     use std::sync::{Mutex, MutexGuard};
 
     /// Manager session name used in tests (EA 0 with "omar-agent-" prefix)
@@ -1918,6 +1921,115 @@ mod tests {
                 }
             })
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn refresh_replaces_dead_manager_session() {
+        let _env_lock = env_lock();
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = HomeEnvGuard::set(dir.path());
+        let tmux_server = format!("omar-app-dead-manager-{}", uuid::Uuid::new_v4());
+        let _tmux = TmuxServerEnvGuard::set(&tmux_server);
+        let mut config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
+        config.agent.default_command = "sleep 600".to_string();
+
+        let manager_session = ea::ea_manager_session(0, &config.dashboard.session_prefix);
+        let client = TmuxClient::new(&config.dashboard.session_prefix);
+
+        let ok = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "new-session",
+                "-d",
+                "-s",
+                &manager_session,
+                "sh",
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("Skipping test: failed to create tmux session");
+            return;
+        }
+
+        let set_ok = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "set-option",
+                "-t",
+                &manager_session,
+                "remain-on-exit",
+                "on",
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !set_ok {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "kill-session", "-t", &manager_session])
+                .status();
+            eprintln!("Skipping test: failed to enable remain-on-exit");
+            return;
+        }
+
+        let target = format!("{manager_session}:0.0");
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "send-keys",
+                "-t",
+                &target,
+                "exit 7",
+                "C-m",
+            ])
+            .status();
+        for _ in 0..20 {
+            if !client
+                .session_has_live_pane(&manager_session)
+                .unwrap_or(true)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if client
+            .session_has_live_pane(&manager_session)
+            .unwrap_or(true)
+        {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &tmux_server, "kill-session", "-t", &manager_session])
+                .status();
+            eprintln!("Skipping test: failed to create dead manager pane");
+            return;
+        }
+        assert!(client.has_session(&manager_session).unwrap());
+
+        let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
+        app.refresh().expect("refresh should replace dead manager");
+
+        assert!(client.has_session(&manager_session).unwrap());
+        assert!(
+            client.session_has_live_pane(&manager_session).unwrap(),
+            "refresh should replace dead manager session with a live pane"
+        );
+
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &tmux_server, "kill-session", "-t", &manager_session])
+            .status();
     }
 
     #[test]
