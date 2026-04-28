@@ -1240,36 +1240,54 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 }
                                 continue;
                             }
+
+                            if let Err(e) = app.refresh() {
+                                app.set_status(format!("Error: {}", e));
+                                continue;
+                            }
+
+                            let selected_popup_receiver = app
+                                .selected_popup_receiver_name()
+                                .map(|name| (name, app.active_ea));
+                            let popup_info = app
+                                .selected_agent()
+                                .map(|a| (a.session.name.clone(), app.client().clone()));
+
                             // Tell the scheduler which agent popup is open so it
                             // defers events for that receiver until the popup closes.
                             // Include ea_id so suppression is scoped per-EA.
-                            //
-                            // Uses `selected_popup_receiver_name` so the EA pane
-                            // normalizes to "ea" — matches the `receiver` field
-                            // the scheduler sees (e.g. from Slack bridge).
-                            *popup_receiver.lock().unwrap_or_else(|err| err.into_inner()) = app
-                                .selected_popup_receiver_name()
-                                .map(|name| (name, app.active_ea));
+                            *popup_receiver.lock().unwrap_or_else(|err| err.into_inner()) =
+                                selected_popup_receiver;
 
                             // Release App lock before blocking popup call
                             drop(app);
 
                             if std::env::var("TMUX").is_ok() {
                                 // Inside tmux: use display-popup overlay.
-                                // IMPORTANT: extract session info while holding the lock,
-                                // then release the lock BEFORE the blocking attach_popup call.
                                 // Holding the lock across attach_popup blocks all API handlers
                                 // that need app.lock() for the entire popup lifetime.
-                                let popup_info = {
-                                    let app = shared_app.lock().await;
-                                    app.selected_agent()
-                                        .map(|a| (a.session.name.clone(), app.client().clone()))
-                                }; // Lock released here
                                 if let Some((session_name, client)) = popup_info {
-                                    if let Err(e) = client.attach_popup(&session_name, "90%", "90%")
-                                    {
-                                        let mut app = shared_app.lock().await;
-                                        app.set_status(format!("Error: {}", e));
+                                    let popup_result =
+                                        client.attach_popup(&session_name, "90%", "90%");
+                                    let session_live = client
+                                        .session_has_live_pane(&session_name)
+                                        .unwrap_or(false);
+
+                                    let mut app = shared_app.lock().await;
+                                    match popup_result {
+                                        Err(e) => app.set_status(format!("Error: {}", e)),
+                                        Ok(()) if !session_live => {
+                                            let _ = app.refresh();
+                                            app.set_status(format!(
+                                                "{} exited; press Enter to restart it",
+                                                session_name
+                                            ));
+                                        }
+                                        Ok(()) => {
+                                            if let Err(e) = app.refresh() {
+                                                app.set_status(format!("Error: {}", e));
+                                            }
+                                        }
                                     }
                                 }
                                 // Discard ticks that accumulated while popup was open
