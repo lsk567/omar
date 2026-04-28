@@ -717,7 +717,7 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             }
         };
 
-        if app.child_count(&app.focus_parent) > 0 {
+        if !is_manager && app.child_count(&app.focus_parent) > 0 {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
