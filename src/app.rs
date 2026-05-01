@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -42,6 +42,7 @@ pub struct AgentInfo {
     pub session: Session,
     pub health: HealthState,
     pub health_info: HealthInfo,
+    pub is_unresolved: bool,
 }
 
 /// A node in the chain-of-command tree
@@ -60,6 +61,8 @@ pub struct CommandTreeNode {
     /// For each ancestor depth, whether that ancestor was the last sibling.
     /// Used to decide whether to draw "│" or " " for vertical continuation lines.
     pub ancestor_is_last: Vec<bool>,
+    /// Whether this node came from a non-canonical OMAR session name.
+    pub is_unresolved: bool,
 }
 
 /// A group of agents: a PM and its workers, or unassigned workers
@@ -151,9 +154,8 @@ impl App {
     ) -> Self {
         let base_prefix = config.dashboard.session_prefix.clone();
 
-        // Run legacy migration (files + tmux sessions)
+        // Run legacy migration for legacy state files.
         ea::migrate_legacy_state(&omar_dir);
-        ea::migrate_legacy_sessions(&base_prefix);
 
         let registered_eas = ea::ensure_default_ea(&omar_dir).unwrap_or_else(|e| {
             eprintln!("warn: ensure default EA: {}", e);
@@ -315,26 +317,31 @@ impl App {
 
         let mut managers_by_ea: HashMap<EaId, Session> = HashMap::new();
         let mut agents_by_ea: HashMap<EaId, Vec<Session>> = HashMap::new();
+        let mut unresolved_sessions: Vec<Session> = Vec::new();
         for session in &all_sessions {
             if session.name == DASHBOARD_SESSION
                 || (!self.base_prefix.is_empty() && !session.name.starts_with(&self.base_prefix))
             {
                 continue;
             }
-            let Some(rest) = session.name.strip_prefix(&self.base_prefix) else {
-                continue;
-            };
-            if let Some(id) = rest
-                .strip_prefix("ea-")
-                .and_then(|raw| raw.parse::<EaId>().ok())
-            {
-                managers_by_ea.insert(id, session.clone());
-            } else if let Some((raw_id, _)) = rest.split_once('-') {
-                if let Ok(id) = raw_id.parse::<EaId>() {
-                    agents_by_ea.entry(id).or_default().push(session.clone());
+            match parse_ea_session_owner(&session.name, &self.base_prefix) {
+                Some(ParseSessionOwner::Manager(ea_id)) => {
+                    managers_by_ea.insert(ea_id, session.clone());
                 }
+                Some(ParseSessionOwner::Worker(ea_id)) => {
+                    agents_by_ea.entry(ea_id).or_default().push(session.clone());
+                }
+                Some(ParseSessionOwner::Unresolved) => {
+                    unresolved_sessions.push(session.clone());
+                }
+                None => {}
             }
         }
+
+        let unresolved_names: HashSet<String> = unresolved_sessions
+            .iter()
+            .map(|session| session.name.clone())
+            .collect();
 
         // Update manager info
         self.manager = managers_by_ea.get(&self.active_ea).cloned().map(|session| {
@@ -347,6 +354,7 @@ impl App {
                 session,
                 health,
                 health_info,
+                is_unresolved: false,
             }
         });
 
@@ -355,10 +363,12 @@ impl App {
         // the popup view (tmux display-popup + attach), the agent session
         // becomes "attached" but is still a valid agent. Filtering attached
         // sessions would cause the API to return "not found" for that agent.
-        self.agents = agents_by_ea
+        let mut active_agents = agents_by_ea
             .get(&self.active_ea)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        active_agents.extend(unresolved_sessions.clone());
+        self.agents = active_agents
             .into_iter()
             .map(|session| {
                 let health_info = health_snapshot
@@ -366,10 +376,12 @@ impl App {
                     .cloned()
                     .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
                 let health = health_info.state;
+                let is_unresolved = unresolved_names.contains(&session.name);
                 AgentInfo {
                     session,
                     health,
                     health_info,
+                    is_unresolved,
                 }
             })
             .collect();
@@ -436,6 +448,7 @@ impl App {
                     session,
                     health,
                     health_info,
+                    is_unresolved: false,
                 }
             });
             let ea_agents: Vec<AgentInfo> = agents_by_ea
@@ -453,9 +466,27 @@ impl App {
                         session: session.clone(),
                         health,
                         health_info,
+                        is_unresolved: unresolved_names.contains(&session.name)
+                            && ea_info.id == self.active_ea,
                     }
                 })
                 .collect();
+            let mut ea_agents = ea_agents;
+            if ea_info.id == self.active_ea {
+                ea_agents.extend(unresolved_sessions.iter().cloned().map(|session| {
+                    let health_info = health_snapshot
+                        .get(&session.name)
+                        .cloned()
+                        .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
+                    let health = health_info.state;
+                    AgentInfo {
+                        session,
+                        health,
+                        health_info,
+                        is_unresolved: true,
+                    }
+                }));
+            }
 
             let mut nodes = build_tree(
                 &ea_agents,
@@ -1587,6 +1618,7 @@ pub fn build_tree(
         depth: 0,
         is_last_sibling: true,
         ancestor_is_last: vec![],
+        is_unresolved: false,
     });
 
     // Build a children map: parent_session -> vec of child agents
@@ -1643,6 +1675,7 @@ pub fn build_tree(
                     depth,
                     is_last_sibling: is_last,
                     ancestor_is_last: ancestor_is_last.to_vec(),
+                    is_unresolved: child.is_unresolved,
                 });
 
                 // Recurse into this child's children
@@ -1697,6 +1730,7 @@ pub fn build_tree(
                 depth: 1,
                 is_last_sibling: sibling_idx == total_root_children - 1,
                 ancestor_is_last: vec![true],
+                is_unresolved: orphan.is_unresolved,
             });
 
             // Orphans can also have children
@@ -1777,6 +1811,46 @@ fn next_agent_name(prefix: &str, existing: &std::collections::HashSet<&str>) -> 
     )
 }
 
+fn parse_ea_id_segment(raw: &str) -> Option<EaId> {
+    let normalized = raw.trim_start_matches('0');
+    let normalized = if normalized.is_empty() {
+        "0"
+    } else {
+        normalized
+    };
+    normalized.parse::<EaId>().ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseSessionOwner {
+    Manager(EaId),
+    Worker(EaId),
+    Unresolved,
+}
+
+fn parse_ea_session_owner(session_name: &str, base_prefix: &str) -> Option<ParseSessionOwner> {
+    let rest = session_name.strip_prefix(base_prefix)?;
+
+    // Manager sessions are explicit: "omar-agent-ea-<id>".
+    if let Some(raw_id) = rest.strip_prefix("ea-") {
+        if let Some(id) = parse_ea_id_segment(raw_id) {
+            return Some(ParseSessionOwner::Manager(id));
+        }
+        return Some(ParseSessionOwner::Unresolved);
+    }
+
+    // Worker sessions are usually "<id>-<name>". Parse `<id>` when present.
+    let raw_id = match rest.split_once('-') {
+        Some((raw_id, _)) => raw_id,
+        None => return Some(ParseSessionOwner::Unresolved),
+    };
+    if let Some(id) = parse_ea_id_segment(raw_id) {
+        return Some(ParseSessionOwner::Worker(id));
+    }
+
+    Some(ParseSessionOwner::Unresolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1853,7 +1927,44 @@ mod tests {
                 last_output: String::new(),
                 auth_failure: false,
             },
+            is_unresolved: false,
         }
+    }
+
+    #[test]
+    fn parse_ea_id_segment_accepts_leading_zero_ids() {
+        assert_eq!(parse_ea_id_segment("01"), Some(1));
+        assert_eq!(parse_ea_id_segment("001"), Some(1));
+    }
+
+    #[test]
+    fn parse_ea_id_segment_accepts_canonical_ids() {
+        assert_eq!(parse_ea_id_segment("0"), Some(0));
+        assert_eq!(parse_ea_id_segment("42"), Some(42));
+    }
+
+    #[test]
+    fn parse_ea_session_owner_classifies_omarprefix_variants() {
+        assert_eq!(
+            parse_ea_session_owner("omar-agent-rest-api", "omar-agent-"),
+            Some(ParseSessionOwner::Unresolved)
+        );
+        assert_eq!(
+            parse_ea_session_owner("omar-agent-ea", "omar-agent-"),
+            Some(ParseSessionOwner::Unresolved)
+        );
+        assert_eq!(
+            parse_ea_session_owner("omar-agent-01-worker", "omar-agent-"),
+            Some(ParseSessionOwner::Worker(1))
+        );
+        assert_eq!(
+            parse_ea_session_owner("omar-agent-ea-foo", "omar-agent-"),
+            Some(ParseSessionOwner::Unresolved)
+        );
+        assert_eq!(
+            parse_ea_session_owner("external-session", "omar-agent-"),
+            None
+        );
     }
 
     #[test]

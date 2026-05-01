@@ -678,6 +678,7 @@ impl OmarMcpServer {
                 session: session.clone(),
                 health: health_info.state,
                 health_info,
+                is_unresolved: false,
             };
             if session.name == manager_session {
                 manager = Some(info);

@@ -288,40 +288,6 @@ pub fn migrate_legacy_state(omar_dir: &Path) {
     }
 }
 
-/// Migrate legacy tmux sessions to EA 0 naming.
-pub fn migrate_legacy_sessions(base_prefix: &str) {
-    // Rename manager: omar-agent-ea -> omar-agent-ea-0
-    let old_manager = format!("{}ea", base_prefix);
-    let new_manager = ea_manager_session(0, base_prefix);
-    if old_manager != new_manager {
-        let _ = crate::tmux::tmux_command()
-            .args(["rename-session", "-t", &old_manager, &new_manager])
-            .output();
-    }
-
-    // Rename agents: omar-agent-{name} -> omar-agent-0-{name}
-    let new_prefix = ea_prefix(0, base_prefix);
-    if let Ok(output) = crate::tmux::tmux_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-    {
-        let sessions = String::from_utf8_lossy(&output.stdout);
-        for name in sessions.lines() {
-            if name.starts_with(base_prefix)
-                && !name.starts_with(&new_prefix)
-                && !name.starts_with(&format!("{}ea-", base_prefix))
-                && name != "omar-dashboard"
-            {
-                let short = name.strip_prefix(base_prefix).unwrap_or(name);
-                let new_name = format!("{}{}", new_prefix, short);
-                let _ = crate::tmux::tmux_command()
-                    .args(["rename-session", "-t", name, &new_name])
-                    .output();
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

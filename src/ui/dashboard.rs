@@ -654,7 +654,12 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             let short = parent_name
                 .strip_prefix(app.client().prefix())
                 .unwrap_or(parent_name);
-            short.to_string()
+            let mut short = short.to_string();
+            if parent_info.map(|p| p.is_unresolved).unwrap_or(false) {
+                short.push(' ');
+                short.push_str("[unresolved]");
+            }
+            short
         };
 
         // Health status dot
@@ -885,7 +890,12 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
             if is_focus {
                 spans.push(Span::styled("►", Style::default().fg(COLOR_ACTIVE)));
             }
-            spans.push(Span::styled(format!("{} ", node.name), name_style));
+            let mut node_name = node.name.clone();
+            if node.is_unresolved {
+                node_name.push(' ');
+                node_name.push_str("[unresolved]");
+            }
+            spans.push(Span::styled(format!("{} ", node_name), name_style));
             spans.push(Span::styled(icon, Style::default().fg(health_color)));
         }
 
@@ -985,7 +995,11 @@ fn render_summary_card(
         .name
         .strip_prefix(app.client().prefix())
         .unwrap_or(&agent.session.name);
-    let display = short_name.to_string();
+    let mut title_name = short_name.to_string();
+    if agent.is_unresolved {
+        title_name.push(' ');
+        title_name.push_str("[unresolved]");
+    }
 
     // Title with status indicator
     let title_line = if selected {
@@ -993,7 +1007,7 @@ fn render_summary_card(
             Span::styled(" [", Style::default().fg(COLOR_ACTIVE)),
             Span::styled(status_icon, Style::default().fg(COLOR_ACTIVE)),
             Span::styled("] ", Style::default().fg(COLOR_ACTIVE)),
-            Span::styled(&display, Style::default().fg(COLOR_ACTIVE)),
+            Span::styled(&title_name, Style::default().fg(COLOR_ACTIVE)),
             Span::styled(" ", Style::default().fg(COLOR_ACTIVE)),
         ])
     } else {
@@ -1001,7 +1015,7 @@ fn render_summary_card(
             Span::styled(" ", Style::default().fg(border_color)),
             Span::styled(status_icon, Style::default().fg(health_color)),
             Span::styled(" ", Style::default().fg(border_color)),
-            Span::styled(&display, Style::default().fg(health_color)),
+            Span::styled(&title_name, Style::default().fg(health_color)),
             Span::styled(" ", Style::default().fg(border_color)),
         ])
     };
@@ -1243,7 +1257,7 @@ fn render_help_popup(frame: &mut Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  Q           Quit dashboard"),
+        Line::from("  Q           Quit"),
         Line::from("  ←/→, h/l   Switch panel (sidebar ↔ main)"),
         Line::from("  ↑/↓, j/k   Move selection up/down"),
         Line::from("  Tab         Drill into selected agent"),
@@ -1293,8 +1307,8 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
         ConfirmAction::Quit => (
             " Confirm Quit ",
             "Quit omar?",
-            "EA sessions and agents will keep running.".to_string(),
-            "Set OMAR_KILL_SESSIONS_ON_EXIT=1 only for destructive cleanup.".to_string(),
+            "This will kill ALL EA sessions and agents.".to_string(),
+            "Press z to walk away instead.".to_string(),
             50,
         ),
         ConfirmAction::DeleteEa => {

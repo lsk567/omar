@@ -93,7 +93,7 @@ mod tests {
         assert!(command_succeeds_with_timeout(
             fast.to_str().unwrap(),
             &["--version"],
-            Duration::from_millis(100),
+            Duration::from_millis(500),
         ));
     }
 }

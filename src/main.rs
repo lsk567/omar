@@ -1459,10 +1459,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // Leaving the dashboard should be resumable: managers, workers, and their
-    // persisted state stay alive. Operators can still opt into the old
-    // destructive shutdown behavior explicitly for local cleanup.
-    if should_kill_sessions_on_exit() {
+    // Kill ALL OMAR EA sessions on quit (managers + workers), even if
+    // registry and tmux are temporarily out of sync.
+    {
         let app = shared_app.lock().await;
         let client = TmuxClient::new("");
         let base_prefix = app.base_prefix.clone();
@@ -1489,48 +1488,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
     Ok(())
 }
 
-fn should_kill_sessions_on_exit() -> bool {
-    std::env::var_os("OMAR_KILL_SESSIONS_ON_EXIT").is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn unset(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, previous }
-        }
-
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.as_ref() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
 
     /// Regression: `extended-keys always` forces tmux to emit modify-other-keys
     /// sequences to every client, including omar's dashboard, which doesn't
@@ -1567,24 +1527,5 @@ mod tests {
             value, "pbcopy",
             "tmux copy-command should pipe native tmux selections into the macOS clipboard"
         );
-    }
-
-    #[test]
-    fn dashboard_exit_preserves_sessions_by_default() {
-        let _guard = env_lock();
-        let _env = EnvVarGuard::unset("OMAR_KILL_SESSIONS_ON_EXIT");
-
-        assert!(
-            !should_kill_sessions_on_exit(),
-            "dashboard exit must be resumable by default"
-        );
-    }
-
-    #[test]
-    fn dashboard_exit_session_kill_is_explicit_opt_in() {
-        let _guard = env_lock();
-        let _env = EnvVarGuard::set("OMAR_KILL_SESSIONS_ON_EXIT", "1");
-
-        assert!(should_kill_sessions_on_exit());
     }
 }
