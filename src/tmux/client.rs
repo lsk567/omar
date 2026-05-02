@@ -638,6 +638,14 @@ impl TmuxClient {
         Ok(result.status.success())
     }
 
+    /// Rename a session.
+    pub fn rename_session(&self, old_name: &str, new_name: &str) -> Result<()> {
+        let old_target = exact_session_target(old_name);
+        let args = vec!["rename-session", "-t", &old_target, new_name];
+        self.run(&args)?;
+        Ok(())
+    }
+
     /// Return true when a tmux session exists and has at least one live pane.
     ///
     /// A user can exit the process inside a pane while tmux keeps the session

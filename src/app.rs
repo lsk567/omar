@@ -521,15 +521,67 @@ impl App {
 
     /// Ensure manager session exists, start if not
     fn ensure_manager(&mut self) -> Result<()> {
-        let manager_session = self.manager_session_name();
+        let canonical_manager_session = self.manager_session_name();
+        let manager_session = canonical_manager_session.clone();
         self.manager_start_error = None;
 
-        if self.client.has_session(&manager_session)? {
-            if self.client.session_has_live_pane(&manager_session)? {
+        let manager_sessions = self.find_manager_sessions_for_active_ea()?;
+        if !manager_sessions.is_empty() {
+            let (mut canonical_live, mut canonical_dead) = (false, false);
+            let mut live_legacy: Vec<String> = Vec::new();
+            let mut dead_legacy: Vec<String> = Vec::new();
+
+            for manager_session in manager_sessions {
+                let live = self.client.session_has_live_pane(&manager_session)?;
+                if manager_session == canonical_manager_session {
+                    if live {
+                        canonical_live = true;
+                    } else {
+                        canonical_dead = true;
+                    }
+                } else if live {
+                    live_legacy.push(manager_session);
+                } else {
+                    dead_legacy.push(manager_session);
+                }
+            }
+
+            // Canonical manager is already healthy. Keep it and remove any competing
+            // live legacy sessions.
+            if canonical_live {
+                for session in live_legacy {
+                    let _ = self.client.kill_session(&session);
+                }
+                return Ok(());
+            }
+
+            // Prefer reusing a live legacy session if canonical died or is missing.
+            if let Some(legacy_manager) = live_legacy.first() {
+                if canonical_dead {
+                    let _ = self.client.kill_session(&canonical_manager_session);
+                }
+
+                if self
+                    .client
+                    .rename_session(legacy_manager, &canonical_manager_session)
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+
+                // Rename failed, but we still have a live manager session. Use it
+                // directly to avoid spawning a duplicate.
                 self.manager_start_error = None;
                 return Ok(());
             }
-            self.client.kill_session(&manager_session)?;
+
+            // No live manager sessions found; clear dead remnants and start fresh.
+            if canonical_dead {
+                let _ = self.client.kill_session(&canonical_manager_session);
+            }
+            for session in dead_legacy {
+                let _ = self.client.kill_session(&session);
+            }
         }
 
         // Reload registry on cache miss so we have the latest EA names
@@ -625,6 +677,32 @@ impl App {
     /// Get all agents (for API)
     pub fn agents(&self) -> &[AgentInfo] {
         &self.agents
+    }
+
+    fn find_manager_sessions_for_active_ea(&self) -> Result<Vec<String>> {
+        let all_sessions = self.client.list_all_sessions()?;
+        let active_ea = self.active_ea;
+
+        let mut manager_sessions: Vec<String> = all_sessions
+            .into_iter()
+            .filter_map(|session| {
+                if matches!(
+                    parse_ea_session_owner(&session.name, &self.base_prefix),
+                    Some(ParseSessionOwner::Manager(id)) if id == active_ea
+                ) {
+                    Some(session.name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if manager_sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        manager_sessions.sort();
+        Ok(manager_sessions)
     }
 
     /// Get manager info (for API)
@@ -2208,6 +2286,143 @@ mod tests {
 
         let _ = std::process::Command::new("tmux")
             .args(["-L", &tmux_server, "kill-session", "-t", &manager_session])
+            .status();
+    }
+
+    #[test]
+    fn refresh_reuses_live_legacy_manager_session_in_place_of_dead_canonical() {
+        let _env_lock = env_lock();
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = HomeEnvGuard::set(dir.path());
+        let tmux_server = format!("omar-app-legacy-manager-{}", uuid::Uuid::new_v4());
+        let _tmux = TmuxServerEnvGuard::set(&tmux_server);
+        let mut config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
+        config.agent.default_command = "sleep 600".to_string();
+
+        let canonical_manager_session = ea::ea_manager_session(0, &config.dashboard.session_prefix);
+        let legacy_manager_session =
+            format!("{}ea", ea::ea_prefix(0, &config.dashboard.session_prefix));
+        let legacy_worker = format!(
+            "{}legacy-worker",
+            ea::ea_prefix(0, &config.dashboard.session_prefix)
+        );
+        let client = TmuxClient::new(&config.dashboard.session_prefix);
+
+        assert!(
+            std::process::Command::new("tmux")
+                .args([
+                    "-L",
+                    &tmux_server,
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &canonical_manager_session,
+                    "sleep",
+                    "1"
+                ])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false),
+            "failed to seed dead canonical manager"
+        );
+        for _ in 0..20 {
+            if !client
+                .session_has_live_pane(&canonical_manager_session)
+                .unwrap_or(true)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            !client
+                .session_has_live_pane(&canonical_manager_session)
+                .unwrap_or(false),
+            "canonical manager should be dead before refresh"
+        );
+
+        assert!(
+            std::process::Command::new("tmux")
+                .args([
+                    "-L",
+                    &tmux_server,
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &legacy_manager_session,
+                    "sleep",
+                    "600"
+                ])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false),
+            "failed to create live legacy manager"
+        );
+        assert!(
+            std::process::Command::new("tmux")
+                .args([
+                    "-L",
+                    &tmux_server,
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &legacy_worker,
+                    "sleep",
+                    "600"
+                ])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false),
+            "failed to create legacy-named EA worker"
+        );
+
+        assert!(client
+            .session_has_live_pane(&legacy_manager_session)
+            .unwrap_or(false));
+
+        let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
+        app.refresh()
+            .expect("refresh should reuse live legacy manager");
+
+        assert!(app.manager.is_some());
+        let manager_session = app
+            .manager
+            .as_ref()
+            .expect("manager should exist")
+            .session
+            .name
+            .clone();
+        assert_eq!(
+            manager_session, canonical_manager_session,
+            "legacy manager should be normalized to canonical name"
+        );
+        assert!(
+            client.has_session(&canonical_manager_session).unwrap(),
+            "canonical manager session should exist after refresh"
+        );
+        assert!(
+            !client
+                .session_has_live_pane(&legacy_manager_session)
+                .unwrap(),
+            "legacy manager session should have been reclaimed when canonicalized"
+        );
+        assert!(
+            client.has_session(&legacy_worker).unwrap(),
+            "existing worker session should be preserved"
+        );
+
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &tmux_server, "kill-server"])
             .status();
     }
 
