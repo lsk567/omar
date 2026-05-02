@@ -95,6 +95,8 @@ pub struct App {
     status_set_at: Option<Instant>,
     /// Warning that persists across tick clears (e.g., tmux misconfiguration)
     pub persistent_warning: Option<String>,
+    /// Most recent manager startup error. Used to avoid silent startup hangs.
+    pub manager_start_error: Option<String>,
     pub projects: Vec<Project>,
     pub project_input_mode: bool,
     pub project_input: String,
@@ -191,6 +193,7 @@ impl App {
             status_message: None,
             status_set_at: None,
             persistent_warning: None,
+            manager_start_error: None,
             projects: projects::load_projects_from(&state_dir),
             project_input_mode: false,
             project_input: String::new(),
@@ -519,8 +522,11 @@ impl App {
     /// Ensure manager session exists, start if not
     fn ensure_manager(&mut self) -> Result<()> {
         let manager_session = self.manager_session_name();
+        self.manager_start_error = None;
+
         if self.client.has_session(&manager_session)? {
             if self.client.session_has_live_pane(&manager_session)? {
+                self.manager_start_error = None;
                 return Ok(());
             }
             self.client.kill_session(&manager_session)?;
@@ -562,8 +568,39 @@ impl App {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
 
-        self.client
-            .new_session(&manager_session, &cmd, Some(&workdir))?;
+        if let Err(err) = self
+            .client
+            .new_session(&manager_session, &cmd, Some(&workdir))
+        {
+            let msg = format!(
+                "Manager session '{}' failed to start: {}",
+                manager_session, err
+            );
+            self.manager_start_error = Some(msg.clone());
+            anyhow::bail!(msg);
+        }
+
+        // Guard against launch failures that produce dead panes; without this
+        // guard the UI can sit forever on the "Starting Executive Assistant..."
+        // screen while retries are happening below.
+        let mut startup_ticks = 0;
+        while startup_ticks < 20 {
+            if self.client.session_has_live_pane(&manager_session)? {
+                break;
+            }
+            startup_ticks += 1;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !self.client.session_has_live_pane(&manager_session)? {
+            let _ = self.client.kill_session(&manager_session);
+            let msg = format!(
+                "Manager session '{}' failed to start (no live pane). Check your default command '{}'.",
+                manager_session,
+                self.default_command
+            );
+            self.manager_start_error = Some(msg.clone());
+            anyhow::bail!(msg);
+        }
 
         // Write memory after creating manager
         let state_dir = self.state_dir();
@@ -1324,6 +1361,7 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         self.focus_stack.clear();
         self.selected = 0;
         self.manager_selected = true;
+        self.manager_start_error = None;
 
         // Ensure EA state directory exists; refresh() will reload projects/parents/tasks
         let state_dir = ea::ea_state_dir(ea_id, &self.omar_dir);
@@ -1812,6 +1850,10 @@ fn next_agent_name(prefix: &str, existing: &std::collections::HashSet<&str>) -> 
 }
 
 fn parse_ea_id_segment(raw: &str) -> Option<EaId> {
+    if raw.is_empty() {
+        return None;
+    }
+
     let normalized = raw.trim_start_matches('0');
     let normalized = if normalized.is_empty() {
         "0"
@@ -1833,6 +1875,15 @@ fn parse_ea_session_owner(session_name: &str, base_prefix: &str) -> Option<Parse
 
     // Manager sessions are explicit: "omar-agent-ea-<id>".
     if let Some(raw_id) = rest.strip_prefix("ea-") {
+        if let Some(id) = parse_ea_id_segment(raw_id) {
+            return Some(ParseSessionOwner::Manager(id));
+        }
+        return Some(ParseSessionOwner::Unresolved);
+    }
+
+    // Also tolerate the inverse form from older naming flows:
+    // "<id>-ea" (same OMAR prefix, still clearly a manager session).
+    if let Some(raw_id) = rest.strip_suffix("-ea") {
         if let Some(id) = parse_ea_id_segment(raw_id) {
             return Some(ParseSessionOwner::Manager(id));
         }
@@ -1944,6 +1995,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_ea_id_segment_rejects_empty_segment() {
+        assert_eq!(parse_ea_id_segment(""), None);
+    }
+
+    #[test]
     fn parse_ea_session_owner_classifies_omarprefix_variants() {
         assert_eq!(
             parse_ea_session_owner("omar-agent-rest-api", "omar-agent-"),
@@ -1954,11 +2010,23 @@ mod tests {
             Some(ParseSessionOwner::Unresolved)
         );
         assert_eq!(
+            parse_ea_session_owner("omar-agent-ea", "omar-agent"),
+            Some(ParseSessionOwner::Unresolved)
+        );
+        assert_eq!(
             parse_ea_session_owner("omar-agent-01-worker", "omar-agent-"),
             Some(ParseSessionOwner::Worker(1))
         );
         assert_eq!(
+            parse_ea_session_owner("omar-agent-1-ea", "omar-agent-"),
+            Some(ParseSessionOwner::Manager(1))
+        );
+        assert_eq!(
             parse_ea_session_owner("omar-agent-ea-foo", "omar-agent-"),
+            Some(ParseSessionOwner::Unresolved)
+        );
+        assert_eq!(
+            parse_ea_session_owner("omar-agent-01", "omar-agent"),
             Some(ParseSessionOwner::Unresolved)
         );
         assert_eq!(
@@ -2141,6 +2209,50 @@ mod tests {
         let _ = std::process::Command::new("tmux")
             .args(["-L", &tmux_server, "kill-session", "-t", &manager_session])
             .status();
+    }
+
+    #[test]
+    fn refresh_fails_if_manager_command_dies_immediately() {
+        let _env_lock = env_lock();
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = HomeEnvGuard::set(dir.path());
+        let tmux_server = format!("omar-app-dead-startup-{}", uuid::Uuid::new_v4());
+        let _tmux = TmuxServerEnvGuard::set(&tmux_server);
+        let mut config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
+        config.agent.default_command = "false".to_string();
+
+        let client = TmuxClient::new(&config.dashboard.session_prefix);
+        let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
+
+        let err = app
+            .refresh()
+            .expect_err("refresh should fail when manager exits immediately");
+        let err = err.to_string();
+        let reported = app.manager_start_error.clone().unwrap_or_default();
+        assert!(
+            reported.contains("failed to start"),
+            "startup error missing from app state: {}",
+            reported
+        );
+        assert!(
+            err.contains("failed to start"),
+            "unexpected refresh error: {}",
+            err
+        );
+        assert!(
+            !client.has_session(&app.manager_session_name()).unwrap(),
+            "dead manager session should be cleaned up"
+        );
     }
 
     #[test]

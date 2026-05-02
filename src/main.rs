@@ -396,15 +396,21 @@ fn list_agents_all(omar_dir: &std::path::Path, base_prefix: &str) -> Result<()> 
 fn sessions_for_ea(base_prefix: &str, ea_id: ea::EaId) -> Result<Vec<tmux::Session>> {
     let prefix = ea::ea_prefix(ea_id, base_prefix);
     let manager_session = ea::ea_manager_session(ea_id, base_prefix);
+    let legacy_manager_session = format!("{}ea", prefix);
     let client = TmuxClient::new("");
     let mut sessions = client.list_all_sessions()?;
-    sessions.retain(|session| session.name == manager_session || session.name.starts_with(&prefix));
+    sessions.retain(|session| {
+        session.name == manager_session
+            || session.name == legacy_manager_session
+            || session.name.starts_with(&prefix)
+    });
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(sessions)
 }
 
 fn display_cli_session_name(session_name: &str, prefix: &str, manager_session: &str) -> String {
-    if session_name == manager_session {
+    let legacy_manager_session = format!("{}ea", prefix);
+    if session_name == manager_session || session_name == legacy_manager_session {
         "ea".to_string()
     } else {
         session_name

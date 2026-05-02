@@ -795,7 +795,18 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(COLOR_INACTIVE))
             .padding(Padding::horizontal(1));
 
-        let paragraph = Paragraph::new("Starting Executive Assistant...")
+        let message = app
+            .manager_start_error
+            .as_ref()
+            .map(|err| {
+                format!(
+                    "Starting Executive Assistant...\n{}\nPress 'r' to retry.",
+                    err
+                )
+            })
+            .unwrap_or_else(|| "Starting Executive Assistant...".to_string());
+
+        let paragraph = Paragraph::new(message)
             .style(Style::default().fg(COLOR_INACTIVE))
             .block(block);
 

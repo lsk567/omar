@@ -263,7 +263,10 @@ impl Config {
         let contents =
             std::fs::read_to_string(&expanded_path).context("Failed to read config file")?;
 
-        toml::from_str(&contents).context("Failed to parse config file")
+        let mut config: Self = toml::from_str(&contents).context("Failed to parse config file")?;
+        config.dashboard.session_prefix =
+            normalize_session_prefix(&config.dashboard.session_prefix);
+        Ok(config)
     }
 
     /// Save config to its default path (~/.omar/config.toml)
@@ -318,6 +321,18 @@ fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+fn normalize_session_prefix(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let raw = raw.trim_end_matches('-');
+    if raw.is_empty() {
+        return String::new();
+    }
+    format!("{}-", raw)
 }
 
 #[cfg(test)]
@@ -435,6 +450,23 @@ default_command = "bash"
         assert!(!config.dashboard.sidebar_right);
         assert_eq!(config.health.idle_warning, 30);
         assert_eq!(config.health.error_patterns, vec!["error", "panic"]);
+    }
+
+    #[test]
+    fn test_load_normalizes_session_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[dashboard]
+session_prefix = "omar-agent"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(Some(config_path.to_str().unwrap())).unwrap();
+        assert_eq!(config.dashboard.session_prefix, "omar-agent-");
     }
 
     #[test]
