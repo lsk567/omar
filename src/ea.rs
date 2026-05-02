@@ -112,7 +112,7 @@ pub fn resolve_ea_selector(base_dir: &Path, selector: Option<&str>) -> anyhow::R
             if let Ok(id) = raw.parse::<EaId>() {
                 eas.iter().find(|ea| ea.id == id).cloned().or_else(|| {
                     if id == 0 && eas.len() == 1 {
-                        eas.iter().next().cloned()
+                        eas.first().cloned()
                     } else {
                         None
                     }
