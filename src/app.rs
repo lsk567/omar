@@ -519,6 +519,44 @@ impl App {
         Ok(())
     }
 
+    /// Build the ordered set of startup command attempts for the manager.
+    ///
+    /// We first try prompt-injected variants (normal + codex compatibility
+    /// fallback), then retry the same commands without injection so the manager
+    /// can still start in degraded mode when the prompt-wrapper path is failing.
+    fn manager_startup_attempts(&self) -> Vec<(String, bool)> {
+        use std::collections::HashSet;
+
+        let mut attempts = Vec::new();
+        let mut seen = HashSet::new();
+
+        let add_attempt = |cmd: String,
+                           inject: bool,
+                           attempts: &mut Vec<(String, bool)>,
+                           seen: &mut HashSet<String>| {
+            let key = format!("{}|{}", inject, cmd);
+            if seen.insert(key) {
+                attempts.push((cmd, inject));
+            }
+        };
+
+        add_attempt(self.default_command.clone(), true, &mut attempts, &mut seen);
+
+        if let Some(fallback) = Self::strip_codex_approval_flag(&self.default_command) {
+            add_attempt(fallback.clone(), true, &mut attempts, &mut seen);
+            add_attempt(fallback, false, &mut attempts, &mut seen);
+        }
+
+        add_attempt(
+            self.default_command.clone(),
+            false,
+            &mut attempts,
+            &mut seen,
+        );
+
+        attempts
+    }
+
     /// Ensure manager session exists, start if not
     fn ensure_manager(&mut self) -> Result<()> {
         let canonical_manager_session = self.manager_session_name();
@@ -544,78 +582,140 @@ impl App {
             .map(|ea| ea.name.as_str())
             .unwrap_or("Default");
 
-        // Build command with EA system prompt + memory baked in
-        let cmd = crate::manager::build_ea_command(
-            &self.default_command,
-            self.active_ea,
-            ea_name,
-            &self.omar_dir,
-            &crate::manager::McpLaunchContext {
+        let workdir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        let attempts = self.manager_startup_attempts();
+
+        let attempt_count = attempts.len();
+
+        for (attempt_idx, (default_command, inject_prompt)) in attempts.into_iter().enumerate() {
+            let context = crate::manager::McpLaunchContext {
                 omar_dir: self.omar_dir.clone(),
                 ea_id: self.active_ea,
                 session_prefix: self.base_prefix.clone(),
-                default_command: self.default_command.clone(),
+                default_command: default_command.clone(),
                 default_workdir: self.default_workdir.clone(),
                 health_idle_warning: self.health_threshold,
                 tmux_server: std::env::var("OMAR_TMUX_SERVER")
                     .ok()
                     .map(|server| server.trim().to_string())
                     .filter(|server| !server.is_empty()),
-            },
-        );
+            };
 
-        // Start manager session — system prompt set at process start
-        let workdir = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+            // Build command with EA system prompt + memory baked in (preferred),
+            // or fall back to raw command if prompt wrapping fails repeatedly.
+            let cmd = if inject_prompt {
+                crate::manager::build_ea_command(
+                    &default_command,
+                    self.active_ea,
+                    ea_name,
+                    &self.omar_dir,
+                    &context,
+                )
+            } else {
+                default_command.clone()
+            };
 
-        if let Err(err) = self
-            .client
-            .new_session(&manager_session, &cmd, Some(&workdir))
-        {
-            let msg = format!(
-                "Manager session '{}' failed to start: {}",
-                manager_session, err
-            );
-            self.manager_start_error = Some(msg.clone());
-            anyhow::bail!(msg);
-        }
+            let last_error = match self
+                .client
+                .new_session(&manager_session, &cmd, Some(&workdir))
+            {
+                Ok(_) => {
+                    let mut startup_ticks = 0;
+                    let mut ever_live = false;
+                    while startup_ticks < 20 {
+                        if self.client.session_has_live_pane(&manager_session)? {
+                            ever_live = true;
+                        }
+                        startup_ticks += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
 
-        // Guard against launch failures that produce dead panes; without this
-        // guard the UI can sit forever on the "Starting Executive Assistant..."
-        // screen while retries are happening below.
-        let mut startup_ticks = 0;
-        while startup_ticks < 20 {
-            if self.client.session_has_live_pane(&manager_session)? {
-                break;
+                    if ever_live && self.client.session_has_live_pane(&manager_session)? {
+                        // Start succeeded with this command variant.
+                        None
+                    } else {
+                        let pane_output = self
+                            .client
+                            .capture_pane_plain(&manager_session, 120)
+                            .unwrap_or_default();
+                        let _ = self.client.kill_session(&manager_session);
+
+                        Some(if pane_output.trim().is_empty() {
+                            format!(
+                                "attempt {}: command '{}' exited immediately with no visible output",
+                                attempt_idx + 1,
+                                &default_command
+                            )
+                        } else {
+                            format!(
+                                "attempt {}: command '{}' exited with output: {}",
+                                attempt_idx + 1,
+                                &default_command,
+                                pane_output.trim()
+                            )
+                        })
+                    }
+                }
+                Err(err) => Some(format!(
+                    "attempt {}: tmux failed to start '{}': {}",
+                    attempt_idx + 1,
+                    &default_command,
+                    err
+                )),
+            };
+
+            if last_error.is_none() {
+                let state_dir = self.state_dir();
+                let events = self.scheduler.list_by_ea(self.active_ea);
+                memory::write_memory_to(
+                    &state_dir,
+                    &self.agents,
+                    None,
+                    &manager_session,
+                    &self.client,
+                    &events,
+                );
+                return Ok(());
             }
-            startup_ticks += 1;
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        if !self.client.session_has_live_pane(&manager_session)? {
-            let _ = self.client.kill_session(&manager_session);
+
+            if attempt_idx + 1 < attempt_count {
+                let _ = self.client.kill_session(&manager_session);
+                continue;
+            }
+
             let msg = format!(
-                "Manager session '{}' failed to start (no live pane). Check your default command '{}'.",
+                "Manager session '{}' failed to start after {} attempt(s){}: {}",
                 manager_session,
-                self.default_command
+                attempt_count,
+                if attempt_count > 1 {
+                    " (including codex approval-flag compatibility fallback)"
+                } else {
+                    ""
+                },
+                last_error.unwrap_or_else(|| "unknown startup failure".to_string()),
             );
             self.manager_start_error = Some(msg.clone());
             anyhow::bail!(msg);
         }
-
-        // Write memory after creating manager
-        let state_dir = self.state_dir();
-        let events = self.scheduler.list_by_ea(self.active_ea);
-        memory::write_memory_to(
-            &state_dir,
-            &self.agents,
-            None,
-            &manager_session,
-            &self.client,
-            &events,
-        );
 
         Ok(())
+    }
+
+    fn strip_codex_approval_flag(command: &str) -> Option<String> {
+        let stripped = command
+            .split_whitespace()
+            .filter(|token| *token != "--dangerously-bypass-approvals-and-sandbox")
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if stripped == command {
+            None
+        } else {
+            Some(stripped)
+        }
     }
 
     /// Get filtered agents
@@ -2028,6 +2128,49 @@ mod tests {
         assert_eq!(
             parse_ea_session_owner("external-session", "omar-agent-"),
             None
+        );
+    }
+
+    #[test]
+    fn strip_codex_approval_flag_removes_unsupported_flag_only() {
+        assert_eq!(
+            App::strip_codex_approval_flag(
+                "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
+            ),
+            Some("codex --no-alt-screen".to_string())
+        );
+        assert_eq!(
+            App::strip_codex_approval_flag("codex --no-alt-screen"),
+            None
+        );
+    }
+
+    #[test]
+    fn manager_startup_attempts_includes_promptless_fallback() {
+        let mut config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
+        config.agent.default_command =
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string();
+        let scheduler = Arc::new(Scheduler::new());
+        let mut app = App::new(&config, TickerBuffer::new(), scheduler);
+        app.default_command = config.agent.default_command.clone();
+
+        let attempts = app.manager_startup_attempts();
+        assert_eq!(attempts.len(), 4);
+        assert_eq!(
+            attempts[0],
+            (
+                "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string(),
+                true
+            )
+        );
+        assert_eq!(attempts[1], ("codex --no-alt-screen".to_string(), true));
+        assert_eq!(attempts[2], ("codex --no-alt-screen".to_string(), false));
+        assert_eq!(
+            attempts[3],
+            (
+                "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string(),
+                false
+            )
         );
     }
 

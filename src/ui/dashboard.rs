@@ -798,12 +798,7 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
         let message = app
             .manager_start_error
             .as_ref()
-            .map(|err| {
-                format!(
-                    "Starting Executive Assistant...\n{}\nPress 'r' to retry.",
-                    err
-                )
-            })
+            .map(|err| format!("Starting Executive Assistant...\n{err}"))
             .unwrap_or_else(|| "Starting Executive Assistant...".to_string());
 
         let paragraph = Paragraph::new(message)

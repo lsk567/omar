@@ -132,10 +132,11 @@ fn popup_attach_command_with_server(target: &str, tmux_server: Option<&str>) -> 
     let mut command = String::from("env -u TMUX tmux");
     if let Some(server) = tmux_server {
         command.push_str(" -L ");
-        command.push_str(&shell_single_quote(server));
+        command.push_str(server);
     }
+    let popup_target = target.strip_prefix('=').unwrap_or(target);
     command.push_str(" attach-session -t ");
-    command.push_str(&shell_single_quote(target));
+    command.push_str(popup_target);
     command
 }
 
@@ -614,7 +615,10 @@ impl TmuxClient {
             args.extend(["-c", dir]);
         }
 
-        args.push(command);
+        // Execute the provided command through a shell so the full string is
+        // interpreted consistently (including quoted args and shell metacharacters)
+        // instead of relying on tmux's shell-command parser heuristics.
+        args.extend(["sh", "-lc", command]);
         self.run(&args)?;
         self.run(&["set-option", "-t", name, "history-limit", "10000"])?;
         Ok(())
@@ -814,7 +818,7 @@ mod tests {
     fn test_popup_attach_command_unsets_nested_tmux_and_quotes_target() {
         assert_eq!(
             popup_attach_command_with_server("=omar-agent-ea-0", None),
-            "env -u TMUX tmux attach-session -t '=omar-agent-ea-0'"
+            "env -u TMUX tmux attach-session -t omar-agent-ea-0"
         );
     }
 
@@ -822,7 +826,7 @@ mod tests {
     fn test_popup_attach_command_preserves_custom_tmux_server() {
         assert_eq!(
             popup_attach_command_with_server("=omar-agent-ea-0", Some("omar-test-server")),
-            "env -u TMUX tmux -L 'omar-test-server' attach-session -t '=omar-agent-ea-0'"
+            "env -u TMUX tmux -L omar-test-server attach-session -t omar-agent-ea-0"
         );
     }
 

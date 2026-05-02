@@ -186,6 +186,35 @@ jobs:
       - name: Run unresolved session integration
         run: bash tests/ci/tmux_unresolved_session.sh
 
+  codex-fallback-integration:
+    name: Codex Fallback Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build omar
+        run: cargo build --bin omar
+
+      - name: Run codex fallback integration
+        run: bash tests/ci/tmux_codex_fallback.sh
+
   ea-zero-selector-integration:
     name: EA Zero Selector Integration
     runs-on: ubuntu-latest
@@ -294,7 +323,7 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, popup-quote-integration, exit-behavior-integration, unresolved-session-integration, ea-zero-selector-integration, opencode-compat, build]
+    needs: [check, fmt, clippy, test, popup-quote-integration, exit-behavior-integration, unresolved-session-integration, codex-fallback-integration, ea-zero-selector-integration, opencode-compat, build]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -307,6 +336,7 @@ jobs:
              [[ "${{ needs.popup-quote-integration.result }}" != "success" ]] || \
              [[ "${{ needs.exit-behavior-integration.result }}" != "success" ]] || \
              [[ "${{ needs.unresolved-session-integration.result }}" != "success" ]] || \
+             [[ "${{ needs.codex-fallback-integration.result }}" != "success" ]] || \
              [[ "${{ needs.ea-zero-selector-integration.result }}" != "success" ]] || \
              [[ "${{ needs.opencode-compat.result }}" != "success" ]] || \
              [[ "${{ needs.build.result }}" != "success" ]]; then
