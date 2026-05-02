@@ -110,7 +110,13 @@ pub fn resolve_ea_selector(base_dir: &Path, selector: Option<&str>) -> anyhow::R
     let ea = match selector {
         Some(raw) => {
             if let Ok(id) = raw.parse::<EaId>() {
-                eas.iter().find(|ea| ea.id == id).cloned()
+                eas.iter().find(|ea| ea.id == id).cloned().or_else(|| {
+                    if id == 0 && eas.len() == 1 {
+                        eas.iter().next().cloned()
+                    } else {
+                        None
+                    }
+                })
             } else {
                 eas.iter().find(|ea| ea.name == raw).cloned()
             }
@@ -127,9 +133,8 @@ pub fn resolve_ea_selector(base_dir: &Path, selector: Option<&str>) -> anyhow::R
 /// Ensure at least one default EA exists on disk.
 pub fn ensure_default_ea(base_dir: &Path) -> anyhow::Result<Vec<EaInfo>> {
     let mut eas = load_registry(base_dir);
-    if !eas.iter().any(|ea| ea.id == 0) {
+    if eas.is_empty() {
         eas.push(default_ea_info());
-        eas.sort_by_key(|ea| ea.id);
         save_registry(base_dir, &eas)?;
         fs::create_dir_all(ea_state_dir(0, base_dir).join("status"))?;
     }
@@ -327,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_default_ea_inserts_when_missing() {
+    fn test_ensure_default_ea_does_not_insert_missing_zero_when_other_eas_exist() {
         let dir = tempfile::tempdir().unwrap();
 
         let stale = vec![EaInfo {
@@ -340,11 +345,30 @@ mod tests {
 
         let eas = ensure_default_ea(dir.path()).unwrap();
 
-        assert_eq!(eas.len(), 2);
-        assert_eq!(eas[0].id, 0);
-        assert_eq!(eas[1].id, 3);
-        assert_eq!(eas[0].name, "Default");
-        assert!(ea_state_dir(0, dir.path()).join("status").exists());
+        assert_eq!(eas.len(), 1);
+        assert_eq!(eas[0].id, 3);
+        assert_eq!(eas[0].name, "Research");
+        assert!(!ea_state_dir(0, dir.path()).join("status").exists());
+    }
+
+    #[test]
+    fn test_resolve_ea_selector_numeric_zero_falls_back_to_single_ea() {
+        let dir = tempfile::tempdir().unwrap();
+        save_registry(
+            dir.path(),
+            &[EaInfo {
+                id: 3,
+                name: "Research".to_string(),
+                description: None,
+                created_at: 1234567890,
+            }],
+        )
+        .unwrap();
+
+        let ea = resolve_ea_selector(dir.path(), Some("0")).unwrap();
+
+        assert_eq!(ea.id, 3);
+        assert_eq!(ea.name, "Research");
     }
 
     #[test]
