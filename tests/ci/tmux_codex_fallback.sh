@@ -14,10 +14,11 @@ if [ ! -x "$OMAR_BIN" ]; then
   exit 1
 fi
 
-server="omar-codex-fallback-${RANDOM}-$$"
+server="omar-codex-yolo-${RANDOM}-$$"
 home_dir="$(mktemp -d)"
 state_file="$home_dir/.omar/fake-codex-fallback.log"
 fake_codex="$home_dir/fake-codex"
+codex_exec="$home_dir/codex"
 
 cleanup() {
   tmux -L "$server" kill-server >/dev/null 2>&1 || true
@@ -35,22 +36,15 @@ prev_attempt=$(cat "${state_file}.count" 2>/dev/null || echo 0)
 attempt=$(( prev_attempt + 1 ))
 printf '%s\n' "$*" >> "$state_file"
 echo "$attempt" > "${state_file}.count"
-printf '%s\\n' "attempt ${attempt}" >> "$state_file"
+printf '%s\n' "attempt ${attempt}" >> "$state_file"
 
-if [ "$attempt" -eq 1 ]; then
-  exit 1
-fi
-if [ "$attempt" -eq 2 ]; then
-  # Fail the first wrapped/legacy-flag variant and continue to promptless fallback.
-  exit 1
-fi
-
-echo "fallback-path" >> "$state_file"
+# Always succeeds on first launch.
 exec sleep 9999
 EOF
 awk -v sf="$state_file" '{gsub("__STATE_FILE__", sf); print}' "$fake_codex" > "${fake_codex}.tmp"
 mv "${fake_codex}.tmp" "$fake_codex"
 chmod +x "$fake_codex"
+ln -sf "$fake_codex" "$codex_exec"
 
 cat >"$home_dir/.omar/config.toml" <<EOF
 [dashboard]
@@ -58,7 +52,7 @@ refresh_interval = 1
 session_prefix = "omar-agent-"
 
 [agent]
-default_command = "$fake_codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
+default_command = "$codex_exec --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
 default_workdir = "."
 EOF
 
@@ -150,26 +144,38 @@ fi
 sleep 0.1
 
 if ! wait_for_state_marker "attempt 1"; then
-  fail "expected initial fallback-triggering invocation"
+  fail "expected initial manager startup attempt"
 fi
 
-if ! wait_for_state_marker "attempt 2"; then
-  fail "expected wrapped codex fallback invocation"
+if ! grep -q "^attempt 1$" "$state_file"; then
+  fail "failed to observe first startup attempt"
 fi
 
-if ! wait_for_state_marker "attempt 3"; then
-  fail "expected promptless fallback invocation"
+if ! grep -q "mcp_servers\\.omar\\.command" "$state_file"; then
+  fail "found startup attempt without omar MCP command override"
 fi
 
-if ! wait_for_state_marker "fallback-path"; then
-  fail "expected fallback invocation without forbidden flag"
+if ! grep -q "mcp_servers\\.omar\\.args" "$state_file"; then
+  fail "found startup attempt without omar MCP args override"
+fi
+
+if ! grep -q "features.scheduled_tasks=false" "$state_file"; then
+  fail "found startup attempt without disabling codex scheduled tasks"
+fi
+
+if grep -q "^attempt 2$" "$state_file"; then
+  fail "unexpected retry attempt"
+fi
+
+if ! grep -q -- "--dangerously-bypass-approvals-and-sandbox" "$state_file"; then
+  fail "startup command did not include the codex bypass flag"
 fi
 
 if capture_dashboard | grep -q "failed to start"; then
-  fail "dashboard still reports failed manager startup"
+  fail "dashboard reports failed manager startup"
 fi
 
 tmux_cmd kill-session -t omar-dashboard >/dev/null 2>&1 || true
 tmux_cmd kill-session -t omar-agent-ea-0 >/dev/null 2>&1 || true
 
-echo "PASS: codex manager startup falls back when approval flag is rejected"
+echo "PASS: codex manager startup keeps approval flag on single startup attempt"

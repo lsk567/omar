@@ -143,6 +143,30 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
         .find_map(detect_backend_token)
 }
 
+fn ensure_codex_runtime_flags(base_command: &str) -> String {
+    if detect_backend(base_command) != Some(BackendKind::Codex) {
+        return base_command.to_string();
+    }
+
+    let mut command = base_command.to_string();
+
+    if !base_command
+        .split_whitespace()
+        .any(|token| token == "--dangerously-bypass-approvals-and-sandbox")
+    {
+        command.push_str(" --dangerously-bypass-approvals-and-sandbox");
+    }
+
+    if !base_command
+        .split_whitespace()
+        .any(|token| token == "--no-alt-screen")
+    {
+        command.push_str(" --no-alt-screen");
+    }
+
+    command
+}
+
 fn backend_token(base_command: &str, kind: BackendKind) -> Option<String> {
     base_command.split_whitespace().find_map(|token| {
         if detect_backend_token(token) == Some(kind) {
@@ -257,6 +281,15 @@ fn materialize_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
     Some(path)
 }
 
+fn materialize_mcp_context_file_fallback(context: &McpLaunchContext) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join("omar").join("mcp");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("codex-context-ea-{}.json", context.ea_id));
+    let json = serde_json::to_vec(context).ok()?;
+    write_private_file(&path, &json).ok()?;
+    Some(path)
+}
+
 fn materialize_claude_mcp_config(context: &McpLaunchContext) -> Option<PathBuf> {
     let server_exe = std::env::current_exe().ok()?;
     let context_file = materialize_mcp_context_file(context)?;
@@ -278,7 +311,8 @@ fn materialize_claude_mcp_config(context: &McpLaunchContext) -> Option<PathBuf> 
 
 fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
     let server_exe = std::env::current_exe().ok()?;
-    let context_file = materialize_mcp_context_file(context)?;
+    let context_file = materialize_mcp_context_file(context)
+        .or_else(|| materialize_mcp_context_file_fallback(context))?;
     let command = serde_json::to_string(&server_exe.display().to_string()).ok()?;
     let args = serde_json::to_string(&vec![
         "mcp-server".to_string(),
@@ -467,6 +501,7 @@ pub fn build_agent_command(
     substitutions: &[(&str, &str)],
     mcp_context: &McpLaunchContext,
 ) -> String {
+    let base_command = ensure_codex_runtime_flags(base_command);
     let path_str = prompt_file.display().to_string();
     let prompt_path = shell_single_quote(&path_str);
     let shell_expr = if substitutions.is_empty() {
@@ -485,7 +520,7 @@ pub fn build_agent_command(
     // that case we fall back to launching the agent without MCP so the
     // session can still come up and the human operator sees the problem
     // via a degraded but visible agent, rather than a launch failure.
-    match detect_backend(base_command) {
+    match detect_backend(&base_command) {
         Some(BackendKind::Claude) => match materialize_claude_mcp_config(mcp_context) {
             Some(mcp_config) => format!(
                 "{} --system-prompt \"{}\" --mcp-config {} --disallowedTools {}",
@@ -531,7 +566,7 @@ pub fn build_agent_command(
                     shell_single_quote(&policy.display().to_string())
                 );
             }
-            if let Some(setup) = gemini_mcp_bootstrap(base_command, mcp_context) {
+            if let Some(setup) = gemini_mcp_bootstrap(&base_command, mcp_context) {
                 cmd = format!("{}; {}", setup, cmd);
             }
             cmd
@@ -1063,11 +1098,33 @@ mod tests {
             &test_mcp_context(dir.path()),
         );
         assert!(cmd.starts_with(
-            "codex --no-alt-screen -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''$(cat '/tmp/prompts/ea.md')'''\""
         ));
         assert!(cmd.contains("mcp_servers.omar.command"));
         assert!(cmd.contains("mcp_servers.omar.args"));
         assert!(cmd.contains("-c features.scheduled_tasks=false"));
+    }
+
+    #[test]
+    fn test_build_ea_command_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = build_ea_command(
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
+            3,
+            "CapX",
+            dir.path(),
+            &test_mcp_context(dir.path()),
+        );
+        assert!(
+            cmd.starts_with(
+                "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''"
+            )
+        );
+        assert!(cmd.contains("mcp_servers.omar.command="));
+        assert!(cmd.contains("mcp_servers.omar.args="));
+        assert!(cmd.contains("\"mcp-server\""));
+        assert!(cmd.contains("-c features.scheduled_tasks=false"));
+        assert!(cmd.contains("CapX"));
     }
 
     #[test]

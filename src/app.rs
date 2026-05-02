@@ -95,8 +95,6 @@ pub struct App {
     status_set_at: Option<Instant>,
     /// Warning that persists across tick clears (e.g., tmux misconfiguration)
     pub persistent_warning: Option<String>,
-    /// Most recent manager startup error. Used to avoid silent startup hangs.
-    pub manager_start_error: Option<String>,
     pub projects: Vec<Project>,
     pub project_input_mode: bool,
     pub project_input: String,
@@ -193,7 +191,6 @@ impl App {
             status_message: None,
             status_set_at: None,
             persistent_warning: None,
-            manager_start_error: None,
             projects: projects::load_projects_from(&state_dir),
             project_input_mode: false,
             project_input: String::new(),
@@ -519,53 +516,21 @@ impl App {
         Ok(())
     }
 
-    /// Build the ordered set of startup command attempts for the manager.
+    /// Build the startup command attempts for the manager.
     ///
-    /// We first try prompt-injected variants (normal + codex compatibility
-    /// fallback), then retry the same commands without injection so the manager
-    /// can still start in degraded mode when the prompt-wrapper path is failing.
+    /// In strict mode we issue exactly one launch command so behavior matches
+    /// main and does not silently degrade to alternate variants.
     fn manager_startup_attempts(&self) -> Vec<(String, bool)> {
-        use std::collections::HashSet;
-
-        let mut attempts = Vec::new();
-        let mut seen = HashSet::new();
-
-        let add_attempt = |cmd: String,
-                           inject: bool,
-                           attempts: &mut Vec<(String, bool)>,
-                           seen: &mut HashSet<String>| {
-            let key = format!("{}|{}", inject, cmd);
-            if seen.insert(key) {
-                attempts.push((cmd, inject));
-            }
-        };
-
-        add_attempt(self.default_command.clone(), true, &mut attempts, &mut seen);
-
-        if let Some(fallback) = Self::strip_codex_approval_flag(&self.default_command) {
-            add_attempt(fallback.clone(), true, &mut attempts, &mut seen);
-            add_attempt(fallback, false, &mut attempts, &mut seen);
-        }
-
-        add_attempt(
-            self.default_command.clone(),
-            false,
-            &mut attempts,
-            &mut seen,
-        );
-
-        attempts
+        vec![(self.default_command.clone(), true)]
     }
 
     /// Ensure manager session exists, start if not
     fn ensure_manager(&mut self) -> Result<()> {
         let canonical_manager_session = self.manager_session_name();
         let manager_session = canonical_manager_session.clone();
-        self.manager_start_error = None;
 
         if self.client.has_session(&manager_session)? {
             if self.client.session_has_live_pane(&manager_session)? {
-                self.manager_start_error = None;
                 return Ok(());
             }
             let _ = self.client.kill_session(&manager_session);
@@ -586,136 +551,58 @@ impl App {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
 
-        let attempts = self.manager_startup_attempts();
+        let (default_command, inject_prompt) = self
+            .manager_startup_attempts()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| (self.default_command.clone(), true));
 
-        let attempt_count = attempts.len();
+        let context = crate::manager::McpLaunchContext {
+            omar_dir: self.omar_dir.clone(),
+            ea_id: self.active_ea,
+            session_prefix: self.base_prefix.clone(),
+            default_command: default_command.clone(),
+            default_workdir: self.default_workdir.clone(),
+            health_idle_warning: self.health_threshold,
+            tmux_server: std::env::var("OMAR_TMUX_SERVER")
+                .ok()
+                .map(|server| server.trim().to_string())
+                .filter(|server| !server.is_empty()),
+        };
 
-        for (attempt_idx, (default_command, inject_prompt)) in attempts.into_iter().enumerate() {
-            let context = crate::manager::McpLaunchContext {
-                omar_dir: self.omar_dir.clone(),
-                ea_id: self.active_ea,
-                session_prefix: self.base_prefix.clone(),
-                default_command: default_command.clone(),
-                default_workdir: self.default_workdir.clone(),
-                health_idle_warning: self.health_threshold,
-                tmux_server: std::env::var("OMAR_TMUX_SERVER")
-                    .ok()
-                    .map(|server| server.trim().to_string())
-                    .filter(|server| !server.is_empty()),
-            };
-
-            // Build command with EA system prompt + memory baked in (preferred),
-            // or fall back to raw command if prompt wrapping fails repeatedly.
-            let cmd = if inject_prompt {
-                crate::manager::build_ea_command(
-                    &default_command,
-                    self.active_ea,
-                    ea_name,
-                    &self.omar_dir,
-                    &context,
-                )
-            } else {
-                default_command.clone()
-            };
-
-            let last_error = match self
-                .client
-                .new_session(&manager_session, &cmd, Some(&workdir))
-            {
-                Ok(_) => {
-                    let mut startup_ticks = 0;
-                    let mut ever_live = false;
-                    while startup_ticks < 20 {
-                        if self.client.session_has_live_pane(&manager_session)? {
-                            ever_live = true;
-                        }
-                        startup_ticks += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-
-                    if ever_live && self.client.session_has_live_pane(&manager_session)? {
-                        // Start succeeded with this command variant.
-                        None
-                    } else {
-                        let pane_output = self
-                            .client
-                            .capture_pane_plain(&manager_session, 120)
-                            .unwrap_or_default();
-                        let _ = self.client.kill_session(&manager_session);
-
-                        Some(if pane_output.trim().is_empty() {
-                            format!(
-                                "attempt {}: command '{}' exited immediately with no visible output",
-                                attempt_idx + 1,
-                                &default_command
-                            )
-                        } else {
-                            format!(
-                                "attempt {}: command '{}' exited with output: {}",
-                                attempt_idx + 1,
-                                &default_command,
-                                pane_output.trim()
-                            )
-                        })
-                    }
-                }
-                Err(err) => Some(format!(
-                    "attempt {}: tmux failed to start '{}': {}",
-                    attempt_idx + 1,
-                    &default_command,
-                    err
-                )),
-            };
-
-            if last_error.is_none() {
-                let state_dir = self.state_dir();
-                let events = self.scheduler.list_by_ea(self.active_ea);
-                memory::write_memory_to(
-                    &state_dir,
-                    &self.agents,
-                    None,
-                    &manager_session,
-                    &self.client,
-                    &events,
-                );
-                return Ok(());
-            }
-
-            if attempt_idx + 1 < attempt_count {
-                let _ = self.client.kill_session(&manager_session);
-                continue;
-            }
-
-            let msg = format!(
-                "Manager session '{}' failed to start after {} attempt(s){}: {}",
-                manager_session,
-                attempt_count,
-                if attempt_count > 1 {
-                    " (including codex approval-flag compatibility fallback)"
-                } else {
-                    ""
-                },
-                last_error.unwrap_or_else(|| "unknown startup failure".to_string()),
-            );
-            self.manager_start_error = Some(msg.clone());
-            anyhow::bail!(msg);
-        }
-
-        Ok(())
-    }
-
-    fn strip_codex_approval_flag(command: &str) -> Option<String> {
-        let stripped = command
-            .split_whitespace()
-            .filter(|token| *token != "--dangerously-bypass-approvals-and-sandbox")
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        if stripped == command {
-            None
+        let cmd = if inject_prompt {
+            crate::manager::build_ea_command(
+                &default_command,
+                self.active_ea,
+                ea_name,
+                &self.omar_dir,
+                &context,
+            )
         } else {
-            Some(stripped)
-        }
+            default_command.clone()
+        };
+
+        self.client
+            .new_session(&manager_session, &cmd, Some(&workdir))
+            .map_err(|err| {
+                let msg = format!(
+                    "tmux failed to start manager '{}' with command '{}': {}",
+                    manager_session, default_command, err
+                );
+                anyhow::anyhow!(msg)
+            })?;
+
+        let state_dir = self.state_dir();
+        let events = self.scheduler.list_by_ea(self.active_ea);
+        memory::write_memory_to(
+            &state_dir,
+            &self.agents,
+            None,
+            &manager_session,
+            &self.client,
+            &events,
+        );
+        Ok(())
     }
 
     /// Get filtered agents
@@ -1462,7 +1349,6 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         self.focus_stack.clear();
         self.selected = 0;
         self.manager_selected = true;
-        self.manager_start_error = None;
 
         // Ensure EA state directory exists; refresh() will reload projects/parents/tasks
         let state_dir = ea::ea_state_dir(ea_id, &self.omar_dir);
@@ -2132,21 +2018,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_codex_approval_flag_removes_unsupported_flag_only() {
-        assert_eq!(
-            App::strip_codex_approval_flag(
-                "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
-            ),
-            Some("codex --no-alt-screen".to_string())
-        );
-        assert_eq!(
-            App::strip_codex_approval_flag("codex --no-alt-screen"),
-            None
-        );
-    }
-
-    #[test]
-    fn manager_startup_attempts_includes_promptless_fallback() {
+    fn manager_startup_attempts_single_prompted_variant() {
         let mut config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
         config.agent.default_command =
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string();
@@ -2155,7 +2027,7 @@ mod tests {
         app.default_command = config.agent.default_command.clone();
 
         let attempts = app.manager_startup_attempts();
-        assert_eq!(attempts.len(), 4);
+        assert_eq!(attempts.len(), 1);
         assert_eq!(
             attempts[0],
             (
@@ -2163,15 +2035,28 @@ mod tests {
                 true
             )
         );
-        assert_eq!(attempts[1], ("codex --no-alt-screen".to_string(), true));
-        assert_eq!(attempts[2], ("codex --no-alt-screen".to_string(), false));
-        assert_eq!(
-            attempts[3],
-            (
-                "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string(),
-                false
-            )
-        );
+    }
+
+    #[test]
+    fn manager_startup_attempts_is_single_attempt_for_all_backends() {
+        let config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
+        let scheduler = Arc::new(Scheduler::new());
+        let mut app = App::new(&config, TickerBuffer::new(), scheduler);
+
+        for cmd in &[
+            "claude --dangerously-skip-permissions",
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
+            "cursor agent --yolo",
+            "gemini --yolo",
+            "opencode",
+            "custom --no-flags",
+        ] {
+            app.default_command = (*cmd).to_string();
+            let attempts = app.manager_startup_attempts();
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].0, *cmd);
+            assert!(attempts[0].1);
+        }
     }
 
     #[test]
@@ -2348,50 +2233,6 @@ mod tests {
         let _ = std::process::Command::new("tmux")
             .args(["-L", &tmux_server, "kill-session", "-t", &manager_session])
             .status();
-    }
-
-    #[test]
-    fn refresh_fails_if_manager_command_dies_immediately() {
-        let _env_lock = env_lock();
-        if !std::process::Command::new("tmux")
-            .arg("-V")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let _home = HomeEnvGuard::set(dir.path());
-        let tmux_server = format!("omar-app-dead-startup-{}", uuid::Uuid::new_v4());
-        let _tmux = TmuxServerEnvGuard::set(&tmux_server);
-        let mut config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
-        config.agent.default_command = "false".to_string();
-
-        let client = TmuxClient::new(&config.dashboard.session_prefix);
-        let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
-
-        let err = app
-            .refresh()
-            .expect_err("refresh should fail when manager exits immediately");
-        let err = err.to_string();
-        let reported = app.manager_start_error.clone().unwrap_or_default();
-        assert!(
-            reported.contains("failed to start"),
-            "startup error missing from app state: {}",
-            reported
-        );
-        assert!(
-            err.contains("failed to start"),
-            "unexpected refresh error: {}",
-            err
-        );
-        assert!(
-            !client.has_session(&app.manager_session_name()).unwrap(),
-            "dead manager session should be cleaned up"
-        );
     }
 
     #[test]
