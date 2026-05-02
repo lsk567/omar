@@ -127,15 +127,17 @@ pub fn resolve_ea_selector(base_dir: &Path, selector: Option<&str>) -> anyhow::R
 /// Ensure at least one default EA exists on disk.
 pub fn ensure_default_ea(base_dir: &Path) -> anyhow::Result<Vec<EaInfo>> {
     let mut eas = load_registry(base_dir);
-    if eas.is_empty() {
+    if !eas.iter().any(|ea| ea.id == 0) {
         eas.push(default_ea_info());
+        eas.sort_by_key(|ea| ea.id);
         save_registry(base_dir, &eas)?;
-        if load_next_id_counter(base_dir) == 0 {
-            save_next_id_counter(base_dir, 0)?;
-        }
         fs::create_dir_all(ea_state_dir(0, base_dir).join("status"))?;
-        let _ = save_active_ea(base_dir, 0);
     }
+
+    if load_next_id_counter(base_dir) == 0 && eas.iter().any(|ea| ea.id == 0) {
+        save_next_id_counter(base_dir, eas.iter().map(|ea| ea.id).max().unwrap_or(0))?;
+    }
+
     Ok(eas)
 }
 
@@ -322,6 +324,27 @@ mod tests {
         assert_eq!(eas.len(), 1);
         assert_eq!(eas[0].id, 0);
         assert_eq!(load_next_id_counter(dir.path()), 7);
+    }
+
+    #[test]
+    fn test_ensure_default_ea_inserts_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let stale = vec![EaInfo {
+            id: 3,
+            name: "Research".to_string(),
+            description: None,
+            created_at: 1234567890,
+        }];
+        save_registry(dir.path(), &stale).unwrap();
+
+        let eas = ensure_default_ea(dir.path()).unwrap();
+
+        assert_eq!(eas.len(), 2);
+        assert_eq!(eas[0].id, 0);
+        assert_eq!(eas[1].id, 3);
+        assert_eq!(eas[0].name, "Default");
+        assert!(ea_state_dir(0, dir.path()).join("status").exists());
     }
 
     #[test]
