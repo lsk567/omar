@@ -879,15 +879,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
         std::env::remove_var("NO_COLOR");
     }
 
-    // Best-effort cleanup of pre-0.3 MCP context files left behind in
-    // `/tmp/omar-mcp/`. Current builds write to `~/.omar/mcp/ea-<id>/`.
-    // Runs only from the dashboard entry point; `omar mcp-server` is
-    // spawned by live backends and must not touch their context files.
-    let legacy_tmp = std::env::temp_dir().join("omar-mcp");
-    if legacy_tmp.is_dir() {
-        let _ = std::fs::remove_dir_all(&legacy_tmp);
-    }
-
     // Create the ticker buffer and scheduler, then spawn the event loop
     let ticker = scheduler::TickerBuffer::new();
     let app_ticker = ticker.clone();
@@ -1256,8 +1247,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             // Tell the scheduler which agent popup is open so it
                             // defers events for that receiver until the popup closes.
                             // Include ea_id so suppression is scoped per-EA.
-                            *popup_receiver.lock().unwrap_or_else(|err| err.into_inner()) =
-                                selected_popup_receiver;
+                            *popup_receiver.lock().unwrap() = selected_popup_receiver;
 
                             // Release App lock before blocking popup call
                             drop(app);
@@ -1329,7 +1319,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
 
                             // Popup closed — clear so events resume delivery
-                            *popup_receiver.lock().unwrap_or_else(|err| err.into_inner()) = None;
+                            *popup_receiver.lock().unwrap() = None;
                         }
                         KeyCode::Char('n') => {
                             if let Err(e) = app.spawn_agent() {

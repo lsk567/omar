@@ -255,46 +255,6 @@ fn save_registry(base_dir: &Path, eas: &[EaInfo]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Migrate legacy state files from ~/.omar/ to ~/.omar/ea/0/
-pub fn migrate_legacy_state(omar_dir: &Path) {
-    let ea0_dir = ea_state_dir(0, omar_dir);
-    if ea0_dir.exists() {
-        return; // Already migrated (or fresh install with no legacy files)
-    }
-    fs::create_dir_all(ea0_dir.join("status")).ok();
-
-    let files = [
-        "tasks.md",
-        "memory.md",
-        "worker_tasks.json",
-        "agent_parents.json",
-        "ea_prompt_combined.md",
-    ];
-    for file in &files {
-        let old = omar_dir.join(file);
-        let new_path = ea0_dir.join(file);
-        if old.exists() && !new_path.exists() {
-            fs::rename(&old, &new_path).ok();
-        }
-    }
-
-    // Move status directory
-    let old_status = omar_dir.join("status");
-    let new_status = ea0_dir.join("status");
-    if old_status.exists() {
-        // Copy files from old status to new status (dir may already exist)
-        if let Ok(entries) = fs::read_dir(&old_status) {
-            for entry in entries.flatten() {
-                let dest = new_status.join(entry.file_name());
-                if !dest.exists() {
-                    fs::rename(entry.path(), dest).ok();
-                }
-            }
-        }
-        fs::remove_dir_all(&old_status).ok();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

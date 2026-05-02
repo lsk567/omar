@@ -154,9 +154,6 @@ impl App {
     ) -> Self {
         let base_prefix = config.dashboard.session_prefix.clone();
 
-        // Run legacy migration for legacy state files.
-        ea::migrate_legacy_state(&omar_dir);
-
         let registered_eas = ea::ensure_default_ea(&omar_dir).unwrap_or_else(|e| {
             eprintln!("warn: ensure default EA: {}", e);
             ea::load_registry(&omar_dir)

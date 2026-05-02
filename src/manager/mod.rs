@@ -281,15 +281,6 @@ fn materialize_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
     Some(path)
 }
 
-fn materialize_mcp_context_file_fallback(context: &McpLaunchContext) -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join("omar").join("mcp");
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("codex-context-ea-{}.json", context.ea_id));
-    let json = serde_json::to_vec(context).ok()?;
-    write_private_file(&path, &json).ok()?;
-    Some(path)
-}
-
 fn materialize_claude_mcp_config(context: &McpLaunchContext) -> Option<PathBuf> {
     let server_exe = std::env::current_exe().ok()?;
     let context_file = materialize_mcp_context_file(context)?;
@@ -311,8 +302,7 @@ fn materialize_claude_mcp_config(context: &McpLaunchContext) -> Option<PathBuf> 
 
 fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
     let server_exe = std::env::current_exe().ok()?;
-    let context_file = materialize_mcp_context_file(context)
-        .or_else(|| materialize_mcp_context_file_fallback(context))?;
+    let context_file = materialize_mcp_context_file(context)?;
     let command = serde_json::to_string(&server_exe.display().to_string()).ok()?;
     let args = serde_json::to_string(&vec![
         "mcp-server".to_string(),

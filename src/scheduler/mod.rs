@@ -5,17 +5,13 @@ pub use event::ScheduledEvent;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 use crate::ea;
 use crate::process::pid_file_is_stale;
 use crate::tmux::DeliveryOptions;
-
-fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|err| err.into_inner())
-}
 
 /// A ticker message with its creation time.
 struct TickerEntry {
@@ -38,7 +34,7 @@ impl TickerBuffer {
 
     /// Push a new message into the ticker. Caps at 50 entries.
     pub fn push(&self, msg: impl Into<String>) {
-        let mut buf = lock_recover(&self.entries);
+        let mut buf = self.entries.lock().unwrap();
         if buf.len() >= 50 {
             buf.pop_front();
         }
@@ -51,7 +47,7 @@ impl TickerBuffer {
     /// Return the joined ticker content, filtering entries older than `ttl`.
     /// Does NOT prune the buffer — old entries remain for `latest()` / debug console.
     pub fn render(&self, ttl: std::time::Duration) -> String {
-        let buf = lock_recover(&self.entries);
+        let buf = self.entries.lock().unwrap();
         let now = Instant::now();
         buf.iter()
             .filter(|e| now.duration_since(e.created_at) < ttl)
@@ -62,7 +58,7 @@ impl TickerBuffer {
 
     /// Return the last `n` messages regardless of age (for debug console).
     pub fn latest(&self, n: usize) -> Vec<String> {
-        let buf = lock_recover(&self.entries);
+        let buf = self.entries.lock().unwrap();
         buf.iter()
             .rev()
             .take(n)
@@ -231,7 +227,7 @@ impl Scheduler {
                                 err
                             );
                         }
-                        let mut queue = lock_recover(&self.queue);
+                        let mut queue = self.queue.lock().unwrap();
                         return f(&mut queue);
                     }
                 };
@@ -243,11 +239,11 @@ impl Scheduler {
                 if persist {
                     save_events_to_store(store_path, &queue);
                 }
-                *lock_recover(&self.queue) = queue;
+                *self.queue.lock().unwrap() = queue;
                 result
             }
             None => {
-                let mut queue = lock_recover(&self.queue);
+                let mut queue = self.queue.lock().unwrap();
                 f(&mut queue)
             }
         }
@@ -564,7 +560,7 @@ pub(crate) fn should_defer_for_popup(
 ) -> bool {
     popup_receiver
         .lock()
-        .unwrap_or_else(|err| err.into_inner())
+        .unwrap()
         .as_ref()
         .is_some_and(|(r, eid)| *eid == ea_id && receivers_match(r, receiver))
 }
