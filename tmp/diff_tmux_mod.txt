@@ -1,0 +1,13 @@
+diff --git a/src/tmux/mod.rs b/src/tmux/mod.rs
+index 6c27144..94461a7 100644
+--- a/src/tmux/mod.rs
++++ b/src/tmux/mod.rs
+@@ -2,7 +2,7 @@ mod client;
+ mod health;
+ mod session;
+ 
+-pub use client::{DeliveryOptions, TmuxClient};
++pub use client::{tmux_command, DeliveryOptions, TmuxClient};
+ pub use health::{HealthChecker, HealthInfo, HealthState};
+ pub use session::Session;
+ 
