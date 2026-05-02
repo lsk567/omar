@@ -828,16 +828,20 @@ impl OmarMcpServer {
         }
         let mut killed = 0usize;
         for session_name in session_names {
-            let _ = client.kill_session(&session_name);
+            client
+                .kill_session(&session_name)
+                .map_err(|e| anyhow!("Failed to kill session '{}': {}", session_name, e))?;
             killed += 1;
         }
         let state_dir = ea::ea_state_dir(args.ea_id, &self.context.omar_dir);
         if state_dir.exists() {
-            let _ = fs::remove_dir_all(state_dir);
+            fs::remove_dir_all(&state_dir)
+                .map_err(|e| anyhow!("Failed to remove state dir {:?}: {}", state_dir, e))?;
         }
         let notes_path = memory::manager_notes_path(&self.context.omar_dir, args.ea_id);
         if notes_path.exists() {
-            let _ = fs::remove_file(notes_path);
+            fs::remove_file(&notes_path)
+                .map_err(|e| anyhow!("Failed to remove notes {:?}: {}", notes_path, e))?;
         }
         let events_cancelled = self.scheduler().cancel_by_ea(args.ea_id);
         ea::unregister_ea(&self.context.omar_dir, args.ea_id)?;
