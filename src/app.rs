@@ -2040,18 +2040,17 @@ mod tests {
         let scheduler = Arc::new(Scheduler::new());
         let mut app = App::new(&config, TickerBuffer::new(), scheduler);
 
-        for cmd in &[
-            "claude --dangerously-skip-permissions",
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
-            "cursor agent --yolo",
-            "gemini --yolo",
-            "opencode",
-            "custom --no-flags",
-        ] {
-            app.default_command = (*cmd).to_string();
+        let mut commands: Vec<String> = ["claude", "codex", "cursor", "gemini", "opencode"]
+            .iter()
+            .map(|name| crate::config::resolve_backend(name).unwrap())
+            .collect();
+        commands.push("custom --no-flags".to_string());
+
+        for cmd in &commands {
+            app.default_command = cmd.clone();
             let attempts = app.manager_startup_attempts();
             assert_eq!(attempts.len(), 1);
-            assert_eq!(attempts[0].0, *cmd);
+            assert_eq!(&attempts[0].0, cmd);
             assert!(attempts[0].1);
         }
     }
