@@ -465,19 +465,6 @@ struct OmarMcpServer {
     scheduler: scheduler::Scheduler,
 }
 
-#[derive(Debug)]
-struct SpawnRequestInternal {
-    name: Option<String>,
-    task: Option<String>,
-    workdir: Option<String>,
-    command: Option<String>,
-    backend: Option<String>,
-    model: Option<String>,
-    role: Option<String>,
-    parent: Option<String>,
-    spawn_lock_wait_ms: u64,
-}
-
 impl OmarMcpServer {
     fn new(context: McpLaunchContext) -> Self {
         let state_dir = ea::ea_state_dir(context.ea_id, &context.omar_dir);
@@ -966,14 +953,19 @@ impl OmarMcpServer {
             parent: Option<String>,
         }
         let args: Args = serde_json::from_value(args)?;
+        let spawn_start = std::time::Instant::now();
         let state_dir = self.state_dir();
+        let ea_id = self.ea_id();
+        let prefix = self.session_prefix();
+        let manager_session = self.manager_session();
+        let client = self.client();
+
         let lock_wait_start = std::time::Instant::now();
         let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
         let spawn_lock_wait_ms = lock_wait_start.elapsed().as_millis() as u64;
 
-        // Project must already exist. Stream 4 owns project creation via
-        // `add_project` — this path never auto-creates. Matches the same
-        // check stream 4 added on the former create_task entry point.
+        // Project must already exist. add_project owns creation; this path
+        // never auto-creates.
         let project = projects::find_project_in(state_dir, args.project_id).ok_or_else(|| {
             anyhow!(
                 "Project '{}' not found. Call add_project first to register a project.",
@@ -991,47 +983,180 @@ impl OmarMcpServer {
             .ok_or_else(|| anyhow!("spawn_agent requires a non-empty 'task'"))?
             .to_string();
 
-        // `task` is metadata for the dashboard and the agent prompt.
-        let task_text = task.clone();
-
         let parent = match args.parent.as_deref().map(str::trim) {
             Some("") => return Err(anyhow!("spawn_agent parent must not be empty")),
             Some(parent) => Some(parent.to_string()),
             None => None,
         };
-
         self.validate_spawn_parent(project_id, parent.as_deref())?;
 
-        let spawn_result = self.spawn_agent_internal(SpawnRequestInternal {
-            name: Some(args.name.clone()),
-            task: Some(task),
-            workdir: args.workdir,
-            command: args.command,
-            backend: args.backend.clone(),
-            model: args.model.clone(),
-            role: None,
-            parent,
-            spawn_lock_wait_ms,
-        })?;
+        let session_name = match args.name.trim() {
+            n if !n.is_empty() => {
+                let stripped = n.strip_prefix(prefix).unwrap_or(n);
+                format!("{}{}", prefix, stripped)
+            }
+            _ => generate_agent_name_in_ea(prefix),
+        };
+        let short_name = self.display_name(&session_name).to_string();
+        let parent_session = match parent.as_deref() {
+            Some("ea") | None => manager_session.to_string(),
+            Some(p) => self.qualified_session_name(p)?,
+        };
+        let prompt_parent = if parent_session == manager_session {
+            "ea".to_string()
+        } else {
+            self.display_name(&parent_session).to_string()
+        };
 
-        let agent_name = spawn_result
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or(&args.name)
-            .to_string();
-        let session_name = self.qualified_session_name(&agent_name)?;
-        memory::save_worker_task_in(state_dir, &session_name, &task_text);
+        if args.backend.is_some() && args.command.is_some() {
+            return Err(anyhow!("Cannot specify both 'backend' and 'command'"));
+        }
+        let mut base_command = if let Some(backend) = args.backend.as_deref() {
+            config::resolve_backend(backend).map_err(|err| anyhow!(err))?
+        } else {
+            args.command
+                .clone()
+                .unwrap_or_else(|| self.context.default_command.clone())
+        };
+        if let Some(model) = args.model.as_deref() {
+            if !model
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+            {
+                return Err(anyhow!(
+                    "Invalid model name. Only alphanumeric, '-', '_', '.', '/' allowed."
+                ));
+            }
+            base_command = format!("{} --model {}", base_command, model);
+        }
+
+        let backend_name = infer_backend_name(args.backend.as_deref(), &base_command);
+        let supports_prompt_delivery = supports_initial_prompt_delivery(&backend_name);
+
+        let workdir = args
+            .workdir
+            .unwrap_or_else(|| self.context.default_workdir.clone());
+        let command = if supports_prompt_delivery {
+            let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
+            manager::build_agent_command(
+                &base_command,
+                &prompt_file,
+                &[
+                    ("{{PARENT_NAME}}", &prompt_parent),
+                    ("{{TASK}}", &task),
+                    ("{{EA_ID}}", &ea_id.to_string()),
+                ],
+                &self.context,
+            )
+        } else {
+            base_command.clone()
+        };
+
+        if client.has_session(&session_name).unwrap_or(false) {
+            return Err(anyhow!("Agent '{}' already exists", short_name));
+        }
+        let tmux_spawn_start = std::time::Instant::now();
+        client.new_session(&session_name, &command, Some(&workdir))?;
+        let tmux_spawn_ms = tmux_spawn_start.elapsed().as_millis() as u64;
+        metrics::record_backend_bootstrap(&backend_name);
+
+        memory::save_agent_parent_in(state_dir, &session_name, &parent_session);
+        memory::save_worker_task_in(state_dir, &session_name, &task);
         memory::save_agent_project_in(state_dir, &session_name, project_id);
+
+        let initial_prompt_delivery = if !supports_prompt_delivery {
+            "metadata_only".to_string()
+        } else {
+            let client2 = client.clone();
+            let session2 = session_name.clone();
+            let header = format!(
+                "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
+                short_name, prompt_parent, task
+            );
+            // opencode has no system-prompt flag, so build_agent_command
+            // spawns it bare. Inline the rendered agent.md content here so
+            // the worker receives instructions plus the YOUR NAME header
+            // in a single user message. Other backends already received
+            // agent.md via their respective system-prompt flags.
+            let first_message = if backend_name == "opencode" {
+                let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
+                let content = std::fs::read_to_string(&prompt_file)
+                    .unwrap_or_default()
+                    .replace("{{PARENT_NAME}}", &prompt_parent)
+                    .replace("{{TASK}}", &task)
+                    .replace("{{EA_ID}}", &ea_id.to_string());
+                format!("{}\n\n---\n\n{}", content, header)
+            } else {
+                header
+            };
+            let backend_name2 = backend_name.clone();
+            let readiness_markers = crate::tmux::backend_readiness_markers(&backend_name).to_vec();
+            let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let delivery_start = std::time::Instant::now();
+                let readiness = if !readiness_markers.is_empty() {
+                    let ready = client2.wait_for_markers(
+                        &session2,
+                        &readiness_markers,
+                        Duration::from_secs(45),
+                        Duration::from_millis(250),
+                    );
+                    if ready {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("backend readiness markers timed out"))
+                    }
+                } else {
+                    client2.wait_for_stable(
+                        &session2,
+                        Duration::from_millis(500),
+                        Duration::from_secs(8),
+                        Duration::from_millis(120),
+                        false,
+                    )
+                };
+                let opts = DeliveryOptions::default();
+                let delivery = client2.deliver_prompt(&session2, &first_message, &opts);
+                let delivery_ok = delivery.is_ok();
+                metrics::record_prompt_delivery(
+                    ea_id,
+                    &session2,
+                    &backend_name2,
+                    delivery_start.elapsed().as_millis() as u64,
+                    delivery_ok,
+                );
+                let status = match (readiness, delivery) {
+                    (Ok(()), Ok(())) => "delivered".to_string(),
+                    (Err(readiness_err), Ok(())) => {
+                        format!("delivered_after_readiness_warning: {}", readiness_err)
+                    }
+                    (_, Err(delivery_err)) => format!("failed: {}", delivery_err),
+                };
+                let _ = delivery_tx.send(status);
+            });
+            delivery_rx
+                .recv_timeout(INITIAL_PROMPT_DELIVERY_STATUS_TIMEOUT)
+                .unwrap_or_else(|_| "pending_background_delivery".to_string())
+        };
+
+        metrics::record_agent_spawn(metrics::AgentSpawnMetric {
+            ea_id,
+            session: &session_name,
+            short_name: &short_name,
+            backend: &backend_name,
+            has_task: supports_prompt_delivery,
+            spawn_lock_wait_ms,
+            tmux_spawn_ms,
+            total_spawn_ms: spawn_start.elapsed().as_millis() as u64,
+        });
+
         self.refresh_memory_locked()?;
         Ok(json!({
             "project_id": project_id,
             "project_name": project_name,
-            "agent_name": agent_name,
+            "agent_name": short_name,
             "status": "running",
-            "initial_prompt_delivery": spawn_result
-                .get("initial_prompt_delivery")
-                .cloned()
-                .unwrap_or_else(|| json!("unknown")),
+            "initial_prompt_delivery": initial_prompt_delivery,
         }))
     }
 
@@ -1099,194 +1224,6 @@ impl OmarMcpServer {
         }
         supervisors.sort();
         supervisors
-    }
-
-    fn spawn_agent_internal(&self, request: SpawnRequestInternal) -> Result<Value> {
-        let spawn_start = std::time::Instant::now();
-        let ea_id = self.ea_id();
-        let state_dir = self.state_dir();
-        let prefix = self.session_prefix();
-        let manager_session = self.manager_session();
-        let client = self.client();
-
-        let session_name = match request.name.as_deref() {
-            Some(n) if !n.trim().is_empty() => {
-                let stripped = n.strip_prefix(prefix).unwrap_or(n);
-                format!("{}{}", prefix, stripped)
-            }
-            _ => generate_agent_name_in_ea(prefix),
-        };
-        let short_name = self.display_name(&session_name).to_string();
-        let parent_session = if let Some(parent) = request.parent {
-            if parent == "ea" {
-                manager_session.to_string()
-            } else {
-                self.qualified_session_name(&parent)?
-            }
-        } else {
-            manager_session.to_string()
-        };
-        let prompt_parent = if parent_session == manager_session {
-            "ea".to_string()
-        } else {
-            self.display_name(&parent_session).to_string()
-        };
-
-        if request.backend.is_some() && request.command.is_some() {
-            return Err(anyhow!("Cannot specify both 'backend' and 'command'"));
-        }
-
-        let mut base_command = if let Some(backend) = request.backend.clone() {
-            config::resolve_backend(&backend).map_err(|err| anyhow!(err))?
-        } else {
-            request
-                .command
-                .unwrap_or_else(|| self.context.default_command.clone())
-        };
-        if let Some(model) = request.model.clone() {
-            if !model
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-            {
-                return Err(anyhow!(
-                    "Invalid model name. Only alphanumeric, '-', '_', '.', '/' allowed."
-                ));
-            }
-            base_command = format!("{} --model {}", base_command, model);
-        }
-
-        let backend_name = infer_backend_name(request.backend.as_deref(), &base_command);
-        let supports_initial_prompt_delivery = supports_initial_prompt_delivery(&backend_name);
-
-        let workdir = request
-            .workdir
-            .unwrap_or_else(|| self.context.default_workdir.clone());
-        let has_agent_prompt = matches!(
-            request.role.as_deref(),
-            Some("project-manager") | Some("agent")
-        ) || (request.task.is_some() && supports_initial_prompt_delivery);
-        let command = if has_agent_prompt {
-            let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
-            manager::build_agent_command(
-                &base_command,
-                &prompt_file,
-                &[
-                    ("{{PARENT_NAME}}", &prompt_parent),
-                    ("{{TASK}}", request.task.as_deref().unwrap_or("")),
-                    ("{{EA_ID}}", &ea_id.to_string()),
-                ],
-                &self.context,
-            )
-        } else {
-            base_command.clone()
-        };
-
-        if client.has_session(&session_name).unwrap_or(false) {
-            return Err(anyhow!("Agent '{}' already exists", short_name));
-        }
-        let tmux_spawn_start = std::time::Instant::now();
-        client.new_session(&session_name, &command, Some(&workdir))?;
-        let tmux_spawn_ms = tmux_spawn_start.elapsed().as_millis() as u64;
-        metrics::record_backend_bootstrap(&backend_name);
-
-        memory::save_agent_parent_in(state_dir, &session_name, &parent_session);
-        let mut initial_prompt_delivery = "not_applicable".to_string();
-        if let Some(task_text) = request.task {
-            memory::save_worker_task_in(state_dir, &session_name, &task_text);
-            if !supports_initial_prompt_delivery {
-                initial_prompt_delivery = "metadata_only".to_string();
-            } else {
-                let client2 = client.clone();
-                let session2 = session_name.clone();
-                let header = format!(
-                    "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
-                    short_name, prompt_parent, task_text
-                );
-                // opencode has no system-prompt flag, so build_agent_command
-                // spawns it bare. Inline the rendered agent.md content here so
-                // the worker receives instructions plus the YOUR NAME header
-                // in a single user message. Other backends already received
-                // agent.md via their respective system-prompt flags.
-                let first_message = if backend_name == "opencode" {
-                    let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
-                    let content = std::fs::read_to_string(&prompt_file)
-                        .unwrap_or_default()
-                        .replace("{{PARENT_NAME}}", &prompt_parent)
-                        .replace("{{TASK}}", &task_text)
-                        .replace("{{EA_ID}}", &ea_id.to_string());
-                    format!("{}\n\n---\n\n{}", content, header)
-                } else {
-                    header
-                };
-                let backend_name2 = backend_name.clone();
-                let readiness_markers =
-                    crate::tmux::backend_readiness_markers(&backend_name).to_vec();
-                let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
-                thread::spawn(move || {
-                    let delivery_start = std::time::Instant::now();
-                    let readiness = if !readiness_markers.is_empty() {
-                        let ready = client2.wait_for_markers(
-                            &session2,
-                            &readiness_markers,
-                            Duration::from_secs(45),
-                            Duration::from_millis(250),
-                        );
-                        if ready {
-                            Ok(())
-                        } else {
-                            Err(anyhow!("backend readiness markers timed out"))
-                        }
-                    } else {
-                        client2.wait_for_stable(
-                            &session2,
-                            Duration::from_millis(500),
-                            Duration::from_secs(8),
-                            Duration::from_millis(120),
-                            false,
-                        )
-                    };
-                    let opts = DeliveryOptions::default();
-                    let delivery = client2.deliver_prompt(&session2, &first_message, &opts);
-                    let delivery_ok = delivery.is_ok();
-                    metrics::record_prompt_delivery(
-                        ea_id,
-                        &session2,
-                        &backend_name2,
-                        delivery_start.elapsed().as_millis() as u64,
-                        delivery_ok,
-                    );
-                    let status = match (readiness, delivery) {
-                        (Ok(()), Ok(())) => "delivered".to_string(),
-                        (Err(readiness_err), Ok(())) => {
-                            format!("delivered_after_readiness_warning: {}", readiness_err)
-                        }
-                        (_, Err(delivery_err)) => format!("failed: {}", delivery_err),
-                    };
-                    let _ = delivery_tx.send(status);
-                });
-                initial_prompt_delivery = delivery_rx
-                    .recv_timeout(INITIAL_PROMPT_DELIVERY_STATUS_TIMEOUT)
-                    .unwrap_or_else(|_| "pending_background_delivery".to_string());
-            }
-        }
-
-        metrics::record_agent_spawn(metrics::AgentSpawnMetric {
-            ea_id,
-            session: &session_name,
-            short_name: &short_name,
-            backend: &backend_name,
-            has_task: has_agent_prompt,
-            spawn_lock_wait_ms: request.spawn_lock_wait_ms,
-            tmux_spawn_ms,
-            total_spawn_ms: spawn_start.elapsed().as_millis() as u64,
-        });
-
-        Ok(json!({
-            "id": short_name,
-            "session": session_name,
-            "status": "running",
-            "initial_prompt_delivery": initial_prompt_delivery,
-        }))
     }
 
     fn kill_agent(&self, args: Value) -> Result<Value> {
