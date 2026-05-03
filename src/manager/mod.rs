@@ -483,7 +483,10 @@ fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
 ///   - codex   → `-c "developer_instructions='''$(cat '<path>')'''"` plus scheduled-task disable
 ///   - cursor  → positional arg `"Load the <path> file and follow the instructions."`
 ///   - gemini  → `-i "$(cat '<path>')"` plus native wake-tool deny policy
-///   - opencode → `--prompt "$(cat '<path>')"` plus native wake-tool deny config
+///   - opencode → MCP env only (no `--prompt`); the agent prompt is delivered
+///     after spawn via tmux because opencode's `--prompt` is treated as the
+///     first **user** message (not system role) and the LLM responds by
+///     asking the user to fill in the fields described in the prompt
 ///   - unknown → returns `base_command` unchanged
 pub fn build_agent_command(
     base_command: &str,
@@ -561,15 +564,21 @@ pub fn build_agent_command(
             }
             cmd
         }
-        Some(BackendKind::Opencode) => match opencode_config_env(mcp_context) {
-            Some(config) => format!(
-                "OPENCODE_CONFIG_CONTENT={} {} --prompt \"{}\"",
-                shell_single_quote(&config),
-                base_command,
-                shell_expr
-            ),
-            None => format!("{} --prompt \"{}\"", base_command, shell_expr),
-        },
+        Some(BackendKind::Opencode) => {
+            // opencode has no `--system-prompt`; `--prompt` is treated as the
+            // first user message, which makes the LLM read agent.md
+            // descriptively and ask back "What is your agent name?" etc.
+            // Spawn opencode bare and let `spawn_worker` deliver the prompt
+            // via tmux as a single combined first user message.
+            match opencode_config_env(mcp_context) {
+                Some(config) => format!(
+                    "OPENCODE_CONFIG_CONTENT={} {}",
+                    shell_single_quote(&config),
+                    base_command
+                ),
+                None => base_command.to_string(),
+            }
+        }
         None => base_command.to_string(),
     }
 }
@@ -998,10 +1007,23 @@ fn spawn_worker(
         false
     };
 
-    let initial_msg = format!(
+    // opencode has no system-prompt flag, so build_agent_command spawns it
+    // bare. Inline the rendered agent.md content here so the worker receives
+    // its instructions plus the YOUR NAME header in a single user message.
+    let header = format!(
         "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
         agent.name, parent_name, agent.task
     );
+    let initial_msg = if detect_backend(command) == Some(BackendKind::Opencode) {
+        let rendered = materialize_prompt_file(
+            &prompt_file,
+            &[("{{TASK}}", &agent.task), ("{{EA_ID}}", &ea_id.to_string())],
+        );
+        let body = std::fs::read_to_string(&rendered).unwrap_or_default();
+        format!("{}\n\n---\n\n{}", body, header)
+    } else {
+        header
+    };
     let opts = DeliveryOptions {
         startup_timeout: Duration::from_secs(45),
         stable_quiet: Duration::from_millis(800),
@@ -1166,7 +1188,9 @@ mod tests {
         assert!(cmd.contains("\"omar\""));
         assert!(cmd.contains("\"doom_loop\":\"deny\""));
         assert!(cmd.contains("\"ScheduleWakeup\":false"));
-        assert!(cmd.contains("--prompt \"$(cat '/tmp/prompts/pm.md')\""));
+        // opencode is spawned bare; the prompt is delivered via tmux after spawn.
+        assert!(!cmd.contains("--prompt"));
+        assert!(cmd.trim_end().ends_with(" opencode"));
     }
 
     #[test]
