@@ -1198,10 +1198,26 @@ impl OmarMcpServer {
             } else {
                 let client2 = client.clone();
                 let session2 = session_name.clone();
-                let first_message = format!(
+                let header = format!(
                     "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
                     short_name, prompt_parent, task_text
                 );
+                // opencode has no system-prompt flag, so build_agent_command
+                // spawns it bare. Inline the rendered agent.md content here so
+                // the worker receives instructions plus the YOUR NAME header
+                // in a single user message. Other backends already received
+                // agent.md via their respective system-prompt flags.
+                let first_message = if backend_name == "opencode" {
+                    let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
+                    let content = std::fs::read_to_string(&prompt_file)
+                        .unwrap_or_default()
+                        .replace("{{PARENT_NAME}}", &prompt_parent)
+                        .replace("{{TASK}}", &task_text)
+                        .replace("{{EA_ID}}", &ea_id.to_string());
+                    format!("{}\n\n---\n\n{}", content, header)
+                } else {
+                    header
+                };
                 let backend_name2 = backend_name.clone();
                 let readiness_markers =
                     crate::tmux::backend_readiness_markers(&backend_name).to_vec();
