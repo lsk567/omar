@@ -1786,3 +1786,173 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
     let _ = tmux(&["kill-session", "-t", &ea0_session]);
     let _ = tmux(&["kill-session", "-t", &ea1_session]);
 }
+
+/// Verifies the EA's manager-notes contract end-to-end without relying on an
+/// LLM: an EA persists state by running a shell heredoc command that writes
+/// `~/.omar/manager_notes_ea<ID>.md`, and a subsequently spawned EA session
+/// must load those notes verbatim into its startup prompt at
+/// `~/.omar/ea/<ID>/ea_prompt_combined.md`. This is the contract documented in
+/// `prompts/executive-assistant.md` and matches main's behavior, where there
+/// is no MCP write path for notes — only the EA's own shell.
+#[test]
+fn test_manager_notes_shell_write_persists_across_ea_restart() {
+    if !tmux_available() {
+        eprintln!("Skipping test: tmux not available");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("temp home");
+
+    // Bootstrap so ~/.omar/{config.toml, prompts/} are populated.
+    bootstrap_cli_home(home.path());
+
+    // Override default_command so `omar manager start` runs a tame shell
+    // instead of invoking a real backend (which isn't installed in CI). The
+    // shell stays alive long enough for us to drive it with `tmux send-keys`.
+    let omar_dir = home.path().join(".omar");
+    let config_path = omar_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[agent]
+default_command = "exec bash"
+"#,
+    )
+    .expect("write test config.toml");
+
+    // EA 0's manager session under the test tmux server.
+    let manager_session = "omar-agent-ea-0".to_string();
+    cleanup_session(&manager_session);
+
+    // First "EA spawn": render the EA prompt, create a tmux session running
+    // bash, attach (no-op without a TTY but harmless). The combined prompt
+    // file gets written to disk before the session is created.
+    let output = omar_command(home.path())
+        .args(["--ea", "0", "manager", "start"])
+        .output()
+        .expect("Failed to run omar manager start (1)");
+    assert!(
+        output.status.success(),
+        "first manager start failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Confirm the manager session exists and is running bash.
+    assert!(
+        tmux_has_session(&manager_session),
+        "first manager start did not create session {}",
+        manager_session,
+    );
+
+    // Sanity: the rendered prompt contains the documented heredoc instruction
+    // — i.e. the EA is told to write notes via shell, not via an MCP tool.
+    let combined_prompt = omar_dir.join("ea/0/ea_prompt_combined.md");
+    let prompt_content = fs::read_to_string(&combined_prompt)
+        .expect("ea_prompt_combined.md must exist after first manager start");
+    // The combined prompt is written before sed-substitution of {{EA_ID}};
+    // substitution happens at backend launch via build_agent_command's sed.
+    assert!(
+        prompt_content.contains("cat > ~/.omar/manager_notes_ea{{EA_ID}}.md << 'NOTES'"),
+        "prompt must instruct the EA to write notes via shell heredoc; got:\n{}",
+        prompt_content,
+    );
+    // No MCP append-note tool should be advertised — main has no such tool
+    // either, and we deleted `append_manager_note` end-to-end.
+    assert!(
+        !prompt_content.contains("append_manager_note"),
+        "prompt must not reference append_manager_note (deleted): {}",
+        prompt_content,
+    );
+
+    // Drive the bash session with the exact heredoc the prompt teaches. This
+    // is the EA's "write via shell" path; it must land at the correct file.
+    let notes_path = omar_dir.join("manager_notes_ea0.md");
+    assert!(
+        !notes_path.exists(),
+        "manager_notes_ea0.md must not exist before first write",
+    );
+
+    let heredoc = "cat > ~/.omar/manager_notes_ea0.md << 'NOTES'\n\
+# Manager Notes\n\n\
+## Active Tasks\n\
+- Project id=1 \"Build REST API\" -> Agent: rest-api (running)\n\n\
+## Notes\n\
+- User prefers TypeScript\n\
+NOTES";
+
+    let _ = tmux(&["send-keys", "-t", &manager_session, "-l", heredoc]);
+    let _ = tmux(&["send-keys", "-t", &manager_session, "Enter"]);
+
+    // Wait for the file to land (heredoc runs asynchronously inside tmux).
+    let mut wrote = false;
+    for _ in 0..50 {
+        if notes_path.exists() {
+            wrote = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        wrote,
+        "EA never wrote {} via shell heredoc",
+        notes_path.display(),
+    );
+
+    let written = fs::read_to_string(&notes_path).expect("read notes");
+    assert!(
+        written.contains("User prefers TypeScript"),
+        "notes body: {}",
+        written
+    );
+    assert!(
+        written.contains("Project id=1 \"Build REST API\""),
+        "notes body: {}",
+        written,
+    );
+
+    // Tear down the first EA session before re-spawning. `omar manager start`
+    // will reuse a live session instead of rebuilding the prompt, so we MUST
+    // kill it to exercise the second-spawn path.
+    cleanup_session(&manager_session);
+    assert!(
+        !tmux_has_session(&manager_session),
+        "first session not killed"
+    );
+
+    // Second "EA spawn": same EA id, fresh tmux session. The newly built
+    // combined prompt must contain the manager notes verbatim under the
+    // documented "Manager Notes (from previous session)" header.
+    fs::remove_file(&combined_prompt).ok();
+
+    let output = omar_command(home.path())
+        .args(["--ea", "0", "manager", "start"])
+        .output()
+        .expect("Failed to run omar manager start (2)");
+    assert!(
+        output.status.success(),
+        "second manager start failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let prompt_after = fs::read_to_string(&combined_prompt)
+        .expect("ea_prompt_combined.md must exist after second manager start");
+    assert!(
+        prompt_after.contains("## Manager Notes (from previous session)"),
+        "second prompt missing notes section header:\n{}",
+        prompt_after,
+    );
+    // Verbatim load: every non-empty line of the on-disk notes must appear in
+    // the rendered prompt with no transformation.
+    for line in written.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            prompt_after.contains(line),
+            "second prompt missing notes line {:?}; full prompt:\n{}",
+            line,
+            prompt_after,
+        );
+    }
+
+    cleanup_session(&manager_session);
+}

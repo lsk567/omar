@@ -273,26 +273,6 @@ fn append_debug_log(context: &McpLaunchContext, line: &str) {
     }
 }
 
-fn write_text_atomic(path: &Path, text: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state");
-    let tmp = path.with_file_name(format!(".{}.{}.tmp", file_name, Uuid::new_v4()));
-    if let Err(err) = fs::write(&tmp, text) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    if let Err(err) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    Ok(())
-}
-
 fn last_output_line(output: &str) -> String {
     output
         .lines()
@@ -581,7 +561,6 @@ impl OmarMcpServer {
             "omar_wake_later" => self.omar_wake_later(call.arguments),
             "list_events" => self.list_events(),
             "cancel_event" => self.cancel_event(call.arguments),
-            "append_manager_note" => self.append_manager_note(call.arguments),
             "log_justification" => self.log_justification(call.arguments),
             "slack_reply" => self.slack_reply(call.arguments),
             "computer_status" => self.computer_status(),
@@ -1445,27 +1424,6 @@ impl OmarMcpServer {
         }))
     }
 
-    fn append_manager_note(&self, args: Value) -> Result<Value> {
-        #[derive(Deserialize)]
-        struct Args {
-            text: String,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        let ea_id = self.ea_id();
-        let state_dir = self.state_dir();
-        let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
-        let path = memory::manager_notes_path(&self.context.omar_dir, ea_id);
-        let existing = fs::read_to_string(&path).unwrap_or_default();
-        let mut out = existing;
-        if !out.trim().is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(&format!("[{}]\n{}\n", now_rfc3339(), args.text.trim()));
-        write_text_atomic(&path, &out).context("Failed to write manager note")?;
-        self.refresh_memory_locked()?;
-        Ok(json!({ "status": "appended", "path": path }))
-    }
-
     /// Queue a Slack reply for the `omar-slack-bridge` peer to pick up and
     /// post to Slack. File-based rendezvous via `{omar_dir}/slack_outbox/`
     /// keeps the MCP surface free of loopback HTTP and survives a bridge
@@ -2172,16 +2130,6 @@ fn tool_definitions() -> Vec<Value> {
                 "type":"object",
                 "properties":{"event_id":{"type":"string"}},
                 "required":["event_id"],
-                "additionalProperties":false
-            }),
-        ),
-        tool(
-            "append_manager_note",
-            "Append durable text to the current EA manager notes file. Use for project/agent mappings, completed-work summaries, user preferences, and recovery context. Side effect: appends to notes on disk; retrying duplicates the note. Do not use to overwrite OMAR memory files.",
-            json!({
-                "type":"object",
-                "properties":{"text":{"type":"string"}},
-                "required":["text"],
                 "additionalProperties":false
             }),
         ),
