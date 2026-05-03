@@ -1,0 +1,60 @@
+name: Opencode Binary Tree (Nightly)
+
+# Real-LLM end-to-end test using opencode (the only free backend). Verifies
+# that omar can spawn a binary tree (root + 2 leaves) of opencode workers
+# with distinct models per node, without the agent-create-wizard regression
+# that was fixed in build_agent_command + spawn_worker + MCP
+# spawn_agent_internal.
+#
+# Why nightly + manual only
+# - Real LLM calls cost time (10 min / run) and a free quota.
+# - LLM nondeterminism makes the test informational rather than gating.
+# - Per-PR CI must stay fast and deterministic; this job is intentionally
+#   not in the merge-required list.
+
+on:
+  schedule:
+    # 07:00 UTC nightly
+    - cron: '0 7 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  opencode-binary-tree:
+    name: Opencode Binary Tree
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux curl
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build omar
+        run: cargo build --bin omar
+
+      - name: Install opencode CLI
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Verify opencode is available
+        run: opencode --version
+
+      - name: Run opencode binary-tree e2e
+        env:
+          OMAR_OPENCODE_E2E: '1'
+        run: bash tests/ci/opencode_binary_tree.sh
