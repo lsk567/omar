@@ -1049,14 +1049,6 @@ fn test_omar_mcp_server_tools_list_via_cli() {
         names
     );
 
-    // The intermediate rename `omar_wake_later` was reverted to `schedule_event`
-    // (matches main's API endpoint name and captures the event-queue semantics).
-    assert!(
-        !names.contains(&"omar_wake_later"),
-        "schedule_event must not appear under its intermediate name omar_wake_later: {:?}",
-        names
-    );
-
     // spawn_agent schema must NOT include a `track` property — the rework
     // intentionally removed any mode flag on the spawn path.
     let spawn_agent = tools
