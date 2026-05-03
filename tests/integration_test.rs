@@ -1010,7 +1010,7 @@ fn test_omar_mcp_server_tools_list_via_cli() {
 
     // spawn_agent is the single spawn-path tool.
     assert!(names.contains(&"spawn_agent"), "names: {:?}", names);
-    assert!(names.contains(&"omar_wake_later"), "names: {:?}", names);
+    assert!(names.contains(&"schedule_event"), "names: {:?}", names);
     assert!(names.contains(&"kill_agent"), "names: {:?}", names);
 
     // Task-lifecycle MCP tools are gone in the metadata-only model.
@@ -1042,17 +1042,18 @@ fn test_omar_mcp_server_tools_list_via_cli() {
         names
     );
 
-    // notify_parent was collapsed into omar_wake_later and must not reappear.
+    // notify_parent was collapsed into schedule_event and must not reappear.
     assert!(
         !names.contains(&"notify_parent"),
-        "notify_parent was collapsed into omar_wake_later and must not appear in the tool list: {:?}",
+        "notify_parent was collapsed into schedule_event and must not appear in the tool list: {:?}",
         names
     );
 
-    // schedule_event was renamed to omar_wake_later and must not reappear under its old name.
+    // The intermediate rename `omar_wake_later` was reverted to `schedule_event`
+    // (matches main's API endpoint name and captures the event-queue semantics).
     assert!(
-        !names.contains(&"schedule_event"),
-        "schedule_event was renamed to omar_wake_later and must not appear in the tool list: {:?}",
+        !names.contains(&"omar_wake_later"),
+        "schedule_event must not appear under its intermediate name omar_wake_later: {:?}",
         names
     );
 
@@ -1497,9 +1498,9 @@ fn test_integer_fields_accept_strings() {
         created
     );
 
-    // omar_wake_later delay_seconds also accepts strings.
+    // schedule_event delay_seconds also accepts strings.
     let scheduled = server.tool_call(
-        "omar_wake_later",
+        "schedule_event",
         json!({
             "receiver": agent_name,
             "payload": "hello",
@@ -1508,7 +1509,7 @@ fn test_integer_fields_accept_strings() {
     );
     assert!(
         scheduled["id"].is_string(),
-        "omar_wake_later should accept string delay_seconds, got {}",
+        "schedule_event should accept string delay_seconds, got {}",
         scheduled
     );
 

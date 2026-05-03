@@ -40,11 +40,26 @@ const PROMPT_WATCHDOG: &str = include_str!("../../prompts/watchdog.md");
 
 // Backend-native wake/reminder tools bypass OMAR's durable, EA-scoped scheduler.
 // Deny these names where a backend exposes per-session tool controls.
+// (Names are a superset across backends; unrecognized names are no-ops.)
 const BACKEND_NATIVE_WAKE_TOOLS: &[&str] = &[
     "ScheduleWakeup",
     "TaskReminder",
     "task_reminder",
     "scheduled_tasks",
+];
+
+// Backend-native subagent/dispatcher tools overlap with OMAR's `spawn_agent`
+// and would let the EA delegate work outside OMAR's bookkeeping (no tmux
+// session, no project tracking, no dashboard visibility, no durable scheduler
+// hooks). Deny them so all delegation flows through OMAR's MCP `spawn_agent`.
+// (Names are a superset across backends; unrecognized names are no-ops.)
+const BACKEND_NATIVE_AGENT_TOOLS: &[&str] = &[
+    "Task", // Claude Code subagent dispatcher
+    "task", // lowercase variant used by some opencode/codex builds
+    "Agent",
+    "agent",
+    "subagent",
+    "dispatch_agent",
 ];
 
 /// Embedded prompt files, keyed by filename.
@@ -88,8 +103,15 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn backend_native_wake_tools_csv() -> String {
-    BACKEND_NATIVE_WAKE_TOOLS.join(",")
+/// CSV of every backend-native tool name OMAR wants denied (wake + subagent
+/// dispatchers). Used by `--disallowedTools` style flags that take a flat list.
+fn backend_native_disallowed_tools_csv() -> String {
+    BACKEND_NATIVE_WAKE_TOOLS
+        .iter()
+        .chain(BACKEND_NATIVE_AGENT_TOOLS.iter())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn current_tmux_server() -> Option<String> {
@@ -319,17 +341,25 @@ fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
     ))
 }
 
-fn materialize_gemini_wake_policy(context: &McpLaunchContext) -> Option<PathBuf> {
+fn materialize_gemini_deny_policy(context: &McpLaunchContext) -> Option<PathBuf> {
     let dir = mcp_ea_dir(context)?;
-    let path = dir.join("gemini-deny-native-wake.toml");
+    let path = dir.join("gemini-deny-native-tools.toml");
     let mut policy = String::new();
-    for tool in BACKEND_NATIVE_WAKE_TOOLS {
+    let entries = BACKEND_NATIVE_WAKE_TOOLS
+        .iter()
+        .map(|t| (*t, "Use the OMAR MCP tool schedule_event instead."))
+        .chain(
+            BACKEND_NATIVE_AGENT_TOOLS
+                .iter()
+                .map(|t| (*t, "Use the OMAR MCP tool spawn_agent instead.")),
+        );
+    for (tool, message) in entries {
         policy.push_str(&format!(
             r#"[[rule]]
 toolName = "{tool}"
 decision = "deny"
 priority = 999
-denyMessage = "Use the OMAR MCP tool omar_wake_later instead."
+denyMessage = "{message}"
 
 "#
         ));
@@ -357,6 +387,16 @@ fn gemini_mcp_bootstrap(base_command: &str, context: &McpLaunchContext) -> Optio
 fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
     let server_exe = std::env::current_exe().ok()?;
     let context_file = materialize_mcp_context_file(context)?;
+    // Disable every backend-native tool that overlaps an OMAR MCP tool so
+    // delegation/scheduling can only flow through OMAR and stays visible in
+    // the dashboard. Names that opencode does not expose are no-ops.
+    let mut tools = serde_json::Map::new();
+    for name in BACKEND_NATIVE_WAKE_TOOLS
+        .iter()
+        .chain(BACKEND_NATIVE_AGENT_TOOLS.iter())
+    {
+        tools.insert((*name).to_string(), serde_json::Value::Bool(false));
+    }
     let config = serde_json::json!({
         "mcp": {
             "omar": {
@@ -370,12 +410,7 @@ fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
                 ]
             }
         },
-        "tools": {
-            "ScheduleWakeup": false,
-            "TaskReminder": false,
-            "task_reminder": false,
-            "scheduled_tasks": false
-        },
+        "tools": tools,
         "permission": {
             "doom_loop": "deny"
         }
@@ -520,7 +555,7 @@ pub fn build_agent_command(
                 base_command,
                 shell_expr,
                 shell_single_quote(&mcp_config.display().to_string()),
-                shell_single_quote(&backend_native_wake_tools_csv())
+                shell_single_quote(&backend_native_disallowed_tools_csv())
             ),
             None => format!("{} --system-prompt \"{}\"", base_command, shell_expr),
         },
@@ -552,7 +587,7 @@ pub fn build_agent_command(
                 "TERM=xterm-256color {} --allowed-mcp-server-names omar -i \"{}\"",
                 base_command, shell_expr
             );
-            if let Some(policy) = materialize_gemini_wake_policy(mcp_context) {
+            if let Some(policy) = materialize_gemini_deny_policy(mcp_context) {
                 cmd = format!(
                     "{} --policy {}",
                     cmd,
@@ -1075,7 +1110,7 @@ mod tests {
     #[test]
     fn embedded_prompts_forbid_backend_native_wake_tools() {
         for prompt in [PROMPT_EA, PROMPT_AGENT] {
-            assert!(prompt.contains("MUST use the OMAR MCP tool `omar_wake_later`"));
+            assert!(prompt.contains("MUST use the OMAR MCP tool `schedule_event`"));
             assert!(prompt.contains("ScheduleWakeup"));
             assert!(prompt.contains("scheduled tasks"));
             assert!(prompt.contains("If a non-OMAR wake/reminder tool is visible, ignore it"));
@@ -1097,7 +1132,16 @@ mod tests {
         );
         assert!(cmd.contains("--mcp-config"));
         assert!(cmd.contains("--disallowedTools"));
-        assert!(cmd.contains("ScheduleWakeup,TaskReminder,task_reminder,scheduled_tasks"));
+        // Wake-tool denylist (overlap with schedule_event).
+        assert!(cmd.contains("ScheduleWakeup"));
+        assert!(cmd.contains("scheduled_tasks"));
+        // Subagent-dispatcher denylist (overlap with spawn_agent). The Claude
+        // Code built-in `Task` tool is the canonical example.
+        assert!(
+            cmd.contains(",Task,") || cmd.contains("Task,task,"),
+            "claude --disallowedTools must include the built-in Task tool: {cmd}"
+        );
+        assert!(cmd.contains("dispatch_agent"));
     }
 
     #[test]
@@ -1168,9 +1212,14 @@ mod tests {
         assert!(cmd.contains(
             "TERM=xterm-256color gemini --yolo --allowed-mcp-server-names omar -i \"$(cat '/tmp/prompts/ea.md')\""
         ));
-        let policy = dir.path().join("mcp/ea-0/gemini-deny-native-wake.toml");
+        let policy = dir.path().join("mcp/ea-0/gemini-deny-native-tools.toml");
         let policy = std::fs::read_to_string(policy).unwrap();
+        // Wake/timer overlap rules.
         assert!(policy.contains("toolName = \"ScheduleWakeup\""));
+        assert!(policy.contains("Use the OMAR MCP tool schedule_event instead."));
+        // Subagent-dispatcher overlap rules.
+        assert!(policy.contains("toolName = \"Task\""));
+        assert!(policy.contains("Use the OMAR MCP tool spawn_agent instead."));
         assert!(policy.contains("decision = \"deny\""));
     }
 
@@ -1188,6 +1237,9 @@ mod tests {
         assert!(cmd.contains("\"omar\""));
         assert!(cmd.contains("\"doom_loop\":\"deny\""));
         assert!(cmd.contains("\"ScheduleWakeup\":false"));
+        // Subagent-dispatcher overlap with OMAR's spawn_agent.
+        assert!(cmd.contains("\"Task\":false"));
+        assert!(cmd.contains("\"dispatch_agent\":false"));
         // opencode is spawned bare; the prompt is delivered via tmux after spawn.
         assert!(!cmd.contains("--prompt"));
         assert!(cmd.trim_end().ends_with(" opencode"));

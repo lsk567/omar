@@ -42,7 +42,7 @@ Your node number is 1. Your level is 1. The max level is 7.
 
 ### If you are a LEAF node (level == 7)
 Output [TASK COMPLETE], then immediately wake your parent by calling:
-  omar_wake_later({"receiver": "t-YOUR_PARENT", "payload": "[CHILD COMPLETE] t-YOUR_NODE: Leaf t-YOUR_NODE complete.", "delay_seconds": 0})
+  schedule_event({"receiver": "t-YOUR_PARENT", "payload": "[CHILD COMPLETE] t-YOUR_NODE: Leaf t-YOUR_NODE complete.", "delay_seconds": 0})
 (YOUR_PARENT = floor(YOUR_NODE / 2).)
 
 ### If you are an INTERNAL node (level < 7)
@@ -62,10 +62,10 @@ Output [TASK COMPLETE], then immediately wake your parent by calling:
        "parent": "t-<YOUR_NODE>"
      })
 
-3. Wait for both children to wake you via `omar_wake_later` — you will receive
+3. Wait for both children to wake you via `schedule_event` — you will receive
    two `[CHILD COMPLETE]` messages. If a child hasn't reported after a
    reasonable time, use `get_agent({"name": "t-<CHILD_NODE>"})` to check its
-   output_tail. Use `omar_wake_later` (sender/receiver both your own name) for
+   output_tail. Use `schedule_event` (sender/receiver both your own name) for
    timed fallback checks instead of busy loops.
 
 4. When BOTH children have reported [CHILD COMPLETE]:
@@ -73,7 +73,7 @@ Output [TASK COMPLETE], then immediately wake your parent by calling:
    b. kill_agent({"name": "t-<RIGHT_CHILD>"})
    c. Output [TASK COMPLETE]
    d. Wake your parent (YOUR_PARENT = floor(YOUR_NODE / 2); the root t-1 uses "ea"):
-      omar_wake_later({"receiver": "t-YOUR_PARENT", "payload": "[CHILD COMPLETE] t-YOUR_NODE: Subtree rooted at t-YOUR_NODE complete. Both children killed.", "delay_seconds": 0})
+      schedule_event({"receiver": "t-YOUR_PARENT", "payload": "[CHILD COMPLETE] t-YOUR_NODE: Subtree rooted at t-YOUR_NODE complete. Both children killed.", "delay_seconds": 0})
 
 IMPORTANT: Do NOT output [TASK COMPLETE] until both children are confirmed
 complete AND killed.
@@ -105,4 +105,4 @@ complete AND killed.
 ## Known Issues
 
 - **Straggler problem:** Parents sometimes output `[TASK COMPLETE]` and exit before kills for their children are confirmed. Mitigation: EA should sweep remaining `t-*` agents after `t-1` reports complete, via `list_agents` + `kill_agent`.
-- **Polling overhead:** Deep trees create many concurrent polling loops. Use `omar_wake_later` wake-ups rather than sleep loops to avoid resource waste.
+- **Polling overhead:** Deep trees create many concurrent polling loops. Use `schedule_event` wake-ups rather than sleep loops to avoid resource waste.

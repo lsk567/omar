@@ -558,7 +558,7 @@ impl OmarMcpServer {
             "list_projects" => self.list_projects(),
             "add_project" => self.add_project(call.arguments),
             "complete_project" => self.complete_project(call.arguments),
-            "omar_wake_later" => self.omar_wake_later(call.arguments),
+            "schedule_event" => self.schedule_event(call.arguments),
             "list_events" => self.list_events(),
             "cancel_event" => self.cancel_event(call.arguments),
             "log_justification" => self.log_justification(call.arguments),
@@ -1257,7 +1257,7 @@ impl OmarMcpServer {
         Ok(json!({ "status": "sent" }))
     }
 
-    fn omar_wake_later(&self, args: Value) -> Result<Value> {
+    fn schedule_event(&self, args: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct Args {
             receiver: String,
@@ -2100,8 +2100,8 @@ fn tool_definitions() -> Vec<Value> {
             }),
         ),
         tool(
-            "omar_wake_later",
-            "Schedule a timed wake-up/message for an agent or the EA using OMAR's persistent scheduler. Use for all timed OMAR check-ins, parent completion notifications, and future nudges instead of sleep loops or external harness wakeups. Side effect: creates a scheduled event visible in the dashboard and durable across restarts. Not retry-safe unless duplicate delivery is acceptable; use list_events/cancel_event after uncertain results. For immediate parent notification after completion, set receiver to the parent name, payload to '[CHILD COMPLETE] {your_name}: {summary}', and delay_seconds to 0.",
+            "schedule_event",
+            "Enqueue an event in OMAR's persistent event queue to wake an agent or the EA at a chosen time. The event queue is OMAR's central coordination primitive: every timed check-in, parent completion notification, future nudge, and recurring cron-style task flows through it. Use this instead of sleep loops or any backend-native timer/reminder tool. Side effect: appends a scheduled event visible in the dashboard via list_events and durable across restarts. Not retry-safe unless duplicate delivery is acceptable; use list_events/cancel_event after uncertain results. For immediate parent notification after completion, set receiver to the parent name, payload to '[CHILD COMPLETE] {your_name}: {summary}', and delay_seconds to 0.",
             json!({
                 "type":"object",
                 "properties":{

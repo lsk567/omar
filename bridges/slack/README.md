@@ -12,7 +12,7 @@ Slack (Socket Mode WS)                       OMAR
        │ @mention event                        │
        ▼                                       │
   omar-slack bridge ──────────────────────►  omar mcp-server
-       │          omar_wake_later (stdio)    (subprocess)
+       │          schedule_event (stdio)    (subprocess)
        │                                       │
        │                                       ▼
        │                                  EA (tmux)
@@ -25,7 +25,7 @@ Slack (Socket Mode WS)                       OMAR
 ```
 
 - **Socket Mode**: WebSocket connection via app-level token — no public endpoint required.
-- **Inbound**: bridge spawns `omar mcp-server` as a subprocess, calls `omar_wake_later` over its stdio.
+- **Inbound**: bridge spawns `omar mcp-server` as a subprocess, calls `schedule_event` over its stdio.
 - **Outbound**: EA calls the `slack_reply` MCP tool, which atomically queues a JSON file in `~/.omar/slack_outbox/`. The bridge polls the directory every 500 ms and delivers to Slack; files are deleted on successful delivery, retained on failure, so transient Slack errors (or a bridge restart) don't lose messages.
 - **No HTTP surface**: the bridge no longer binds any loopback port.
 
@@ -109,7 +109,7 @@ cargo build --release
 2. Bridge spawns `omar mcp-server` as a subprocess and completes the MCP `initialize` handshake over stdio.
 3. When someone @mentions the bot in a channel:
    - Bridge formats the message as a `[SLACK MESSAGE]` event payload (includes channel, thread, user, and reply instructions that point at the `slack_reply` MCP tool).
-   - Calls `omar_wake_later` on the MCP server with `receiver: "ea"`.
+   - Calls `schedule_event` on the MCP server with `receiver: "ea"`.
 4. OMAR's scheduler delivers the event to the EA (deferred if a popup is open).
 5. EA processes the request and replies by invoking the `slack_reply` MCP tool with the channel and thread from the inbound payload.
 6. Bridge's outbox watcher picks the queued reply up and posts it to the correct Slack thread (auto-chunked if >3900 chars).

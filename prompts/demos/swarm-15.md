@@ -67,10 +67,10 @@ The root spawns the rest of the tree via its own `spawn_agent` calls, reusing th
 - Use the OMAR `spawn_agent` MCP tool to spawn children, passing the swarm's `project_id`. Never curl, never use built-in background agents.
 - Always pass `parent` set to your own agent name so the hierarchy is visible in OMAR.
 - Always pass `backend` (see table above). Never pass `model`.
-- Use `omar_wake_later` for check-ins; never sleep loops.
+- Use `schedule_event` for check-ins; never sleep loops.
 - Do NOT kill any agents — all 15 must remain alive after completion.
 - Reply `[TASK COMPLETE]` only once all children report `[TASK COMPLETE]`.
-- After `[TASK COMPLETE]`, always wake your parent immediately by calling `omar_wake_later({"receiver": "<parent_name>", "payload": "[CHILD COMPLETE] YOUR_NAME: <summary>", "delay_seconds": 0})`.
+- After `[TASK COMPLETE]`, always wake your parent immediately by calling `schedule_event({"receiver": "<parent_name>", "payload": "[CHILD COMPLETE] YOUR_NAME: <summary>", "delay_seconds": 0})`.
 
 ## Root Agent Task (`claude-architect`)
 
@@ -83,9 +83,9 @@ Steps:
 1. Create junk/chat-system/ and write package.json (deps: express, ws, better-sqlite3, jsonwebtoken, bcryptjs, uuid; devDeps: jest, supertest; test script `jest --testMatch=**/test/*.test.js`).
 2. Spawn codex-backend (backend="codex") with the Backend-Lead task below.
 3. Spawn opencode-frontend (backend="opencode") with the Frontend-Lead task below.
-4. Wait for `[CHILD COMPLETE]` messages from both. Use `get_agent` + `omar_wake_later` as fallback if a child hasn't notified after a reasonable time.
+4. Wait for `[CHILD COMPLETE]` messages from both. Use `get_agent` + `schedule_event` as fallback if a child hasn't notified after a reasonable time.
 5. Run the tests: `cd junk/chat-system && npm install && npm test`.
-6. Report [TASK COMPLETE] with results. Wake the EA: `omar_wake_later({"receiver": "ea", "payload": "[CHILD COMPLETE] claude-architect: <results>", "delay_seconds": 0})`. Do NOT kill any agents.
+6. Report [TASK COMPLETE] with results. Wake the EA: `schedule_event({"receiver": "ea", "payload": "[CHILD COMPLETE] claude-architect: <results>", "delay_seconds": 0})`. Do NOT kill any agents.
 ```
 
 ## Level-2 Tasks
@@ -99,9 +99,9 @@ You are codex-backend, Backend Lead in the 15-agent swarm. Follow swarm-15 globa
 
 1. Spawn cursor-api (backend="cursor") with the API-Lead task.
 2. Spawn claude-data (backend="claude") with the Data-Lead task.
-3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `omar_wake_later` as fallback.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback.
 4. Write junk/chat-system/src/server.js: wire api.js, ws.js, db.js, and auth.js into an Express+WebSocket server on port 3000.
-5. Report [TASK COMPLETE]. Wake the parent: `omar_wake_later({"receiver": "claude-architect", "payload": "[CHILD COMPLETE] codex-backend: Backend complete.", "delay_seconds": 0})`. Do NOT kill any agents.
+5. Report [TASK COMPLETE]. Wake the parent: `schedule_event({"receiver": "claude-architect", "payload": "[CHILD COMPLETE] codex-backend: Backend complete.", "delay_seconds": 0})`. Do NOT kill any agents.
 ```
 
 ### `opencode-frontend`
@@ -113,8 +113,8 @@ You are opencode-frontend, Frontend Lead in the 15-agent swarm. Follow swarm-15 
 
 1. Spawn codex-ui (backend="codex") with the UI-Lead task.
 2. Spawn opencode-infra (backend="opencode") with the Infra-Lead task.
-3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `omar_wake_later` as fallback.
-4. Report [TASK COMPLETE]. Wake the parent: `omar_wake_later({"receiver": "claude-architect", "payload": "[CHILD COMPLETE] opencode-frontend: Frontend complete.", "delay_seconds": 0})`. Do NOT kill any agents.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback.
+4. Report [TASK COMPLETE]. Wake the parent: `schedule_event({"receiver": "claude-architect", "payload": "[CHILD COMPLETE] opencode-frontend: Frontend complete.", "delay_seconds": 0})`. Do NOT kill any agents.
 ```
 
 ## Level-3 Tasks
@@ -129,8 +129,8 @@ Follow swarm-15 global rules.
 
 1. Spawn claude-rest (backend="claude") with the REST-API task.
 2. Spawn codex-ws (backend="codex") with the WebSocket task.
-3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `omar_wake_later` as fallback. Verify src/api.js and src/ws.js exist.
-4. Report [TASK COMPLETE]. Wake the parent: `omar_wake_later({"receiver": "codex-backend", "payload": "[CHILD COMPLETE] cursor-api: API layer complete.", "delay_seconds": 0})`. Do NOT kill any agents.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback. Verify src/api.js and src/ws.js exist.
+4. Report [TASK COMPLETE]. Wake the parent: `schedule_event({"receiver": "codex-backend", "payload": "[CHILD COMPLETE] cursor-api: API layer complete.", "delay_seconds": 0})`. Do NOT kill any agents.
 ```
 
 ### `claude-data` (Data Lead)
@@ -143,8 +143,8 @@ Follow swarm-15 global rules.
 
 1. Spawn opencode-db (backend="opencode") with the Storage task.
 2. Spawn cursor-auth (backend="cursor") with the Auth task.
-3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `omar_wake_later` as fallback. Verify src/db.js and src/auth.js exist.
-4. Report [TASK COMPLETE]. Wake the parent: `omar_wake_later({"receiver": "codex-backend", "payload": "[CHILD COMPLETE] claude-data: Data layer complete.", "delay_seconds": 0})`. Do NOT kill any agents.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback. Verify src/db.js and src/auth.js exist.
+4. Report [TASK COMPLETE]. Wake the parent: `schedule_event({"receiver": "codex-backend", "payload": "[CHILD COMPLETE] claude-data: Data layer complete.", "delay_seconds": 0})`. Do NOT kill any agents.
 ```
 
 ### `codex-ui` (UI Lead)
@@ -157,8 +157,8 @@ Follow swarm-15 global rules.
 
 1. Spawn claude-chat (backend="claude") with the Chat-UI task.
 2. Spawn codex-admin (backend="codex") with the Admin-Panel task.
-3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `omar_wake_later` as fallback. Verify their files exist.
-4. Report [TASK COMPLETE]. Wake the parent: `omar_wake_later({"receiver": "opencode-frontend", "payload": "[CHILD COMPLETE] codex-ui: UI complete.", "delay_seconds": 0})`. Do NOT kill any agents.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback. Verify their files exist.
+4. Report [TASK COMPLETE]. Wake the parent: `schedule_event({"receiver": "opencode-frontend", "payload": "[CHILD COMPLETE] codex-ui: UI complete.", "delay_seconds": 0})`. Do NOT kill any agents.
 ```
 
 ### `opencode-infra` (Infra Lead)
@@ -171,8 +171,8 @@ Follow swarm-15 global rules.
 
 1. Spawn opencode-cli (backend="opencode") with the CLI task.
 2. Spawn cursor-tests (backend="cursor") with the Test-Suite task.
-3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `omar_wake_later` as fallback. Verify their files exist.
-4. Report [TASK COMPLETE]. Wake the parent: `omar_wake_later({"receiver": "opencode-frontend", "payload": "[CHILD COMPLETE] opencode-infra: Infra complete.", "delay_seconds": 0})`. Do NOT kill any agents.
+3. Wait for `[CHILD COMPLETE]` from both. Use `get_agent` + `schedule_event` as fallback. Verify their files exist.
+4. Report [TASK COMPLETE]. Wake the parent: `schedule_event({"receiver": "opencode-frontend", "payload": "[CHILD COMPLETE] opencode-infra: Infra complete.", "delay_seconds": 0})`. Do NOT kill any agents.
 ```
 
 ## Level-4 Worker Tasks
@@ -188,7 +188,7 @@ Build junk/chat-system/src/api.js — an Express router:
 JSON-only; auth routes public, others require JWT via the auth middleware.
 auth.js exports: hashPassword, comparePassword, generateToken, authMiddleware.
 db.js exports:   createUser, findUser, getRooms, createRoom, getMessages, addMessage.
-Report [TASK COMPLETE], then wake the parent: `omar_wake_later({"receiver": "cursor-api", "payload": "[CHILD COMPLETE] claude-rest: REST API complete: src/api.js written.", "delay_seconds": 0})`.
+Report [TASK COMPLETE], then wake the parent: `schedule_event({"receiver": "cursor-api", "payload": "[CHILD COMPLETE] claude-rest: REST API complete: src/api.js written.", "delay_seconds": 0})`.
 ```
 
 ### `codex-ws` — WebSocket
@@ -200,7 +200,7 @@ Build junk/chat-system/src/ws.js using the ws library:
 - Track presence: who is online, who is in which room.
 - Export setupWebSocket(server) that attaches WS to an HTTP server.
 auth.js exports verifyToken. db.js exports addMessage.
-Report [TASK COMPLETE], then wake the parent: `omar_wake_later({"receiver": "cursor-api", "payload": "[CHILD COMPLETE] codex-ws: WebSocket complete: src/ws.js written.", "delay_seconds": 0})`.
+Report [TASK COMPLETE], then wake the parent: `schedule_event({"receiver": "cursor-api", "payload": "[CHILD COMPLETE] codex-ws: WebSocket complete: src/ws.js written.", "delay_seconds": 0})`.
 ```
 
 ### `opencode-db` — Storage
@@ -211,7 +211,7 @@ Build junk/chat-system/src/db.js using better-sqlite3 (synchronous):
 - createUser/findUser/findUserById
 - getRooms/createRoom/getRoom
 - getMessages(roomId, limit=50)/addMessage
-Export all. Report [TASK COMPLETE], then wake the parent: `omar_wake_later({"receiver": "claude-data", "payload": "[CHILD COMPLETE] opencode-db: Storage complete: src/db.js written.", "delay_seconds": 0})`.
+Export all. Report [TASK COMPLETE], then wake the parent: `schedule_event({"receiver": "claude-data", "payload": "[CHILD COMPLETE] opencode-db: Storage complete: src/db.js written.", "delay_seconds": 0})`.
 ```
 
 ### `cursor-auth` — Auth
@@ -222,7 +222,7 @@ Build junk/chat-system/src/auth.js:
 - generateToken (JWT, {id, username}, 24h expiry; secret from env or default)
 - verifyToken
 - authMiddleware (Express: read Bearer token from Authorization, attach req.user)
-Export all. Report [TASK COMPLETE], then wake the parent: `omar_wake_later({"receiver": "claude-data", "payload": "[CHILD COMPLETE] cursor-auth: Auth complete: src/auth.js written.", "delay_seconds": 0})`.
+Export all. Report [TASK COMPLETE], then wake the parent: `schedule_event({"receiver": "claude-data", "payload": "[CHILD COMPLETE] cursor-auth: Auth complete: src/auth.js written.", "delay_seconds": 0})`.
 ```
 
 ### `claude-chat` — Chat UI
@@ -232,7 +232,7 @@ Build junk/chat-system/public/index.html + public/app.js:
 - Responsive HTML, login/signup forms, room list sidebar, message area, input box.
 - app.js: /api for auth, WebSocket for real-time messaging, typing indicators, online users.
 - Dark theme, embedded CSS, no frameworks.
-Report [TASK COMPLETE], then wake the parent: `omar_wake_later({"receiver": "codex-ui", "payload": "[CHILD COMPLETE] claude-chat: Chat UI complete: public/index.html and public/app.js written.", "delay_seconds": 0})`.
+Report [TASK COMPLETE], then wake the parent: `schedule_event({"receiver": "codex-ui", "payload": "[CHILD COMPLETE] claude-chat: Chat UI complete: public/index.html and public/app.js written.", "delay_seconds": 0})`.
 ```
 
 ### `codex-admin` — Admin Panel
@@ -241,7 +241,7 @@ Report [TASK COMPLETE], then wake the parent: `omar_wake_later({"receiver": "cod
 Build junk/chat-system/public/admin.html + public/admin.js:
 - List all users, list rooms, message counts per room, create/delete rooms.
 - Match main chat UI's dark theme, embedded CSS.
-Report [TASK COMPLETE], then wake the parent: `omar_wake_later({"receiver": "codex-ui", "payload": "[CHILD COMPLETE] codex-admin: Admin panel complete: public/admin.html and public/admin.js written.", "delay_seconds": 0})`.
+Report [TASK COMPLETE], then wake the parent: `schedule_event({"receiver": "codex-ui", "payload": "[CHILD COMPLETE] codex-admin: Admin panel complete: public/admin.html and public/admin.js written.", "delay_seconds": 0})`.
 ```
 
 ### `opencode-cli` — CLI Client
@@ -253,7 +253,7 @@ Build junk/chat-system/src/cli.js (terminal chat client):
 - Receive via WebSocket, display in terminal.
 - readline for input, ws for WebSocket. Defaults to http://localhost:3000 (configurable via CLI arg).
 - Proper CLI entry point (`#!/usr/bin/env node`).
-Report [TASK COMPLETE], then wake the parent: `omar_wake_later({"receiver": "opencode-infra", "payload": "[CHILD COMPLETE] opencode-cli: CLI client complete: src/cli.js written.", "delay_seconds": 0})`.
+Report [TASK COMPLETE], then wake the parent: `schedule_event({"receiver": "opencode-infra", "payload": "[CHILD COMPLETE] opencode-cli: CLI client complete: src/cli.js written.", "delay_seconds": 0})`.
 ```
 
 ### `cursor-tests` — Test Suite
@@ -266,7 +266,7 @@ Build junk/chat-system/test/:
 - Use jest + supertest. Fresh in-memory / temp SQLite per test for isolation.
 - At least 20 test cases total.
 Add the `test` script to package.json if it's not already there.
-Report [TASK COMPLETE], then wake the parent: `omar_wake_later({"receiver": "opencode-infra", "payload": "[CHILD COMPLETE] cursor-tests: Test suite complete: test/ directory written with 20+ cases.", "delay_seconds": 0})`.
+Report [TASK COMPLETE], then wake the parent: `schedule_event({"receiver": "opencode-infra", "payload": "[CHILD COMPLETE] cursor-tests: Test suite complete: test/ directory written with 20+ cases.", "delay_seconds": 0})`.
 ```
 
 ## Expected Behavior
@@ -305,6 +305,6 @@ When running, the OMAR dashboard shows all 15 agents with their backends:
 ## Tips
 
 - Leaf workers may finish before their siblings — level-3 leads should wait for both.
-- If a worker stalls, the lead above should notice; do not kill it in this demo. Instead, send a nudge via `omar_wake_later`.
+- If a worker stalls, the lead above should notice; do not kill it in this demo. Instead, send a nudge via `schedule_event`.
 - `cursor-tests` needs the other modules to exist first — it may need to wait or write tests against expected interfaces.
 - The root's final `npm test` is the integration check that validates everything works together.

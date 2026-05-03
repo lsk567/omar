@@ -208,15 +208,15 @@ impl OmarMcp {
             "payload": payload,
         });
         if let Err(e) = self
-            .try_call_with_timeout("omar_wake_later", args.clone())
+            .try_call_with_timeout("schedule_event", args.clone())
             .await
         {
             warn!(
-                "MCP omar_wake_later failed ({}); restarting MCP server and retrying",
+                "MCP schedule_event failed ({}); restarting MCP server and retrying",
                 e
             );
             self.client = None;
-            self.try_call_with_timeout("omar_wake_later", args).await?;
+            self.try_call_with_timeout("schedule_event", args).await?;
         }
         Ok(())
     }

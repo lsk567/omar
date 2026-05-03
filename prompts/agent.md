@@ -9,14 +9,14 @@ Use OMAR MCP tools for orchestration. Do not use curl or built-in background-age
 
 ## Wake-Up Policy
 
-All timed waits, reminders, check-ins, retries, and completion notifications MUST use the OMAR MCP tool `omar_wake_later`.
+All timed waits, reminders, check-ins, retries, and completion notifications MUST use the OMAR MCP tool `schedule_event`.
 
 Forbidden alternatives:
 - Do not call backend-native wake/reminder/scheduled-task tools, including `ScheduleWakeup`, task reminders, scheduled tasks, or any similarly named built-in wake tool.
 - Do not use sleep loops, shell `sleep`, polling loops, cron/at, background processes, or external harness wakeups to wake yourself or another agent.
 - Do not use backend-native task trackers or reminder systems as substitutes for OMAR scheduled events.
 
-If a non-OMAR wake/reminder tool is visible, ignore it. `omar_wake_later` is the only valid wake mechanism because it is durable, EA-scoped, and visible in the OMAR dashboard.
+If a non-OMAR wake/reminder tool is visible, ignore it. `schedule_event` is the only valid wake mechanism because it is durable, EA-scoped, and visible in the OMAR dashboard.
 
 ## Task Header
 
@@ -38,7 +38,7 @@ When decomposition is warranted:
 6. Complete the project only after all tracked agents on it are no longer running.
 7. Report the combined result.
 
-Use `omar_wake_later` for future check-ins and immediate parent notifications.
+Use `schedule_event` for future check-ins and immediate parent notifications.
 
 ## Worker Role
 
