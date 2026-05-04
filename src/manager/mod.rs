@@ -618,45 +618,35 @@ pub fn build_agent_command(
     }
 }
 
-/// Per-EA workspace dir where backends that auto-load `AGENTS.md` /
-/// `GEMINI.md` from the cwd hierarchy can find the rendered manager prompt.
-/// Lives inside the EA state dir so existing `delete_ea` cleanup picks it up
-/// for free.
-pub fn manager_workspace_dir(ea_id: EaId, omar_dir: &Path) -> PathBuf {
-    let dir = ea::ea_state_dir(ea_id, omar_dir).join("manager_workspace");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
 /// Build the manager (EA) command with memory + notes baked in, and return
 /// the CLI command together with an optional cwd override the caller must
 /// honor when launching the tmux session.
 ///
-/// Manager prompts can be huge (template + memory + notes), so this function
-/// avoids the legacy `--system-prompt "$(cat …)"` /
-/// `-c "developer_instructions='''$(cat …)'''"` path that inlines the full
-/// prompt into a single argv element. On Linux any single argv element
-/// above ~128 KB (`MAX_ARG_STRLEN`) makes `execve` return `E2BIG`
-/// (`Argument list too long`), which manifests as a tmux session dying
-/// inside `omar manager start` with an opaque "can't find session" error.
+/// Manager prompts can be huge (template + memory + notes). On Linux any
+/// single argv element above ~128 KB (`MAX_ARG_STRLEN`) makes `execve`
+/// return `E2BIG` (`Argument list too long`), which manifests as a tmux
+/// session dying inside `omar manager start` with an opaque "can't find
+/// session" error. Two complementary defenses:
 ///
-/// Strategy per backend (managers only — workers still use the inline
-/// `build_agent_command` path because their cwd must remain the user's
-/// project workdir):
+/// 1. **claude** uses the native `--system-prompt-file <path>` flag, so
+///    the prompt never touches argv at all and is unbounded.
+/// 2. **codex / gemini / opencode** keep the legacy inline shell-expansion
+///    path because their auto-loaded prompt files (`AGENTS.md` /
+///    `GEMINI.md`) are anchored at the agent's *working root*, not at the
+///    process cwd. Setting cwd = a per-EA workspace dir would either
+///    silently load the wrong `AGENTS.md` (the one at the user's working
+///    root) or force the manager to operate in a dir that isn't the
+///    user's project. A bounded truncation cap in `memory.rs`
+///    (see `truncate_for_prompt`) keeps the inlined prompt comfortably
+///    under `MAX_ARG_STRLEN`.
 ///
-/// - **claude**: `--system-prompt-file <combined_path>` (native flag). No
-///   cwd override.
-/// - **codex**: write `AGENTS.md` into `manager_workspace_dir`, drop the
-///   inline `-c "developer_instructions=…"` arg, and launch with
-///   cwd = workspace (codex auto-loads `AGENTS.md` from the cwd hierarchy
-///   on startup).
-/// - **gemini**: same idea with `GEMINI.md`.
-/// - **opencode**: same idea with `AGENTS.md`. Also keeps the
-///   `OPENCODE_CONFIG_CONTENT=…` env wiring for MCP/tools.
-/// - **cursor**: unchanged — cursor was already file-based via
-///   `materialize_prompt_file` and never hit the argv limit.
-/// - **unknown**: fall through to the inline path so the manager still
-///   launches in a degraded but visible state.
+/// Cursor was already file-based via `materialize_prompt_file` and is
+/// unaffected. Unknown backends fall through to the inline path so the
+/// manager still launches in a degraded but visible state.
+///
+/// The `Option<PathBuf>` in the return type is reserved for future
+/// backends that gain a real workspace mode; currently only claude could
+/// in principle benefit, and it doesn't need a cwd override either.
 pub fn build_ea_command(
     base_command: &str,
     ea_id: EaId,
@@ -690,17 +680,20 @@ pub fn build_ea_command(
             prompt_content, mem, notes
         ),
     };
-    // Resolve `{{EA_ID}}` / `{{EA_NAME}}` on disk so the file the backend
-    // reads has them already substituted; the legacy `sed` shell expression
-    // is no longer used for managers.
-    let combined = combined
-        .replace("{{EA_ID}}", &ea_id.to_string())
-        .replace("{{EA_NAME}}", ea_name);
+    // For claude (file flag) we resolve `{{EA_ID}}` / `{{EA_NAME}}` on
+    // disk. The other backends still go through `build_agent_command`,
+    // which pipes the file through sed at launch time, so we leave the
+    // placeholders intact for them and write a separate, pre-resolved
+    // file for claude.
     std::fs::write(&combined_path, &combined).ok();
-
     let backend = detect_backend(base_command);
+
     match backend {
         Some(BackendKind::Claude) => {
+            let resolved = combined
+                .replace("{{EA_ID}}", &ea_id.to_string())
+                .replace("{{EA_NAME}}", ea_name);
+            std::fs::write(&combined_path, &resolved).ok();
             let base_command = ensure_codex_runtime_flags(base_command);
             let cmd = match materialize_claude_mcp_config(mcp_context) {
                 Some(mcp_config) => format!(
@@ -718,69 +711,14 @@ pub fn build_ea_command(
             };
             (cmd, None)
         }
-        Some(kind @ (BackendKind::Codex | BackendKind::Gemini | BackendKind::Opencode)) => {
-            let workspace = manager_workspace_dir(ea_id, omar_dir);
-            let agents_md_name = match kind {
-                BackendKind::Gemini => "GEMINI.md",
-                _ => "AGENTS.md",
-            };
-            // Atomic write so a backend reading the file mid-spawn never
-            // sees a partial document.
-            let agents_md = workspace.join(agents_md_name);
-            let _ = write_private_file(&agents_md, combined.as_bytes());
-
-            let base_command = ensure_codex_runtime_flags(base_command);
-            let cmd = match kind {
-                BackendKind::Codex => {
-                    // Drop the inline `-c "developer_instructions=…"` flag —
-                    // codex auto-loads AGENTS.md from cwd hierarchy.
-                    let mut c = base_command;
-                    if let Some(overrides) = codex_mcp_overrides(mcp_context) {
-                        c.push(' ');
-                        c.push_str(&overrides);
-                    }
-                    c
-                }
-                BackendKind::Gemini => {
-                    // Drop the inline `-i "$(cat …)"` flag — gemini walks up
-                    // from cwd loading GEMINI.md automatically.
-                    let mut c = format!(
-                        "TERM=xterm-256color {} --allowed-mcp-server-names omar",
-                        base_command
-                    );
-                    if let Some(policy) = materialize_gemini_deny_policy(mcp_context) {
-                        c = format!(
-                            "{} --policy {}",
-                            c,
-                            shell_single_quote(&policy.display().to_string())
-                        );
-                    }
-                    if let Some(setup) = gemini_mcp_bootstrap(&base_command, mcp_context) {
-                        c = format!("{}; {}", setup, c);
-                    }
-                    c
-                }
-                BackendKind::Opencode => match opencode_config_env(mcp_context) {
-                    Some(config) => format!(
-                        "OPENCODE_CONFIG_CONTENT={} {}",
-                        shell_single_quote(&config),
-                        base_command
-                    ),
-                    None => base_command,
-                },
-                _ => unreachable!(),
-            };
-            (cmd, Some(workspace))
-        }
-        Some(BackendKind::Cursor) | None => {
-            // Legacy inline path. Cursor was already file-based via
-            // `materialize_prompt_file`, and unknown backends keep their
-            // previous behavior (degraded but visible).
+        _ => {
+            // Inline path for codex/gemini/opencode/cursor/unknown. The
+            // truncation cap in memory.rs keeps the rendered prompt under
+            // `MAX_ARG_STRLEN` even when notes/memory grow large.
             let cmd = build_agent_command(
                 base_command,
                 &combined_path,
-                // Substitutions already applied to the on-disk prompt above.
-                &[],
+                &[("{{EA_ID}}", &ea_id.to_string()), ("{{EA_NAME}}", ea_name)],
                 mcp_context,
             );
             (cmd, None)
@@ -1297,30 +1235,24 @@ mod tests {
             omar_dir,
             &test_mcp_context(omar_dir),
         );
-        // The codex manager command no longer inlines the prompt as
-        // `-c "developer_instructions=…"` — that's the whole point of the
-        // workspace approach. Instead, it relies on AGENTS.md auto-discovery
-        // from cwd.
+        // codex stays on the inline path: its `AGENTS.md` auto-discovery
+        // is anchored at the agent's working root (`-C`), not the launch
+        // cwd, so a workspace-dir launch would either load the wrong
+        // `AGENTS.md` or force the manager to operate outside the user's
+        // project. The truncation cap in memory.rs keeps the inlined
+        // prompt under MAX_ARG_STRLEN even with large notes/memory.
         assert!(
-            cmd.starts_with("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"),
+            cmd.starts_with("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''"),
             "unexpected codex manager command prefix: {cmd}"
-        );
-        assert!(
-            !cmd.contains("developer_instructions"),
-            "codex manager must not inline developer_instructions arg: {cmd}"
         );
         assert!(cmd.contains("mcp_servers.omar.command="));
         assert!(cmd.contains("mcp_servers.omar.args="));
         assert!(cmd.contains("\"mcp-server\""));
         assert!(cmd.contains("-c features.scheduled_tasks=false"));
-
-        let workspace = workspace.expect("codex manager must return a workspace cwd");
-        let agents_md = workspace.join("AGENTS.md");
-        let body = std::fs::read_to_string(&agents_md).expect("AGENTS.md missing");
+        assert!(cmd.contains("CapX"));
         assert!(
-            body.contains("CapX"),
-            "AGENTS.md should contain rendered EA name (CapX): {}",
-            &body[..body.len().min(400)]
+            workspace.is_none(),
+            "codex manager must not override the launch cwd"
         );
     }
 

@@ -1843,18 +1843,15 @@ default_command = "exec bash"
     let combined_prompt = omar_dir.join("ea/0/ea_prompt_combined.md");
     let prompt_content = fs::read_to_string(&combined_prompt)
         .expect("ea_prompt_combined.md must exist after first manager start");
-    // For managers, `{{EA_ID}}` / `{{EA_NAME}}` are now resolved on disk
-    // (the file approach reads the prompt directly via `--system-prompt-file`
-    // / `AGENTS.md` auto-discovery, with no shell sed step). So the rendered
-    // heredoc must reference EA 0 literally.
+    // The combined prompt is written before sed-substitution of {{EA_ID}};
+    // for non-claude backends the substitution still happens at backend
+    // launch via build_agent_command's sed (claude alone pre-resolves on
+    // disk because it loads via --system-prompt-file). The test config uses
+    // `exec bash` which falls through to the inline path, so the on-disk
+    // prompt keeps the placeholder.
     assert!(
-        prompt_content.contains("cat > ~/.omar/manager_notes_ea0.md << 'NOTES'"),
+        prompt_content.contains("cat > ~/.omar/manager_notes_ea{{EA_ID}}.md << 'NOTES'"),
         "prompt must instruct the EA to write notes via shell heredoc; got:\n{}",
-        prompt_content,
-    );
-    assert!(
-        !prompt_content.contains("{{EA_ID}}"),
-        "managers must have {{{{EA_ID}}}} pre-substituted on disk; got:\n{}",
         prompt_content,
     );
     // No MCP append-note tool should be advertised — main has no such tool

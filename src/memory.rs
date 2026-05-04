@@ -176,7 +176,13 @@ pub fn load_memory_from(state_dir: &Path) -> String {
 /// `Argument list too long`, leaving the user with `can't find session`. We
 /// keep the most recent bytes (tail) since recency matters most for resume
 /// context and prepend a truncation marker so the agent knows.
-const PROMPT_CONTEXT_BYTE_CAP: usize = 64 * 1024;
+// 40 KB per piece × 2 (memory + notes) = 80 KB of dynamic content, plus the
+// EA prompt template (~5 KB) and framing ≈ 90 KB worst case. That leaves
+// ~38 KB headroom under the 128 KB MAX_ARG_STRLEN limit for the
+// surrounding shell expansion (`developer_instructions='''…'''`,
+// `--system-prompt "…"`, etc.) used by codex / gemini / opencode managers
+// and by every worker spawn.
+const PROMPT_CONTEXT_BYTE_CAP: usize = 40 * 1024;
 
 fn truncate_for_prompt(content: String) -> String {
     if content.len() <= PROMPT_CONTEXT_BYTE_CAP {
