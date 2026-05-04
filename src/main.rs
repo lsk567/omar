@@ -215,7 +215,10 @@ async fn async_main() -> Result<()> {
     let omar_dir = omar_dir();
 
     if let Some(ref selector) = cli.ea {
-        let ea_info = ea::resolve_ea_selector(&omar_dir, Some(selector))?;
+        let (ea_info, created) = ea::resolve_or_create_ea_selector(&omar_dir, Some(selector))?;
+        if created {
+            eprintln!("Created EA '{}' (id={})", ea_info.name, ea_info.id);
+        }
         ea::save_active_ea(&omar_dir, ea_info.id)?;
     }
 
@@ -333,7 +336,7 @@ fn omar_dir() -> PathBuf {
 }
 
 fn resolve_cli_ea(omar_dir: &std::path::Path, selector: Option<&str>) -> Result<ea::EaInfo> {
-    ea::resolve_ea_selector(omar_dir, selector)
+    Ok(ea::resolve_or_create_ea_selector(omar_dir, selector)?.0)
 }
 
 fn list_agents_for_ea(base_prefix: &str, ea_info: &ea::EaInfo) -> Result<()> {

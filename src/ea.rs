@@ -130,6 +130,33 @@ pub fn resolve_ea_selector(base_dir: &Path, selector: Option<&str>) -> anyhow::R
     ea.ok_or_else(|| anyhow::anyhow!("EA '{}' not found", selector.unwrap_or("<active>")))
 }
 
+/// Like `resolve_ea_selector`, but creates a new EA when the selector is a
+/// non-numeric, valid name that does not match any registered EA. Numeric
+/// selectors that don't match still fail because EA IDs are server-assigned
+/// (monotonic and never reused).
+///
+/// Returns `(EaInfo, was_created)`.
+pub fn resolve_or_create_ea_selector(
+    base_dir: &Path,
+    selector: Option<&str>,
+) -> anyhow::Result<(EaInfo, bool)> {
+    if let Some(raw) = selector {
+        if raw.parse::<EaId>().is_err() {
+            let eas = ensure_default_ea(base_dir)?;
+            if let Some(ea) = eas.iter().find(|ea| ea.name == raw) {
+                return Ok((ea.clone(), false));
+            }
+            let id = register_ea(base_dir, raw, None)?;
+            let ea = load_registry(base_dir)
+                .into_iter()
+                .find(|ea| ea.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Created EA {} missing from registry", id))?;
+            return Ok((ea, true));
+        }
+    }
+    Ok((resolve_ea_selector(base_dir, selector)?, false))
+}
+
 /// Ensure at least one default EA exists on disk.
 pub fn ensure_default_ea(base_dir: &Path) -> anyhow::Result<Vec<EaInfo>> {
     let mut eas = load_registry(base_dir);
@@ -392,6 +419,67 @@ mod tests {
 
         assert_eq!(ea.id, id);
         assert_eq!(ea.name, "Research");
+    }
+
+    #[test]
+    fn test_resolve_or_create_ea_selector_creates_on_name_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+
+        let (ea, created) = resolve_or_create_ea_selector(dir.path(), Some("Research")).unwrap();
+
+        assert!(created);
+        assert_eq!(ea.name, "Research");
+        assert!(load_registry(dir.path())
+            .iter()
+            .any(|e| e.id == ea.id && e.name == "Research"));
+    }
+
+    #[test]
+    fn test_resolve_or_create_ea_selector_returns_existing_on_name_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+        let id = register_ea(dir.path(), "Research", None).unwrap();
+
+        let (ea, created) = resolve_or_create_ea_selector(dir.path(), Some("Research")).unwrap();
+
+        assert!(!created);
+        assert_eq!(ea.id, id);
+    }
+
+    #[test]
+    fn test_resolve_or_create_ea_selector_numeric_miss_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+        // Register a second EA so the "id=0 + single-EA" fallback in
+        // resolve_ea_selector cannot mask the miss.
+        let _ = register_ea(dir.path(), "Other", None).unwrap();
+
+        let result = resolve_or_create_ea_selector(dir.path(), Some("99"));
+        assert!(result.is_err(), "numeric miss must not auto-create");
+    }
+
+    #[test]
+    fn test_resolve_or_create_ea_selector_rejects_invalid_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+
+        let result = resolve_or_create_ea_selector(dir.path(), Some("bad name!"));
+        assert!(
+            result.is_err(),
+            "invalid name must error rather than auto-create"
+        );
+    }
+
+    #[test]
+    fn test_resolve_or_create_ea_selector_no_selector_returns_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+
+        let (ea, created) = resolve_or_create_ea_selector(dir.path(), None).unwrap();
+
+        assert!(!created);
+        assert_eq!(ea.id, 0);
     }
 
     #[test]
