@@ -164,7 +164,41 @@ pub fn save_agent_status_in(state_dir: &Path, session_name: &str, status: &str) 
 /// Load the memory file contents (empty string if missing)
 pub fn load_memory_from(state_dir: &Path) -> String {
     let path = state_dir.join("memory.md");
-    fs::read_to_string(&path).unwrap_or_default()
+    truncate_for_prompt(fs::read_to_string(&path).unwrap_or_default())
+}
+
+/// Maximum bytes of free-form context (memory snapshot or manager notes) that
+/// will be inlined into the EA system prompt. Linux exec(3) limits any single
+/// argv element to roughly 128 KB (32 pages × 4 KB) regardless of `ARG_MAX`,
+/// and the codex backend bakes the prompt into a single `-c
+/// "developer_instructions='''...'''"` arg. Without this cap, a manager-notes
+/// file that grows past ~120 KB silently blows up `manager start` with
+/// `Argument list too long`, leaving the user with `can't find session`. We
+/// keep the most recent bytes (tail) since recency matters most for resume
+/// context and prepend a truncation marker so the agent knows.
+const PROMPT_CONTEXT_BYTE_CAP: usize = 64 * 1024;
+
+fn truncate_for_prompt(content: String) -> String {
+    if content.len() <= PROMPT_CONTEXT_BYTE_CAP {
+        return content;
+    }
+    let cut = content.len() - PROMPT_CONTEXT_BYTE_CAP;
+    // Advance to the next char boundary so we never split a UTF-8 codepoint.
+    let mut start = cut;
+    while start < content.len() && !content.is_char_boundary(start) {
+        start += 1;
+    }
+    // Then to the next line boundary so the surviving section starts cleanly.
+    let tail = if let Some(nl) = content[start..].find('\n') {
+        &content[start + nl + 1..]
+    } else {
+        &content[start..]
+    };
+    format!(
+        "[... truncated {} earlier bytes; showing most recent tail to keep \
+         system-prompt under the OS argv size limit ...]\n{}",
+        start, tail
+    )
 }
 
 /// Returns the EA-specific manager notes file path.
@@ -177,7 +211,7 @@ pub fn manager_notes_path(omar_dir: &Path, ea_id: EaId) -> PathBuf {
 /// Load manager notes for an EA (empty string if file is missing).
 pub fn load_manager_notes(omar_dir: &Path, ea_id: EaId) -> String {
     let path = manager_notes_path(omar_dir, ea_id);
-    fs::read_to_string(&path).unwrap_or_default()
+    truncate_for_prompt(fs::read_to_string(&path).unwrap_or_default())
 }
 
 /// Write a full state snapshot — SCOPED to one EA

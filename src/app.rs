@@ -567,7 +567,7 @@ impl App {
                 .filter(|server| !server.is_empty()),
         };
 
-        let cmd = if inject_prompt {
+        let (cmd, workspace_cwd) = if inject_prompt {
             crate::manager::build_ea_command(
                 &default_command,
                 self.active_ea,
@@ -576,15 +576,24 @@ impl App {
                 &context,
             )
         } else {
-            default_command.clone()
+            (default_command.clone(), None)
         };
 
+        // For backends whose manager prompt is now loaded from an auto-
+        // discovered file (codex `AGENTS.md`, gemini `GEMINI.md`, opencode
+        // `AGENTS.md`), build_ea_command returns the workspace dir we must
+        // launch in. Fall back to the user's workdir for claude/cursor.
+        let launch_cwd = workspace_cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(workdir);
+
         self.client
-            .new_session(&manager_session, &cmd, Some(&workdir))
+            .new_session(&manager_session, &cmd, Some(&launch_cwd))
             .map_err(|err| {
                 let msg = format!(
-                    "tmux failed to start manager '{}' with command '{}': {}",
-                    manager_session, default_command, err
+                    "tmux failed to start manager '{}' (cwd '{}') with command '{}': {}",
+                    manager_session, launch_cwd, default_command, err
                 );
                 anyhow::anyhow!(msg)
             })?;

@@ -618,19 +618,52 @@ pub fn build_agent_command(
     }
 }
 
-/// Build an EA command with memory state baked into the system prompt.
+/// Per-EA workspace dir where backends that auto-load `AGENTS.md` /
+/// `GEMINI.md` from the cwd hierarchy can find the rendered manager prompt.
+/// Lives inside the EA state dir so existing `delete_ea` cleanup picks it up
+/// for free.
+pub fn manager_workspace_dir(ea_id: EaId, omar_dir: &Path) -> PathBuf {
+    let dir = ea::ea_state_dir(ea_id, omar_dir).join("manager_workspace");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Build the manager (EA) command with memory + notes baked in, and return
+/// the CLI command together with an optional cwd override the caller must
+/// honor when launching the tmux session.
 ///
-/// Reads the EA prompt template, appends the latest memory snapshot, writes a
-/// combined file to `{omar_dir}/ea/{ea_id}/ea_prompt_combined.md` (per-EA scoped,
-/// fixing Gotcha G8), and returns the CLI command with `{{EA_ID}}` and `{{EA_NAME}}`
-/// substituted via sed.
+/// Manager prompts can be huge (template + memory + notes), so this function
+/// avoids the legacy `--system-prompt "$(cat …)"` /
+/// `-c "developer_instructions='''$(cat …)'''"` path that inlines the full
+/// prompt into a single argv element. On Linux any single argv element
+/// above ~128 KB (`MAX_ARG_STRLEN`) makes `execve` return `E2BIG`
+/// (`Argument list too long`), which manifests as a tmux session dying
+/// inside `omar manager start` with an opaque "can't find session" error.
+///
+/// Strategy per backend (managers only — workers still use the inline
+/// `build_agent_command` path because their cwd must remain the user's
+/// project workdir):
+///
+/// - **claude**: `--system-prompt-file <combined_path>` (native flag). No
+///   cwd override.
+/// - **codex**: write `AGENTS.md` into `manager_workspace_dir`, drop the
+///   inline `-c "developer_instructions=…"` arg, and launch with
+///   cwd = workspace (codex auto-loads `AGENTS.md` from the cwd hierarchy
+///   on startup).
+/// - **gemini**: same idea with `GEMINI.md`.
+/// - **opencode**: same idea with `AGENTS.md`. Also keeps the
+///   `OPENCODE_CONFIG_CONTENT=…` env wiring for MCP/tools.
+/// - **cursor**: unchanged — cursor was already file-based via
+///   `materialize_prompt_file` and never hit the argv limit.
+/// - **unknown**: fall through to the inline path so the manager still
+///   launches in a degraded but visible state.
 pub fn build_ea_command(
     base_command: &str,
     ea_id: EaId,
     ea_name: &str,
     omar_dir: &Path,
     mcp_context: &McpLaunchContext,
-) -> String {
+) -> (String, Option<PathBuf>) {
     let prompt_file = prompts_dir(omar_dir).join("executive-assistant.md");
     let state_dir = ea::ea_state_dir(ea_id, omar_dir);
     let mem = memory::load_memory_from(&state_dir);
@@ -657,15 +690,102 @@ pub fn build_ea_command(
             prompt_content, mem, notes
         ),
     };
+    // Resolve `{{EA_ID}}` / `{{EA_NAME}}` on disk so the file the backend
+    // reads has them already substituted; the legacy `sed` shell expression
+    // is no longer used for managers.
+    let combined = combined
+        .replace("{{EA_ID}}", &ea_id.to_string())
+        .replace("{{EA_NAME}}", ea_name);
     std::fs::write(&combined_path, &combined).ok();
 
-    // Substitute {{EA_ID}} and {{EA_NAME}} in the prompt
-    build_agent_command(
-        base_command,
-        &combined_path,
-        &[("{{EA_ID}}", &ea_id.to_string()), ("{{EA_NAME}}", ea_name)],
-        mcp_context,
-    )
+    let backend = detect_backend(base_command);
+    match backend {
+        Some(BackendKind::Claude) => {
+            let base_command = ensure_codex_runtime_flags(base_command);
+            let cmd = match materialize_claude_mcp_config(mcp_context) {
+                Some(mcp_config) => format!(
+                    "{} --system-prompt-file {} --mcp-config {} --disallowedTools {}",
+                    base_command,
+                    shell_single_quote(&combined_path.display().to_string()),
+                    shell_single_quote(&mcp_config.display().to_string()),
+                    shell_single_quote(&backend_native_disallowed_tools_csv())
+                ),
+                None => format!(
+                    "{} --system-prompt-file {}",
+                    base_command,
+                    shell_single_quote(&combined_path.display().to_string())
+                ),
+            };
+            (cmd, None)
+        }
+        Some(kind @ (BackendKind::Codex | BackendKind::Gemini | BackendKind::Opencode)) => {
+            let workspace = manager_workspace_dir(ea_id, omar_dir);
+            let agents_md_name = match kind {
+                BackendKind::Gemini => "GEMINI.md",
+                _ => "AGENTS.md",
+            };
+            // Atomic write so a backend reading the file mid-spawn never
+            // sees a partial document.
+            let agents_md = workspace.join(agents_md_name);
+            let _ = write_private_file(&agents_md, combined.as_bytes());
+
+            let base_command = ensure_codex_runtime_flags(base_command);
+            let cmd = match kind {
+                BackendKind::Codex => {
+                    // Drop the inline `-c "developer_instructions=…"` flag —
+                    // codex auto-loads AGENTS.md from cwd hierarchy.
+                    let mut c = base_command;
+                    if let Some(overrides) = codex_mcp_overrides(mcp_context) {
+                        c.push(' ');
+                        c.push_str(&overrides);
+                    }
+                    c
+                }
+                BackendKind::Gemini => {
+                    // Drop the inline `-i "$(cat …)"` flag — gemini walks up
+                    // from cwd loading GEMINI.md automatically.
+                    let mut c = format!(
+                        "TERM=xterm-256color {} --allowed-mcp-server-names omar",
+                        base_command
+                    );
+                    if let Some(policy) = materialize_gemini_deny_policy(mcp_context) {
+                        c = format!(
+                            "{} --policy {}",
+                            c,
+                            shell_single_quote(&policy.display().to_string())
+                        );
+                    }
+                    if let Some(setup) = gemini_mcp_bootstrap(&base_command, mcp_context) {
+                        c = format!("{}; {}", setup, c);
+                    }
+                    c
+                }
+                BackendKind::Opencode => match opencode_config_env(mcp_context) {
+                    Some(config) => format!(
+                        "OPENCODE_CONFIG_CONTENT={} {}",
+                        shell_single_quote(&config),
+                        base_command
+                    ),
+                    None => base_command,
+                },
+                _ => unreachable!(),
+            };
+            (cmd, Some(workspace))
+        }
+        Some(BackendKind::Cursor) | None => {
+            // Legacy inline path. Cursor was already file-based via
+            // `materialize_prompt_file`, and unknown backends keep their
+            // previous behavior (degraded but visible).
+            let cmd = build_agent_command(
+                base_command,
+                &combined_path,
+                // Substitutions already applied to the on-disk prompt above.
+                &[],
+                mcp_context,
+            );
+            (cmd, None)
+        }
+    }
 }
 
 /// Start the manager agent session for a specific EA.
@@ -691,8 +811,11 @@ pub fn start_manager(
         client.kill_session(&session)?;
     }
 
-    // Build command with EA system prompt + memory baked in
-    let cmd = build_ea_command(
+    // Build command with EA system prompt + memory baked in. For backends
+    // whose prompt is now loaded from a workspace file (codex/gemini/opencode)
+    // the build also returns the cwd that backend must be launched in for
+    // auto-discovery to work.
+    let (cmd, workspace_cwd) = build_ea_command(
         command,
         ea_id,
         ea_name,
@@ -710,11 +833,11 @@ pub fn start_manager(
 
     // Create manager session — system prompt set at process start
     println!("Starting manager agent (EA {})...", ea_id);
-    client.new_session(
-        &session,
-        &cmd,
-        Some(&std::env::current_dir()?.to_string_lossy()),
-    )?;
+    let cwd = match workspace_cwd {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => std::env::current_dir()?.to_string_lossy().into_owned(),
+    };
+    client.new_session(&session, &cmd, Some(&cwd))?;
 
     // Give it time to start
     thread::sleep(Duration::from_secs(2));
@@ -1164,23 +1287,41 @@ mod tests {
     #[test]
     fn test_build_ea_command_codex() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = build_ea_command(
+        let omar_dir = dir.path();
+        let state_dir = ea::ea_state_dir(3, omar_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let (cmd, workspace) = build_ea_command(
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
             3,
             "CapX",
-            dir.path(),
-            &test_mcp_context(dir.path()),
+            omar_dir,
+            &test_mcp_context(omar_dir),
+        );
+        // The codex manager command no longer inlines the prompt as
+        // `-c "developer_instructions=…"` — that's the whole point of the
+        // workspace approach. Instead, it relies on AGENTS.md auto-discovery
+        // from cwd.
+        assert!(
+            cmd.starts_with("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"),
+            "unexpected codex manager command prefix: {cmd}"
         );
         assert!(
-            cmd.starts_with(
-                "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox -c \"developer_instructions='''"
-            )
+            !cmd.contains("developer_instructions"),
+            "codex manager must not inline developer_instructions arg: {cmd}"
         );
         assert!(cmd.contains("mcp_servers.omar.command="));
         assert!(cmd.contains("mcp_servers.omar.args="));
         assert!(cmd.contains("\"mcp-server\""));
         assert!(cmd.contains("-c features.scheduled_tasks=false"));
-        assert!(cmd.contains("CapX"));
+
+        let workspace = workspace.expect("codex manager must return a workspace cwd");
+        let agents_md = workspace.join("AGENTS.md");
+        let body = std::fs::read_to_string(&agents_md).expect("AGENTS.md missing");
+        assert!(
+            body.contains("CapX"),
+            "AGENTS.md should contain rendered EA name (CapX): {}",
+            &body[..body.len().min(400)]
+        );
     }
 
     #[test]
@@ -1259,6 +1400,49 @@ mod tests {
         assert!(cmd.starts_with("env ANTHROPIC_API_KEY=test claude --yolo --system-prompt"));
     }
 
+    /// Regression for the codex-EA-manager-won't-start bug. With a very
+    /// large notes file (here 200 KB), the legacy inline path generated a
+    /// `-c "developer_instructions='''<huge>'''"` argv element that
+    /// exceeded `MAX_ARG_STRLEN` (~128 KB) and crashed the manager spawn
+    /// with `Argument list too long`. The file/workspace approach must
+    /// keep every argv element comfortably under that limit regardless
+    /// of prompt size.
+    #[test]
+    fn test_build_ea_command_handles_oversized_notes_for_all_backends() {
+        // 200 KB of notes — well past MAX_ARG_STRLEN.
+        let huge_notes: String = "x".repeat(200 * 1024);
+
+        for backend in [
+            "claude",
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
+            "gemini --yolo",
+            "opencode",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let omar_dir = dir.path();
+            let state_dir = ea::ea_state_dir(7, omar_dir);
+            std::fs::create_dir_all(&state_dir).unwrap();
+            std::fs::write(memory::manager_notes_path(omar_dir, 7), &huge_notes).unwrap();
+
+            let (cmd, _ws) =
+                build_ea_command(backend, 7, "Big", omar_dir, &test_mcp_context(omar_dir));
+
+            // No single argv element (whitespace-separated token) may exceed
+            // a safe ceiling — 96 KB leaves comfortable headroom under the
+            // 128 KB MAX_ARG_STRLEN limit on Linux.
+            const ARG_CEILING: usize = 96 * 1024;
+            for tok in cmd.split_whitespace() {
+                assert!(
+                    tok.len() < ARG_CEILING,
+                    "backend {backend}: argv token of {} bytes would risk \
+                     exec(3) E2BIG (MAX_ARG_STRLEN ≈ 128 KB): {}",
+                    tok.len(),
+                    &tok[..tok.len().min(120)]
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_build_agent_command_unknown_backend() {
         let dir = tempfile::tempdir().unwrap();
@@ -1321,15 +1505,38 @@ mod tests {
         let state_dir = ea::ea_state_dir(0, omar_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        let cmd = build_ea_command(
+        let (cmd, workspace) = build_ea_command(
             "claude",
             0,
             "Default",
             omar_dir,
             &test_mcp_context(omar_dir),
         );
-        assert!(cmd.contains("s|{{EA_ID}}|0|g"));
-        assert!(cmd.contains("s|{{EA_NAME}}|Default|g"));
+        // claude manager now uses --system-prompt-file (no sed substitution
+        // expression in the command). EA_ID/EA_NAME are pre-substituted on
+        // disk in the combined prompt file.
+        assert!(
+            workspace.is_none(),
+            "claude manager doesn't need workspace cwd"
+        );
+        assert!(
+            cmd.contains("--system-prompt-file"),
+            "claude must use file flag: {cmd}"
+        );
+        assert!(
+            !cmd.contains("s|{{EA_ID}}|"),
+            "no sed expression expected: {cmd}"
+        );
+        let combined = state_dir.join("ea_prompt_combined.md");
+        let body = std::fs::read_to_string(&combined).unwrap();
+        assert!(
+            !body.contains("{{EA_ID}}"),
+            "combined prompt should have EA_ID resolved"
+        );
+        assert!(
+            !body.contains("{{EA_NAME}}"),
+            "combined prompt should have EA_NAME resolved"
+        );
     }
 
     #[test]
@@ -1340,7 +1547,7 @@ mod tests {
         let state_dir = ea::ea_state_dir(1, omar_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        build_ea_command(
+        let _ = build_ea_command(
             "claude",
             1,
             "Research",
@@ -1372,7 +1579,7 @@ mod tests {
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::write(state_dir.join("memory.md"), "# Saved state\nSome memory").unwrap();
 
-        build_ea_command(
+        let _ = build_ea_command(
             "claude",
             0,
             "Default",

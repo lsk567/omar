@@ -809,6 +809,18 @@ impl OmarMcpServer {
             fs::remove_file(&notes_path)
                 .map_err(|e| anyhow!("Failed to remove notes {:?}: {}", notes_path, e))?;
         }
+        // Per-EA MCP scratch dir (context.json, claude-mcp.json,
+        // gemini-deny-native-tools.toml). These were silently leaking on
+        // EA delete before and could grow unbounded across re-creates.
+        let mcp_dir = self
+            .context
+            .omar_dir
+            .join("mcp")
+            .join(format!("ea-{}", args.ea_id));
+        if mcp_dir.exists() {
+            fs::remove_dir_all(&mcp_dir)
+                .map_err(|e| anyhow!("Failed to remove mcp dir {:?}: {}", mcp_dir, e))?;
+        }
         let events_cancelled = self.scheduler().cancel_by_ea(args.ea_id);
         ea::unregister_ea(&self.context.omar_dir, args.ea_id)?;
         Ok(json!({
@@ -2374,6 +2386,38 @@ mod tests {
             "delete_ea must not remove state before rejecting only EA"
         );
         assert_eq!(ea::load_registry(&context.omar_dir).len(), 1);
+    }
+
+    #[test]
+    fn delete_ea_purges_per_ea_mcp_dir() {
+        let context = test_context();
+        let server = OmarMcpServer::new(context.clone());
+        ea::ensure_default_ea(&context.omar_dir).unwrap();
+        let target_id = ea::register_ea(&context.omar_dir, "Doomed", None).unwrap();
+
+        // Simulate the per-EA MCP scratch files that build_ea_command and
+        // friends materialize on every manager spawn. Pre-fix these were
+        // leaked across delete_ea calls, growing without bound.
+        let mcp_dir = context
+            .omar_dir
+            .join("mcp")
+            .join(format!("ea-{}", target_id));
+        std::fs::create_dir_all(&mcp_dir).unwrap();
+        std::fs::write(mcp_dir.join("context.json"), "{}").unwrap();
+        std::fs::write(mcp_dir.join("claude-mcp.json"), "{}").unwrap();
+
+        // Also seed an EA state dir so the existing cleanup path runs.
+        let state_dir = ea::ea_state_dir(target_id, &context.omar_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let result = server.delete_ea(json!({ "ea_id": target_id }));
+        assert!(result.is_ok(), "delete_ea must succeed: {:?}", result);
+        assert!(
+            !mcp_dir.exists(),
+            "mcp/ea-{} dir leaked after delete_ea",
+            target_id
+        );
+        assert!(!state_dir.exists(), "state dir leaked after delete_ea");
     }
 
     #[test]
