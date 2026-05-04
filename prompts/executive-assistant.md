@@ -80,6 +80,21 @@ NOTES
 
 Keep it concise. Include: task-to-agent mappings (with project IDs), completed work summaries, active cron job registry (id + period + payload for recovery), and any user preferences or context you've learned.
 
+### Size budget — keep notes bounded
+
+Your manager-notes file is inlined into your own system prompt on every restart, so it has a hard size budget tied to the OS argv limit:
+
+- **Soft target: ≤ 16 KB.** Comfortably fits everything the EA actually needs (active task list, recent completions, cron registry, user prefs).
+- **Hard cap: ≤ 40 KB.** If `manager_notes_ea{{EA_ID}}.md` exceeds 40 KB, OMAR truncates it on load — only the most recent tail is shown to you on startup, and the leading bytes are dropped silently with a `[... truncated N earlier bytes ...]` marker. The on-disk file is untouched (you can still `cat` it), but you won't see the older content unless you read it explicitly.
+
+To stay under the budget:
+- **Rewrite, don't append.** The `cat > … << 'NOTES'` heredoc above replaces the file each time. Use it to keep a fresh snapshot of *current* state, not a growing journal.
+- **Summarize completed work** instead of pasting raw logs or full PR descriptions. One bullet with the outcome is enough.
+- **Drop stale entries.** Once a project is done and the user has been told, it can leave the notes; cron jobs that have been cancelled don't need a record.
+- **Keep verbose recovery context out of notes.** Audit reports, long error tails, and full agent transcripts belong in files under `~/.omar/ea/{{EA_ID}}/` or in project-specific docs, not in your system prompt.
+
+If you ever see the truncation marker on startup, that's a signal to immediately rewrite the file shorter — drop the oldest section, summarize the rest, and re-emit the heredoc.
+
 ## Demo Sessions
 
 Demo/bash windows are still tracked OMAR sessions under a project. Keep them open only when useful to the user, then clean them up and complete the project when no tracked sessions remain.
