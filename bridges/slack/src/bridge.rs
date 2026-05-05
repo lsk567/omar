@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::omar::OmarMcp;
+use crate::settings;
 use crate::slack::{SlackClient, SlackMessage};
 
 /// A Slack reply the EA queued via the `slack_reply` MCP tool. Fields
@@ -61,6 +62,17 @@ impl Bridge {
             ),
         }
 
+        // 2b. Resolve the bridge's persisted EA pin against the dashboard's
+        //     EA registry. If the persisted name is missing or unresolvable,
+        //     fall back to the first registered EA and write that back so
+        //     subsequent runs are stable.
+        if let Err(e) = self.resolve_target_ea().await {
+            warn!(
+                "Failed to resolve target EA: {} — using dashboard default",
+                e
+            );
+        }
+
         // 3. Spawn the outbound outbox watcher.
         let outbox_dir = self.config.omar_dir.join("slack_outbox");
         if let Err(e) = std::fs::create_dir_all(&outbox_dir) {
@@ -95,8 +107,13 @@ impl Bridge {
     }
 
     /// Translate one Slack message into an EA event payload and hand it to
-    /// OMAR via MCP.
+    /// OMAR via MCP. Slash commands beginning with `/ea` are handled
+    /// entirely by the bridge and never reach the LLM.
     async fn handle_message(&self, msg: SlackMessage) -> Result<()> {
+        if let Some(name) = parse_ea_command(&msg.text) {
+            return self.handle_ea_command(name, &msg).await;
+        }
+
         let user_name = {
             let mut slack = self.slack.lock().await;
             slack.resolve_user_name(&msg.user).await
@@ -127,6 +144,135 @@ impl Bridge {
             .await
             .context("Failed to post Slack event via MCP")?;
         Ok(())
+    }
+
+    /// Read the persisted target EA from `~/.omar/config.toml`, validate
+    /// against the live registry, fall back to the first EA if missing,
+    /// then pin the MCP client to the resolved EA. Persists the resolved
+    /// name when it had to fall back so the file converges.
+    async fn resolve_target_ea(&self) -> Result<()> {
+        let mut omar = self.omar.lock().await;
+        let (_, eas) = omar.list_eas().await.context("list_eas failed")?;
+        if eas.is_empty() {
+            return Err(anyhow::anyhow!("dashboard reports zero registered EAs"));
+        }
+        let desired = settings::load_active_ea(&self.config.omar_dir);
+        let (target_id, target_name) = match desired
+            .as_deref()
+            .and_then(|name| eas.iter().find(|(_, n)| n == name).cloned())
+        {
+            Some((id, name)) => (id, name),
+            None => {
+                let (id, name) = eas[0].clone();
+                if desired.is_some() {
+                    warn!(
+                        "Persisted active_ea '{}' not in registry; falling back to '{}'",
+                        desired.as_deref().unwrap_or(""),
+                        name
+                    );
+                }
+                if let Err(e) = settings::save_active_ea(&self.config.omar_dir, &name) {
+                    warn!("Failed to persist resolved active_ea '{}': {}", name, e);
+                }
+                (id, name)
+            }
+        };
+        info!(
+            "Slack bridge pinned to EA '{}' (id={})",
+            target_name, target_id
+        );
+        omar.set_target_ea(Some(target_id));
+        Ok(())
+    }
+
+    /// Apply a `/ea <name>` Slack command. Validates the name against the
+    /// live EA registry, persists the selection, repoints the MCP client,
+    /// and replies in the same Slack thread. Never forwards to the LLM.
+    async fn handle_ea_command(&self, name: &str, msg: &SlackMessage) -> Result<()> {
+        let thread_ts = msg.thread_ts.as_deref().unwrap_or(&msg.ts).to_string();
+        let channel = msg.channel.clone();
+
+        if name.is_empty() {
+            self.slack_reply(&channel, &thread_ts, "Usage: `/ea <EA_name>`")
+                .await;
+            return Ok(());
+        }
+
+        let lookup = {
+            let mut omar = self.omar.lock().await;
+            omar.list_eas().await
+        };
+        let (_, eas) = match lookup {
+            Ok(v) => v,
+            Err(e) => {
+                let text = format!("Failed to list EAs: {}", e);
+                self.slack_reply(&channel, &thread_ts, &text).await;
+                return Ok(());
+            }
+        };
+
+        let matched = eas.iter().find(|(_, n)| n == name).cloned();
+        match matched {
+            None => {
+                let available = if eas.is_empty() {
+                    "(none registered)".to_string()
+                } else {
+                    eas.iter()
+                        .map(|(_, n)| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let text = format!("EA '{}' not found. Available: {}", name, available);
+                self.slack_reply(&channel, &thread_ts, &text).await;
+            }
+            Some((id, resolved_name)) => {
+                if let Err(e) = settings::save_active_ea(&self.config.omar_dir, &resolved_name) {
+                    let text = format!("Failed to persist EA selection: {}", e);
+                    self.slack_reply(&channel, &thread_ts, &text).await;
+                    return Ok(());
+                }
+                {
+                    let mut omar = self.omar.lock().await;
+                    omar.set_target_ea(Some(id));
+                }
+                info!(
+                    "Slack bridge re-pinned to EA '{}' (id={})",
+                    resolved_name, id
+                );
+                let text = format!("Switched to EA '{}' (id={})", resolved_name, id);
+                self.slack_reply(&channel, &thread_ts, &text).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn slack_reply(&self, channel: &str, thread_ts: &str, text: &str) {
+        let slack = self.slack.lock().await;
+        if let Err(e) = slack
+            .post_message_chunked(
+                channel,
+                text,
+                Some(thread_ts),
+                self.config.max_message_length,
+            )
+            .await
+        {
+            warn!("Failed to post /ea reply to Slack: {}", e);
+        }
+    }
+}
+
+/// Parse a Slack message body for the `/ea <name>` command. Returns
+/// `Some(name)` (possibly empty) iff the trimmed body starts with `/ea`
+/// followed by end-of-string or whitespace. Returns `None` when the
+/// message is not an `/ea` command — those flow through to the LLM.
+pub(crate) fn parse_ea_command(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("/ea")?;
+    match rest.chars().next() {
+        None => Some(""),
+        Some(c) if c.is_whitespace() => Some(rest.trim()),
+        Some(_) => None, // e.g. `/each`, not our command
     }
 }
 
@@ -210,4 +356,33 @@ async fn drain_outbox_once(outbox_dir: &Path, slack: &Mutex<SlackClient>, max_le
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ea_command;
+
+    #[test]
+    fn parses_ea_with_name() {
+        assert_eq!(parse_ea_command("/ea Research"), Some("Research"));
+    }
+
+    #[test]
+    fn parses_ea_with_extra_whitespace() {
+        assert_eq!(parse_ea_command("   /ea   Research  "), Some("Research"));
+    }
+
+    #[test]
+    fn parses_ea_with_empty_argument() {
+        assert_eq!(parse_ea_command("/ea"), Some(""));
+        assert_eq!(parse_ea_command("/ea   "), Some(""));
+    }
+
+    #[test]
+    fn rejects_non_ea_commands() {
+        assert_eq!(parse_ea_command("/each"), None);
+        assert_eq!(parse_ea_command("/eat lunch"), None);
+        assert_eq!(parse_ea_command("hello /ea Research"), None);
+        assert_eq!(parse_ea_command("regular message"), None);
+    }
 }

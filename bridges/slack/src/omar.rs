@@ -29,15 +29,26 @@ impl McpClient {
     /// `omar_binary` is the path to the omar executable (resolved by the
     /// caller — typically next to the bridge binary, falling back to
     /// `omar` on PATH).
-    pub async fn start(omar_binary: &PathBuf, omar_dir: &std::path::Path) -> Result<Self> {
-        let mut child = Command::new(omar_binary)
+    pub async fn start(
+        omar_binary: &PathBuf,
+        omar_dir: &std::path::Path,
+        ea_id_override: Option<u32>,
+    ) -> Result<Self> {
+        let mut command = Command::new(omar_binary);
+        command
             .arg("mcp-server")
             .env("OMAR_DIR", omar_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Inherit stderr so the MCP server's log lines (config errors,
             // EA resolution failures) surface in the bridge's log.
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if let Some(id) = ea_id_override {
+            command.env("OMAR_EA_ID", id.to_string());
+        } else {
+            command.env_remove("OMAR_EA_ID");
+        }
+        let mut child = command
             .spawn()
             .with_context(|| format!("Failed to spawn {:?} mcp-server", omar_binary))?;
 
@@ -180,6 +191,7 @@ impl Drop for McpClient {
 pub struct OmarMcp {
     omar_binary: PathBuf,
     omar_dir: PathBuf,
+    ea_id_override: Option<u32>,
     client: Option<McpClient>,
 }
 
@@ -188,16 +200,57 @@ impl OmarMcp {
         Self {
             omar_binary,
             omar_dir,
+            ea_id_override: None,
             client: None,
+        }
+    }
+
+    /// Pin future MCP children to `ea_id`. Drops the current child so the
+    /// next tool call respawns with the new pinning. Pass `None` to revert
+    /// to the dashboard's globally-active EA.
+    pub fn set_target_ea(&mut self, ea_id: Option<u32>) {
+        if self.ea_id_override != ea_id {
+            self.ea_id_override = ea_id;
+            self.client = None;
         }
     }
 
     async fn client_mut(&mut self) -> Result<&mut McpClient> {
         if self.client.is_none() {
-            let client = McpClient::start(&self.omar_binary, &self.omar_dir).await?;
+            let client =
+                McpClient::start(&self.omar_binary, &self.omar_dir, self.ea_id_override).await?;
             self.client = Some(client);
         }
         Ok(self.client.as_mut().unwrap())
+    }
+
+    /// Fetch `(active_id, [(id, name), ...])` from the MCP `list_eas` tool.
+    pub async fn list_eas(&mut self) -> Result<(u32, Vec<(u32, String)>)> {
+        let result = self.try_call_with_timeout("list_eas", json!({})).await?;
+        let active = result
+            .get("active")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow!("list_eas: missing 'active' field"))?
+            as u32;
+        let eas = result
+            .get("eas")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("list_eas: missing 'eas' array"))?;
+        let mut entries = Vec::with_capacity(eas.len());
+        for entry in eas {
+            let id = entry
+                .get("id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("list_eas: entry missing 'id'"))?
+                as u32;
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("list_eas: entry missing 'name'"))?
+                .to_string();
+            entries.push((id, name));
+        }
+        Ok((active, entries))
     }
 
     /// Post an inbound Slack message to the EA's event queue.

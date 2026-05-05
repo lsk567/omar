@@ -2096,6 +2096,7 @@ mod tests {
             },
             watchdog: WatchdogConfig::default(),
             metrics: MetricsConfig::default(),
+            slack_bridge: crate::config::SlackBridgeConfig::default(),
         }
     }
 

@@ -22,6 +22,9 @@ pub struct Config {
 
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    #[serde(default)]
+    pub slack_bridge: SlackBridgeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +98,15 @@ pub struct MetricsConfig {
     /// Enable global spawn metrics sink at ~/.omar/metrics/spawn_metrics.jsonl
     #[serde(default)]
     pub spawn_metrics_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SlackBridgeConfig {
+    /// EA name the slack bridge targets. The bridge resolves this against
+    /// the EA registry at startup; if unset or unresolvable it falls back
+    /// to the first registered EA. Set via the `/ea <name>` Slack command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_ea: Option<String>,
 }
 
 fn default_true() -> bool {

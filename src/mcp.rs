@@ -421,7 +421,7 @@ pub fn run_server_with_default_context() -> Result<()> {
     let config = crate::config::Config::load(Some(&config_path))
         .with_context(|| format!("Failed to load omar config for {}", omar_dir.display()))?;
     let registered = ea::ensure_default_ea(&omar_dir)?;
-    let ea_id = ea::resolve_active_ea(&omar_dir, &registered);
+    let ea_id = resolve_default_context_ea(&omar_dir, &registered)?;
     let context = McpLaunchContext {
         omar_dir,
         ea_id,
@@ -435,6 +435,28 @@ pub fn run_server_with_default_context() -> Result<()> {
             .filter(|server| !server.is_empty()),
     };
     OmarMcpServer::new(context).run()
+}
+
+/// Pick the EA id for a default-context server. Honors `OMAR_EA_ID` so
+/// peer processes (e.g. the Slack bridge) can pin a child to a specific
+/// EA without mutating the global active-EA pointer the dashboard reads.
+fn resolve_default_context_ea(omar_dir: &Path, registered: &[ea::EaInfo]) -> Result<ea::EaId> {
+    if let Some(raw) = std::env::var_os("OMAR_EA_ID") {
+        let raw = raw.to_string_lossy();
+        if !raw.is_empty() {
+            let id: ea::EaId = raw
+                .parse()
+                .with_context(|| format!("OMAR_EA_ID '{}' is not a valid EA id", raw))?;
+            if !registered.iter().any(|ea| ea.id == id) {
+                return Err(anyhow!(
+                    "OMAR_EA_ID {} is not a registered EA on this dashboard",
+                    id
+                ));
+            }
+            return Ok(id);
+        }
+    }
+    Ok(ea::resolve_active_ea(omar_dir, registered))
 }
 
 struct OmarMcpServer {
@@ -2311,6 +2333,77 @@ mod tests {
             health_idle_warning: 15,
             tmux_server: None,
         }
+    }
+
+    #[test]
+    fn resolve_default_context_ea_uses_active_when_env_unset() {
+        let _lock = env_lock();
+        let _guard = EnvVarGuard::unset("OMAR_EA_ID");
+        let dir = tempfile::tempdir().unwrap();
+        let registered = ea::ensure_default_ea(dir.path()).unwrap();
+        let id = ea::register_ea(dir.path(), "Research", None).unwrap();
+        ea::save_active_ea(dir.path(), id).unwrap();
+        let registered = {
+            let mut all = registered;
+            all.extend(
+                ea::load_registry(dir.path())
+                    .into_iter()
+                    .filter(|ea| ea.id == id),
+            );
+            all
+        };
+
+        let resolved = resolve_default_context_ea(dir.path(), &registered).unwrap();
+
+        assert_eq!(resolved, id);
+    }
+
+    #[test]
+    fn resolve_default_context_ea_honors_env_override() {
+        let _lock = env_lock();
+        let _guard = EnvVarGuard::unset("OMAR_EA_ID");
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ea::ensure_default_ea(dir.path()).unwrap();
+        let target = ea::register_ea(dir.path(), "Research", None).unwrap();
+        ea::save_active_ea(dir.path(), 0).unwrap();
+        let registered = ea::load_registry(dir.path());
+
+        std::env::set_var("OMAR_EA_ID", target.to_string());
+        let resolved = resolve_default_context_ea(dir.path(), &registered).unwrap();
+
+        assert_eq!(resolved, target);
+    }
+
+    #[test]
+    fn resolve_default_context_ea_rejects_unknown_env_id() {
+        let _lock = env_lock();
+        let _guard = EnvVarGuard::unset("OMAR_EA_ID");
+        let dir = tempfile::tempdir().unwrap();
+        let registered = ea::ensure_default_ea(dir.path()).unwrap();
+
+        std::env::set_var("OMAR_EA_ID", "99");
+        let err = resolve_default_context_ea(dir.path(), &registered).unwrap_err();
+
+        assert!(
+            err.to_string().contains("99"),
+            "error must name the rejected id: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_default_context_ea_rejects_nonnumeric_env() {
+        let _lock = env_lock();
+        let _guard = EnvVarGuard::unset("OMAR_EA_ID");
+        let dir = tempfile::tempdir().unwrap();
+        let registered = ea::ensure_default_ea(dir.path()).unwrap();
+
+        std::env::set_var("OMAR_EA_ID", "not-a-number");
+        let err = resolve_default_context_ea(dir.path(), &registered).unwrap_err();
+
+        assert!(
+            err.to_string().to_lowercase().contains("valid ea id"),
+            "error should mention invalid id: {err}"
+        );
     }
 
     #[test]

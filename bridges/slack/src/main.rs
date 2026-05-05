@@ -1,6 +1,7 @@
 mod bridge;
 mod config;
 mod omar;
+mod settings;
 mod slack;
 
 use anyhow::Result;
