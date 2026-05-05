@@ -102,8 +102,16 @@ struct StoreLock {
 }
 
 impl StoreLock {
+    /// Try to acquire the cross-process scheduler lock. The retry budget is
+    /// kept short on purpose: `transaction()` is reachable from async event
+    /// loops (e.g. `take_due_deliveries`), so a long blocking wait here would
+    /// stall a Tokio worker thread. Lock callers degrade gracefully to
+    /// in-memory operation on failure (see `Scheduler::transaction`), so
+    /// timing out fast is preferable to long blocking.
     fn acquire(path: PathBuf) -> std::io::Result<Self> {
-        for _ in 0..500 {
+        const MAX_ATTEMPTS: u32 = 50;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+        for _ in 0..MAX_ATTEMPTS {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -119,7 +127,7 @@ impl StoreLock {
                         let _ = fs::remove_file(&path);
                         continue;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(RETRY_DELAY);
                 }
                 Err(err) => return Err(err),
             }
@@ -253,8 +261,11 @@ impl Scheduler {
         self.transaction(true, |queue| {
             queue.push(event);
         });
-        // `notify_one` stores a permit so the event loop wakes up even if it
-        // isn't currently parked on `notified().await`.
+        // `notify_one` (not `notify_waiters`) stores a permit so the event
+        // loop wakes up even if it isn't currently parked on
+        // `notified().await`. All queue mutations follow this convention so
+        // a cancellation that removed the next-due event can't leave the
+        // loop sleeping until the stale deadline.
         self.notify.notify_one();
     }
 
@@ -289,7 +300,7 @@ impl Scheduler {
                 None => Err(wrong_ea),
             }
         });
-        self.notify.notify_waiters();
+        self.notify.notify_one();
         result
     }
 
@@ -316,7 +327,7 @@ impl Scheduler {
             *queue = remaining;
             count
         });
-        self.notify.notify_waiters();
+        self.notify.notify_one();
         count
     }
 
@@ -337,7 +348,7 @@ impl Scheduler {
             *queue = remaining;
             count
         });
-        self.notify.notify_waiters();
+        self.notify.notify_one();
         count
     }
 
@@ -359,7 +370,7 @@ impl Scheduler {
             *queue = remaining;
             batch
         });
-        self.notify.notify_waiters();
+        self.notify.notify_one();
         batch
     }
 
