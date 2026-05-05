@@ -1108,11 +1108,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 KeyCode::Backspace => {
                                     buf.pop();
                                 }
-                                KeyCode::Char(c) => {
-                                    // Block control chars; allow normal text.
-                                    if !c.is_control() {
-                                        buf.push(c);
-                                    }
+                                // Block control chars; allow normal text.
+                                KeyCode::Char(c) if !c.is_control() => {
+                                    buf.push(c);
                                 }
                                 _ => {}
                             }
