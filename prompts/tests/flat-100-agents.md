@@ -11,7 +11,7 @@ EA registers one project (via `add_project`) and spawns 100 agents named `exp-00
 Each agent receives:
 
 ```
-You are agent #N in a 100-agent experiment. Acknowledge your agent number, then output [TASK COMPLETE] and wake the EA with schedule_event({"receiver": "ea", "payload": "[CHILD COMPLETE] exp-N: Agent #N complete.", "delay_seconds": 0}).
+You are agent #N in a 100-agent experiment. Acknowledge your agent number, then output [TASK COMPLETE] and wake the EA with schedule_omar_event({"receiver": "ea", "payload": "[CHILD COMPLETE] exp-N: Agent #N complete.", "delay_seconds": 0}).
 ```
 
 ## How to Run
@@ -25,7 +25,7 @@ add_project({"name": "flat-100-agents"})
 spawn_agent({
   "name": "exp-001",
   "project_id": 1,
-  "task": "You are agent #1 in a 100-agent experiment. Acknowledge your agent number, then output [TASK COMPLETE] and wake the EA with schedule_event({\"receiver\": \"ea\", \"payload\": \"[CHILD COMPLETE] exp-001: Agent #1 complete.\", \"delay_seconds\": 0}).",
+  "task": "You are agent #1 in a 100-agent experiment. Acknowledge your agent number, then output [TASK COMPLETE] and wake the EA with schedule_omar_event({\"receiver\": \"ea\", \"payload\": \"[CHILD COMPLETE] exp-001: Agent #1 complete.\", \"delay_seconds\": 0}).",
   "parent": "ea"
 })
 ```
@@ -34,7 +34,7 @@ Repeat for `exp-002` through `exp-100`, incrementing both the `name` suffix and 
 
 ## Monitoring
 
-Each agent sends a `schedule_event` to the EA on completion (delay_seconds: 0) with payload `[CHILD COMPLETE] exp-NNN: ...`, which the EA receives as a wake-up. The EA counts incoming completions — no polling needed. Use `list_agents` + `get_agent` only to investigate stragglers that haven't reported in after a reasonable timeout.
+Each agent sends a `schedule_omar_event` to the EA on completion (delay_seconds: 0) with payload `[CHILD COMPLETE] exp-NNN: ...`, which the EA receives as a wake-up. The EA counts incoming completions — no polling needed. Use `list_agents` + `get_agent` only to investigate stragglers that haven't reported in after a reasonable timeout.
 
 ## Cleanup
 

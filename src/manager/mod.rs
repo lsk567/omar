@@ -347,7 +347,7 @@ fn materialize_gemini_deny_policy(context: &McpLaunchContext) -> Option<PathBuf>
     let mut policy = String::new();
     let entries = BACKEND_NATIVE_WAKE_TOOLS
         .iter()
-        .map(|t| (*t, "Use the OMAR MCP tool schedule_event instead."))
+        .map(|t| (*t, "Use the OMAR MCP tool schedule_omar_event instead."))
         .chain(
             BACKEND_NATIVE_AGENT_TOOLS
                 .iter()
@@ -1171,7 +1171,7 @@ mod tests {
     #[test]
     fn embedded_prompts_forbid_backend_native_wake_tools() {
         for prompt in [PROMPT_EA, PROMPT_AGENT] {
-            assert!(prompt.contains("MUST use the OMAR MCP tool `schedule_event`"));
+            assert!(prompt.contains("MUST use the OMAR MCP tool `schedule_omar_event`"));
             assert!(prompt.contains("ScheduleWakeup"));
             assert!(prompt.contains("scheduled tasks"));
             assert!(prompt.contains("If a non-OMAR wake/reminder tool is visible, ignore it"));
@@ -1193,7 +1193,7 @@ mod tests {
         );
         assert!(cmd.contains("--mcp-config"));
         assert!(cmd.contains("--disallowedTools"));
-        // Wake-tool denylist (overlap with schedule_event).
+        // Wake-tool denylist (overlap with schedule_omar_event).
         assert!(cmd.contains("ScheduleWakeup"));
         assert!(cmd.contains("scheduled_tasks"));
         // Subagent-dispatcher denylist (overlap with spawn_agent). The Claude
@@ -1289,7 +1289,7 @@ mod tests {
         let policy = std::fs::read_to_string(policy).unwrap();
         // Wake/timer overlap rules.
         assert!(policy.contains("toolName = \"ScheduleWakeup\""));
-        assert!(policy.contains("Use the OMAR MCP tool schedule_event instead."));
+        assert!(policy.contains("Use the OMAR MCP tool schedule_omar_event instead."));
         // Subagent-dispatcher overlap rules.
         assert!(policy.contains("toolName = \"Task\""));
         assert!(policy.contains("Use the OMAR MCP tool spawn_agent instead."));

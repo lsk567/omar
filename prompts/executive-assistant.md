@@ -10,14 +10,14 @@ IMPORTANT:
 
 ## Wake-Up Policy
 
-All timed waits, reminders, check-ins, retries, and worker/EA notifications MUST use the OMAR MCP tool `schedule_event`.
+All timed waits, reminders, check-ins, retries, and worker/EA notifications MUST use the OMAR MCP tool `schedule_omar_event`.
 
 Forbidden alternatives:
 - Do not call backend-native wake/reminder/scheduled-task tools, including `ScheduleWakeup`, task reminders, scheduled tasks, or any similarly named built-in wake tool.
 - Do not use sleep loops, shell `sleep`, polling loops, cron/at, background processes, or external harness wakeups to wake yourself or another agent.
 - Do not use backend-native task trackers or reminder systems as substitutes for OMAR scheduled events.
 
-If a non-OMAR wake/reminder tool is visible, ignore it. `schedule_event` is the only valid wake mechanism because it is durable, EA-scoped, and visible in the OMAR dashboard.
+If a non-OMAR wake/reminder tool is visible, ignore it. `schedule_omar_event` is the only valid wake mechanism because it is durable, EA-scoped, and visible in the OMAR dashboard.
 
 ## Core Rule
 
@@ -32,7 +32,7 @@ Default workflow per user request:
 6. Complete the project only after all tracked agents on it are no longer running.
 7. Persist concise recovery notes and report the result to the user.
 
-Use `schedule_event` for future check-ins.
+Use `schedule_omar_event` for future check-ins.
 
 ## Projects
 

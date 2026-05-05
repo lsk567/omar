@@ -580,7 +580,7 @@ impl OmarMcpServer {
             "list_projects" => self.list_projects(),
             "add_project" => self.add_project(call.arguments),
             "complete_project" => self.complete_project(call.arguments),
-            "schedule_event" => self.schedule_event(call.arguments),
+            "schedule_omar_event" => self.schedule_omar_event(call.arguments),
             "list_events" => self.list_events(),
             "cancel_event" => self.cancel_event(call.arguments),
             "log_justification" => self.log_justification(call.arguments),
@@ -1291,7 +1291,7 @@ impl OmarMcpServer {
         Ok(json!({ "status": "sent" }))
     }
 
-    fn schedule_event(&self, args: Value) -> Result<Value> {
+    fn schedule_omar_event(&self, args: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct Args {
             receiver: String,
@@ -2134,7 +2134,7 @@ fn tool_definitions() -> Vec<Value> {
             }),
         ),
         tool(
-            "schedule_event",
+            "schedule_omar_event",
             "Enqueue an event in OMAR's persistent event queue to wake an agent or the EA at a chosen time. The event queue is OMAR's central coordination primitive: every timed check-in, parent completion notification, future nudge, and recurring cron-style task flows through it. Use this instead of sleep loops or any backend-native timer/reminder tool. Side effect: appends a scheduled event visible in the dashboard via list_events and durable across restarts. Not retry-safe unless duplicate delivery is acceptable; use list_events/cancel_event after uncertain results. For immediate parent notification after completion, set receiver to the parent name, payload to '[CHILD COMPLETE] {your_name}: {summary}', and delay_seconds to 0.",
             json!({
                 "type":"object",

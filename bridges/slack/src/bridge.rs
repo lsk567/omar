@@ -95,7 +95,7 @@ impl Bridge {
         info!("Socket Mode connected, listening for messages...");
 
         // 5. Process inbound messages — each becomes an EA-scoped event
-        //    via the `schedule_event` MCP tool.
+        //    via the `schedule_omar_event` MCP tool.
         while let Some(msg) = message_rx.recv().await {
             if let Err(e) = self.handle_message(msg).await {
                 error!("Error handling message: {}", e);
