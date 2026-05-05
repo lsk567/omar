@@ -1,10 +1,11 @@
-//! Read/write the bridge's `[slack_bridge].active_ea` field in the shared
-//! `~/.omar/config.toml`. Uses `toml_edit` so other sections (and any
-//! comments) are preserved verbatim on save.
+//! Read the bridge's `[slack_bridge].active_ea` field from the shared
+//! `~/.omar/config.toml`. The file is the single source of truth and is
+//! only edited manually (or by the dashboard); the bridge never writes
+//! it, to avoid any path that lets a Slack peer mutate the workspace
+//! target.
 
-use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use toml_edit::{value, DocumentMut, Item, Table};
+use toml_edit::DocumentMut;
 
 const SECTION: &str = "slack_bridge";
 const FIELD: &str = "active_ea";
@@ -25,42 +26,9 @@ pub fn load_active_ea(omar_dir: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Persist `[slack_bridge].active_ea = ea_name` in the shared config file,
-/// preserving every other section. Creates the file if absent.
-pub fn save_active_ea(omar_dir: &Path, ea_name: &str) -> Result<()> {
-    let path = config_path(omar_dir);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc: DocumentMut = if content.is_empty() {
-        DocumentMut::new()
-    } else {
-        content
-            .parse()
-            .with_context(|| format!("Failed to parse {}", path.display()))?
-    };
-    if !matches!(doc.get(SECTION), Some(Item::Table(_))) {
-        doc[SECTION] = Item::Table(Table::new());
-    }
-    doc[SECTION][FIELD] = value(ea_name);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string())?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn save_then_load_roundtrips() {
-        let dir = tempfile::tempdir().unwrap();
-        save_active_ea(dir.path(), "Research").unwrap();
-        assert_eq!(load_active_ea(dir.path()), Some("Research".to_string()));
-    }
 
     #[test]
     fn load_returns_none_when_missing() {
@@ -69,32 +37,33 @@ mod tests {
     }
 
     #[test]
-    fn save_preserves_other_sections() {
+    fn load_reads_persisted_value() {
         let dir = tempfile::tempdir().unwrap();
         let path = config_path(dir.path());
         std::fs::write(
             &path,
-            "# top comment\n[dashboard]\nrefresh_interval = 5\n\n[agent]\ndefault_command = \"claude\"\n",
+            "[dashboard]\nrefresh_interval = 5\n\n[slack_bridge]\nactive_ea = \"Research\"\n",
         )
         .unwrap();
 
-        save_active_ea(dir.path(), "Research").unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("# top comment"));
-        assert!(content.contains("[dashboard]"));
-        assert!(content.contains("refresh_interval = 5"));
-        assert!(content.contains("[agent]"));
-        assert!(content.contains("default_command = \"claude\""));
-        assert!(content.contains("[slack_bridge]"));
-        assert!(content.contains("active_ea = \"Research\""));
+        assert_eq!(load_active_ea(dir.path()), Some("Research".to_string()));
     }
 
     #[test]
-    fn save_overwrites_existing_value() {
+    fn load_returns_none_when_section_missing() {
         let dir = tempfile::tempdir().unwrap();
-        save_active_ea(dir.path(), "First").unwrap();
-        save_active_ea(dir.path(), "Second").unwrap();
-        assert_eq!(load_active_ea(dir.path()), Some("Second".to_string()));
+        let path = config_path(dir.path());
+        std::fs::write(&path, "[dashboard]\nrefresh_interval = 5\n").unwrap();
+
+        assert_eq!(load_active_ea(dir.path()), None);
+    }
+
+    #[test]
+    fn load_returns_none_when_field_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_path(dir.path());
+        std::fs::write(&path, "[slack_bridge]\nother_field = 1\n").unwrap();
+
+        assert_eq!(load_active_ea(dir.path()), None);
     }
 }

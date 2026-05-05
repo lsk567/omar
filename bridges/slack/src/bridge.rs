@@ -64,8 +64,8 @@ impl Bridge {
 
         // 2b. Resolve the bridge's persisted EA pin against the dashboard's
         //     EA registry. If the persisted name is missing or unresolvable,
-        //     fall back to the first registered EA and write that back so
-        //     subsequent runs are stable.
+        //     fall back to the first registered EA at runtime — never
+        //     written back, so config.toml stays the single source of truth.
         if let Err(e) = self.resolve_target_ea().await {
             warn!(
                 "Failed to resolve target EA: {} — using dashboard default",
@@ -97,7 +97,7 @@ impl Bridge {
         // 5. Process inbound messages — each becomes an EA-scoped event
         //    via the `schedule_event` MCP tool.
         while let Some(msg) = message_rx.recv().await {
-            if let Err(e) = self.handle_message(msg, &bot_user_id).await {
+            if let Err(e) = self.handle_message(msg).await {
                 error!("Error handling message: {}", e);
             }
         }
@@ -107,16 +107,8 @@ impl Bridge {
     }
 
     /// Translate one Slack message into an EA event payload and hand it to
-    /// OMAR via MCP. Slash commands beginning with `/ea` are handled
-    /// entirely by the bridge and never reach the LLM. In channels Slack
-    /// prepends the bot mention to the message text (`<@BOTID> /ea X`),
-    /// so we strip a leading mention before checking the command prefix.
-    async fn handle_message(&self, msg: SlackMessage, bot_user_id: &str) -> Result<()> {
-        let cleaned = strip_leading_bot_mention(&msg.text, bot_user_id);
-        if let Some(name) = parse_ea_command(cleaned) {
-            return self.handle_ea_command(name, &msg).await;
-        }
-
+    /// OMAR via MCP.
+    async fn handle_message(&self, msg: SlackMessage) -> Result<()> {
         let user_name = {
             let mut slack = self.slack.lock().await;
             slack.resolve_user_name(&msg.user).await
@@ -149,10 +141,11 @@ impl Bridge {
         Ok(())
     }
 
-    /// Read the persisted target EA from `~/.omar/config.toml`, validate
-    /// against the live registry, fall back to the first EA if missing,
-    /// then pin the MCP client to the resolved EA. Persists the resolved
-    /// name when it had to fall back so the file converges.
+    /// Read `[slack_bridge].active_ea` from `~/.omar/config.toml` and pin
+    /// the bridge's MCP client to the matching EA. Falls back to the
+    /// first registered EA at runtime if the persisted name is missing
+    /// or unresolvable; never writes back, so the toml file remains the
+    /// single source of truth (edited manually or via the dashboard).
     async fn resolve_target_ea(&self) -> Result<()> {
         let mut omar = self.omar.lock().await;
         let (_, eas) = omar.list_eas().await.context("list_eas failed")?;
@@ -169,13 +162,11 @@ impl Bridge {
                 let (id, name) = eas[0].clone();
                 if desired.is_some() {
                     warn!(
-                        "Persisted active_ea '{}' not in registry; falling back to '{}'",
+                        "Persisted [slack_bridge].active_ea '{}' not in registry; \
+                         using first EA '{}' for this session (config.toml is unchanged)",
                         desired.as_deref().unwrap_or(""),
                         name
                     );
-                }
-                if let Err(e) = settings::save_active_ea(&self.config.omar_dir, &name) {
-                    warn!("Failed to persist resolved active_ea '{}': {}", name, e);
                 }
                 (id, name)
             }
@@ -187,127 +178,6 @@ impl Bridge {
         omar.set_target_ea(Some(target_id));
         Ok(())
     }
-
-    /// Apply a `/ea <name>` Slack command. Validates the name against the
-    /// live EA registry, persists the selection, repoints the MCP client,
-    /// and replies in the same Slack thread. Never forwards to the LLM.
-    async fn handle_ea_command(&self, name: &str, msg: &SlackMessage) -> Result<()> {
-        let thread_ts = msg.thread_ts.as_deref().unwrap_or(&msg.ts).to_string();
-        let channel = msg.channel.clone();
-
-        if name.is_empty() {
-            self.slack_reply(&channel, &thread_ts, "Usage: `/ea <EA_name>`")
-                .await;
-            return Ok(());
-        }
-
-        let lookup = {
-            let mut omar = self.omar.lock().await;
-            omar.list_eas().await
-        };
-        let (_, eas) = match lookup {
-            Ok(v) => v,
-            Err(e) => {
-                let text = format!("Failed to list EAs: {}", e);
-                self.slack_reply(&channel, &thread_ts, &text).await;
-                return Ok(());
-            }
-        };
-
-        let matched = eas.iter().find(|(_, n)| n == name).cloned();
-        match matched {
-            None => {
-                let available = if eas.is_empty() {
-                    "(none registered)".to_string()
-                } else {
-                    eas.iter()
-                        .map(|(_, n)| n.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let text = format!("EA '{}' not found. Available: {}", name, available);
-                self.slack_reply(&channel, &thread_ts, &text).await;
-            }
-            Some((id, resolved_name)) => {
-                if let Err(e) = settings::save_active_ea(&self.config.omar_dir, &resolved_name) {
-                    let text = format!("Failed to persist EA selection: {}", e);
-                    self.slack_reply(&channel, &thread_ts, &text).await;
-                    return Ok(());
-                }
-                {
-                    let mut omar = self.omar.lock().await;
-                    omar.set_target_ea(Some(id));
-                }
-                info!(
-                    "Slack bridge re-pinned to EA '{}' (id={})",
-                    resolved_name, id
-                );
-                let text = format!("Switched to EA '{}' (id={})", resolved_name, id);
-                self.slack_reply(&channel, &thread_ts, &text).await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn slack_reply(&self, channel: &str, thread_ts: &str, text: &str) {
-        let slack = self.slack.lock().await;
-        if let Err(e) = slack
-            .post_message_chunked(
-                channel,
-                text,
-                Some(thread_ts),
-                self.config.max_message_length,
-            )
-            .await
-        {
-            warn!("Failed to post /ea reply to Slack: {}", e);
-        }
-    }
-}
-
-/// Parse a Slack message body for the `/ea <name>` command. Returns
-/// `Some(name)` (possibly empty) iff the trimmed body starts with `/ea`
-/// followed by end-of-string or whitespace. Returns `None` when the
-/// message is not an `/ea` command — those flow through to the LLM.
-pub(crate) fn parse_ea_command(text: &str) -> Option<&str> {
-    let trimmed = text.trim();
-    let rest = trimmed.strip_prefix("/ea")?;
-    match rest.chars().next() {
-        None => Some(""),
-        Some(c) if c.is_whitespace() => Some(rest.trim()),
-        Some(_) => None, // e.g. `/each`, not our command
-    }
-}
-
-/// Strip a leading `<@BOTID>` (or `<@BOTID|name>`) Slack mention so the
-/// rest of the message can be parsed as if it had been sent in a DM.
-/// Slack only prepends this mention in channel/group conversations; DMs
-/// arrive without it. Only the bot's own mention is stripped — mentions
-/// of other users pass through untouched so the agent still sees them.
-pub(crate) fn strip_leading_bot_mention<'a>(text: &'a str, bot_user_id: &str) -> &'a str {
-    if bot_user_id.is_empty() {
-        return text;
-    }
-    let trimmed = text.trim_start();
-    let prefix = format!("<@{}", bot_user_id);
-    let rest = match trimmed.strip_prefix(&prefix) {
-        Some(rest) => rest,
-        None => return text,
-    };
-    let after_close = if let Some(rest) = rest.strip_prefix('>') {
-        rest
-    } else if let Some(after_pipe) = rest.strip_prefix('|') {
-        match after_pipe.find('>') {
-            Some(idx) => &after_pipe[idx + 1..],
-            None => return text,
-        }
-    } else {
-        // Prefix matched the bot id but the next char isn't '>' or '|',
-        // so this is `<@BOTIDX...>` — a different user whose id starts
-        // with ours. Leave the message alone.
-        return text;
-    };
-    after_close.trim_start()
 }
 
 /// Poll `outbox_dir` for `slack_reply` MCP tool results and forward them
@@ -390,91 +260,4 @@ async fn drain_outbox_once(outbox_dir: &Path, slack: &Mutex<SlackClient>, max_le
         }
     }
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{parse_ea_command, strip_leading_bot_mention};
-
-    #[test]
-    fn parses_ea_with_name() {
-        assert_eq!(parse_ea_command("/ea Research"), Some("Research"));
-    }
-
-    #[test]
-    fn parses_ea_with_extra_whitespace() {
-        assert_eq!(parse_ea_command("   /ea   Research  "), Some("Research"));
-    }
-
-    #[test]
-    fn parses_ea_with_empty_argument() {
-        assert_eq!(parse_ea_command("/ea"), Some(""));
-        assert_eq!(parse_ea_command("/ea   "), Some(""));
-    }
-
-    #[test]
-    fn rejects_non_ea_commands() {
-        assert_eq!(parse_ea_command("/each"), None);
-        assert_eq!(parse_ea_command("/eat lunch"), None);
-        assert_eq!(parse_ea_command("hello /ea Research"), None);
-        assert_eq!(parse_ea_command("regular message"), None);
-    }
-
-    #[test]
-    fn strip_mention_removes_bare_id() {
-        assert_eq!(
-            strip_leading_bot_mention("<@U12345> /ea Research", "U12345"),
-            "/ea Research"
-        );
-    }
-
-    #[test]
-    fn strip_mention_removes_id_with_label() {
-        assert_eq!(
-            strip_leading_bot_mention("<@U12345|omar-bot> /ea Research", "U12345"),
-            "/ea Research"
-        );
-    }
-
-    #[test]
-    fn strip_mention_handles_leading_whitespace() {
-        assert_eq!(
-            strip_leading_bot_mention("   <@U12345>   /ea Research", "U12345"),
-            "/ea Research"
-        );
-    }
-
-    #[test]
-    fn strip_mention_leaves_text_alone_without_mention() {
-        assert_eq!(
-            strip_leading_bot_mention("/ea Research", "U12345"),
-            "/ea Research"
-        );
-        assert_eq!(
-            strip_leading_bot_mention("regular message", "U12345"),
-            "regular message"
-        );
-    }
-
-    #[test]
-    fn strip_mention_only_strips_bot_id() {
-        // Another user mentioned at the start — leave it alone so the
-        // agent still sees the @who.
-        assert_eq!(
-            strip_leading_bot_mention("<@UOTHER> hi", "U12345"),
-            "<@UOTHER> hi"
-        );
-        // Bot id is a *prefix* of another user's id (no terminator) —
-        // must not be stripped.
-        assert_eq!(
-            strip_leading_bot_mention("<@U12345X> hi", "U12345"),
-            "<@U12345X> hi"
-        );
-    }
-
-    #[test]
-    fn strip_mention_then_parse_ea() {
-        let stripped = strip_leading_bot_mention("<@U12345> /ea Research", "U12345");
-        assert_eq!(parse_ea_command(stripped), Some("Research"));
-    }
 }
