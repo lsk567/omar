@@ -97,7 +97,7 @@ impl Bridge {
         // 5. Process inbound messages — each becomes an EA-scoped event
         //    via the `schedule_event` MCP tool.
         while let Some(msg) = message_rx.recv().await {
-            if let Err(e) = self.handle_message(msg).await {
+            if let Err(e) = self.handle_message(msg, &bot_user_id).await {
                 error!("Error handling message: {}", e);
             }
         }
@@ -108,9 +108,12 @@ impl Bridge {
 
     /// Translate one Slack message into an EA event payload and hand it to
     /// OMAR via MCP. Slash commands beginning with `/ea` are handled
-    /// entirely by the bridge and never reach the LLM.
-    async fn handle_message(&self, msg: SlackMessage) -> Result<()> {
-        if let Some(name) = parse_ea_command(&msg.text) {
+    /// entirely by the bridge and never reach the LLM. In channels Slack
+    /// prepends the bot mention to the message text (`<@BOTID> /ea X`),
+    /// so we strip a leading mention before checking the command prefix.
+    async fn handle_message(&self, msg: SlackMessage, bot_user_id: &str) -> Result<()> {
+        let cleaned = strip_leading_bot_mention(&msg.text, bot_user_id);
+        if let Some(name) = parse_ea_command(cleaned) {
             return self.handle_ea_command(name, &msg).await;
         }
 
@@ -276,6 +279,37 @@ pub(crate) fn parse_ea_command(text: &str) -> Option<&str> {
     }
 }
 
+/// Strip a leading `<@BOTID>` (or `<@BOTID|name>`) Slack mention so the
+/// rest of the message can be parsed as if it had been sent in a DM.
+/// Slack only prepends this mention in channel/group conversations; DMs
+/// arrive without it. Only the bot's own mention is stripped — mentions
+/// of other users pass through untouched so the agent still sees them.
+pub(crate) fn strip_leading_bot_mention<'a>(text: &'a str, bot_user_id: &str) -> &'a str {
+    if bot_user_id.is_empty() {
+        return text;
+    }
+    let trimmed = text.trim_start();
+    let prefix = format!("<@{}", bot_user_id);
+    let rest = match trimmed.strip_prefix(&prefix) {
+        Some(rest) => rest,
+        None => return text,
+    };
+    let after_close = if let Some(rest) = rest.strip_prefix('>') {
+        rest
+    } else if let Some(after_pipe) = rest.strip_prefix('|') {
+        match after_pipe.find('>') {
+            Some(idx) => &after_pipe[idx + 1..],
+            None => return text,
+        }
+    } else {
+        // Prefix matched the bot id but the next char isn't '>' or '|',
+        // so this is `<@BOTIDX...>` — a different user whose id starts
+        // with ours. Leave the message alone.
+        return text;
+    };
+    after_close.trim_start()
+}
+
 /// Poll `outbox_dir` for `slack_reply` MCP tool results and forward them
 /// to Slack. Files are deleted on successful delivery; failures leave the
 /// file in place so the next poll retries. Survives bridge restarts —
@@ -360,7 +394,7 @@ async fn drain_outbox_once(outbox_dir: &Path, slack: &Mutex<SlackClient>, max_le
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ea_command;
+    use super::{parse_ea_command, strip_leading_bot_mention};
 
     #[test]
     fn parses_ea_with_name() {
@@ -384,5 +418,63 @@ mod tests {
         assert_eq!(parse_ea_command("/eat lunch"), None);
         assert_eq!(parse_ea_command("hello /ea Research"), None);
         assert_eq!(parse_ea_command("regular message"), None);
+    }
+
+    #[test]
+    fn strip_mention_removes_bare_id() {
+        assert_eq!(
+            strip_leading_bot_mention("<@U12345> /ea Research", "U12345"),
+            "/ea Research"
+        );
+    }
+
+    #[test]
+    fn strip_mention_removes_id_with_label() {
+        assert_eq!(
+            strip_leading_bot_mention("<@U12345|omar-bot> /ea Research", "U12345"),
+            "/ea Research"
+        );
+    }
+
+    #[test]
+    fn strip_mention_handles_leading_whitespace() {
+        assert_eq!(
+            strip_leading_bot_mention("   <@U12345>   /ea Research", "U12345"),
+            "/ea Research"
+        );
+    }
+
+    #[test]
+    fn strip_mention_leaves_text_alone_without_mention() {
+        assert_eq!(
+            strip_leading_bot_mention("/ea Research", "U12345"),
+            "/ea Research"
+        );
+        assert_eq!(
+            strip_leading_bot_mention("regular message", "U12345"),
+            "regular message"
+        );
+    }
+
+    #[test]
+    fn strip_mention_only_strips_bot_id() {
+        // Another user mentioned at the start — leave it alone so the
+        // agent still sees the @who.
+        assert_eq!(
+            strip_leading_bot_mention("<@UOTHER> hi", "U12345"),
+            "<@UOTHER> hi"
+        );
+        // Bot id is a *prefix* of another user's id (no terminator) —
+        // must not be stripped.
+        assert_eq!(
+            strip_leading_bot_mention("<@U12345X> hi", "U12345"),
+            "<@U12345X> hi"
+        );
+    }
+
+    #[test]
+    fn strip_mention_then_parse_ea() {
+        let stripped = strip_leading_bot_mention("<@U12345> /ea Research", "U12345");
+        assert_eq!(parse_ea_command(stripped), Some("Research"));
     }
 }
