@@ -192,6 +192,10 @@ pub struct OmarMcp {
     omar_binary: PathBuf,
     omar_dir: PathBuf,
     ea_id_override: Option<u32>,
+    /// Last value read from `[slack_bridge].active_ea`. Used to detect
+    /// dashboard-side edits without re-resolving against `list_eas` on
+    /// every inbound Slack message.
+    last_desired_name: Option<String>,
     client: Option<McpClient>,
 }
 
@@ -201,6 +205,7 @@ impl OmarMcp {
             omar_binary,
             omar_dir,
             ea_id_override: None,
+            last_desired_name: None,
             client: None,
         }
     }
@@ -213,6 +218,17 @@ impl OmarMcp {
             self.ea_id_override = ea_id;
             self.client = None;
         }
+    }
+
+    /// Cached snapshot of `[slack_bridge].active_ea` from the last
+    /// successful `resolve_target_ea`. Compared against fresh toml reads
+    /// to decide whether to re-resolve.
+    pub fn last_desired_name(&self) -> Option<&str> {
+        self.last_desired_name.as_deref()
+    }
+
+    pub fn set_last_desired_name(&mut self, name: Option<String>) {
+        self.last_desired_name = name;
     }
 
     async fn client_mut(&mut self) -> Result<&mut McpClient> {

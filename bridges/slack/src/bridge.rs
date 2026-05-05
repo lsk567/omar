@@ -107,8 +107,13 @@ impl Bridge {
     }
 
     /// Translate one Slack message into an EA event payload and hand it to
-    /// OMAR via MCP.
+    /// OMAR via MCP. Re-checks the persisted `[slack_bridge].active_ea`
+    /// before posting so dashboard-side edits land without a restart.
     async fn handle_message(&self, msg: SlackMessage) -> Result<()> {
+        if let Err(e) = self.refresh_target_if_changed().await {
+            warn!("Failed to refresh target EA before message: {}", e);
+        }
+
         let user_name = {
             let mut slack = self.slack.lock().await;
             slack.resolve_user_name(&msg.user).await
@@ -176,7 +181,30 @@ impl Bridge {
             target_name, target_id
         );
         omar.set_target_ea(Some(target_id));
+        omar.set_last_desired_name(desired);
         Ok(())
+    }
+
+    /// Cheap per-message check: if the on-disk `[slack_bridge].active_ea`
+    /// differs from the value we last resolved against, kick a fresh
+    /// `resolve_target_ea`. Otherwise return without doing any MCP work.
+    /// Reads only the toml file, not the registry — the registry call
+    /// happens lazily inside `resolve_target_ea` on a real change.
+    async fn refresh_target_if_changed(&self) -> Result<()> {
+        let desired = settings::load_active_ea(&self.config.omar_dir);
+        let last = {
+            let omar = self.omar.lock().await;
+            omar.last_desired_name().map(|s| s.to_string())
+        };
+        if desired.as_deref() == last.as_deref() {
+            return Ok(());
+        }
+        info!(
+            "Detected [slack_bridge].active_ea change ('{}' → '{}'); re-resolving",
+            last.as_deref().unwrap_or(""),
+            desired.as_deref().unwrap_or("")
+        );
+        self.resolve_target_ea().await
     }
 }
 
