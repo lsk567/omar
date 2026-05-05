@@ -296,33 +296,82 @@ impl Config {
         }
     }
 
-    /// Number of toggleable settings
+    /// Number of settings exposed in the dashboard panel.
     pub fn settings_count(&self) -> usize {
-        3
+        4
     }
 
-    /// Get label and current value for a setting by index
-    pub fn settings_item(&self, index: usize) -> Option<(&str, bool)> {
+    /// Settings panel entry: a labelled toggle or a labelled text field.
+    pub fn settings_item(&self, index: usize) -> Option<SettingItem<'_>> {
         match index {
-            0 => Some((
-                "Show event queue in sidebar",
-                self.dashboard.show_event_queue,
-            )),
-            1 => Some(("Sidebar on right side", self.dashboard.sidebar_right)),
-            2 => Some(("Show inspirational quotes", self.dashboard.show_quotes)),
+            0 => Some(SettingItem::Toggle {
+                label: "Show event queue in sidebar",
+                value: self.dashboard.show_event_queue,
+            }),
+            1 => Some(SettingItem::Toggle {
+                label: "Sidebar on right side",
+                value: self.dashboard.sidebar_right,
+            }),
+            2 => Some(SettingItem::Toggle {
+                label: "Show inspirational quotes",
+                value: self.dashboard.show_quotes,
+            }),
+            3 => Some(SettingItem::Text {
+                label: "Slack bridge target EA (name)",
+                value: self.slack_bridge.active_ea.as_deref().unwrap_or(""),
+            }),
             _ => None,
         }
     }
 
-    /// Toggle a setting by index and save
+    /// Toggle a boolean setting and save. No-op for text-typed settings.
     pub fn toggle_setting(&mut self, index: usize) {
         match index {
             0 => self.dashboard.show_event_queue = !self.dashboard.show_event_queue,
             1 => self.dashboard.sidebar_right = !self.dashboard.sidebar_right,
             2 => self.dashboard.show_quotes = !self.dashboard.show_quotes,
-            _ => {}
+            _ => return,
         }
         self.save();
+    }
+
+    /// Set a text-typed setting by index and save. An empty string clears
+    /// the field (serializes as a missing key thanks to
+    /// `skip_serializing_if = "Option::is_none"`). Returns `true` if the
+    /// index targets a text setting.
+    pub fn set_text_setting(&mut self, index: usize, value: &str) -> bool {
+        let trimmed = value.trim();
+        match index {
+            3 => {
+                self.slack_bridge.active_ea = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+            _ => return false,
+        }
+        self.save();
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingItem<'a> {
+    Toggle { label: &'a str, value: bool },
+    Text { label: &'a str, value: &'a str },
+}
+
+impl SettingItem<'_> {
+    pub fn label(&self) -> &str {
+        match self {
+            SettingItem::Toggle { label, .. } => label,
+            SettingItem::Text { label, .. } => label,
+        }
+    }
+
+    pub fn is_text(&self) -> bool {
+        matches!(self, SettingItem::Text { .. })
     }
 }
 
@@ -368,14 +417,49 @@ mod tests {
         let mut config = Config::default();
         assert!(config.dashboard.show_event_queue);
         assert!(!config.dashboard.show_quotes);
-        assert_eq!(config.settings_count(), 3);
-        assert_eq!(
+        assert_eq!(config.settings_count(), 4);
+        assert!(matches!(
             config.settings_item(0),
-            Some(("Show event queue in sidebar", true))
-        );
+            Some(SettingItem::Toggle {
+                label: "Show event queue in sidebar",
+                value: true,
+            })
+        ));
         // Toggle without saving to disk (just test the in-memory toggle)
         config.dashboard.show_event_queue = !config.dashboard.show_event_queue;
         assert!(!config.dashboard.show_event_queue);
+    }
+
+    #[test]
+    fn slack_bridge_text_setting_round_trips() {
+        let mut config = Config::default();
+        // The default state is no persisted EA — exposed as the empty string.
+        assert!(matches!(
+            config.settings_item(3),
+            Some(SettingItem::Text {
+                label: "Slack bridge target EA (name)",
+                value: "",
+            })
+        ));
+        // Use a tempdir so save() doesn't write to ~/.omar in tests.
+        let dir = tempfile::tempdir().unwrap();
+        let original = std::env::var("HOME").ok();
+        std::env::set_var("HOME", dir.path());
+
+        assert!(config.set_text_setting(3, "Research"));
+        assert_eq!(config.slack_bridge.active_ea.as_deref(), Some("Research"));
+
+        // Whitespace-only input clears the field rather than storing blanks.
+        assert!(config.set_text_setting(3, "   "));
+        assert_eq!(config.slack_bridge.active_ea, None);
+
+        // Toggle indices return false (rejected).
+        assert!(!config.set_text_setting(0, "anything"));
+
+        match original {
+            Some(prev) => std::env::set_var("HOME", prev),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]

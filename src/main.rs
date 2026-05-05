@@ -1091,6 +1091,33 @@ async fn run_dashboard(config: Config) -> Result<()> {
 
                     // Handle settings popup
                     if app.show_settings {
+                        // Text-edit mode: capture characters and structural keys.
+                        // The buffer is only committed to config on Enter, so
+                        // Esc safely discards in-flight edits.
+                        if let Some(buf) = app.settings_edit_buffer.as_mut() {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.settings_edit_buffer = None;
+                                }
+                                KeyCode::Enter => {
+                                    let value = buf.clone();
+                                    let idx = app.settings_selected;
+                                    app.settings_edit_buffer = None;
+                                    app.config.set_text_setting(idx, &value);
+                                }
+                                KeyCode::Backspace => {
+                                    buf.pop();
+                                }
+                                KeyCode::Char(c) => {
+                                    // Block control chars; allow normal text.
+                                    if !c.is_control() {
+                                        buf.push(c);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Esc | KeyCode::Char('S') => {
                                 app.show_settings = false;
@@ -1105,12 +1132,27 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                             KeyCode::Enter => {
                                 let idx = app.settings_selected;
-                                app.config.toggle_setting(idx);
-                                // If event queue was just hidden, move sidebar off Events panel
-                                if !app.config.dashboard.show_event_queue
-                                    && app.sidebar_panel == app::SidebarPanel::Events
-                                {
-                                    app.sidebar_panel = app::SidebarPanel::Projects;
+                                let is_text = app
+                                    .config
+                                    .settings_item(idx)
+                                    .map(|item| item.is_text())
+                                    .unwrap_or(false);
+                                if is_text {
+                                    let current = match app.config.settings_item(idx) {
+                                        Some(config::SettingItem::Text { value, .. }) => {
+                                            value.to_string()
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    app.settings_edit_buffer = Some(current);
+                                } else {
+                                    app.config.toggle_setting(idx);
+                                    // If event queue was just hidden, move sidebar off Events panel
+                                    if !app.config.dashboard.show_event_queue
+                                        && app.sidebar_panel == app::SidebarPanel::Events
+                                    {
+                                        app.sidebar_panel = app::SidebarPanel::Projects;
+                                    }
                                 }
                             }
                             _ => {}

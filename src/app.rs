@@ -111,6 +111,10 @@ pub struct App {
     pub show_debug_console: bool,
     pub show_settings: bool,
     pub settings_selected: usize,
+    /// `Some(buffer)` while the user is typing into a text-typed setting
+    /// row. `None` otherwise. The buffer holds the live edit; it is only
+    /// committed to `config` on Enter.
+    pub settings_edit_buffer: Option<String>,
     pub config: Config,
     /// Session name of the agent shown in the bottom panel (the EA's manager session)
     pub focus_parent: String,
@@ -217,6 +221,7 @@ impl App {
             show_debug_console: false,
             show_settings: false,
             settings_selected: 0,
+            settings_edit_buffer: None,
             config: config.clone(),
             focus_parent: manager_session,
             focus_stack: Vec::new(),
@@ -1376,6 +1381,7 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         self.show_events = false;
         self.show_debug_console = false;
         self.show_settings = false;
+        self.settings_edit_buffer = None;
         self.sidebar_popup = None;
         self.pending_confirm = None;
         Ok(())
