@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::backend_probe;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -16,10 +18,13 @@ pub struct Config {
     pub agent: AgentConfig,
 
     #[serde(default)]
-    pub api: ApiConfig,
+    pub watchdog: WatchdogConfig,
 
     #[serde(default)]
-    pub watchdog: WatchdogConfig,
+    pub metrics: MetricsConfig,
+
+    #[serde(default)]
+    pub slack_bridge: SlackBridgeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,21 +77,6 @@ pub struct AgentConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiConfig {
-    /// Whether to enable the HTTP API
-    #[serde(default = "default_api_enabled")]
-    pub enabled: bool,
-
-    /// Host to bind to
-    #[serde(default = "default_api_host")]
-    pub host: String,
-
-    /// Port to listen on
-    #[serde(default = "default_api_port")]
-    pub port: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchdogConfig {
     /// Command to run the watchdog agent (empty = watchdog disabled).
     /// Should be an untrusted/free backend — no secrets will be passed.
@@ -101,6 +91,22 @@ pub struct WatchdogConfig {
     /// Slack channel ID for watchdog alerts (empty = no Slack alerts)
     #[serde(default)]
     pub slack_channel: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Enable global spawn metrics sink at ~/.omar/metrics/spawn_metrics.jsonl
+    #[serde(default)]
+    pub spawn_metrics_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SlackBridgeConfig {
+    /// EA name the slack bridge targets. The bridge resolves this against
+    /// the EA registry at startup; if unset or unresolvable it falls back
+    /// to the first registered EA. Set via the `/ea <name>` Slack command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_ea: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -135,9 +141,7 @@ fn default_error_patterns() -> Vec<String> {
 /// Detect which agent command is available on the system.
 /// Checks PATH for the supported first-class backends, falling back to `claude`.
 fn detect_agent_command() -> String {
-    use std::process::Command;
-
-    for (binary, command) in [
+    detect_agent_command_from(&[
         ("claude", "claude --dangerously-skip-permissions"),
         (
             "codex",
@@ -146,18 +150,15 @@ fn detect_agent_command() -> String {
         ("cursor", "cursor agent --yolo"),
         ("gemini", "gemini --yolo"),
         ("opencode", "opencode"),
-    ] {
-        if Command::new(binary)
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
-            return command.to_string();
-        }
-    }
+    ])
+    .unwrap_or_else(|| "claude --dangerously-skip-permissions".to_string())
+}
 
-    // Fallback to claude even if not found (user may install it later)
-    "claude --dangerously-skip-permissions".to_string()
+fn detect_agent_command_from(candidates: &[(&str, &str)]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|(binary, _)| backend_probe::backend_version_probe_succeeds(binary))
+        .map(|(_, command)| (*command).to_string())
 }
 
 fn default_command() -> String {
@@ -203,18 +204,6 @@ fn default_auth_failure_patterns() -> Vec<String> {
     ]
 }
 
-fn default_api_enabled() -> bool {
-    true
-}
-
-fn default_api_host() -> String {
-    "127.0.0.1".to_string()
-}
-
-fn default_api_port() -> u16 {
-    9876
-}
-
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
@@ -246,16 +235,6 @@ impl Default for AgentConfig {
     }
 }
 
-impl Default for ApiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_api_enabled(),
-            host: default_api_host(),
-            port: default_api_port(),
-        }
-    }
-}
-
 impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
@@ -275,63 +254,124 @@ impl Config {
             .join("config.toml")
     }
 
-    /// Load config from file. Creates default config at ~/.omar/config.toml on first run.
-    pub fn load(path: Option<&str>) -> Result<Self> {
-        let expanded_path = match path {
+    /// Resolve a config path from CLI input, expanding `~/`.
+    pub fn resolve_path(path: Option<&str>) -> PathBuf {
+        match path {
             Some(p) => expand_tilde(p),
             None => Self::default_path(),
-        };
+        }
+    }
+
+    /// Load config from file. Creates default config at ~/.omar/config.toml on first run.
+    pub fn load(path: Option<&str>) -> Result<Self> {
+        let expanded_path = Self::resolve_path(path);
 
         if !expanded_path.exists() {
             let config = Self::default();
-            config.save();
+            config.save_to_path(&expanded_path);
             return Ok(config);
         }
 
         let contents =
             std::fs::read_to_string(&expanded_path).context("Failed to read config file")?;
 
-        toml::from_str(&contents).context("Failed to parse config file")
+        let mut config: Self = toml::from_str(&contents).context("Failed to parse config file")?;
+        config.dashboard.session_prefix =
+            normalize_session_prefix(&config.dashboard.session_prefix);
+        Ok(config)
     }
 
     /// Save config to its default path (~/.omar/config.toml)
     pub fn save(&self) {
-        let path = Self::default_path();
+        self.save_to_path(&Self::default_path());
+    }
+
+    /// Save config to a specific path.
+    pub fn save_to_path(&self, path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         if let Ok(contents) = toml::to_string_pretty(self) {
-            std::fs::write(&path, contents).ok();
+            std::fs::write(path, contents).ok();
         }
     }
 
-    /// Number of toggleable settings
+    /// Number of settings exposed in the dashboard panel.
     pub fn settings_count(&self) -> usize {
-        3
+        4
     }
 
-    /// Get label and current value for a setting by index
-    pub fn settings_item(&self, index: usize) -> Option<(&str, bool)> {
+    /// Settings panel entry: a labelled toggle or a labelled text field.
+    pub fn settings_item(&self, index: usize) -> Option<SettingItem<'_>> {
         match index {
-            0 => Some((
-                "Show event queue in sidebar",
-                self.dashboard.show_event_queue,
-            )),
-            1 => Some(("Sidebar on right side", self.dashboard.sidebar_right)),
-            2 => Some(("Show inspirational quotes", self.dashboard.show_quotes)),
+            0 => Some(SettingItem::Toggle {
+                label: "Show event queue in sidebar",
+                value: self.dashboard.show_event_queue,
+            }),
+            1 => Some(SettingItem::Toggle {
+                label: "Sidebar on right side",
+                value: self.dashboard.sidebar_right,
+            }),
+            2 => Some(SettingItem::Toggle {
+                label: "Show inspirational quotes",
+                value: self.dashboard.show_quotes,
+            }),
+            3 => Some(SettingItem::Text {
+                label: "Slack bridge target EA (name)",
+                value: self.slack_bridge.active_ea.as_deref().unwrap_or(""),
+            }),
             _ => None,
         }
     }
 
-    /// Toggle a setting by index and save
+    /// Toggle a boolean setting and save. No-op for text-typed settings.
     pub fn toggle_setting(&mut self, index: usize) {
         match index {
             0 => self.dashboard.show_event_queue = !self.dashboard.show_event_queue,
             1 => self.dashboard.sidebar_right = !self.dashboard.sidebar_right,
             2 => self.dashboard.show_quotes = !self.dashboard.show_quotes,
-            _ => {}
+            _ => return,
         }
         self.save();
+    }
+
+    /// Set a text-typed setting by index and save. An empty string clears
+    /// the field (serializes as a missing key thanks to
+    /// `skip_serializing_if = "Option::is_none"`). Returns `true` if the
+    /// index targets a text setting.
+    pub fn set_text_setting(&mut self, index: usize, value: &str) -> bool {
+        let trimmed = value.trim();
+        match index {
+            3 => {
+                self.slack_bridge.active_ea = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+            _ => return false,
+        }
+        self.save();
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingItem<'a> {
+    Toggle { label: &'a str, value: bool },
+    Text { label: &'a str, value: &'a str },
+}
+
+impl SettingItem<'_> {
+    pub fn label(&self) -> &str {
+        match self {
+            SettingItem::Toggle { label, .. } => label,
+            SettingItem::Text { label, .. } => label,
+        }
+    }
+
+    pub fn is_text(&self) -> bool {
+        matches!(self, SettingItem::Text { .. })
     }
 }
 
@@ -342,6 +382,18 @@ fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+fn normalize_session_prefix(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let raw = raw.trim_end_matches('-');
+    if raw.is_empty() {
+        return String::new();
+    }
+    format!("{}-", raw)
 }
 
 #[cfg(test)]
@@ -357,6 +409,7 @@ mod tests {
         assert!(config.dashboard.sidebar_right);
         assert_eq!(config.health.idle_warning, 15);
         assert_eq!(config.health.idle_critical, 300);
+        assert!(!config.metrics.spawn_metrics_enabled);
     }
 
     #[test]
@@ -364,14 +417,49 @@ mod tests {
         let mut config = Config::default();
         assert!(config.dashboard.show_event_queue);
         assert!(!config.dashboard.show_quotes);
-        assert_eq!(config.settings_count(), 3);
-        assert_eq!(
+        assert_eq!(config.settings_count(), 4);
+        assert!(matches!(
             config.settings_item(0),
-            Some(("Show event queue in sidebar", true))
-        );
+            Some(SettingItem::Toggle {
+                label: "Show event queue in sidebar",
+                value: true,
+            })
+        ));
         // Toggle without saving to disk (just test the in-memory toggle)
         config.dashboard.show_event_queue = !config.dashboard.show_event_queue;
         assert!(!config.dashboard.show_event_queue);
+    }
+
+    #[test]
+    fn slack_bridge_text_setting_round_trips() {
+        let mut config = Config::default();
+        // The default state is no persisted EA — exposed as the empty string.
+        assert!(matches!(
+            config.settings_item(3),
+            Some(SettingItem::Text {
+                label: "Slack bridge target EA (name)",
+                value: "",
+            })
+        ));
+        // Use a tempdir so save() doesn't write to ~/.omar in tests.
+        let dir = tempfile::tempdir().unwrap();
+        let original = std::env::var("HOME").ok();
+        std::env::set_var("HOME", dir.path());
+
+        assert!(config.set_text_setting(3, "Research"));
+        assert_eq!(config.slack_bridge.active_ea.as_deref(), Some("Research"));
+
+        // Whitespace-only input clears the field rather than storing blanks.
+        assert!(config.set_text_setting(3, "   "));
+        assert_eq!(config.slack_bridge.active_ea, None);
+
+        // Toggle indices return false (rejected).
+        assert!(!config.set_text_setting(0, "anything"));
+
+        match original {
+            Some(prev) => std::env::set_var("HOME", prev),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
@@ -396,9 +484,41 @@ sidebar_right = false
             cmd.contains("claude")
                 || cmd.contains("codex")
                 || cmd.contains("cursor")
+                || cmd.contains("gemini")
                 || cmd.contains("opencode"),
             "Unexpected default command: {}",
             cmd
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_agent_command_skips_hanging_probe() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let slow = temp.path().join("slow-agent");
+        let fast = temp.path().join("fast-agent");
+        fs::write(&slow, "#!/bin/sh\nsleep 5\n").unwrap();
+        fs::write(&fast, "#!/bin/sh\nexit 0\n").unwrap();
+        for path in [&slow, &fast] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        let start = Instant::now();
+        let cmd = detect_agent_command_from(&[
+            (slow.to_str().unwrap(), "slow command"),
+            (fast.to_str().unwrap(), "fast command"),
+        ]);
+
+        assert_eq!(cmd.as_deref(), Some("fast command"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "hanging probe should be skipped after the bounded timeout"
         );
     }
 
@@ -426,6 +546,23 @@ default_command = "bash"
         assert!(!config.dashboard.sidebar_right);
         assert_eq!(config.health.idle_warning, 30);
         assert_eq!(config.health.error_patterns, vec!["error", "panic"]);
+    }
+
+    #[test]
+    fn test_load_normalizes_session_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[dashboard]
+session_prefix = "omar-agent"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(Some(config_path.to_str().unwrap())).unwrap();
+        assert_eq!(config.dashboard.session_prefix, "omar-agent-");
     }
 
     #[test]
@@ -518,5 +655,28 @@ default_command = "claude --dangerously-skip-permissions"
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.watchdog.command.is_empty());
         assert!(!config.watchdog.auth_failure_patterns.is_empty());
+    }
+
+    #[test]
+    fn test_parse_metrics_config() {
+        let toml = r#"
+[metrics]
+spawn_metrics_enabled = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.metrics.spawn_metrics_enabled);
+    }
+
+    #[test]
+    fn test_load_missing_custom_path_writes_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.toml");
+
+        let _config = Config::load(Some(path.to_str().unwrap())).unwrap();
+
+        assert!(
+            path.exists(),
+            "missing explicit config path should be created"
+        );
     }
 }

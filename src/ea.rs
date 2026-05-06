@@ -110,7 +110,13 @@ pub fn resolve_ea_selector(base_dir: &Path, selector: Option<&str>) -> anyhow::R
     let ea = match selector {
         Some(raw) => {
             if let Ok(id) = raw.parse::<EaId>() {
-                eas.iter().find(|ea| ea.id == id).cloned()
+                eas.iter().find(|ea| ea.id == id).cloned().or_else(|| {
+                    if id == 0 && eas.len() == 1 {
+                        eas.first().cloned()
+                    } else {
+                        None
+                    }
+                })
             } else {
                 eas.iter().find(|ea| ea.name == raw).cloned()
             }
@@ -124,18 +130,46 @@ pub fn resolve_ea_selector(base_dir: &Path, selector: Option<&str>) -> anyhow::R
     ea.ok_or_else(|| anyhow::anyhow!("EA '{}' not found", selector.unwrap_or("<active>")))
 }
 
+/// Like `resolve_ea_selector`, but creates a new EA when the selector is a
+/// non-numeric, valid name that does not match any registered EA. Numeric
+/// selectors that don't match still fail because EA IDs are server-assigned
+/// (monotonic and never reused).
+///
+/// Returns `(EaInfo, was_created)`.
+pub fn resolve_or_create_ea_selector(
+    base_dir: &Path,
+    selector: Option<&str>,
+) -> anyhow::Result<(EaInfo, bool)> {
+    if let Some(raw) = selector {
+        if raw.parse::<EaId>().is_err() {
+            let eas = ensure_default_ea(base_dir)?;
+            if let Some(ea) = eas.iter().find(|ea| ea.name == raw) {
+                return Ok((ea.clone(), false));
+            }
+            let id = register_ea(base_dir, raw, None)?;
+            let ea = load_registry(base_dir)
+                .into_iter()
+                .find(|ea| ea.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Created EA {} missing from registry", id))?;
+            return Ok((ea, true));
+        }
+    }
+    Ok((resolve_ea_selector(base_dir, selector)?, false))
+}
+
 /// Ensure at least one default EA exists on disk.
 pub fn ensure_default_ea(base_dir: &Path) -> anyhow::Result<Vec<EaInfo>> {
     let mut eas = load_registry(base_dir);
     if eas.is_empty() {
         eas.push(default_ea_info());
         save_registry(base_dir, &eas)?;
-        if load_next_id_counter(base_dir) == 0 {
-            save_next_id_counter(base_dir, 0)?;
-        }
         fs::create_dir_all(ea_state_dir(0, base_dir).join("status"))?;
-        let _ = save_active_ea(base_dir, 0);
     }
+
+    if load_next_id_counter(base_dir) == 0 && eas.iter().any(|ea| ea.id == 0) {
+        save_next_id_counter(base_dir, eas.iter().map(|ea| ea.id).max().unwrap_or(0))?;
+    }
+
     Ok(eas)
 }
 
@@ -220,6 +254,9 @@ pub fn unregister_ea(base_dir: &Path, ea_id: EaId) -> anyhow::Result<()> {
     if eas.len() <= 1 {
         anyhow::bail!("Cannot delete the only EA; at least one EA must remain");
     }
+    if !eas.iter().any(|e| e.id == ea_id) {
+        anyhow::bail!("EA {} not found in registry", ea_id);
+    }
     eas.retain(|e| e.id != ea_id);
     save_registry(base_dir, &eas)
 }
@@ -243,108 +280,6 @@ fn save_registry(base_dir: &Path, eas: &[EaInfo]) -> anyhow::Result<()> {
     fs::write(&tmp, &json)?;
     fs::rename(&tmp, &path)?;
     Ok(())
-}
-
-/// Clear persisted EA registry/state so each dashboard run starts fresh.
-/// This removes:
-/// - eas.json (EA registry)
-/// - active_ea
-/// - ea_next_id
-/// - ea/ (per-EA state directories)
-/// - manager_notes_ea*.md
-pub fn clear_registry_and_state(base_dir: &Path) {
-    let _ = fs::remove_file(base_dir.join("eas.json"));
-    let _ = fs::remove_file(base_dir.join("active_ea"));
-    let _ = fs::remove_file(base_dir.join("ea_next_id"));
-    let _ = fs::remove_dir_all(base_dir.join("ea"));
-
-    if let Ok(entries) = fs::read_dir(base_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if name.starts_with("manager_notes_ea") && name.ends_with(".md") {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
-}
-
-/// Migrate legacy state files from ~/.omar/ to ~/.omar/ea/0/
-pub fn migrate_legacy_state(omar_dir: &Path) {
-    let ea0_dir = ea_state_dir(0, omar_dir);
-    if ea0_dir.exists() {
-        return; // Already migrated (or fresh install with no legacy files)
-    }
-    fs::create_dir_all(ea0_dir.join("status")).ok();
-
-    let files = [
-        "tasks.md",
-        "memory.md",
-        "worker_tasks.json",
-        "agent_parents.json",
-        "ea_prompt_combined.md",
-    ];
-    for file in &files {
-        let old = omar_dir.join(file);
-        let new_path = ea0_dir.join(file);
-        if old.exists() && !new_path.exists() {
-            fs::rename(&old, &new_path).ok();
-        }
-    }
-
-    // Move status directory
-    let old_status = omar_dir.join("status");
-    let new_status = ea0_dir.join("status");
-    if old_status.exists() {
-        // Copy files from old status to new status (dir may already exist)
-        if let Ok(entries) = fs::read_dir(&old_status) {
-            for entry in entries.flatten() {
-                let dest = new_status.join(entry.file_name());
-                if !dest.exists() {
-                    fs::rename(entry.path(), dest).ok();
-                }
-            }
-        }
-        fs::remove_dir_all(&old_status).ok();
-    }
-}
-
-/// Migrate legacy tmux sessions to EA 0 naming.
-pub fn migrate_legacy_sessions(base_prefix: &str) {
-    use std::process::Command;
-
-    // Rename manager: omar-agent-ea -> omar-agent-ea-0
-    let old_manager = format!("{}ea", base_prefix);
-    let new_manager = ea_manager_session(0, base_prefix);
-    if old_manager != new_manager {
-        let _ = Command::new("tmux")
-            .args(["rename-session", "-t", &old_manager, &new_manager])
-            .output();
-    }
-
-    // Rename agents: omar-agent-{name} -> omar-agent-0-{name}
-    let new_prefix = ea_prefix(0, base_prefix);
-    if let Ok(output) = Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-    {
-        let sessions = String::from_utf8_lossy(&output.stdout);
-        for name in sessions.lines() {
-            if name.starts_with(base_prefix)
-                && !name.starts_with(&new_prefix)
-                && !name.starts_with(&format!("{}ea-", base_prefix))
-                && name != "omar-dashboard"
-            {
-                let short = name.strip_prefix(base_prefix).unwrap_or(name);
-                let new_name = format!("{}{}", new_prefix, short);
-                let _ = Command::new("tmux")
-                    .args(["rename-session", "-t", name, &new_name])
-                    .output();
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -381,6 +316,46 @@ mod tests {
         assert_eq!(eas.len(), 1);
         assert_eq!(eas[0].id, 0);
         assert_eq!(load_next_id_counter(dir.path()), 7);
+    }
+
+    #[test]
+    fn test_ensure_default_ea_does_not_insert_missing_zero_when_other_eas_exist() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let stale = vec![EaInfo {
+            id: 3,
+            name: "Research".to_string(),
+            description: None,
+            created_at: 1234567890,
+        }];
+        save_registry(dir.path(), &stale).unwrap();
+
+        let eas = ensure_default_ea(dir.path()).unwrap();
+
+        assert_eq!(eas.len(), 1);
+        assert_eq!(eas[0].id, 3);
+        assert_eq!(eas[0].name, "Research");
+        assert!(!ea_state_dir(0, dir.path()).join("status").exists());
+    }
+
+    #[test]
+    fn test_resolve_ea_selector_numeric_zero_falls_back_to_single_ea() {
+        let dir = tempfile::tempdir().unwrap();
+        save_registry(
+            dir.path(),
+            &[EaInfo {
+                id: 3,
+                name: "Research".to_string(),
+                description: None,
+                created_at: 1234567890,
+            }],
+        )
+        .unwrap();
+
+        let ea = resolve_ea_selector(dir.path(), Some("0")).unwrap();
+
+        assert_eq!(ea.id, 3);
+        assert_eq!(ea.name, "Research");
     }
 
     #[test]
@@ -447,6 +422,67 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_or_create_ea_selector_creates_on_name_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+
+        let (ea, created) = resolve_or_create_ea_selector(dir.path(), Some("Research")).unwrap();
+
+        assert!(created);
+        assert_eq!(ea.name, "Research");
+        assert!(load_registry(dir.path())
+            .iter()
+            .any(|e| e.id == ea.id && e.name == "Research"));
+    }
+
+    #[test]
+    fn test_resolve_or_create_ea_selector_returns_existing_on_name_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+        let id = register_ea(dir.path(), "Research", None).unwrap();
+
+        let (ea, created) = resolve_or_create_ea_selector(dir.path(), Some("Research")).unwrap();
+
+        assert!(!created);
+        assert_eq!(ea.id, id);
+    }
+
+    #[test]
+    fn test_resolve_or_create_ea_selector_numeric_miss_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+        // Register a second EA so the "id=0 + single-EA" fallback in
+        // resolve_ea_selector cannot mask the miss.
+        let _ = register_ea(dir.path(), "Other", None).unwrap();
+
+        let result = resolve_or_create_ea_selector(dir.path(), Some("99"));
+        assert!(result.is_err(), "numeric miss must not auto-create");
+    }
+
+    #[test]
+    fn test_resolve_or_create_ea_selector_rejects_invalid_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+
+        let result = resolve_or_create_ea_selector(dir.path(), Some("bad name!"));
+        assert!(
+            result.is_err(),
+            "invalid name must error rather than auto-create"
+        );
+    }
+
+    #[test]
+    fn test_resolve_or_create_ea_selector_no_selector_returns_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ensure_default_ea(dir.path()).unwrap();
+
+        let (ea, created) = resolve_or_create_ea_selector(dir.path(), None).unwrap();
+
+        assert!(!created);
+        assert_eq!(ea.id, 0);
+    }
+
+    #[test]
     fn test_register_and_load() {
         let dir = tempfile::tempdir().unwrap();
         let id = register_ea(dir.path(), "Research", Some("R&D")).unwrap();
@@ -490,6 +526,19 @@ mod tests {
         let result = unregister_ea(dir.path(), id1);
         assert!(result.is_err(), "should reject deleting the last EA");
         assert!(result.unwrap_err().to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn test_unregister_unknown_ea_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        register_ea(dir.path(), "Alpha", None).unwrap();
+        register_ea(dir.path(), "Beta", None).unwrap();
+
+        let result = unregister_ea(dir.path(), 99);
+
+        assert!(result.is_err(), "should reject unknown EA id");
+        assert!(result.unwrap_err().to_string().contains("not found"));
+        assert_eq!(load_registry(dir.path()).len(), 2);
     }
 
     #[test]

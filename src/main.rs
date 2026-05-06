@@ -1,12 +1,15 @@
-mod api;
 mod app;
+mod backend_probe;
 mod computer;
 mod config;
 mod ea;
 mod event;
 mod manager;
+mod mcp;
 mod memory;
+mod metrics;
 mod panic_hook;
+mod process;
 mod projects;
 mod scheduler;
 mod tmux;
@@ -36,10 +39,12 @@ use tokio::sync::Mutex;
 use app::App;
 use config::Config;
 use event::{AppEvent, EventHandler};
-use tmux::TmuxClient;
+use tmux::{tmux_command, TmuxClient};
 
 /// Tmux session name used when omar auto-launches into tmux
 pub const DASHBOARD_SESSION: &str = "omar-dashboard";
+
+const TMUX_SETUP_WARNING: &str = "⚠ tmux not configured for omar — run 'omar setup-tmux' to fix";
 
 #[derive(Parser)]
 #[command(name = "omar", about = "Agent dashboard for tmux", version)]
@@ -58,6 +63,10 @@ struct Cli {
     /// EA to target by id or name [default: active EA]
     #[arg(long, global = true)]
     ea: Option<String>,
+
+    /// Enable global spawn metrics logging sink
+    #[arg(long, global = true)]
+    spawn_metrics: bool,
 }
 
 #[derive(Subcommand)]
@@ -99,6 +108,22 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ManagerAction>,
     },
+
+    /// Manage scheduled events for the target EA
+    Event {
+        #[command(subcommand)]
+        action: EventAction,
+    },
+
+    /// Start the OMAR MCP server over stdio
+    McpServer {
+        /// Path to a serialized MCP server context JSON file. When omitted,
+        /// the server builds a default context from the current config and
+        /// active EA — used by peer processes (e.g. the Slack bridge) that
+        /// aren't spawned by a specific backend launch.
+        #[arg(long)]
+        context_file: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -107,6 +132,53 @@ enum ManagerAction {
     Start,
     /// Run in orchestration mode (interactive)
     Orchestrate,
+}
+
+#[derive(Subcommand)]
+enum EventAction {
+    /// Schedule an event for an agent or the EA
+    Schedule {
+        /// Receiver name ("ea" for the manager)
+        #[arg(long)]
+        receiver: String,
+
+        /// Event payload text
+        #[arg(long)]
+        payload: String,
+
+        /// Sender label shown in the delivered message
+        #[arg(long)]
+        sender: Option<String>,
+
+        /// Absolute trigger timestamp in nanoseconds since epoch
+        #[arg(long)]
+        at_ns: Option<u64>,
+
+        /// Relative delay in seconds from now
+        #[arg(long)]
+        in_seconds: Option<u64>,
+
+        /// Relative delay in nanoseconds from now
+        #[arg(long)]
+        in_ns: Option<u64>,
+
+        /// Recurrence interval in seconds
+        #[arg(long)]
+        every_seconds: Option<u64>,
+
+        /// Recurrence interval in nanoseconds
+        #[arg(long)]
+        every_ns: Option<u64>,
+    },
+
+    /// List scheduled events for the target EA
+    List,
+
+    /// Cancel a scheduled event by id
+    Cancel {
+        /// Event id
+        id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -135,10 +207,18 @@ async fn async_main() -> Result<()> {
         config.agent.default_command =
             config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
     }
+    if cli.spawn_metrics {
+        config.metrics.spawn_metrics_enabled = true;
+        config.save_to_path(&Config::resolve_path(cli.config.as_deref()));
+    }
+    metrics::configure(config.metrics.spawn_metrics_enabled);
     let omar_dir = omar_dir();
 
     if let Some(ref selector) = cli.ea {
-        let ea_info = ea::resolve_ea_selector(&omar_dir, Some(selector))?;
+        let (ea_info, created) = ea::resolve_or_create_ea_selector(&omar_dir, Some(selector))?;
+        if created {
+            eprintln!("Created EA '{}' (id={})", ea_info.name, ea_info.id);
+        }
         ea::save_active_ea(&omar_dir, ea_info.id)?;
     }
 
@@ -166,7 +246,12 @@ async fn async_main() -> Result<()> {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
             let client =
                 TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
-            kill_agent(&client, &name)
+            kill_agent(
+                &client,
+                &name,
+                &scheduler::Scheduler::with_store(scheduler::events_store_path(&omar_dir)),
+                target.id,
+            )
         }
         Some(Commands::SetupTmux) => setup_tmux(),
         Some(Commands::Manager { action }) => {
@@ -181,6 +266,10 @@ async fn async_main() -> Result<()> {
                     &target.name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
+                    &manager::ManagerRuntimeOptions {
+                        default_workdir: config.agent.default_workdir.clone(),
+                        health_idle_warning: config.health.idle_warning,
+                    },
                 ),
                 Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(
                     &client,
@@ -189,9 +278,47 @@ async fn async_main() -> Result<()> {
                     &target.name,
                     &omar_dir,
                     &config.dashboard.session_prefix,
+                    &manager::ManagerRuntimeOptions {
+                        default_workdir: config.agent.default_workdir.clone(),
+                        health_idle_warning: config.health.idle_warning,
+                    },
                 ),
             }
         }
+        Some(Commands::Event { action }) => {
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let scheduler =
+                scheduler::Scheduler::with_store(scheduler::events_store_path(&omar_dir));
+            match action {
+                EventAction::Schedule {
+                    receiver,
+                    payload,
+                    sender,
+                    at_ns,
+                    in_seconds,
+                    in_ns,
+                    every_seconds,
+                    every_ns,
+                } => schedule_cli_event(
+                    &scheduler,
+                    target.id,
+                    receiver,
+                    payload,
+                    sender,
+                    at_ns,
+                    in_seconds,
+                    in_ns,
+                    every_seconds,
+                    every_ns,
+                ),
+                EventAction::List => list_cli_events(&scheduler, target.id),
+                EventAction::Cancel { id } => cancel_cli_event(&scheduler, target.id, &id),
+            }
+        }
+        Some(Commands::McpServer { context_file }) => match context_file {
+            Some(path) => mcp::run_server_from_context_file(PathBuf::from(path)),
+            None => mcp::run_server_with_default_context(),
+        },
         None => {
             if std::env::var("TMUX").is_err() {
                 relaunch_in_tmux()
@@ -209,7 +336,7 @@ fn omar_dir() -> PathBuf {
 }
 
 fn resolve_cli_ea(omar_dir: &std::path::Path, selector: Option<&str>) -> Result<ea::EaInfo> {
-    ea::resolve_ea_selector(omar_dir, selector)
+    Ok(ea::resolve_or_create_ea_selector(omar_dir, selector)?.0)
 }
 
 fn list_agents_for_ea(base_prefix: &str, ea_info: &ea::EaInfo) -> Result<()> {
@@ -307,16 +434,107 @@ fn spawn_agent(
     Ok(())
 }
 
-fn kill_agent(client: &TmuxClient, name: &str) -> Result<()> {
+fn kill_agent(
+    client: &TmuxClient,
+    name: &str,
+    scheduler: &scheduler::Scheduler,
+    ea_id: ea::EaId,
+) -> Result<()> {
     let full_name = format!("{}{}", client.prefix(), name);
 
     if !client.has_session(&full_name)? {
         anyhow::bail!("Session '{}' not found", name);
     }
+    let _ = client.ensure_session_not_attached(&full_name)?;
 
     client.kill_session(&full_name)?;
+    let _ = scheduler.cancel_by_receiver_and_ea(name, ea_id);
     println!("Killed agent: {}", name);
     Ok(())
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos() as u64
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_cli_event(
+    scheduler: &scheduler::Scheduler,
+    ea_id: ea::EaId,
+    receiver: String,
+    payload: String,
+    sender: Option<String>,
+    at_ns: Option<u64>,
+    in_seconds: Option<u64>,
+    in_ns: Option<u64>,
+    every_seconds: Option<u64>,
+    every_ns: Option<u64>,
+) -> Result<()> {
+    let base = now_ns();
+    let delay_ns = scheduler::combine_seconds_and_ns(in_seconds, in_ns).unwrap_or(0);
+    let timestamp = at_ns.unwrap_or_else(|| base.saturating_add(delay_ns));
+    let recurring_ns = scheduler::combine_seconds_and_ns(every_seconds, every_ns);
+
+    let event = scheduler::ScheduledEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        sender: sender.unwrap_or_else(|| "ea".to_string()),
+        receiver,
+        timestamp,
+        payload,
+        created_at: base,
+        recurring_ns,
+        ea_id,
+    };
+    scheduler.insert(event.clone());
+    println!(
+        "Scheduled event: {} -> {} at {}",
+        event.sender, event.receiver, event.timestamp
+    );
+    println!("Event id: {}", event.id);
+    Ok(())
+}
+
+fn list_cli_events(scheduler: &scheduler::Scheduler, ea_id: ea::EaId) -> Result<()> {
+    let mut events = scheduler.list_by_ea(ea_id);
+    if events.is_empty() {
+        println!("No scheduled events found for EA {}", ea_id);
+        return Ok(());
+    }
+    events.sort_by_key(|event| (event.timestamp, event.created_at));
+    println!(
+        "{:<36} {:<14} {:<14} {:<18} {:<12} PAYLOAD",
+        "ID", "SENDER", "RECEIVER", "TIMESTAMP_NS", "RECURRING"
+    );
+    println!("{}", "-".repeat(120));
+    for event in events {
+        let recurring = event
+            .recurring_ns
+            .map(|ns| ns.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<36} {:<14} {:<14} {:<18} {:<12} {}",
+            event.id, event.sender, event.receiver, event.timestamp, recurring, event.payload
+        );
+    }
+    Ok(())
+}
+
+fn cancel_cli_event(
+    scheduler: &scheduler::Scheduler,
+    ea_id: ea::EaId,
+    event_id: &str,
+) -> Result<()> {
+    match scheduler.cancel_if_ea(event_id, ea_id) {
+        Ok(event) => {
+            println!("Cancelled event: {}", event.id);
+            Ok(())
+        }
+        Err(true) => anyhow::bail!("Event '{}' belongs to a different EA", event_id),
+        Err(false) => anyhow::bail!("Event '{}' not found", event_id),
+    }
 }
 
 /// Re-launch omar inside a tmux session.
@@ -335,7 +553,7 @@ fn relaunch_in_tmux() -> Result<()> {
     // Preserve a live dashboard across detach/reattach cycles.
     // Only kill the session if attach fails, which indicates a stale tmux session.
     if client.has_session(DASHBOARD_SESSION)? {
-        let status = std::process::Command::new("tmux")
+        let status = tmux_command()
             .args(["-2", "attach-session", "-t", DASHBOARD_SESSION])
             .status();
 
@@ -350,7 +568,7 @@ fn relaunch_in_tmux() -> Result<()> {
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let mut cmd = std::process::Command::new("tmux");
+    let mut cmd = tmux_command();
     // Force 256-color mode when launching the dashboard session.
     cmd.arg("-2");
     cmd.args(["new-session", "-s", DASHBOARD_SESSION]);
@@ -387,6 +605,16 @@ const TMUX_RECOMMENDED: &[(&str, &str, &str)] = &[
     ),
 ];
 
+#[cfg(target_os = "macos")]
+const TMUX_PLATFORM_RECOMMENDED: &[(&str, &str, &str)] = &[(
+    "copy-command",
+    "set -g copy-command pbcopy",
+    "copy tmux selections to the macOS clipboard",
+)];
+
+#[cfg(not(target_os = "macos"))]
+const TMUX_PLATFORM_RECOMMENDED: &[(&str, &str, &str)] = &[];
+
 /// Additional raw lines that need to appear in tmux.conf (checked by substring).
 const TMUX_EXTRA_LINES: &[(&str, &str, &str)] = &[
     (
@@ -413,13 +641,13 @@ const TMUX_EXTRA_LINES: &[(&str, &str, &str)] = &[
 
 /// Check if any recommended tmux settings are missing.
 fn tmux_setup_needed() -> bool {
-    for &(opt, cmd, _) in TMUX_RECOMMENDED {
+    for &(opt, cmd, _) in TMUX_RECOMMENDED
+        .iter()
+        .chain(TMUX_PLATFORM_RECOMMENDED.iter())
+    {
         // Extract expected value from the command string (last word)
         let expected = cmd.split_whitespace().last().unwrap_or("on");
-        if let Ok(out) = std::process::Command::new("tmux")
-            .args(["show-options", "-gv", opt])
-            .output()
-        {
+        if let Ok(out) = tmux_command().args(["show-options", "-gv", opt]).output() {
             let val = String::from_utf8_lossy(&out.stdout);
             if val.trim() != expected {
                 return true;
@@ -427,6 +655,14 @@ fn tmux_setup_needed() -> bool {
         }
     }
     false
+}
+
+fn sync_tmux_setup_warning(app: &mut app::App) {
+    if tmux_setup_needed() {
+        app.set_persistent_warning_if_clear_or_same(TMUX_SETUP_WARNING);
+    } else {
+        app.clear_persistent_warning_if(TMUX_SETUP_WARNING);
+    }
 }
 
 /// Interactive tmux configuration setup.
@@ -442,11 +678,14 @@ fn setup_tmux() -> Result<()> {
     // Collect missing settings
     let mut to_add: Vec<(&str, &str)> = Vec::new();
 
-    for &(opt, line, desc) in TMUX_RECOMMENDED {
+    for &(opt, line, desc) in TMUX_RECOMMENDED
+        .iter()
+        .chain(TMUX_PLATFORM_RECOMMENDED.iter())
+    {
         // Check runtime value — even if the line is in the config,
         // a later conflicting line may override it.
         let expected = line.split_whitespace().last().unwrap_or("on");
-        let runtime_ok = std::process::Command::new("tmux")
+        let runtime_ok = tmux_command()
             .args(["show-options", "-gv", opt])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == expected)
@@ -502,7 +741,7 @@ fn setup_tmux() -> Result<()> {
     // Apply settings directly to the running tmux server.
     // source-file alone isn't reliable because earlier conflicting lines
     // in the config (e.g., oh-my-tmux sets mouse off) can override ours.
-    let tmux_running = std::process::Command::new("tmux")
+    let tmux_running = tmux_command()
         .args(["list-sessions"])
         .output()
         .map(|o| o.status.success())
@@ -512,7 +751,7 @@ fn setup_tmux() -> Result<()> {
         for (line, _) in &to_add {
             // Each line is a full tmux command (e.g. "set -g mouse on")
             let args: Vec<&str> = line.split_whitespace().collect();
-            let _ = std::process::Command::new("tmux").args(&args).status();
+            let _ = tmux_command().args(&args).status();
         }
         println!("✓ Applied to ~/.tmux.conf and running tmux server.");
     } else {
@@ -649,7 +888,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
     // Create the ticker buffer and scheduler, then spawn the event loop
     let ticker = scheduler::TickerBuffer::new();
     let app_ticker = ticker.clone();
-    let scheduler = Arc::new(scheduler::Scheduler::new());
+    let omar_dir = omar_dir();
+    let scheduler = Arc::new(scheduler::Scheduler::with_store(
+        scheduler::events_store_path(&omar_dir),
+    ));
     let popup_receiver = scheduler::new_popup_receiver();
     let base_prefix = config.dashboard.session_prefix.clone();
     tokio::spawn(scheduler::run_event_loop(
@@ -659,36 +901,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
         base_prefix,
     ));
 
-    // Create SINGLE shared App instance (fixes V1: Two-App Problem / BUG-C2).
-    // Both the API server and dashboard operate on the same App via Arc<Mutex<App>>.
+    // Create SINGLE shared App instance for the dashboard/runtime state.
     let shared_app = Arc::new(Mutex::new(App::new(
         &config,
         ticker.clone(),
         scheduler.clone(),
     )));
-
-    // Start API server if enabled
-    if config.api.enabled {
-        let api_config = config.api.clone();
-        let (base_prefix, omar_dir) = {
-            let app_guard = shared_app.lock().await;
-            (app_guard.base_prefix.clone(), app_guard.omar_dir.clone())
-        };
-        let api_state = Arc::new(api::handlers::ApiState {
-            app: shared_app.clone(), // Same Arc — single source of truth
-            scheduler: scheduler.clone(),
-            computer_lock: computer::new_lock(),
-            base_prefix,
-            omar_dir,
-            health_idle_warning: config.health.idle_warning,
-            spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
-        });
-        tokio::spawn(async move {
-            if let Err(e) = api::start_server(api_state, &api_config).await {
-                eprintln!("API server error: {}", e);
-            }
-        });
-    }
 
     // Spawn Slack bridge if configured
     let mut slack_bridge = spawn_slack_bridge();
@@ -723,10 +941,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
     }
 
     // Warn if tmux config is missing recommended settings
-    if tmux_setup_needed() {
-        shared_app.lock().await.set_persistent_warning(
-            "⚠ tmux not configured for omar — run 'omar setup-tmux' to fix",
-        );
+    {
+        let mut app = shared_app.lock().await;
+        sync_tmux_setup_warning(&mut app);
     }
 
     // Initial refresh
@@ -874,6 +1091,31 @@ async fn run_dashboard(config: Config) -> Result<()> {
 
                     // Handle settings popup
                     if app.show_settings {
+                        // Text-edit mode: capture characters and structural keys.
+                        // The buffer is only committed to config on Enter, so
+                        // Esc safely discards in-flight edits.
+                        if let Some(buf) = app.settings_edit_buffer.as_mut() {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.settings_edit_buffer = None;
+                                }
+                                KeyCode::Enter => {
+                                    let value = buf.clone();
+                                    let idx = app.settings_selected;
+                                    app.settings_edit_buffer = None;
+                                    app.config.set_text_setting(idx, &value);
+                                }
+                                KeyCode::Backspace => {
+                                    buf.pop();
+                                }
+                                // Block control chars; allow normal text.
+                                KeyCode::Char(c) if !c.is_control() => {
+                                    buf.push(c);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Esc | KeyCode::Char('S') => {
                                 app.show_settings = false;
@@ -888,12 +1130,27 @@ async fn run_dashboard(config: Config) -> Result<()> {
                             }
                             KeyCode::Enter => {
                                 let idx = app.settings_selected;
-                                app.config.toggle_setting(idx);
-                                // If event queue was just hidden, move sidebar off Events panel
-                                if !app.config.dashboard.show_event_queue
-                                    && app.sidebar_panel == app::SidebarPanel::Events
-                                {
-                                    app.sidebar_panel = app::SidebarPanel::Projects;
+                                let is_text = app
+                                    .config
+                                    .settings_item(idx)
+                                    .map(|item| item.is_text())
+                                    .unwrap_or(false);
+                                if is_text {
+                                    let current = match app.config.settings_item(idx) {
+                                        Some(config::SettingItem::Text { value, .. }) => {
+                                            value.to_string()
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    app.settings_edit_buffer = Some(current);
+                                } else {
+                                    app.config.toggle_setting(idx);
+                                    // If event queue was just hidden, move sidebar off Events panel
+                                    if !app.config.dashboard.show_event_queue
+                                        && app.sidebar_panel == app::SidebarPanel::Events
+                                    {
+                                        app.sidebar_panel = app::SidebarPanel::Projects;
+                                    }
                                 }
                             }
                             _ => {}
@@ -1020,36 +1277,53 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 }
                                 continue;
                             }
+
+                            if let Err(e) = app.refresh() {
+                                app.set_status(format!("Error: {}", e));
+                                continue;
+                            }
+
+                            let selected_popup_receiver = app
+                                .selected_popup_receiver_name()
+                                .map(|name| (name, app.active_ea));
+                            let popup_info = app
+                                .selected_agent()
+                                .map(|a| (a.session.name.clone(), app.client().clone()));
+
                             // Tell the scheduler which agent popup is open so it
                             // defers events for that receiver until the popup closes.
                             // Include ea_id so suppression is scoped per-EA.
-                            //
-                            // Uses `selected_popup_receiver_name` so the EA pane
-                            // normalizes to "ea" — matches the `receiver` field
-                            // the scheduler sees (e.g. from Slack bridge).
-                            *popup_receiver.lock().unwrap() = app
-                                .selected_popup_receiver_name()
-                                .map(|name| (name, app.active_ea));
+                            *popup_receiver.lock().unwrap() = selected_popup_receiver;
 
                             // Release App lock before blocking popup call
                             drop(app);
 
                             if std::env::var("TMUX").is_ok() {
                                 // Inside tmux: use display-popup overlay.
-                                // IMPORTANT: extract session info while holding the lock,
-                                // then release the lock BEFORE the blocking attach_popup call.
                                 // Holding the lock across attach_popup blocks all API handlers
                                 // that need app.lock() for the entire popup lifetime.
-                                let popup_info = {
-                                    let app = shared_app.lock().await;
-                                    app.selected_agent()
-                                        .map(|a| (a.session.name.clone(), app.client().clone()))
-                                }; // Lock released here
                                 if let Some((session_name, client)) = popup_info {
-                                    if let Err(e) = client.attach_popup(&session_name, "90%", "90%")
-                                    {
-                                        let mut app = shared_app.lock().await;
-                                        app.set_status(format!("Error: {}", e));
+                                    let popup_result =
+                                        client.attach_popup(&session_name, "90%", "90%");
+                                    let session_live = client
+                                        .session_has_live_pane(&session_name)
+                                        .unwrap_or(false);
+
+                                    let mut app = shared_app.lock().await;
+                                    match popup_result {
+                                        Err(e) => app.set_status(format!("Error: {}", e)),
+                                        Ok(()) if !session_live => {
+                                            let _ = app.refresh();
+                                            app.set_status(format!(
+                                                "{} exited; press Enter to restart it",
+                                                session_name
+                                            ));
+                                        }
+                                        Ok(()) => {
+                                            if let Err(e) = app.refresh() {
+                                                app.set_status(format!("Error: {}", e));
+                                            }
+                                        }
                                     }
                                 }
                                 // Discard ticks that accumulated while popup was open
@@ -1134,9 +1408,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         // Detach from tmux — dashboard + agents keep running
                         KeyCode::Char('z') if std::env::var("TMUX").is_ok() => {
-                            let _ = std::process::Command::new("tmux")
-                                .args(["detach-client"])
-                                .status();
+                            let _ = tmux_command().args(["detach-client"]).status();
                         }
                         KeyCode::Char('S') => {
                             app.show_settings = true;
@@ -1153,6 +1425,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     tick_count += 1;
                     if tick_count.is_multiple_of(30) {
                         app.quote_index = app.quote_index.wrapping_add(1);
+                        sync_tmux_setup_warning(&mut app);
                     }
 
                     // Fix V2: EA-scoped events instead of global list
@@ -1171,17 +1444,21 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         app.check_auth_failures(&app_ticker);
                     }
 
-                    // Keep system_state.md in sync with live state (EA-scoped)
-                    let state_dir = app.state_dir();
-                    let manager_session = app.manager_session_name();
-                    memory::write_memory_to(
-                        &state_dir,
-                        &app.agents,
-                        app.manager.as_ref(),
-                        &manager_session,
-                        app.client(),
-                        &app.scheduled_events,
-                    );
+                    // Keep system_state.md reasonably fresh without capturing
+                    // the manager pane and rewriting JSON on every dashboard
+                    // tick. State-changing actions still write immediately.
+                    if tick_count.is_multiple_of(3) && !app.has_popup() {
+                        let state_dir = app.state_dir();
+                        let manager_session = app.manager_session_name();
+                        memory::write_memory_to(
+                            &state_dir,
+                            &app.agents,
+                            app.manager.as_ref(),
+                            &manager_session,
+                            app.client(),
+                            &app.scheduled_events,
+                        );
+                    }
                 }
                 AppEvent::TickerScroll => {
                     let mut app = shared_app.lock().await;
@@ -1271,6 +1548,20 @@ mod tests {
             "extended-keys must be `on`, not `{}` — `always` breaks Shift+Tab \
              in the dashboard (see tests comment)",
             value
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tmux_macos_copy_command_uses_pbcopy() {
+        let entry = TMUX_PLATFORM_RECOMMENDED
+            .iter()
+            .find(|(opt, _, _)| *opt == "copy-command")
+            .expect("macOS setup must configure tmux copy-command");
+        let value = entry.1.split_whitespace().last().unwrap_or("");
+        assert_eq!(
+            value, "pbcopy",
+            "tmux copy-command should pipe native tmux selections into the macOS clipboard"
         );
     }
 }

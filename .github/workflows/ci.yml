@@ -99,6 +99,151 @@ jobs:
       - name: Run all tests
         run: cargo test -- --test-threads=1
 
+  popup-quote-integration:
+    name: Popup Quote Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux and zsh
+        run: sudo apt-get update && sudo apt-get install -y tmux zsh
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build omar
+        run: cargo build --bin omar
+
+      - name: Run popup quote regression
+        run: bash tests/ci/tmux_popup_quote.sh
+
+  exit-behavior-integration:
+    name: Exit Behavior Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build omar
+        run: cargo build --bin omar
+
+      - name: Run exit behavior integration
+        run: bash tests/ci/tmux_exit_behavior.sh
+
+  unresolved-session-integration:
+    name: Unresolved Session Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build omar
+        run: cargo build --bin omar
+
+      - name: Run unresolved session integration
+        run: bash tests/ci/tmux_unresolved_session.sh
+
+  codex-yolo-integration:
+    name: Codex YOLO Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build omar
+        run: cargo build --bin omar
+
+      - name: Run codex YOLO integration
+        run: bash tests/ci/tmux_codex_fallback.sh
+
+  ea-zero-selector-integration:
+    name: EA Zero Selector Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build omar
+        run: cargo build --bin omar
+
+      - name: Run EA zero-selector integration
+        run: bash tests/ci/tmux_ea_selector_zero.sh
+
   opencode-compat:
     name: Opencode Compatibility
     runs-on: ubuntu-latest
@@ -178,7 +323,7 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, opencode-compat, build]
+    needs: [check, fmt, clippy, test, popup-quote-integration, exit-behavior-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, opencode-compat, build]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -188,6 +333,11 @@ jobs:
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.popup-quote-integration.result }}" != "success" ]] || \
+             [[ "${{ needs.exit-behavior-integration.result }}" != "success" ]] || \
+             [[ "${{ needs.unresolved-session-integration.result }}" != "success" ]] || \
+             [[ "${{ needs.codex-yolo-integration.result }}" != "success" ]] || \
+             [[ "${{ needs.ea-zero-selector-integration.result }}" != "success" ]] || \
              [[ "${{ needs.opencode-compat.result }}" != "success" ]] || \
              [[ "${{ needs.build.result }}" != "success" ]]; then
             echo "One or more jobs failed"

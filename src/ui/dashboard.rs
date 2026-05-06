@@ -8,6 +8,7 @@ use ratatui::{
 use regex::Regex;
 
 use crate::app::{AgentInfo, App, ConfirmAction, SidebarPanel};
+use crate::config;
 use crate::tmux::HealthState;
 
 /// Dashboard theme palette. Two named slots — selected/active vs.
@@ -654,7 +655,12 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             let short = parent_name
                 .strip_prefix(app.client().prefix())
                 .unwrap_or(parent_name);
-            short.to_string()
+            let mut short = short.to_string();
+            if parent_info.map(|p| p.is_unresolved).unwrap_or(false) {
+                short.push(' ');
+                short.push_str("[unresolved]");
+            }
+            short
         };
 
         // Health status dot
@@ -717,7 +723,7 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             }
         };
 
-        if app.child_count(&app.focus_parent) > 0 {
+        if !is_manager && app.child_count(&app.focus_parent) > 0 {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -790,7 +796,9 @@ fn render_focus_parent(frame: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(COLOR_INACTIVE))
             .padding(Padding::horizontal(1));
 
-        let paragraph = Paragraph::new("Starting Executive Assistant...")
+        let message = "Starting Executive Assistant...".to_string();
+
+        let paragraph = Paragraph::new(message)
             .style(Style::default().fg(COLOR_INACTIVE))
             .block(block);
 
@@ -885,7 +893,12 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
             if is_focus {
                 spans.push(Span::styled("►", Style::default().fg(COLOR_ACTIVE)));
             }
-            spans.push(Span::styled(format!("{} ", node.name), name_style));
+            let mut node_name = node.name.clone();
+            if node.is_unresolved {
+                node_name.push(' ');
+                node_name.push_str("[unresolved]");
+            }
+            spans.push(Span::styled(format!("{} ", node_name), name_style));
             spans.push(Span::styled(icon, Style::default().fg(health_color)));
         }
 
@@ -985,7 +998,11 @@ fn render_summary_card(
         .name
         .strip_prefix(app.client().prefix())
         .unwrap_or(&agent.session.name);
-    let display = short_name.to_string();
+    let mut title_name = short_name.to_string();
+    if agent.is_unresolved {
+        title_name.push(' ');
+        title_name.push_str("[unresolved]");
+    }
 
     // Title with status indicator
     let title_line = if selected {
@@ -993,7 +1010,7 @@ fn render_summary_card(
             Span::styled(" [", Style::default().fg(COLOR_ACTIVE)),
             Span::styled(status_icon, Style::default().fg(COLOR_ACTIVE)),
             Span::styled("] ", Style::default().fg(COLOR_ACTIVE)),
-            Span::styled(&display, Style::default().fg(COLOR_ACTIVE)),
+            Span::styled(&title_name, Style::default().fg(COLOR_ACTIVE)),
             Span::styled(" ", Style::default().fg(COLOR_ACTIVE)),
         ])
     } else {
@@ -1001,7 +1018,7 @@ fn render_summary_card(
             Span::styled(" ", Style::default().fg(border_color)),
             Span::styled(status_icon, Style::default().fg(health_color)),
             Span::styled(" ", Style::default().fg(border_color)),
-            Span::styled(&display, Style::default().fg(health_color)),
+            Span::styled(&title_name, Style::default().fg(health_color)),
             Span::styled(" ", Style::default().fg(border_color)),
         ])
     };
@@ -1610,42 +1627,79 @@ fn render_settings_popup(frame: &mut Frame, app: &App) {
     ];
 
     for i in 0..app.config.settings_count() {
-        if let Some((label, value)) = app.config.settings_item(i) {
-            let selected = i == app.settings_selected;
-            let toggle = if value { "[ON] " } else { "[OFF]" };
-            let toggle_color = if value { Color::Green } else { Color::Red };
-            let prefix = if selected { "▸ " } else { "  " };
+        let Some(item) = app.config.settings_item(i) else {
+            continue;
+        };
+        let selected = i == app.settings_selected;
+        let editing = selected && app.settings_edit_buffer.is_some();
+        let prefix = if selected { "▸ " } else { "  " };
+        let prefix_span = Span::styled(
+            prefix,
+            Style::default().fg(if selected {
+                Color::Cyan
+            } else {
+                COLOR_INACTIVE
+            }),
+        );
+        let label_style = Style::default().fg(if selected {
+            Color::Reset
+        } else {
+            COLOR_INACTIVE
+        });
 
-            lines.push(Line::from(vec![
-                Span::styled(
-                    prefix,
-                    Style::default().fg(if selected {
-                        Color::Cyan
-                    } else {
-                        COLOR_INACTIVE
-                    }),
-                ),
-                Span::styled(
-                    toggle,
-                    Style::default()
-                        .fg(toggle_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" {}", label),
-                    Style::default().fg(if selected {
-                        Color::Reset
-                    } else {
-                        COLOR_INACTIVE
-                    }),
-                ),
-            ]));
+        match item {
+            config::SettingItem::Toggle { label, value } => {
+                let toggle = if value { "[ON] " } else { "[OFF]" };
+                let toggle_color = if value { Color::Green } else { Color::Red };
+                lines.push(Line::from(vec![
+                    prefix_span,
+                    Span::styled(
+                        toggle,
+                        Style::default()
+                            .fg(toggle_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" {}", label), label_style),
+                ]));
+            }
+            config::SettingItem::Text { label, value } => {
+                let display: String = if editing {
+                    let buf = app.settings_edit_buffer.as_deref().unwrap_or("");
+                    format!("[{}_]", buf)
+                } else if value.is_empty() {
+                    "[unset]".to_string()
+                } else {
+                    format!("[{}]", value)
+                };
+                let value_color = if editing {
+                    Color::Yellow
+                } else if value.is_empty() {
+                    COLOR_INACTIVE
+                } else {
+                    Color::Green
+                };
+                lines.push(Line::from(vec![
+                    prefix_span,
+                    Span::styled(
+                        display,
+                        Style::default()
+                            .fg(value_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" {}", label), label_style),
+                ]));
+            }
         }
     }
 
     lines.push(Line::from(""));
+    let hint = if app.settings_edit_buffer.is_some() {
+        "Type to edit  Enter:Save  Esc:Cancel"
+    } else {
+        "↑↓:Select  Enter:Toggle/Edit  Esc:Close"
+    };
     lines.push(Line::from(Span::styled(
-        "↑↓:Select  Enter:Toggle  Esc:Close",
+        hint,
         Style::default().fg(COLOR_INACTIVE),
     )));
 

@@ -174,12 +174,11 @@ mod tests {
     /// and verifies HealthChecker picks it up.
     #[test]
     fn test_auth_failure_detection_live_tmux() {
-        use std::process::Command;
         use std::thread;
         use std::time::Duration;
 
         fn tmux(args: &[&str]) -> bool {
-            Command::new("tmux")
+            crate::tmux::tmux_command()
                 .args(args)
                 .output()
                 .map(|o| o.status.success())
@@ -199,10 +198,10 @@ mod tests {
         struct Cleanup(&'static str, &'static str);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux::tmux_command()
                     .args(["kill-session", "-t", self.0])
                     .output();
-                let _ = Command::new("tmux")
+                let _ = crate::tmux::tmux_command()
                     .args(["kill-session", "-t", self.1])
                     .output();
             }
