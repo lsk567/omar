@@ -262,6 +262,56 @@ fn supports_initial_prompt_delivery(backend_name: &str) -> bool {
     backend_name != "unknown"
 }
 
+fn validate_model_name(model: &str) -> Result<()> {
+    if !model
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    {
+        return Err(anyhow!(
+            "Invalid model name. Only alphanumeric, '-', '_', '.', '/' allowed."
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reasoning_effort(reasoning_effort: &str) -> Result<()> {
+    if matches!(reasoning_effort, "low" | "medium" | "high" | "xhigh") {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Invalid reasoning_effort. Supported values: low, medium, high, xhigh."
+        ))
+    }
+}
+
+fn apply_spawn_agent_command_overrides(
+    mut base_command: String,
+    backend: Option<&str>,
+    command: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> Result<String> {
+    if let Some(model) = model {
+        validate_model_name(model)?;
+        base_command = format!("{} --model {}", base_command, model);
+    }
+
+    if let Some(reasoning_effort) = reasoning_effort {
+        validate_reasoning_effort(reasoning_effort)?;
+        if command.is_some() || backend != Some("codex") {
+            return Err(anyhow!(
+                "reasoning_effort is only supported when spawn_agent uses backend='codex'."
+            ));
+        }
+        base_command = format!(
+            "{} -c model_reasoning_effort='\"{}\"'",
+            base_command, reasoning_effort
+        );
+    }
+
+    Ok(base_command)
+}
+
 fn append_debug_log(context: &McpLaunchContext, line: &str) {
     let state_dir = ea::ea_state_dir(context.ea_id, &context.omar_dir);
     if std::fs::create_dir_all(&state_dir).is_err() {
@@ -963,6 +1013,7 @@ impl OmarMcpServer {
             command: Option<String>,
             backend: Option<String>,
             model: Option<String>,
+            reasoning_effort: Option<String>,
             parent: Option<String>,
         }
         let args: Args = serde_json::from_value(args)?;
@@ -1031,17 +1082,13 @@ impl OmarMcpServer {
                 .clone()
                 .unwrap_or_else(|| self.context.default_command.clone())
         };
-        if let Some(model) = args.model.as_deref() {
-            if !model
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-            {
-                return Err(anyhow!(
-                    "Invalid model name. Only alphanumeric, '-', '_', '.', '/' allowed."
-                ));
-            }
-            base_command = format!("{} --model {}", base_command, model);
-        }
+        base_command = apply_spawn_agent_command_overrides(
+            base_command,
+            args.backend.as_deref(),
+            args.command.as_deref(),
+            args.model.as_deref(),
+            args.reasoning_effort.as_deref(),
+        )?;
 
         let backend_name = infer_backend_name(args.backend.as_deref(), &base_command);
         let supports_prompt_delivery = supports_initial_prompt_delivery(&backend_name);
@@ -2073,6 +2120,7 @@ fn tool_definitions() -> Vec<Value> {
                     "command":{"type":"string","description":"Raw command to run instead of a backend agent (e.g. 'bash' for a demo window). Mutually exclusive with backend."},
                     "backend":{"type":"string","enum":["claude","codex","cursor","opencode","gemini"],"description":"Backend agent command to launch. Mutually exclusive with command."},
                     "model":{"type":"string","description":"Optional backend model override. Allowed characters are alphanumeric plus '-', '_', '.', '/'."},
+                    "reasoning_effort":{"type":"string","enum":["low","medium","high","xhigh"],"description":"Optional Codex reasoning effort override. Supported only with backend='codex'; appends a Codex config override such as -c model_reasoning_effort='\"high\"'."},
                     "workdir":{"type":"string","description":"Working directory for the new session. Defaults to this MCP server's launch workdir."},
                     "parent":{"type":"string","description":"Parent agent name for hierarchy tracking. Omit only for new EA-owned top-level work; use your own name for child tasks. Pass 'ea' only for intentional EA-owned work."}
                 },
@@ -2333,6 +2381,74 @@ mod tests {
             health_idle_warning: 15,
             tmux_server: None,
         }
+    }
+
+    #[test]
+    fn spawn_agent_command_overrides_preserve_model_and_add_codex_reasoning() {
+        let command = apply_spawn_agent_command_overrides(
+            "codex".to_string(),
+            Some("codex"),
+            None,
+            Some("gpt-5.5"),
+            Some("high"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            command,
+            "codex --model gpt-5.5 -c model_reasoning_effort='\"high\"'"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_command_overrides_validate_reasoning_effort() {
+        let err = apply_spawn_agent_command_overrides(
+            "codex".to_string(),
+            Some("codex"),
+            None,
+            None,
+            Some("max"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("low, medium, high, xhigh"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_command_overrides_reject_non_codex_reasoning_effort() {
+        let err = apply_spawn_agent_command_overrides(
+            "claude".to_string(),
+            Some("claude"),
+            None,
+            None,
+            Some("high"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("backend='codex'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_command_overrides_reject_raw_command_reasoning_effort() {
+        let err = apply_spawn_agent_command_overrides(
+            "codex".to_string(),
+            None,
+            Some("codex"),
+            None,
+            Some("high"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("backend='codex'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

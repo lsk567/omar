@@ -1061,6 +1061,12 @@ fn test_omar_mcp_server_tools_list_via_cli() {
         "spawn_agent schema must not have a `track` property: {}",
         spawn_agent["inputSchema"]
     );
+    assert_eq!(
+        props["reasoning_effort"]["enum"],
+        json!(["low", "medium", "high", "xhigh"]),
+        "spawn_agent schema must advertise Codex reasoning effort enum: {}",
+        spawn_agent["inputSchema"]
+    );
     // Sanity-check required fields.
     let required: Vec<&str> = spawn_agent["inputSchema"]["required"]
         .as_array()
