@@ -1881,22 +1881,28 @@ NOTES";
     let _ = tmux(&["send-keys", "-t", &manager_session, "-l", heredoc]);
     let _ = tmux(&["send-keys", "-t", &manager_session, "Enter"]);
 
-    // Wait for the file to land (heredoc runs asynchronously inside tmux).
+    // Wait for the heredoc body to land. `cat > file` opens (and creates)
+    // the target file immediately, before reading stdin — so a bare
+    // `path.exists()` check would race ahead of the heredoc and read an
+    // empty file. Poll for the actual content marker instead.
+    let mut written = String::new();
     let mut wrote = false;
     for _ in 0..50 {
-        if notes_path.exists() {
-            wrote = true;
-            break;
+        if let Ok(content) = fs::read_to_string(&notes_path) {
+            if content.contains("User prefers TypeScript") {
+                written = content;
+                wrote = true;
+                break;
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
     assert!(
         wrote,
-        "EA never wrote {} via shell heredoc",
+        "EA never wrote expected content into {} via shell heredoc",
         notes_path.display(),
     );
 
-    let written = fs::read_to_string(&notes_path).expect("read notes");
     assert!(
         written.contains("User prefers TypeScript"),
         "notes body: {}",
