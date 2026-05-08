@@ -82,6 +82,23 @@ fn paste_rendered(hay: &str, end_sentinel: &str, baseline_placeholders: usize) -
     hay.matches(PASTE_PLACEHOLDER_MARKER).count() > baseline_placeholders
 }
 
+fn tail_pane_lines(output: String, lines: i32) -> String {
+    if lines <= 0 {
+        return output;
+    }
+
+    let limit = lines as usize;
+    let had_trailing_newline = output.ends_with('\n');
+    let mut selected: Vec<&str> = output.lines().rev().take(limit).collect();
+    selected.reverse();
+
+    let mut capped = selected.join("\n");
+    if had_trailing_newline {
+        capped.push('\n');
+    }
+    capped
+}
+
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
     prefix: String,
@@ -257,14 +274,15 @@ impl TmuxClient {
     /// would *not* contain the contiguous string "Claude Code".
     pub fn capture_pane_plain(&self, target: &str, lines: i32) -> Result<String> {
         let target = exact_pane_target(target);
-        self.run(&[
+        let output = self.run(&[
             "capture-pane",
             "-t",
             &target,
             "-p",
             "-S",
             &(-lines).to_string(),
-        ])
+        ])?;
+        Ok(tail_pane_lines(output, lines))
     }
 
     /// Get the name of the command currently running in a pane.
@@ -799,6 +817,71 @@ mod tests {
             sentinel,
             0
         ));
+    }
+
+    #[test]
+    fn test_plain_capture_tail_caps_real_idle_claude_fixture() {
+        // Captured locally with:
+        // `tmux capture-pane -t omar-fixture-claude -p -S -30`
+        // from an idle Claude Code v2.1.136 pane.
+        const IDLE_CLAUDE_CAPTURE: &str = r#" ▐▛███▜▌   Claude Code v2.1.136
+▝▜█████▛▘  Opus 4.7 with low effort · Claude Max
+  ▘▘ ▝▝    ~/Documents/research/omar
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "refactor dashboard.rs"
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  PR #133
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"#;
+
+        let capped = tail_pane_lines(IDLE_CLAUDE_CAPTURE.to_string(), 1);
+
+        assert_eq!(capped.lines().count(), 1);
+        assert!(!capped.contains("Claude Code"));
+        assert!(!capped.contains("PR #133"));
     }
 
     #[test]

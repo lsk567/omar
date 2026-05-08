@@ -538,9 +538,12 @@ fn get_pane_last_line(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Opt
 /// The input box is typically in the lower portion, bordered by box-drawing chars.
 /// We look for lines that appear to be inside the input area (not borders/chrome).
 fn extract_opencode_input(client: &crate::tmux::TmuxClient, target: &str) -> Option<String> {
-    let content = client.capture_pane_plain(target, 20).ok()?;
-    let lines: Vec<&str> = content.lines().collect();
+    let content = client.capture_pane_plain(target, 80).ok()?;
+    Some(extract_opencode_input_from_capture(&content))
+}
 
+fn extract_opencode_input_from_capture(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
     // opencode TUI structure (bottom-up): status bar, input box border, input content, ...
     // Look for the input area by finding lines that are NOT pure TUI chrome.
     // TUI chrome typically contains box-drawing characters: │ ─ └ ┘ ┌ ┐ ├ ┤ ┬ ┴ ┼
@@ -558,14 +561,14 @@ fn extract_opencode_input(client: &crate::tmux::TmuxClient, target: &str) -> Opt
             continue;
         }
 
-        // Status bar: often contains mode info, model name, or has many special chars
-        if !in_input_area && is_opencode_status_bar(trimmed) {
-            continue;
-        }
-
         // Bottom border of input box: typically a line of ─ or └───...───┘
         if !in_input_area && is_tui_horizontal_border(trimmed) {
             in_input_area = true;
+            continue;
+        }
+
+        // Status bar: often contains mode info, model name, or has many special chars
+        if !in_input_area && is_opencode_status_bar(trimmed) {
             continue;
         }
 
@@ -576,8 +579,11 @@ fn extract_opencode_input(client: &crate::tmux::TmuxClient, target: &str) -> Opt
 
         // Inside input area - extract content (strip leading/trailing box borders)
         if in_input_area {
+            if !trimmed.is_empty() && !has_tui_vertical_border(line) {
+                break;
+            }
             let content = strip_tui_borders(line);
-            if !content.trim().is_empty() {
+            if !content.trim().is_empty() && !is_opencode_input_chrome(content) {
                 input_lines.push(content);
             }
         }
@@ -590,8 +596,7 @@ fn extract_opencode_input(client: &crate::tmux::TmuxClient, target: &str) -> Opt
 
     // Return the combined input (or empty string if no input found)
     input_lines.reverse();
-    let input = input_lines.join(" ").trim().to_string();
-    Some(input)
+    input_lines.join(" ").trim().to_string()
 }
 
 /// Check if a line looks like a TUI status bar or chrome (not user input).
@@ -601,6 +606,16 @@ fn extract_opencode_input(client: &crate::tmux::TmuxClient, target: &str) -> Opt
 /// icons, pipes). Avoids keyword matching so user input that happens to
 /// contain words like "claude" or "mode" is never misclassified.
 fn is_opencode_status_bar(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if line.contains('•')
+        && (lower.contains("opencode")
+            || lower.contains("mcp")
+            || lower.contains("model")
+            || lower.contains("token"))
+    {
+        return true;
+    }
+
     let special = line
         .chars()
         .filter(|c| !c.is_alphanumeric() && !c.is_whitespace())
@@ -609,18 +624,29 @@ fn is_opencode_status_bar(line: &str) -> bool {
     total > 0 && special * 4 > total
 }
 
+fn is_opencode_input_chrome(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("Ask anything...")
+        || trimmed.starts_with("Build ·")
+        || trimmed.starts_with("Plan ·")
+        || trimmed.starts_with("Debug ·")
+        || trimmed.starts_with("Free Models")
+}
+
+fn has_tui_vertical_border(line: &str) -> bool {
+    line.chars().any(|c| matches!(c, '│' | '┃' | '║'))
+}
+
 /// Check if a line is a TUI horizontal border (made of ─, └, ┘, etc.)
 fn is_tui_horizontal_border(line: &str) -> bool {
     if line.is_empty() {
         return false;
     }
-    let border_chars = [
-        '─', '━', '═', '└', '┘', '┌', '┐', '├', '┤', '┬', '┴', '┼', '╔', '╗', '╚', '╝', '╠', '╣',
-        '╦', '╩', '╬',
-    ];
-    let border_count = line.chars().filter(|c| border_chars.contains(c)).count();
+    let border_chars = "─━═└┘┌┐├┤┬┴┼╔╗╚╝╠╣╦╩╬▀▁▂▃▄▅▆▇█▔╴╵╶╷╸╹╺╻";
+    let border_count = line.chars().filter(|c| border_chars.contains(*c)).count();
+    let non_whitespace_count = line.chars().filter(|c| !c.is_whitespace()).count();
     // A border line is mostly made of border characters
-    border_count > line.chars().count() / 2
+    non_whitespace_count > 0 && border_count > non_whitespace_count / 2
 }
 
 /// Strip TUI vertical border characters from the edges of a line
@@ -1251,6 +1277,12 @@ mod tests {
             "┌─────────────────────────────────────────────┐"
         ));
         assert!(is_tui_horizontal_border("════════════════════════════════"));
+        assert!(is_tui_horizontal_border(
+            "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀"
+        ));
+        assert!(is_tui_horizontal_border(
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄"
+        ));
         assert!(!is_tui_horizontal_border("hello world"));
         assert!(!is_tui_horizontal_border("│ some text │"));
         assert!(!is_tui_horizontal_border(""));
@@ -1261,6 +1293,9 @@ mod tests {
         // High special-char density → status bar / chrome
         assert!(is_opencode_status_bar("──────────────────────────────"));
         assert!(is_opencode_status_bar("│◆ ready │ ⬆ 0 ⬇ 0 │ main │"));
+        assert!(is_opencode_status_bar(
+            "15.3K (8%) context left • OpenCode 1.14.28"
+        ));
         // Normal prose → not a status bar, even if it contains tool names
         assert!(!is_opencode_status_bar("fix the bug in claude"));
         assert!(!is_opencode_status_bar("hello world"));
@@ -1273,6 +1308,89 @@ mod tests {
         assert_eq!(strip_tui_borders("║ content ║"), "content");
         assert_eq!(strip_tui_borders("  text  "), "text");
         assert_eq!(strip_tui_borders("no borders"), "no borders");
+    }
+
+    #[test]
+    fn opencode_idle_capture_extracts_no_meaningful_input() {
+        // Captured locally with:
+        // `tmux capture-pane -t omar-fixture-opencode -p -S -30`
+        // from an idle opencode 1.14.41 pane.
+        const IDLE_OPENCODE_CAPTURE: &str = r#"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                             ▄
+                                                                            █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█
+                                                                            █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀
+                                                                            ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀
+
+
+                                                          ┃
+                                                          ┃  Ask anything... "Fix broken tests"
+                                                          ┃
+                                                          ┃  Build · Free Models Router OpenRouter
+                                                          ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                                                          tab agents  ctrl+p commands
+
+
+
+                                                              ● Tip Configure "git push": "ask" to require approval before pushing
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ~/Documents/research/omar:fix/smart-popup-event-deferral                                                                                                                            1.14.41
+"#;
+
+        let input = extract_opencode_input_from_capture(IDLE_OPENCODE_CAPTURE);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_meaningful(&input));
+    }
+
+    #[test]
+    fn opencode_capture_extracts_typed_input() {
+        let capture = r#"
+                                                          ┃
+                                                          ┃  fix the scheduler deferral bug
+                                                          ┃
+                                                          ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                                                          tab agents  ctrl+p commands
+"#;
+
+        assert!(capture
+            .lines()
+            .any(|line| is_tui_horizontal_border(line.trim())));
+        let input = extract_opencode_input_from_capture(capture);
+
+        assert_eq!(input, "fix the scheduler deferral bug");
+        assert!(pane_input_meaningful(&input));
     }
 
     // ── Popup-defer decision (pure helper) ──
