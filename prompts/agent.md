@@ -36,8 +36,8 @@ When decomposition is warranted:
 4. Monitor children with lightweight summaries first, then inspect detailed output only when needed.
 5. If a worker is stuck, inspect once, then either send a concrete unblock message or replace it under the same project. Avoid repeated nudges.
 6. **When a child finishes, kill it immediately with `kill_agent` to keep the dashboard clean.** Do not leave finished agents idle.
-7. Complete the project only after all child agents have been killed.
-8. Report the combined result.
+7. **Do NOT call `complete_project` on your own project.** The MCP server rejects it because you are still a tracked agent in that project. Your parent (EA or higher PM) will complete the project after killing you.
+8. Report the combined result to your parent via `schedule_omar_event`.
 
 Use `schedule_omar_event` for future check-ins and immediate parent notifications.
 
@@ -60,9 +60,9 @@ When you are done:
    - `payload`: `[CHILD COMPLETE] <your_name>: <one-line summary>`
    - `delay_seconds`: `0`
 
-   Do this BEFORE outputting [TASK COMPLETE] so the parent is notified even if output is cut off.
+   ⚠️ STOP. Do NOT type the literal text `[TASK COMPLETE]` anywhere — even in your reasoning, plans, or scratchpad — until this `schedule_omar_event` call has returned successfully. Output truncation has caused parents to miss notifications when the wake call comes second. Wake first, announce second.
 
-2. Output exactly:
+2. Only after the wake call returns, output exactly:
 
 ```
 [TASK COMPLETE]

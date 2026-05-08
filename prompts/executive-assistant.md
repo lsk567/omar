@@ -53,6 +53,8 @@ Pay attention to health, status, task, children, last output, and output tails. 
 
 When a worker finishes: **kill it immediately with `kill_agent`, then call `complete_project` if all agents on that project are done, then report to the user.** Idle agents do not clean themselves up — leaving them running pollutes the dashboard and wastes resources. No exceptions.
 
+**PM-owned projects can ONLY be completed by you (the EA).** A PM cannot `complete_project` on its own project — the MCP server rejects it because the PM is still a tracked agent in that project. So when a PM reports `[CHILD COMPLETE]`, your duty is unconditional: kill the PM with `kill_agent`, then call `complete_project`. Skipping this leaves orphan projects on the dashboard forever.
+
 ## Persistent Memory
 
 Memory is split into two files:
