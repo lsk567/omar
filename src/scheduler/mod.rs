@@ -502,11 +502,132 @@ fn pane_target_name(receiver: &str, ea_id: ea::EaId, base_prefix: &str) -> Strin
 
 /// Capture the last line of the agent's pane (plain text, no ANSI).
 /// Returns `None` if the pane cannot be read (agent not running, tmux absent).
+///
+/// For opencode (a TUI app), the last line is typically status bar garbage,
+/// so we capture more lines and extract input from the TUI's input box area.
 fn get_pane_last_line(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Option<String> {
     let target = pane_target_name(receiver, ea_id, base_prefix);
-    crate::tmux::TmuxClient::new("")
-        .capture_pane_plain(&target, 1)
+    let client = crate::tmux::TmuxClient::new("");
+
+    // Check if this pane is running opencode (TUI app)
+    let is_opencode = client
+        .get_pane_command(&target)
         .ok()
+        .map(|cmd| cmd == "opencode" || cmd.ends_with("/opencode"))
+        .unwrap_or(false);
+
+    if is_opencode {
+        // opencode is a TUI - capture more lines and extract input from the TUI
+        return extract_opencode_input(&client, &target);
+    }
+
+    // Standard CLI: last line is the prompt/input line
+    client.capture_pane_plain(&target, 1).ok()
+}
+
+/// Extract user input from opencode's TUI.
+///
+/// opencode renders a full-screen TUI with message area, input box, and status bar.
+/// The input box is typically in the lower portion, bordered by box-drawing chars.
+/// We look for lines that appear to be inside the input area (not borders/chrome).
+fn extract_opencode_input(client: &crate::tmux::TmuxClient, target: &str) -> Option<String> {
+    let content = client.capture_pane_plain(target, 20).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    // opencode TUI structure (bottom-up): status bar, input box border, input content, ...
+    // Look for the input area by finding lines that are NOT pure TUI chrome.
+    // TUI chrome typically contains box-drawing characters: │ ─ └ ┘ ┌ ┐ ├ ┤ ┬ ┴ ┼
+    // The input content is inside the box, potentially with leading │ border.
+
+    // Start from the bottom and skip status bar / border lines
+    let mut input_lines: Vec<&str> = Vec::new();
+    let mut in_input_area = false;
+
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+
+        // Skip empty lines at the very bottom
+        if trimmed.is_empty() && input_lines.is_empty() {
+            continue;
+        }
+
+        // Status bar: often contains mode info, model name, or has many special chars
+        if !in_input_area && is_opencode_status_bar(trimmed) {
+            continue;
+        }
+
+        // Bottom border of input box: typically a line of ─ or └───...───┘
+        if !in_input_area && is_tui_horizontal_border(trimmed) {
+            in_input_area = true;
+            continue;
+        }
+
+        // Top border of input box: signals end of input area
+        if in_input_area && is_tui_horizontal_border(trimmed) {
+            break;
+        }
+
+        // Inside input area - extract content (strip leading/trailing box borders)
+        if in_input_area {
+            let content = strip_tui_borders(line);
+            if !content.trim().is_empty() {
+                input_lines.push(content);
+            }
+        }
+
+        // Safety: don't scan too far up
+        if input_lines.len() > 5 {
+            break;
+        }
+    }
+
+    // Return the combined input (or empty string if no input found)
+    input_lines.reverse();
+    let input = input_lines.join(" ").trim().to_string();
+    Some(input)
+}
+
+/// Check if a line looks like opencode's status bar (model name, tokens, etc.)
+fn is_opencode_status_bar(line: &str) -> bool {
+    // Status bars often contain: model names, token counts, mode indicators
+    let status_indicators = [
+        "claude",
+        "gpt",
+        "tokens",
+        "cost",
+        "mode",
+        "session",
+        "anthropic",
+        "openai",
+    ];
+    let lower = line.to_lowercase();
+    status_indicators.iter().any(|s| lower.contains(s))
+        || line
+            .chars()
+            .filter(|c| !c.is_alphanumeric() && !c.is_whitespace())
+            .count()
+            > line.len() / 3
+}
+
+/// Check if a line is a TUI horizontal border (made of ─, └, ┘, etc.)
+fn is_tui_horizontal_border(line: &str) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+    let border_chars = [
+        '─', '━', '═', '└', '┘', '┌', '┐', '├', '┤', '┬', '┴', '┼', '╔', '╗', '╚', '╝', '╠', '╣',
+        '╦', '╩', '╬',
+    ];
+    let border_count = line.chars().filter(|c| border_chars.contains(c)).count();
+    // A border line is mostly made of border characters
+    border_count > line.chars().count() / 2
+}
+
+/// Strip TUI vertical border characters from the edges of a line
+fn strip_tui_borders(line: &str) -> &str {
+    let border_chars = ['│', '┃', '║', ' '];
+    line.trim_start_matches(|c| border_chars.contains(&c))
+        .trim_end_matches(|c| border_chars.contains(&c))
 }
 
 /// Return `true` when the pane's last line contains enough non-whitespace text
@@ -1117,6 +1238,41 @@ mod tests {
     fn pane_input_whitespace_only_after_prompt_is_not_meaningful() {
         assert!(!pane_input_meaningful("❯   "));
         assert!(!pane_input_meaningful("$    "));
+    }
+
+    // ── opencode TUI extraction helpers ──
+
+    #[test]
+    fn tui_border_detection() {
+        assert!(is_tui_horizontal_border(
+            "└───────────────────────────────────────────┘"
+        ));
+        assert!(is_tui_horizontal_border(
+            "┌─────────────────────────────────────────────┐"
+        ));
+        assert!(is_tui_horizontal_border("════════════════════════════════"));
+        assert!(!is_tui_horizontal_border("hello world"));
+        assert!(!is_tui_horizontal_border("│ some text │"));
+        assert!(!is_tui_horizontal_border(""));
+    }
+
+    #[test]
+    fn tui_status_bar_detection() {
+        assert!(is_opencode_status_bar(
+            "claude-3.5-sonnet | 1234 tokens | $0.02"
+        ));
+        assert!(is_opencode_status_bar("gpt-4o | session active"));
+        assert!(is_opencode_status_bar("anthropic/claude-3-opus"));
+        assert!(!is_opencode_status_bar("fix the bug"));
+        assert!(!is_opencode_status_bar("hello world"));
+    }
+
+    #[test]
+    fn tui_border_stripping() {
+        assert_eq!(strip_tui_borders("│ hello world │"), "hello world");
+        assert_eq!(strip_tui_borders("║ content ║"), "content");
+        assert_eq!(strip_tui_borders("  text  "), "text");
+        assert_eq!(strip_tui_borders("no borders"), "no borders");
     }
 
     // ── Popup-defer decision (pure helper) ──

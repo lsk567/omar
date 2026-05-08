@@ -267,6 +267,21 @@ impl TmuxClient {
         ])
     }
 
+    /// Get the name of the command currently running in a pane.
+    ///
+    /// Returns the executable name (e.g. "opencode", "claude", "zsh").
+    pub fn get_pane_command(&self, target: &str) -> Result<String> {
+        let target = exact_pane_target(target);
+        let output = self.run(&[
+            "display-message",
+            "-t",
+            &target,
+            "-p",
+            "#{pane_current_command}",
+        ])?;
+        Ok(output.trim().to_string())
+    }
+
     /// Get the activity timestamp of a pane.
     ///
     /// Uses `#{window_activity}` — the per-pane `#{pane_activity}` format is
