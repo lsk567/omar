@@ -127,7 +127,7 @@ fail() {
 
 # Spawn the EA (root). Uses the configured default_command (opencode + model_a).
 omar_cmd manager start >/dev/null 2>&1 &
-ea_session="omar-agent-0-default"
+ea_session="omar-agent-ea-0"
 wait_for_session "$ea_session" 60 || fail "EA session never came up"
 
 # Wait for the EA's opencode TUI to become interactive. We don't have a
@@ -142,8 +142,8 @@ omar_cmd spawn -n leaf1 -c "opencode -m $model_a" >/dev/null 2>&1 \
 omar_cmd spawn -n leaf2 -c "opencode -m $model_b" >/dev/null 2>&1 \
   || fail "failed to spawn leaf2"
 
-leaf1_session="omar-agent-leaf1"
-leaf2_session="omar-agent-leaf2"
+leaf1_session="omar-agent-0-leaf1"
+leaf2_session="omar-agent-0-leaf2"
 wait_for_session "$leaf1_session" 60 || fail "leaf1 session never came up"
 wait_for_session "$leaf2_session" 60 || fail "leaf2 session never came up"
 
