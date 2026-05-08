@@ -509,16 +509,23 @@ fn get_pane_last_line(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Opt
     let target = pane_target_name(receiver, ea_id, base_prefix);
     let client = crate::tmux::TmuxClient::new("");
 
-    // Check if this pane is running opencode (TUI app)
-    let is_opencode = client
-        .get_pane_command(&target)
-        .ok()
-        .map(|cmd| cmd == "opencode" || cmd.ends_with("/opencode"))
-        .unwrap_or(false);
+    // Check if this pane is running a special backend
+    let pane_cmd = client.get_pane_command(&target).ok().unwrap_or_default();
 
-    if is_opencode {
-        // opencode is a TUI - capture more lines and extract input from the TUI
+    // opencode: TUI app - parse input from the TUI box
+    if pane_cmd == "opencode" || pane_cmd.ends_with("/opencode") {
         return extract_opencode_input(&client, &target);
+    }
+
+    // cursor: GUI app (Electron IDE). When launched via `cursor --approve-mcps`,
+    // the IDE opens in a separate GUI window. The terminal pane shows only the
+    // shell that spawned cursor (or cursor's minimal CLI output), not the user's
+    // actual input which happens in the GUI. Since tmux cannot observe GUI input,
+    // return empty string → pane_input_meaningful returns false → deliver immediately.
+    // Tradeoff: events always deliver even if user is typing in the GUI, but this
+    // is better than indefinitely deferring events we can never detect completion of.
+    if pane_cmd == "cursor" || pane_cmd.ends_with("/cursor") {
+        return Some(String::new());
     }
 
     // Standard CLI: last line is the prompt/input line
@@ -587,26 +594,19 @@ fn extract_opencode_input(client: &crate::tmux::TmuxClient, target: &str) -> Opt
     Some(input)
 }
 
-/// Check if a line looks like opencode's status bar (model name, tokens, etc.)
+/// Check if a line looks like a TUI status bar or chrome (not user input).
+///
+/// Uses only structural density: status bars and chrome lines contain a high
+/// proportion of non-alphanumeric, non-whitespace characters (separators,
+/// icons, pipes). Avoids keyword matching so user input that happens to
+/// contain words like "claude" or "mode" is never misclassified.
 fn is_opencode_status_bar(line: &str) -> bool {
-    // Status bars often contain: model names, token counts, mode indicators
-    let status_indicators = [
-        "claude",
-        "gpt",
-        "tokens",
-        "cost",
-        "mode",
-        "session",
-        "anthropic",
-        "openai",
-    ];
-    let lower = line.to_lowercase();
-    status_indicators.iter().any(|s| lower.contains(s))
-        || line
-            .chars()
-            .filter(|c| !c.is_alphanumeric() && !c.is_whitespace())
-            .count()
-            > line.len() / 3
+    let special = line
+        .chars()
+        .filter(|c| !c.is_alphanumeric() && !c.is_whitespace())
+        .count();
+    let total = line.chars().count();
+    total > 0 && special * 4 > total
 }
 
 /// Check if a line is a TUI horizontal border (made of ─, └, ┘, etc.)
@@ -1258,13 +1258,13 @@ mod tests {
 
     #[test]
     fn tui_status_bar_detection() {
-        assert!(is_opencode_status_bar(
-            "claude-3.5-sonnet | 1234 tokens | $0.02"
-        ));
-        assert!(is_opencode_status_bar("gpt-4o | session active"));
-        assert!(is_opencode_status_bar("anthropic/claude-3-opus"));
-        assert!(!is_opencode_status_bar("fix the bug"));
+        // High special-char density → status bar / chrome
+        assert!(is_opencode_status_bar("──────────────────────────────"));
+        assert!(is_opencode_status_bar("│◆ ready │ ⬆ 0 ⬇ 0 │ main │"));
+        // Normal prose → not a status bar, even if it contains tool names
+        assert!(!is_opencode_status_bar("fix the bug in claude"));
         assert!(!is_opencode_status_bar("hello world"));
+        assert!(!is_opencode_status_bar("refactor the openai client"));
     }
 
     #[test]
