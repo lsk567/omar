@@ -378,7 +378,11 @@ impl Scheduler {
         self.transaction(false, |queue| queue.peek().map(|event| event.timestamp))
     }
 
-    fn take_due_deliveries(&self, popup_receiver: &PopupReceiver) -> Vec<DueDelivery> {
+    fn take_due_deliveries(
+        &self,
+        popup_receiver: &PopupReceiver,
+        base_prefix: &str,
+    ) -> Vec<DueDelivery> {
         self.transaction(true, |queue| {
             let Some(earliest_ts) = queue.peek().map(|event| event.timestamp) else {
                 return Vec::new();
@@ -418,19 +422,33 @@ impl Scheduler {
                 }
 
                 if should_defer_for_popup(popup_receiver, &receiver, ea_id) {
-                    let defer_until = now_ns() + POPUP_DEFER_NS;
-                    for mut event in batch {
-                        event.timestamp = defer_until;
-                        remaining.push(event);
+                    // Only defer if the user is actually mid-sentence (≥3 non-whitespace
+                    // chars of real input after the prompt). If the input buffer is empty
+                    // or trivial we clear it with C-u and deliver immediately so that
+                    // crons/check-ins reach the agent while the popup is open.
+                    let has_meaningful_input = get_pane_last_line(base_prefix, &receiver, ea_id)
+                        .map(|line| pane_input_meaningful(&line))
+                        .unwrap_or(true); // can't read pane → defer to be safe
+
+                    if has_meaningful_input {
+                        let defer_until = now_ns() + POPUP_DEFER_NS;
+                        for mut event in batch {
+                            event.timestamp = defer_until;
+                            remaining.push(event);
+                        }
+                        deliveries.push(DueDelivery {
+                            receiver,
+                            ea_id,
+                            timestamp: earliest_ts,
+                            batch: Vec::new(),
+                            deferred_for_popup: true,
+                        });
+                        continue;
                     }
-                    deliveries.push(DueDelivery {
-                        receiver,
-                        ea_id,
-                        timestamp: earliest_ts,
-                        batch: Vec::new(),
-                        deferred_for_popup: true,
-                    });
-                    continue;
+                    // Input is trivial — clear any partial stub and fall through
+                    // to the normal delivery path below.
+                    let target = pane_target_name(&receiver, ea_id, base_prefix);
+                    let _ = crate::tmux::TmuxClient::new("").send_keys(&target, "C-u");
                 }
 
                 let remaining_quota = MAX_EVENTS_PER_EA_PER_TICK - delivered_so_far;
@@ -473,6 +491,48 @@ impl Scheduler {
     }
 }
 
+/// Build the tmux session name for a receiver.
+fn pane_target_name(receiver: &str, ea_id: ea::EaId, base_prefix: &str) -> String {
+    if receiver == "ea" || receiver == "omar" {
+        ea::ea_manager_session(ea_id, base_prefix)
+    } else {
+        format!("{}{}", ea::ea_prefix(ea_id, base_prefix), receiver)
+    }
+}
+
+/// Capture the last line of the agent's pane (plain text, no ANSI).
+/// Returns `None` if the pane cannot be read (agent not running, tmux absent).
+fn get_pane_last_line(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Option<String> {
+    let target = pane_target_name(receiver, ea_id, base_prefix);
+    crate::tmux::TmuxClient::new("")
+        .capture_pane_plain(&target, 1)
+        .ok()
+}
+
+/// Return `true` when the pane's last line contains enough non-whitespace text
+/// to indicate the user is mid-sentence and delivery would corrupt their input.
+///
+/// Heuristic:
+/// - Strip a leading prompt token (a non-alphanumeric prefix up to the first
+///   space, e.g. `❯ `, `$ `, `> `) so prompt chars don't count.
+/// - If the remaining user input has ≥ 3 non-whitespace characters, treat it
+///   as meaningful and keep deferring.
+/// - Fewer than 3 chars (empty prompt, one-or-two-char stub) → trivial; safe
+///   to clear with C-u and deliver immediately.
+pub(crate) fn pane_input_meaningful(last_line: &str) -> bool {
+    let trimmed = last_line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Strip a leading prompt token: a non-alphanumeric prefix before the first
+    // space (e.g. "❯ hello" → "hello", "$ cd" → "cd", "> ab" → "ab").
+    let user_input = match trimmed.find(' ') {
+        Some(pos) if trimmed[..pos].chars().all(|c| !c.is_alphanumeric()) => trimmed[pos..].trim(),
+        _ => trimmed,
+    };
+    user_input.chars().filter(|c| !c.is_whitespace()).count() >= 3
+}
+
 pub(crate) fn deliver_to_tmux(
     ea_id: u32,
     receiver: &str,
@@ -480,13 +540,7 @@ pub(crate) fn deliver_to_tmux(
     base_prefix: &str,
     ticker: &TickerBuffer,
 ) {
-    // Keep one consistent delivery method for all agents, including EA.
-    let target = if receiver == "ea" || receiver == "omar" {
-        ea::ea_manager_session(ea_id, base_prefix)
-    } else {
-        let prefix = ea::ea_prefix(ea_id, base_prefix);
-        format!("{}{}", prefix, receiver)
-    };
+    let target = pane_target_name(receiver, ea_id, base_prefix);
     let client = crate::tmux::TmuxClient::new("");
     let opts = DeliveryOptions::default();
     if let Err(e) = client.deliver_prompt(&target, message, &opts) {
@@ -626,7 +680,7 @@ pub async fn run_event_loop(
                     }
                 }
 
-                for delivery in scheduler.take_due_deliveries(&popup_receiver) {
+                for delivery in scheduler.take_due_deliveries(&popup_receiver, &base_prefix) {
                     let receiver = delivery.receiver;
                     let ea_id = delivery.ea_id;
                     if delivery.deferred_for_popup {
@@ -1015,6 +1069,54 @@ mod tests {
         assert_eq!(buf.len(), 50);
         // Oldest entries should have been dropped
         assert_eq!(buf.front().unwrap().text, "msg10");
+    }
+
+    // ── pane_input_meaningful — pure heuristic ──
+
+    #[test]
+    fn pane_input_empty_is_not_meaningful() {
+        assert!(!pane_input_meaningful(""));
+        assert!(!pane_input_meaningful("   "));
+    }
+
+    #[test]
+    fn pane_input_bare_prompt_is_not_meaningful() {
+        // Typical shells/agents: prompt char + space, no user text
+        assert!(!pane_input_meaningful("❯ "));
+        assert!(!pane_input_meaningful("$ "));
+        assert!(!pane_input_meaningful("> "));
+        assert!(!pane_input_meaningful("% "));
+    }
+
+    #[test]
+    fn pane_input_short_stub_under_threshold_is_not_meaningful() {
+        // 1–2 user chars after the prompt — safe to clear
+        assert!(!pane_input_meaningful("❯ a"));
+        assert!(!pane_input_meaningful("❯ ab"));
+        assert!(!pane_input_meaningful("$ x"));
+        assert!(!pane_input_meaningful("> xy"));
+    }
+
+    #[test]
+    fn pane_input_three_or_more_chars_is_meaningful() {
+        assert!(pane_input_meaningful("❯ abc"));
+        assert!(pane_input_meaningful("$ hello world"));
+        assert!(pane_input_meaningful("> fix the bug"));
+    }
+
+    #[test]
+    fn pane_input_no_prompt_counts_whole_line() {
+        // If there's no leading non-alphanumeric prefix, the whole line is
+        // user input (e.g. a raw terminal with no prompt).
+        assert!(!pane_input_meaningful("ab"));
+        assert!(pane_input_meaningful("abc"));
+        assert!(pane_input_meaningful("hello"));
+    }
+
+    #[test]
+    fn pane_input_whitespace_only_after_prompt_is_not_meaningful() {
+        assert!(!pane_input_meaningful("❯   "));
+        assert!(!pane_input_meaningful("$    "));
     }
 
     // ── Popup-defer decision (pure helper) ──
