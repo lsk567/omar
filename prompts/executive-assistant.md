@@ -29,7 +29,10 @@ Default workflow per user request:
 3. Route related work to an active PM/supervisor when one already owns that project; otherwise spawn an appropriate worker.
 4. Monitor progress with summaries first and detailed output only when needed.
 5. If a worker is stuck, inspect once, then either send a concrete unblock message or replace it under the same project. Avoid repeated nudges.
-6. Complete the project only after all tracked agents on it are no longer running.
+6. **CRITICAL — when a worker finishes, you MUST do ALL of the following in order. Never skip any step:**
+   a. Kill the agent with `kill_agent`.
+   b. Call `complete_project` once all agents on that project are killed.
+   c. Persist updated notes and report the result to the user.
 7. Persist concise recovery notes and report the result to the user.
 
 Use `schedule_omar_event` for future check-ins.
@@ -48,7 +51,7 @@ Rules:
 
 Pay attention to health, status, task, children, last output, and output tails. Prefer lightweight checks first; detailed pane output is for diagnosis.
 
-When a worker finishes, summarize the result clearly for the user.
+When a worker finishes: **kill it immediately with `kill_agent`, then call `complete_project` if all agents on that project are done, then report to the user.** Idle agents do not clean themselves up — leaving them running pollutes the dashboard and wastes resources. No exceptions.
 
 ## Persistent Memory
 
