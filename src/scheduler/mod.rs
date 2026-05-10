@@ -378,7 +378,11 @@ impl Scheduler {
         self.transaction(false, |queue| queue.peek().map(|event| event.timestamp))
     }
 
-    fn take_due_deliveries(&self, popup_receiver: &PopupReceiver) -> Vec<DueDelivery> {
+    fn take_due_deliveries(
+        &self,
+        popup_receiver: &PopupReceiver,
+        base_prefix: &str,
+    ) -> Vec<DueDelivery> {
         self.transaction(true, |queue| {
             let Some(earliest_ts) = queue.peek().map(|event| event.timestamp) else {
                 return Vec::new();
@@ -418,19 +422,33 @@ impl Scheduler {
                 }
 
                 if should_defer_for_popup(popup_receiver, &receiver, ea_id) {
-                    let defer_until = now_ns() + POPUP_DEFER_NS;
-                    for mut event in batch {
-                        event.timestamp = defer_until;
-                        remaining.push(event);
+                    // Only defer if the user is actually mid-sentence (≥3 non-whitespace
+                    // chars of real input after the prompt). If the input buffer is empty
+                    // or trivial we clear it with C-u and deliver immediately so that
+                    // crons/check-ins reach the agent while the popup is open.
+                    let has_meaningful_input = get_pane_last_line(base_prefix, &receiver, ea_id)
+                        .map(|line| pane_input_meaningful(&line))
+                        .unwrap_or(true); // can't read pane → defer to be safe
+
+                    if has_meaningful_input {
+                        let defer_until = now_ns() + POPUP_DEFER_NS;
+                        for mut event in batch {
+                            event.timestamp = defer_until;
+                            remaining.push(event);
+                        }
+                        deliveries.push(DueDelivery {
+                            receiver,
+                            ea_id,
+                            timestamp: earliest_ts,
+                            batch: Vec::new(),
+                            deferred_for_popup: true,
+                        });
+                        continue;
                     }
-                    deliveries.push(DueDelivery {
-                        receiver,
-                        ea_id,
-                        timestamp: earliest_ts,
-                        batch: Vec::new(),
-                        deferred_for_popup: true,
-                    });
-                    continue;
+                    // Input is trivial — clear any partial stub and fall through
+                    // to the normal delivery path below.
+                    let target = pane_target_name(&receiver, ea_id, base_prefix);
+                    let _ = crate::tmux::TmuxClient::new("").send_keys(&target, "C-u");
                 }
 
                 let remaining_quota = MAX_EVENTS_PER_EA_PER_TICK - delivered_so_far;
@@ -473,6 +491,195 @@ impl Scheduler {
     }
 }
 
+/// Build the tmux session name for a receiver.
+fn pane_target_name(receiver: &str, ea_id: ea::EaId, base_prefix: &str) -> String {
+    if receiver == "ea" || receiver == "omar" {
+        ea::ea_manager_session(ea_id, base_prefix)
+    } else {
+        format!("{}{}", ea::ea_prefix(ea_id, base_prefix), receiver)
+    }
+}
+
+/// Capture the last line of the agent's pane (plain text, no ANSI).
+/// Returns `None` if the pane cannot be read (agent not running, tmux absent).
+///
+/// For opencode (a TUI app), the last line is typically status bar garbage,
+/// so we capture more lines and extract input from the TUI's input box area.
+fn get_pane_last_line(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Option<String> {
+    let target = pane_target_name(receiver, ea_id, base_prefix);
+    let client = crate::tmux::TmuxClient::new("");
+
+    // Check if this pane is running a special backend
+    let pane_cmd = client.get_pane_command(&target).ok().unwrap_or_default();
+
+    // opencode: TUI app - parse input from the TUI box
+    if pane_cmd == "opencode" || pane_cmd.ends_with("/opencode") {
+        return extract_opencode_input(&client, &target);
+    }
+
+    // cursor: GUI app (Electron IDE). When launched via `cursor --approve-mcps`,
+    // the IDE opens in a separate GUI window. The terminal pane shows only the
+    // shell that spawned cursor (or cursor's minimal CLI output), not the user's
+    // actual input which happens in the GUI. Since tmux cannot observe GUI input,
+    // return empty string → pane_input_meaningful returns false → deliver immediately.
+    // Tradeoff: events always deliver even if user is typing in the GUI, but this
+    // is better than indefinitely deferring events we can never detect completion of.
+    if pane_cmd == "cursor" || pane_cmd.ends_with("/cursor") {
+        return Some(String::new());
+    }
+
+    // Standard CLI: last line is the prompt/input line
+    client.capture_pane_plain(&target, 1).ok()
+}
+
+/// Extract user input from opencode's TUI.
+///
+/// opencode renders a full-screen TUI with message area, input box, and status bar.
+/// The input box is typically in the lower portion, bordered by box-drawing chars.
+/// We look for lines that appear to be inside the input area (not borders/chrome).
+fn extract_opencode_input(client: &crate::tmux::TmuxClient, target: &str) -> Option<String> {
+    let content = client.capture_pane_plain(target, 80).ok()?;
+    Some(extract_opencode_input_from_capture(&content))
+}
+
+fn extract_opencode_input_from_capture(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    // opencode TUI structure (bottom-up): status bar, input box border, input content, ...
+    // Look for the input area by finding lines that are NOT pure TUI chrome.
+    // TUI chrome typically contains box-drawing characters: │ ─ └ ┘ ┌ ┐ ├ ┤ ┬ ┴ ┼
+    // The input content is inside the box, potentially with leading │ border.
+
+    // Start from the bottom and skip status bar / border lines
+    let mut input_lines: Vec<&str> = Vec::new();
+    let mut in_input_area = false;
+
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+
+        // Skip empty lines at the very bottom
+        if trimmed.is_empty() && input_lines.is_empty() {
+            continue;
+        }
+
+        // Bottom border of input box: typically a line of ─ or └───...───┘
+        if !in_input_area && is_tui_horizontal_border(trimmed) {
+            in_input_area = true;
+            continue;
+        }
+
+        // Status bar: often contains mode info, model name, or has many special chars
+        if !in_input_area && is_opencode_status_bar(trimmed) {
+            continue;
+        }
+
+        // Top border of input box: signals end of input area
+        if in_input_area && is_tui_horizontal_border(trimmed) {
+            break;
+        }
+
+        // Inside input area - extract content (strip leading/trailing box borders)
+        if in_input_area {
+            if !trimmed.is_empty() && !has_tui_vertical_border(line) {
+                break;
+            }
+            let content = strip_tui_borders(line);
+            if !content.trim().is_empty() && !is_opencode_input_chrome(content) {
+                input_lines.push(content);
+            }
+        }
+
+        // Safety: don't scan too far up
+        if input_lines.len() > 5 {
+            break;
+        }
+    }
+
+    // Return the combined input (or empty string if no input found)
+    input_lines.reverse();
+    input_lines.join(" ").trim().to_string()
+}
+
+/// Check if a line looks like a TUI status bar or chrome (not user input).
+///
+/// Uses only structural density: status bars and chrome lines contain a high
+/// proportion of non-alphanumeric, non-whitespace characters (separators,
+/// icons, pipes). Avoids keyword matching so user input that happens to
+/// contain words like "claude" or "mode" is never misclassified.
+fn is_opencode_status_bar(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if line.contains('•')
+        && (lower.contains("opencode")
+            || lower.contains("mcp")
+            || lower.contains("model")
+            || lower.contains("token"))
+    {
+        return true;
+    }
+
+    let special = line
+        .chars()
+        .filter(|c| !c.is_alphanumeric() && !c.is_whitespace())
+        .count();
+    let total = line.chars().count();
+    total > 0 && special * 4 > total
+}
+
+fn is_opencode_input_chrome(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("Ask anything...")
+        || trimmed.starts_with("Build ·")
+        || trimmed.starts_with("Plan ·")
+        || trimmed.starts_with("Debug ·")
+        || trimmed.starts_with("Free Models")
+}
+
+fn has_tui_vertical_border(line: &str) -> bool {
+    line.chars().any(|c| matches!(c, '│' | '┃' | '║'))
+}
+
+/// Check if a line is a TUI horizontal border (made of ─, └, ┘, etc.)
+fn is_tui_horizontal_border(line: &str) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+    let border_chars = "─━═└┘┌┐├┤┬┴┼╔╗╚╝╠╣╦╩╬▀▁▂▃▄▅▆▇█▔╴╵╶╷╸╹╺╻";
+    let border_count = line.chars().filter(|c| border_chars.contains(*c)).count();
+    let non_whitespace_count = line.chars().filter(|c| !c.is_whitespace()).count();
+    // A border line is mostly made of border characters
+    non_whitespace_count > 0 && border_count > non_whitespace_count / 2
+}
+
+/// Strip TUI vertical border characters from the edges of a line
+fn strip_tui_borders(line: &str) -> &str {
+    let border_chars = ['│', '┃', '║', ' '];
+    line.trim_start_matches(|c| border_chars.contains(&c))
+        .trim_end_matches(|c| border_chars.contains(&c))
+}
+
+/// Return `true` when the pane's last line contains enough non-whitespace text
+/// to indicate the user is mid-sentence and delivery would corrupt their input.
+///
+/// Heuristic:
+/// - Strip a leading prompt token (a non-alphanumeric prefix up to the first
+///   space, e.g. `❯ `, `$ `, `> `) so prompt chars don't count.
+/// - If the remaining user input has ≥ 3 non-whitespace characters, treat it
+///   as meaningful and keep deferring.
+/// - Fewer than 3 chars (empty prompt, one-or-two-char stub) → trivial; safe
+///   to clear with C-u and deliver immediately.
+pub(crate) fn pane_input_meaningful(last_line: &str) -> bool {
+    let trimmed = last_line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Strip a leading prompt token: a non-alphanumeric prefix before the first
+    // space (e.g. "❯ hello" → "hello", "$ cd" → "cd", "> ab" → "ab").
+    let user_input = match trimmed.find(' ') {
+        Some(pos) if trimmed[..pos].chars().all(|c| !c.is_alphanumeric()) => trimmed[pos..].trim(),
+        _ => trimmed,
+    };
+    user_input.chars().filter(|c| !c.is_whitespace()).count() >= 3
+}
+
 pub(crate) fn deliver_to_tmux(
     ea_id: u32,
     receiver: &str,
@@ -480,13 +687,7 @@ pub(crate) fn deliver_to_tmux(
     base_prefix: &str,
     ticker: &TickerBuffer,
 ) {
-    // Keep one consistent delivery method for all agents, including EA.
-    let target = if receiver == "ea" || receiver == "omar" {
-        ea::ea_manager_session(ea_id, base_prefix)
-    } else {
-        let prefix = ea::ea_prefix(ea_id, base_prefix);
-        format!("{}{}", prefix, receiver)
-    };
+    let target = pane_target_name(receiver, ea_id, base_prefix);
     let client = crate::tmux::TmuxClient::new("");
     let opts = DeliveryOptions::default();
     if let Err(e) = client.deliver_prompt(&target, message, &opts) {
@@ -626,7 +827,7 @@ pub async fn run_event_loop(
                     }
                 }
 
-                for delivery in scheduler.take_due_deliveries(&popup_receiver) {
+                for delivery in scheduler.take_due_deliveries(&popup_receiver, &base_prefix) {
                     let receiver = delivery.receiver;
                     let ea_id = delivery.ea_id;
                     if delivery.deferred_for_popup {
@@ -1015,6 +1216,181 @@ mod tests {
         assert_eq!(buf.len(), 50);
         // Oldest entries should have been dropped
         assert_eq!(buf.front().unwrap().text, "msg10");
+    }
+
+    // ── pane_input_meaningful — pure heuristic ──
+
+    #[test]
+    fn pane_input_empty_is_not_meaningful() {
+        assert!(!pane_input_meaningful(""));
+        assert!(!pane_input_meaningful("   "));
+    }
+
+    #[test]
+    fn pane_input_bare_prompt_is_not_meaningful() {
+        // Typical shells/agents: prompt char + space, no user text
+        assert!(!pane_input_meaningful("❯ "));
+        assert!(!pane_input_meaningful("$ "));
+        assert!(!pane_input_meaningful("> "));
+        assert!(!pane_input_meaningful("% "));
+    }
+
+    #[test]
+    fn pane_input_short_stub_under_threshold_is_not_meaningful() {
+        // 1–2 user chars after the prompt — safe to clear
+        assert!(!pane_input_meaningful("❯ a"));
+        assert!(!pane_input_meaningful("❯ ab"));
+        assert!(!pane_input_meaningful("$ x"));
+        assert!(!pane_input_meaningful("> xy"));
+    }
+
+    #[test]
+    fn pane_input_three_or_more_chars_is_meaningful() {
+        assert!(pane_input_meaningful("❯ abc"));
+        assert!(pane_input_meaningful("$ hello world"));
+        assert!(pane_input_meaningful("> fix the bug"));
+    }
+
+    #[test]
+    fn pane_input_no_prompt_counts_whole_line() {
+        // If there's no leading non-alphanumeric prefix, the whole line is
+        // user input (e.g. a raw terminal with no prompt).
+        assert!(!pane_input_meaningful("ab"));
+        assert!(pane_input_meaningful("abc"));
+        assert!(pane_input_meaningful("hello"));
+    }
+
+    #[test]
+    fn pane_input_whitespace_only_after_prompt_is_not_meaningful() {
+        assert!(!pane_input_meaningful("❯   "));
+        assert!(!pane_input_meaningful("$    "));
+    }
+
+    // ── opencode TUI extraction helpers ──
+
+    #[test]
+    fn tui_border_detection() {
+        assert!(is_tui_horizontal_border(
+            "└───────────────────────────────────────────┘"
+        ));
+        assert!(is_tui_horizontal_border(
+            "┌─────────────────────────────────────────────┐"
+        ));
+        assert!(is_tui_horizontal_border("════════════════════════════════"));
+        assert!(is_tui_horizontal_border(
+            "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀"
+        ));
+        assert!(is_tui_horizontal_border(
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄"
+        ));
+        assert!(!is_tui_horizontal_border("hello world"));
+        assert!(!is_tui_horizontal_border("│ some text │"));
+        assert!(!is_tui_horizontal_border(""));
+    }
+
+    #[test]
+    fn tui_status_bar_detection() {
+        // High special-char density → status bar / chrome
+        assert!(is_opencode_status_bar("──────────────────────────────"));
+        assert!(is_opencode_status_bar("│◆ ready │ ⬆ 0 ⬇ 0 │ main │"));
+        assert!(is_opencode_status_bar(
+            "15.3K (8%) context left • OpenCode 1.14.28"
+        ));
+        // Normal prose → not a status bar, even if it contains tool names
+        assert!(!is_opencode_status_bar("fix the bug in claude"));
+        assert!(!is_opencode_status_bar("hello world"));
+        assert!(!is_opencode_status_bar("refactor the openai client"));
+    }
+
+    #[test]
+    fn tui_border_stripping() {
+        assert_eq!(strip_tui_borders("│ hello world │"), "hello world");
+        assert_eq!(strip_tui_borders("║ content ║"), "content");
+        assert_eq!(strip_tui_borders("  text  "), "text");
+        assert_eq!(strip_tui_borders("no borders"), "no borders");
+    }
+
+    #[test]
+    fn opencode_idle_capture_extracts_no_meaningful_input() {
+        // Captured locally with:
+        // `tmux capture-pane -t omar-fixture-opencode -p -S -30`
+        // from an idle opencode 1.14.41 pane.
+        const IDLE_OPENCODE_CAPTURE: &str = r#"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                             ▄
+                                                                            █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█
+                                                                            █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀
+                                                                            ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀
+
+
+                                                          ┃
+                                                          ┃  Ask anything... "Fix broken tests"
+                                                          ┃
+                                                          ┃  Build · Free Models Router OpenRouter
+                                                          ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                                                          tab agents  ctrl+p commands
+
+
+
+                                                              ● Tip Configure "git push": "ask" to require approval before pushing
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ~/Documents/research/omar:fix/smart-popup-event-deferral                                                                                                                            1.14.41
+"#;
+
+        let input = extract_opencode_input_from_capture(IDLE_OPENCODE_CAPTURE);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_meaningful(&input));
+    }
+
+    #[test]
+    fn opencode_capture_extracts_typed_input() {
+        let capture = r#"
+                                                          ┃
+                                                          ┃  fix the scheduler deferral bug
+                                                          ┃
+                                                          ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                                                          tab agents  ctrl+p commands
+"#;
+
+        assert!(capture
+            .lines()
+            .any(|line| is_tui_horizontal_border(line.trim())));
+        let input = extract_opencode_input_from_capture(capture);
+
+        assert_eq!(input, "fix the scheduler deferral bug");
+        assert!(pane_input_meaningful(&input));
     }
 
     // ── Popup-defer decision (pure helper) ──
