@@ -99,6 +99,11 @@ Shutdown the test project and its agents.
 | [Gemini CLI](https://geminicli.com) | `omar -a gemini` |
 | [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode` |
 
+When spawning Codex workers through OMAR's MCP `spawn_agent` tool, pass
+`backend: "codex"`, optional `model` (for example `gpt-5.5`), and optional
+`reasoning_effort` (`low`, `medium`, `high`, or `xhigh`) to launch native Codex
+sessions without building raw shell commands.
+
 ## License
 
 BSD 3-Clause
