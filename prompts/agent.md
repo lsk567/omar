@@ -35,8 +35,9 @@ When decomposition is warranted:
 3. Spawn 2-5 child agents with one tracked task each. Set each child's `parent` to your own agent name.
 4. Monitor children with lightweight summaries first, then inspect detailed output only when needed.
 5. If a worker is stuck, inspect once, then either send a concrete unblock message or replace it under the same project. Avoid repeated nudges.
-6. Complete the project only after all tracked agents on it are no longer running.
-7. Report the combined result.
+6. **When a child finishes, kill it immediately with `kill_agent` to keep the dashboard clean.** Do not leave finished agents idle.
+7. **Do NOT call `complete_project` on your own project.** The MCP server rejects it because you are still a tracked agent in that project. Your parent (EA or higher PM) will complete the project after killing you.
+8. Report the combined result to your parent via `schedule_omar_event`.
 
 Use `schedule_omar_event` for future check-ins and immediate parent notifications.
 
@@ -54,7 +55,14 @@ Before significant state-changing OMAR actions, write a short justification expl
 
 When you are done:
 
-1. Output exactly:
+1. Call `schedule_omar_event` with:
+   - `receiver`: `{{PARENT_NAME}}`
+   - `payload`: `[CHILD COMPLETE] <your_name>: <one-line summary>`
+   - `delay_seconds`: `0`
+
+   ⚠️ STOP. Do NOT type the literal text `[TASK COMPLETE]` anywhere — even in your reasoning, plans, or scratchpad — until this `schedule_omar_event` call has returned successfully. Output truncation has caused parents to miss notifications when the wake call comes second. Wake first, announce second.
+
+2. Only after the wake call returns, output exactly:
 
 ```
 [TASK COMPLETE]
@@ -64,7 +72,5 @@ Summary:
 - <key files changed or outputs produced>
 - <follow-up notes if any>
 ```
-
-2. Wake your parent immediately with an OMAR scheduled message containing `[CHILD COMPLETE] {your_name}: {summary}`.
 
 If you were acting as a PM, do not report completion until all child tasks are complete or intentionally abandoned.
