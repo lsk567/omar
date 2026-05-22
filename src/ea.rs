@@ -442,7 +442,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handoff = DashboardLaunchHandoff {
             active_ea: 4,
-            default_command: "claude --dangerously-skip-permissions".to_string(),
+            default_command: crate::config::resolve_backend("claude").unwrap(),
             default_workdir: "/tmp/omar".to_string(),
         };
 

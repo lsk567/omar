@@ -2091,7 +2091,7 @@ mod tests {
         let mut app = App::new(&config, TickerBuffer::new(), scheduler);
         let handoff = ea::DashboardLaunchHandoff {
             active_ea: 0,
-            default_command: "claude --dangerously-skip-permissions".to_string(),
+            default_command: crate::config::resolve_backend("claude").unwrap(),
             default_workdir: "/tmp/omar-launch".to_string(),
         };
         ea::save_dashboard_launch_handoff(&app.omar_dir, &handoff).unwrap();
