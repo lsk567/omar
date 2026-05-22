@@ -161,11 +161,13 @@ for s in "$leaf1_session" "$leaf2_session"; do
 done
 
 # Positive assertion: each leaf pane should show that opencode came up.
-# We look for the opencode TUI banner; if the model name renders we accept
-# either signal. Both indicate the worker is alive and not crashed.
+# We look for the opencode TUI banner, normal prompt/status text, or the
+# opencode-owned update modal. Any of these indicates the worker is alive
+# and not crashed; the wizard-regression check above remains the behavioral
+# failure signal this test exists to catch.
 for s in "$leaf1_session" "$leaf2_session"; do
   text="$(pane_text "$s")"
-  if ! grep -qE 'opencode|chat|prompt' <<<"$text"; then
+  if ! grep -qiE 'opencode|chat|prompt|update available|new release' <<<"$text"; then
     fail "$s pane does not show opencode UI markers"
   fi
 done

@@ -20,6 +20,13 @@ pub struct EaInfo {
     pub created_at: u64, // Unix timestamp
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardLaunchHandoff {
+    pub active_ea: EaId,
+    pub default_command: String,
+    pub default_workdir: String,
+}
+
 fn default_ea_info() -> EaInfo {
     EaInfo {
         id: 0,
@@ -60,6 +67,10 @@ fn active_ea_path(base_dir: &Path) -> PathBuf {
     base_dir.join("active_ea")
 }
 
+fn dashboard_handoff_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("dashboard_handoff.json")
+}
+
 /// Load all registered EAs from ~/.omar/eas.json.
 pub fn load_registry(base_dir: &Path) -> Vec<EaInfo> {
     let path = base_dir.join("eas.json");
@@ -92,6 +103,23 @@ pub fn save_active_ea(base_dir: &Path, ea_id: EaId) -> anyhow::Result<()> {
     fs::create_dir_all(base_dir)?;
     fs::write(&path, ea_id.to_string())?;
     Ok(())
+}
+
+pub fn save_dashboard_launch_handoff(
+    base_dir: &Path,
+    handoff: &DashboardLaunchHandoff,
+) -> anyhow::Result<()> {
+    let path = dashboard_handoff_path(base_dir);
+    fs::create_dir_all(base_dir)?;
+    fs::write(&path, serde_json::to_vec(handoff)?)?;
+    Ok(())
+}
+
+pub fn take_dashboard_launch_handoff(base_dir: &Path) -> Option<DashboardLaunchHandoff> {
+    let path = dashboard_handoff_path(base_dir);
+    let content = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    serde_json::from_str(&content).ok()
 }
 
 /// Resolve the active EA, falling back to the lowest registered EA when needed.
@@ -407,6 +435,24 @@ mod tests {
 
         assert_eq!(resolve_active_ea(dir.path(), &eas), 0);
         assert_eq!(load_active_ea(dir.path()), Some(0));
+    }
+
+    #[test]
+    fn dashboard_launch_handoff_round_trips_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = DashboardLaunchHandoff {
+            active_ea: 4,
+            default_command: "claude --dangerously-skip-permissions".to_string(),
+            default_workdir: "/tmp/omar".to_string(),
+        };
+
+        save_dashboard_launch_handoff(dir.path(), &handoff).unwrap();
+
+        let loaded = take_dashboard_launch_handoff(dir.path()).unwrap();
+        assert_eq!(loaded.active_ea, handoff.active_ea);
+        assert_eq!(loaded.default_command, handoff.default_command);
+        assert_eq!(loaded.default_workdir, handoff.default_workdir);
+        assert!(take_dashboard_launch_handoff(dir.path()).is_none());
     }
 
     #[test]

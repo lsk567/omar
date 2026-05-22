@@ -282,6 +282,7 @@ impl App {
 
     /// Refresh the list of agents (scoped to active EA)
     pub fn refresh(&mut self) -> Result<()> {
+        self.apply_dashboard_launch_handoff();
         self.registered_eas = ea::load_registry(&self.omar_dir);
 
         // Pick up out-of-band EA switches (e.g. via the MCP `switch_ea` tool)
@@ -518,6 +519,18 @@ impl App {
         Ok(())
     }
 
+    fn apply_dashboard_launch_handoff(&mut self) {
+        let Some(handoff) = ea::take_dashboard_launch_handoff(&self.omar_dir) else {
+            return;
+        };
+
+        self.config.agent.default_command = handoff.default_command.clone();
+        self.config.agent.default_workdir = handoff.default_workdir.clone();
+        self.default_command = handoff.default_command;
+        self.default_workdir = handoff.default_workdir;
+        let _ = ea::save_active_ea(&self.omar_dir, handoff.active_ea);
+    }
+
     /// Build the startup command attempts for the manager.
     ///
     /// In strict mode we issue exactly one launch command so behavior matches
@@ -549,9 +562,7 @@ impl App {
             .map(|ea| ea.name.as_str())
             .unwrap_or("Default");
 
-        let workdir = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let workdir = self.default_workdir.clone();
 
         let (default_command, inject_prompt) = self
             .manager_startup_attempts()
@@ -2068,6 +2079,30 @@ mod tests {
             assert_eq!(&attempts[0].0, cmd);
             assert!(attempts[0].1);
         }
+    }
+
+    #[test]
+    fn dashboard_launch_handoff_updates_runtime_command_and_workdir() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = HomeEnvGuard::set(dir.path());
+        let config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
+        let scheduler = Arc::new(Scheduler::new());
+        let mut app = App::new(&config, TickerBuffer::new(), scheduler);
+        let handoff = ea::DashboardLaunchHandoff {
+            active_ea: 0,
+            default_command: "claude --dangerously-skip-permissions".to_string(),
+            default_workdir: "/tmp/omar-launch".to_string(),
+        };
+        ea::save_dashboard_launch_handoff(&app.omar_dir, &handoff).unwrap();
+
+        app.apply_dashboard_launch_handoff();
+
+        assert_eq!(app.default_command(), handoff.default_command);
+        assert_eq!(app.default_workdir, handoff.default_workdir);
+        assert_eq!(app.config.agent.default_command, handoff.default_command);
+        assert_eq!(app.config.agent.default_workdir, handoff.default_workdir);
+        assert!(ea::take_dashboard_launch_handoff(&app.omar_dir).is_none());
     }
 
     #[test]
