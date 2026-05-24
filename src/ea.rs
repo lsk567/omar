@@ -25,6 +25,8 @@ pub struct DashboardLaunchHandoff {
     pub active_ea: EaId,
     pub default_command: String,
     pub default_workdir: String,
+    #[serde(default)]
+    pub restart_manager: bool,
 }
 
 fn default_ea_info() -> EaInfo {
@@ -444,6 +446,7 @@ mod tests {
             active_ea: 4,
             default_command: crate::config::resolve_backend("claude").unwrap(),
             default_workdir: "/tmp/omar".to_string(),
+            restart_manager: true,
         };
 
         save_dashboard_launch_handoff(dir.path(), &handoff).unwrap();
@@ -452,6 +455,7 @@ mod tests {
         assert_eq!(loaded.active_ea, handoff.active_ea);
         assert_eq!(loaded.default_command, handoff.default_command);
         assert_eq!(loaded.default_workdir, handoff.default_workdir);
+        assert_eq!(loaded.restart_manager, handoff.restart_manager);
         assert!(take_dashboard_launch_handoff(dir.path()).is_none());
     }
 

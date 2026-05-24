@@ -322,7 +322,7 @@ async fn async_main() -> Result<()> {
         None => {
             if std::env::var("TMUX").is_err() {
                 let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
-                relaunch_in_tmux(&config, &omar_dir, target.id)
+                relaunch_in_tmux(&config, &omar_dir, target.id, cli.agent.is_some())
             } else {
                 run_dashboard(config).await
             }
@@ -550,6 +550,7 @@ fn relaunch_in_tmux(
     config: &Config,
     omar_dir: &std::path::Path,
     active_ea: ea::EaId,
+    restart_manager: bool,
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
@@ -563,6 +564,7 @@ fn relaunch_in_tmux(
             active_ea,
             default_command: config.agent.default_command.clone(),
             default_workdir: current_dir.to_string_lossy().into_owned(),
+            restart_manager,
         };
         ea::save_dashboard_launch_handoff(omar_dir, &handoff)?;
         let target = format!("={}", DASHBOARD_SESSION);

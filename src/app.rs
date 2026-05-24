@@ -282,7 +282,7 @@ impl App {
 
     /// Refresh the list of agents (scoped to active EA)
     pub fn refresh(&mut self) -> Result<()> {
-        self.apply_dashboard_launch_handoff();
+        self.apply_dashboard_launch_handoff()?;
         self.registered_eas = ea::load_registry(&self.omar_dir);
 
         // Pick up out-of-band EA switches (e.g. via the MCP `switch_ea` tool)
@@ -519,16 +519,26 @@ impl App {
         Ok(())
     }
 
-    fn apply_dashboard_launch_handoff(&mut self) {
+    fn apply_dashboard_launch_handoff(&mut self) -> Result<()> {
         let Some(handoff) = ea::take_dashboard_launch_handoff(&self.omar_dir) else {
-            return;
+            return Ok(());
         };
 
         self.config.agent.default_command = handoff.default_command.clone();
         self.config.agent.default_workdir = handoff.default_workdir.clone();
         self.default_command = handoff.default_command;
         self.default_workdir = handoff.default_workdir;
-        let _ = ea::save_active_ea(&self.omar_dir, handoff.active_ea);
+        self.activate_ea_local(handoff.active_ea)?;
+        ea::save_active_ea(&self.omar_dir, handoff.active_ea)?;
+
+        if handoff.restart_manager {
+            let manager_session = ea::ea_manager_session(handoff.active_ea, &self.base_prefix);
+            if self.client.has_session(&manager_session)? {
+                self.client.kill_session(&manager_session)?;
+                self.manager = None;
+            }
+        }
+        Ok(())
     }
 
     /// Build the startup command attempts for the manager.
@@ -1351,30 +1361,8 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
 
     /// Switch the dashboard to a different EA. Full reload of all state.
     pub fn switch_ea(&mut self, ea_id: EaId) -> Result<()> {
-        // Reload registry and validate that the target EA exists
-        self.registered_eas = ea::load_registry(&self.omar_dir);
-        if !self.registered_eas.iter().any(|e| e.id == ea_id) {
-            anyhow::bail!("EA {} not registered", ea_id);
-        }
-
-        self.active_ea = ea_id;
+        self.activate_ea_local(ea_id)?;
         ea::save_active_ea(&self.omar_dir, ea_id)?;
-
-        // Reconstruct tmux client with new EA's prefix
-        let new_prefix = ea::ea_prefix(ea_id, &self.base_prefix);
-        self.client = TmuxClient::new(&new_prefix);
-        self.health_checker = HealthChecker::new(self.client.clone(), self.health_threshold)
-            .with_auth_failure_patterns(self.config.watchdog.auth_failure_patterns.clone());
-
-        // Reset all view state
-        self.focus_parent = ea::ea_manager_session(ea_id, &self.base_prefix);
-        self.focus_stack.clear();
-        self.selected = 0;
-        self.manager_selected = true;
-
-        // Ensure EA state directory exists; refresh() will reload projects/parents/tasks
-        let state_dir = ea::ea_state_dir(ea_id, &self.omar_dir);
-        std::fs::create_dir_all(&state_dir).ok();
 
         // Refresh discovers agents via the new prefix and reloads all EA state
         self.refresh()?;
@@ -1395,6 +1383,27 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         self.settings_edit_buffer = None;
         self.sidebar_popup = None;
         self.pending_confirm = None;
+        Ok(())
+    }
+
+    fn activate_ea_local(&mut self, ea_id: EaId) -> Result<()> {
+        self.registered_eas = ea::load_registry(&self.omar_dir);
+        if !self.registered_eas.iter().any(|e| e.id == ea_id) {
+            anyhow::bail!("EA {} not registered", ea_id);
+        }
+
+        self.active_ea = ea_id;
+        let new_prefix = ea::ea_prefix(ea_id, &self.base_prefix);
+        self.client = TmuxClient::new(&new_prefix);
+        self.health_checker = HealthChecker::new(self.client.clone(), self.health_threshold)
+            .with_auth_failure_patterns(self.config.watchdog.auth_failure_patterns.clone());
+        self.focus_parent = ea::ea_manager_session(ea_id, &self.base_prefix);
+        self.focus_stack.clear();
+        self.selected = 0;
+        self.manager_selected = true;
+
+        let state_dir = ea::ea_state_dir(ea_id, &self.omar_dir);
+        std::fs::create_dir_all(&state_dir).ok();
         Ok(())
     }
 
@@ -2093,10 +2102,11 @@ mod tests {
             active_ea: 0,
             default_command: crate::config::resolve_backend("claude").unwrap(),
             default_workdir: "/tmp/omar-launch".to_string(),
+            restart_manager: false,
         };
         ea::save_dashboard_launch_handoff(&app.omar_dir, &handoff).unwrap();
 
-        app.apply_dashboard_launch_handoff();
+        app.apply_dashboard_launch_handoff().unwrap();
 
         assert_eq!(app.default_command(), handoff.default_command);
         assert_eq!(app.default_workdir, handoff.default_workdir);
