@@ -517,40 +517,53 @@ fn get_pane_input(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Option<
     // Check if this pane is running a special backend
     let pane_cmd = client.get_pane_command(&target).ok().unwrap_or_default();
 
-    // opencode: TUI app - parse input from the TUI box
-    if pane_cmd == "opencode" || pane_cmd.ends_with("/opencode") {
-        return extract_opencode_input(&client, &target);
+    let pane_capture = client.capture_pane_plain(&target, 120).ok()?;
+
+    if pane_cmd == "opencode"
+        || pane_cmd.ends_with("/opencode")
+        || pane_capture.contains("OpenCode")
+    {
+        return Some(extract_opencode_input_from_capture(&pane_capture));
     }
 
     if pane_cmd == "claude"
         || pane_cmd == "claude.exe"
         || pane_cmd.ends_with("/claude")
         || pane_cmd.ends_with("/claude.exe")
+        || pane_capture.contains("Claude Code")
     {
-        return extract_claude_input(&client, &target);
+        return Some(extract_claude_input_from_capture(&pane_capture));
     }
 
-    // cursor: GUI app (Electron IDE). When launched via `cursor --approve-mcps`,
-    // the IDE opens in a separate GUI window. The terminal pane shows only the
-    // shell that spawned cursor (or cursor's minimal CLI output), not the user's
-    // actual input which happens in the GUI. Since tmux cannot observe GUI input,
-    // return empty string → pane_input_should_restore returns false → deliver immediately.
-    // Tradeoff: events always deliver even if user is typing in the GUI, but this
-    // is better than indefinitely deferring events we can never detect completion of.
-    if pane_cmd == "cursor" || pane_cmd.ends_with("/cursor") {
-        return Some(String::new());
+    if pane_capture.contains("OpenAI Codex") {
+        return Some(extract_prefixed_input_from_capture(
+            &pane_capture,
+            "›",
+            is_codex_input_chrome,
+        ));
+    }
+
+    if pane_capture.contains("Cursor Agent") {
+        return Some(extract_prefixed_input_from_capture(
+            &pane_capture,
+            "→",
+            |_| false,
+        ));
+    }
+
+    if pane_capture.contains("Gemini CLI") {
+        return Some(extract_prefixed_input_from_capture(
+            &pane_capture,
+            "*",
+            |_| false,
+        ));
     }
 
     // Standard CLI: last line is the prompt/input line.
-    client
-        .capture_pane_plain(&target, 1)
-        .ok()
-        .map(|line| strip_prompt_prefix(&line).to_string())
-}
-
-fn extract_claude_input(client: &crate::tmux::TmuxClient, target: &str) -> Option<String> {
-    let content = client.capture_pane_plain(target, 80).ok()?;
-    Some(extract_claude_input_from_capture(&content))
+    pane_capture
+        .lines()
+        .last()
+        .map(|line| strip_prompt_prefix(line).to_string())
 }
 
 fn extract_claude_input_from_capture(content: &str) -> String {
@@ -570,14 +583,29 @@ fn extract_claude_prompt_line(line: &str) -> Option<String> {
     Some(input.to_string())
 }
 
-/// Extract user input from opencode's TUI.
-///
-/// opencode renders a full-screen TUI with message area, input box, and status bar.
-/// The input box is typically in the lower portion, bordered by box-drawing chars.
-/// We look for lines that appear to be inside the input area (not borders/chrome).
-fn extract_opencode_input(client: &crate::tmux::TmuxClient, target: &str) -> Option<String> {
-    let content = client.capture_pane_plain(target, 80).ok()?;
-    Some(extract_opencode_input_from_capture(&content))
+fn extract_prefixed_input_from_capture(
+    content: &str,
+    prefix: &str,
+    is_chrome: impl Fn(&str) -> bool,
+) -> String {
+    content
+        .lines()
+        .rev()
+        .find_map(|line| extract_prefixed_input_line(line, prefix, &is_chrome))
+        .unwrap_or_default()
+}
+
+fn extract_prefixed_input_line(
+    line: &str,
+    prefix: &str,
+    is_chrome: &impl Fn(&str) -> bool,
+) -> Option<String> {
+    let trimmed = line.trim_start();
+    let input = trimmed.strip_prefix(prefix)?.trim();
+    if is_chrome(input) {
+        return Some(String::new());
+    }
+    Some(input.to_string())
 }
 
 fn extract_opencode_input_from_capture(content: &str) -> String {
@@ -674,6 +702,11 @@ fn is_opencode_input_chrome(line: &str) -> bool {
 fn is_claude_input_chrome(line: &str) -> bool {
     let trimmed = line.trim();
     trimmed.is_empty() || trimmed.starts_with("Try \"")
+}
+
+fn is_codex_input_chrome(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with("Improve documentation in @filename")
 }
 
 fn has_tui_vertical_border(line: &str) -> bool {
@@ -1483,6 +1516,82 @@ mod tests {
 
         assert_eq!(input, "abc");
         assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn codex_capture_extracts_typed_input_for_restore() {
+        let capture = r#"
+╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.133.0)                     │
+╰────────────────────────────────────────────────╯
+
+› Improve documentation in @filename
+
+  gpt-5.5 medium · ~/Documents/Cal/research/omar
+
+› hello world
+
+  gpt-5.5 medium · ~/Documents/Cal/research/omar
+"#;
+
+        let input = extract_prefixed_input_from_capture(capture, "›", is_codex_input_chrome);
+
+        assert_eq!(input, "hello world");
+        assert!(pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn codex_idle_capture_ignores_placeholder() {
+        let capture = r#"
+╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.133.0)                     │
+╰────────────────────────────────────────────────╯
+
+› Improve documentation in @filename
+
+  gpt-5.5 medium · ~/Documents/Cal/research/omar
+"#;
+
+        let input = extract_prefixed_input_from_capture(capture, "›", is_codex_input_chrome);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn cursor_capture_extracts_typed_input_for_restore() {
+        let capture = r#"
+  Cursor Agent
+  v2026.05.24-dda726e
+
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  → hello world
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  Composer 2.5 Fast                                                   Auto-run
+"#;
+
+        let input = extract_prefixed_input_from_capture(capture, "→", |_| false);
+
+        assert_eq!(input, "hello world");
+        assert!(pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn gemini_capture_extracts_typed_input_for_restore() {
+        let capture = r#"
+ ▝▜▄     Gemini CLI v0.40.1
+
+────────────────────────────────────────────────────────────────────────────────
+ YOLO Ctrl+Y                                                      2 MCP servers
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+ * hello world
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+"#;
+
+        let input = extract_prefixed_input_from_capture(capture, "*", |_| false);
+
+        assert_eq!(input, "hello world");
+        assert!(pane_input_should_restore(&input));
     }
 
     // ── Popup-defer decision (pure helper) ──
