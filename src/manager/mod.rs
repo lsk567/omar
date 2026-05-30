@@ -303,8 +303,54 @@ fn materialize_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Strip a trailing " (deleted)" marker from an executable path.
+///
+/// On Linux, when a running binary's file is replaced or unlinked (e.g. a
+/// rebuild/reinstall while omar keeps running), `/proc/self/exe` — and thus
+/// `std::env::current_exe()` — resolves to the original path with a literal
+/// " (deleted)" suffix appended. Only a trailing marker is removed; the same
+/// substring elsewhere in the path is preserved.
+fn strip_deleted_suffix(path: &Path) -> PathBuf {
+    const MARKER: &str = " (deleted)";
+    match path.to_str() {
+        Some(s) => match s.strip_suffix(MARKER) {
+            Some(stripped) => PathBuf::from(stripped),
+            None => path.to_path_buf(),
+        },
+        None => path.to_path_buf(),
+    }
+}
+
+/// Resolve the path to the running omar binary for use as a backend MCP server
+/// command.
+///
+/// Uses `std::env::current_exe()`, but guards against the Linux "(deleted)"
+/// case: if the binary was replaced after the process started, the raw path is
+/// not runnable. We strip the marker and, if the result no longer exists on
+/// disk, fall back to locating the same binary name on `PATH`. Writing an
+/// unrunnable path into a backend MCP config makes the OMAR server silently
+/// fail to launch, so every backend config builder must go through here.
+fn omar_server_exe() -> Option<PathBuf> {
+    let raw = std::env::current_exe().ok()?;
+    let cleaned = strip_deleted_suffix(&raw);
+    if cleaned.exists() {
+        return Some(cleaned);
+    }
+    // The current binary was replaced/unlinked; find it again on PATH.
+    let file_name = cleaned.file_name()?;
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(file_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    // Last resort: return the cleaned path even if we could not confirm it.
+    Some(cleaned)
+}
+
 fn materialize_claude_mcp_config(context: &McpLaunchContext) -> Option<PathBuf> {
-    let server_exe = std::env::current_exe().ok()?;
+    let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
     let json = serde_json::json!({
         "mcpServers": {
@@ -323,7 +369,7 @@ fn materialize_claude_mcp_config(context: &McpLaunchContext) -> Option<PathBuf> 
 }
 
 fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
-    let server_exe = std::env::current_exe().ok()?;
+    let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
     let command = serde_json::to_string(&server_exe.display().to_string()).ok()?;
     let args = serde_json::to_string(&vec![
@@ -369,7 +415,7 @@ denyMessage = "{message}"
 }
 
 fn gemini_mcp_bootstrap(base_command: &str, context: &McpLaunchContext) -> Option<String> {
-    let server_exe = std::env::current_exe().ok()?;
+    let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
     let gemini_exec =
         backend_token(base_command, BackendKind::Gemini).unwrap_or_else(|| "gemini".to_string());
@@ -385,7 +431,7 @@ fn gemini_mcp_bootstrap(base_command: &str, context: &McpLaunchContext) -> Optio
 }
 
 fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
-    let server_exe = std::env::current_exe().ok()?;
+    let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
     // Disable every backend-native tool that overlaps an OMAR MCP tool so
     // delegation/scheduling can only flow through OMAR and stays visible in
@@ -424,7 +470,7 @@ fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
     // across EAs don't clobber each other, preserve every non-omar key the
     // user already has, and write via tmp+rename so partial writes under
     // concurrency can't corrupt the file.
-    let server_exe = std::env::current_exe().ok()?;
+    let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
     let home = std::env::var("HOME").ok()?;
     let cursor_dir = PathBuf::from(home).join(".cursor");
@@ -1150,6 +1196,38 @@ fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_deleted_suffix_removes_trailing_marker() {
+        // The Linux "(deleted)" marker on a replaced binary is stripped.
+        assert_eq!(
+            strip_deleted_suffix(Path::new("/home/u/.cargo/bin/omar (deleted)")),
+            PathBuf::from("/home/u/.cargo/bin/omar")
+        );
+        // A clean path is returned unchanged.
+        assert_eq!(
+            strip_deleted_suffix(Path::new("/home/u/.cargo/bin/omar")),
+            PathBuf::from("/home/u/.cargo/bin/omar")
+        );
+        // The marker is only stripped when it is a true suffix, not when the
+        // same substring appears earlier in the path.
+        assert_eq!(
+            strip_deleted_suffix(Path::new("/home/u/omar (deleted)/bin/omar")),
+            PathBuf::from("/home/u/omar (deleted)/bin/omar")
+        );
+    }
+
+    #[test]
+    fn omar_server_exe_returns_existing_binary() {
+        // The running test binary exists, so resolution returns a real path
+        // (never one carrying the "(deleted)" marker).
+        let exe = omar_server_exe().expect("current exe should resolve");
+        assert!(exe.exists(), "resolved exe should exist on disk: {exe:?}");
+        assert!(
+            !exe.to_string_lossy().ends_with(" (deleted)"),
+            "resolved exe must not retain the (deleted) marker: {exe:?}"
+        );
+    }
 
     /// A minimal MCP context scoped to a caller-supplied temp dir. Tests that
     /// exercise only command-string shape (no filesystem assertions) can pass
