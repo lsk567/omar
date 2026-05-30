@@ -421,16 +421,14 @@ impl Scheduler {
                     continue;
                 }
 
+                let mut restore_input = None;
                 if should_defer_for_popup(popup_receiver, &receiver, ea_id) {
-                    // Only defer if the user is actually mid-sentence (≥3 non-whitespace
-                    // chars of real input after the prompt). If the input buffer is empty
-                    // or trivial we clear it with C-u and deliver immediately so that
-                    // crons/check-ins reach the agent while the popup is open.
-                    let has_meaningful_input = get_pane_last_line(base_prefix, &receiver, ea_id)
-                        .map(|line| pane_input_meaningful(&line))
-                        .unwrap_or(true); // can't read pane → defer to be safe
-
-                    if has_meaningful_input {
+                    // If the user has a meaningful draft, preserve it across
+                    // event delivery: capture input, let the normal delivery
+                    // path clear/submit the event, then restore the draft.
+                    // If the pane cannot be read, defer rather than risk
+                    // wiping text we cannot put back.
+                    let Some(input) = get_pane_input(base_prefix, &receiver, ea_id) else {
                         let defer_until = now_ns() + POPUP_DEFER_NS;
                         for mut event in batch {
                             event.timestamp = defer_until;
@@ -442,11 +440,16 @@ impl Scheduler {
                             timestamp: earliest_ts,
                             batch: Vec::new(),
                             deferred_for_popup: true,
+                            restore_input: None,
                         });
                         continue;
+                    };
+
+                    if pane_input_should_restore(&input) {
+                        restore_input = Some(input);
                     }
-                    // Input is trivial — clear any partial stub and fall through
-                    // to the normal delivery path below.
+                    // Input is empty/trivial or has been captured for restore.
+                    // Clear the current line before normal event delivery.
                     let target = pane_target_name(&receiver, ea_id, base_prefix);
                     let _ = crate::tmux::TmuxClient::new("").send_keys(&target, "C-u");
                 }
@@ -482,6 +485,7 @@ impl Scheduler {
                     timestamp: earliest_ts,
                     batch,
                     deferred_for_popup: false,
+                    restore_input,
                 });
             }
 
@@ -500,46 +504,108 @@ fn pane_target_name(receiver: &str, ea_id: ea::EaId, base_prefix: &str) -> Strin
     }
 }
 
-/// Capture the last line of the agent's pane (plain text, no ANSI).
+/// Capture the current user input in the agent's pane (plain text, no ANSI).
 /// Returns `None` if the pane cannot be read (agent not running, tmux absent).
 ///
-/// For opencode (a TUI app), the last line is typically status bar garbage,
-/// so we capture more lines and extract input from the TUI's input box area.
-fn get_pane_last_line(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Option<String> {
+/// TUI backends render status bars and input boxes differently, so special
+/// cases return only the user's draft text. Shell-like backends fall back to
+/// the last line with a prompt prefix stripped.
+fn get_pane_input(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Option<String> {
     let target = pane_target_name(receiver, ea_id, base_prefix);
     let client = crate::tmux::TmuxClient::new("");
 
     // Check if this pane is running a special backend
     let pane_cmd = client.get_pane_command(&target).ok().unwrap_or_default();
 
-    // opencode: TUI app - parse input from the TUI box
-    if pane_cmd == "opencode" || pane_cmd.ends_with("/opencode") {
-        return extract_opencode_input(&client, &target);
+    let pane_capture = client.capture_pane_plain(&target, 120).ok()?;
+
+    if pane_cmd == "opencode"
+        || pane_cmd.ends_with("/opencode")
+        || pane_capture.contains("OpenCode")
+    {
+        return Some(extract_opencode_input_from_capture(&pane_capture));
     }
 
-    // cursor: GUI app (Electron IDE). When launched via `cursor --approve-mcps`,
-    // the IDE opens in a separate GUI window. The terminal pane shows only the
-    // shell that spawned cursor (or cursor's minimal CLI output), not the user's
-    // actual input which happens in the GUI. Since tmux cannot observe GUI input,
-    // return empty string → pane_input_meaningful returns false → deliver immediately.
-    // Tradeoff: events always deliver even if user is typing in the GUI, but this
-    // is better than indefinitely deferring events we can never detect completion of.
-    if pane_cmd == "cursor" || pane_cmd.ends_with("/cursor") {
-        return Some(String::new());
+    if pane_cmd == "claude"
+        || pane_cmd == "claude.exe"
+        || pane_cmd.ends_with("/claude")
+        || pane_cmd.ends_with("/claude.exe")
+        || pane_capture.contains("Claude Code")
+    {
+        return Some(extract_claude_input_from_capture(&pane_capture));
     }
 
-    // Standard CLI: last line is the prompt/input line
-    client.capture_pane_plain(&target, 1).ok()
+    if pane_capture.contains("OpenAI Codex") {
+        return Some(extract_prefixed_input_from_capture(
+            &pane_capture,
+            "›",
+            is_codex_input_chrome,
+        ));
+    }
+
+    if pane_capture.contains("Cursor Agent") {
+        return Some(extract_prefixed_input_from_capture(
+            &pane_capture,
+            "→",
+            |_| false,
+        ));
+    }
+
+    if pane_capture.contains("Gemini CLI") {
+        return Some(extract_prefixed_input_from_capture(
+            &pane_capture,
+            "*",
+            |_| false,
+        ));
+    }
+
+    // Standard CLI: last line is the prompt/input line.
+    pane_capture
+        .lines()
+        .last()
+        .map(|line| strip_prompt_prefix(line).to_string())
 }
 
-/// Extract user input from opencode's TUI.
-///
-/// opencode renders a full-screen TUI with message area, input box, and status bar.
-/// The input box is typically in the lower portion, bordered by box-drawing chars.
-/// We look for lines that appear to be inside the input area (not borders/chrome).
-fn extract_opencode_input(client: &crate::tmux::TmuxClient, target: &str) -> Option<String> {
-    let content = client.capture_pane_plain(target, 80).ok()?;
-    Some(extract_opencode_input_from_capture(&content))
+fn extract_claude_input_from_capture(content: &str) -> String {
+    content
+        .lines()
+        .rev()
+        .find_map(extract_claude_prompt_line)
+        .unwrap_or_default()
+}
+
+fn extract_claude_prompt_line(line: &str) -> Option<String> {
+    let (_, after_prompt) = line.split_once('❯')?;
+    let input = after_prompt.trim();
+    if is_claude_input_chrome(input) {
+        return Some(String::new());
+    }
+    Some(input.to_string())
+}
+
+fn extract_prefixed_input_from_capture(
+    content: &str,
+    prefix: &str,
+    is_chrome: impl Fn(&str) -> bool,
+) -> String {
+    content
+        .lines()
+        .rev()
+        .find_map(|line| extract_prefixed_input_line(line, prefix, &is_chrome))
+        .unwrap_or_default()
+}
+
+fn extract_prefixed_input_line(
+    line: &str,
+    prefix: &str,
+    is_chrome: &impl Fn(&str) -> bool,
+) -> Option<String> {
+    let trimmed = line.trim_start();
+    let input = trimmed.strip_prefix(prefix)?.trim();
+    if is_chrome(input) {
+        return Some(String::new());
+    }
+    Some(input.to_string())
 }
 
 fn extract_opencode_input_from_capture(content: &str) -> String {
@@ -633,6 +699,16 @@ fn is_opencode_input_chrome(line: &str) -> bool {
         || trimmed.starts_with("Free Models")
 }
 
+fn is_claude_input_chrome(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with("Try \"")
+}
+
+fn is_codex_input_chrome(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with("Improve documentation in @filename")
+}
+
 fn has_tui_vertical_border(line: &str) -> bool {
     line.chars().any(|c| matches!(c, '│' | '┃' | '║'))
 }
@@ -656,28 +732,27 @@ fn strip_tui_borders(line: &str) -> &str {
         .trim_end_matches(|c| border_chars.contains(&c))
 }
 
-/// Return `true` when the pane's last line contains enough non-whitespace text
-/// to indicate the user is mid-sentence and delivery would corrupt their input.
-///
-/// Heuristic:
-/// - Strip a leading prompt token (a non-alphanumeric prefix up to the first
-///   space, e.g. `❯ `, `$ `, `> `) so prompt chars don't count.
-/// - If the remaining user input has ≥ 3 non-whitespace characters, treat it
-///   as meaningful and keep deferring.
-/// - Fewer than 3 chars (empty prompt, one-or-two-char stub) → trivial; safe
-///   to clear with C-u and deliver immediately.
-pub(crate) fn pane_input_meaningful(last_line: &str) -> bool {
-    let trimmed = last_line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // Strip a leading prompt token: a non-alphanumeric prefix before the first
-    // space (e.g. "❯ hello" → "hello", "$ cd" → "cd", "> ab" → "ab").
-    let user_input = match trimmed.find(' ') {
+/// Strip a leading prompt token from shell-like input lines.
+fn strip_prompt_prefix(line: &str) -> &str {
+    let trimmed = line.trim();
+    match trimmed.find(' ') {
         Some(pos) if trimmed[..pos].chars().all(|c| !c.is_alphanumeric()) => trimmed[pos..].trim(),
         _ => trimmed,
-    };
-    user_input.chars().filter(|c| !c.is_whitespace()).count() >= 3
+    }
+}
+
+fn input_char_count(input: &str) -> usize {
+    input.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+/// Return `true` when the captured input is large enough that OMAR should
+/// preserve and restore it across event delivery.
+///
+/// Heuristic:
+/// - 0-3 non-whitespace chars: trivial stub; wipe and deliver.
+/// - >3 non-whitespace chars: user draft; wipe, deliver, restore.
+pub(crate) fn pane_input_should_restore(input: &str) -> bool {
+    input_char_count(input) > 3
 }
 
 pub(crate) fn deliver_to_tmux(
@@ -686,6 +761,7 @@ pub(crate) fn deliver_to_tmux(
     message: &str,
     base_prefix: &str,
     ticker: &TickerBuffer,
+    restore_input: Option<&str>,
 ) {
     let target = pane_target_name(receiver, ea_id, base_prefix);
     let client = crate::tmux::TmuxClient::new("");
@@ -693,6 +769,13 @@ pub(crate) fn deliver_to_tmux(
     if let Err(e) = client.deliver_prompt(&target, message, &opts) {
         ticker.push(format!("tmux prompt delivery failed for {}: {}", target, e));
         return;
+    }
+    if let Some(input) = restore_input.filter(|input| !input.is_empty()) {
+        if let Err(e) = client.paste_text(&target, input) {
+            ticker.push(format!("tmux input restore failed for {}: {}", target, e));
+            return;
+        }
+        ticker.push(format!("restored draft input for {}", receiver));
     }
     ticker.push(format!("delivered event(s) to {}", receiver));
 }
@@ -756,6 +839,7 @@ struct DueDelivery {
     timestamp: u64,
     batch: Vec<ScheduledEvent>,
     deferred_for_popup: bool,
+    restore_input: Option<String>,
 }
 
 /// Decide whether to defer an event for `(receiver, ea_id)` because the user
@@ -828,18 +912,23 @@ pub async fn run_event_loop(
                 }
 
                 for delivery in scheduler.take_due_deliveries(&popup_receiver, &base_prefix) {
-                    let receiver = delivery.receiver;
-                    let ea_id = delivery.ea_id;
-                    if delivery.deferred_for_popup {
+                    let DueDelivery {
+                        receiver,
+                        ea_id,
+                        timestamp,
+                        batch,
+                        deferred_for_popup,
+                        restore_input,
+                    } = delivery;
+                    if deferred_for_popup {
                         ticker.push(format!("deferred event(s) for {} (popup open)", receiver));
                         continue;
                     }
-                    let batch = delivery.batch;
                     if batch.is_empty() {
                         continue;
                     }
 
-                    let message = format_delivery(&batch, delivery.timestamp);
+                    let message = format_delivery(&batch, timestamp);
                     let receiver_name = receiver.clone();
                     let base_prefix_clone = base_prefix.clone();
                     let ticker_clone = ticker.clone();
@@ -850,6 +939,7 @@ pub async fn run_event_loop(
                             &message,
                             &base_prefix_clone,
                             &ticker_clone,
+                            restore_input.as_deref(),
                         );
                     })
                     .await;
@@ -860,7 +950,7 @@ pub async fn run_event_loop(
                         ));
                     }
 
-                    let lag_ns = now_ns().saturating_sub(delivery.timestamp);
+                    let lag_ns = now_ns().saturating_sub(timestamp);
                     let lag_ms = lag_ns as f64 / 1_000_000.0;
                     ticker.push(format!(
                         "delivered {} event(s) to {}, lag={:.2}ms",
@@ -1218,52 +1308,40 @@ mod tests {
         assert_eq!(buf.front().unwrap().text, "msg10");
     }
 
-    // ── pane_input_meaningful — pure heuristic ──
+    // ── input preservation threshold — pure heuristic ──
 
     #[test]
-    fn pane_input_empty_is_not_meaningful() {
-        assert!(!pane_input_meaningful(""));
-        assert!(!pane_input_meaningful("   "));
+    fn pane_input_empty_is_not_restored() {
+        assert!(!pane_input_should_restore(""));
+        assert!(!pane_input_should_restore("   "));
     }
 
     #[test]
-    fn pane_input_bare_prompt_is_not_meaningful() {
-        // Typical shells/agents: prompt char + space, no user text
-        assert!(!pane_input_meaningful("❯ "));
-        assert!(!pane_input_meaningful("$ "));
-        assert!(!pane_input_meaningful("> "));
-        assert!(!pane_input_meaningful("% "));
+    fn pane_input_short_stub_at_or_under_threshold_is_not_restored() {
+        assert!(!pane_input_should_restore("a"));
+        assert!(!pane_input_should_restore("ab"));
+        assert!(!pane_input_should_restore("abc"));
+        assert!(!pane_input_should_restore("a b c"));
     }
 
     #[test]
-    fn pane_input_short_stub_under_threshold_is_not_meaningful() {
-        // 1–2 user chars after the prompt — safe to clear
-        assert!(!pane_input_meaningful("❯ a"));
-        assert!(!pane_input_meaningful("❯ ab"));
-        assert!(!pane_input_meaningful("$ x"));
-        assert!(!pane_input_meaningful("> xy"));
+    fn pane_input_more_than_three_chars_is_restored() {
+        assert!(pane_input_should_restore("abcd"));
+        assert!(pane_input_should_restore("hello world"));
+        assert!(pane_input_should_restore("fix the bug"));
     }
 
     #[test]
-    fn pane_input_three_or_more_chars_is_meaningful() {
-        assert!(pane_input_meaningful("❯ abc"));
-        assert!(pane_input_meaningful("$ hello world"));
-        assert!(pane_input_meaningful("> fix the bug"));
+    fn shell_prompt_prefix_is_stripped() {
+        assert_eq!(strip_prompt_prefix("❯ abc"), "abc");
+        assert_eq!(strip_prompt_prefix("$ hello world"), "hello world");
+        assert_eq!(strip_prompt_prefix("> fix the bug"), "fix the bug");
     }
 
     #[test]
-    fn pane_input_no_prompt_counts_whole_line() {
-        // If there's no leading non-alphanumeric prefix, the whole line is
-        // user input (e.g. a raw terminal with no prompt).
-        assert!(!pane_input_meaningful("ab"));
-        assert!(pane_input_meaningful("abc"));
-        assert!(pane_input_meaningful("hello"));
-    }
-
-    #[test]
-    fn pane_input_whitespace_only_after_prompt_is_not_meaningful() {
-        assert!(!pane_input_meaningful("❯   "));
-        assert!(!pane_input_meaningful("$    "));
+    fn shell_prompt_prefix_preserves_plain_input() {
+        assert_eq!(strip_prompt_prefix("abc"), "abc");
+        assert_eq!(strip_prompt_prefix("hello"), "hello");
     }
 
     // ── opencode TUI extraction helpers ──
@@ -1371,7 +1449,7 @@ mod tests {
         let input = extract_opencode_input_from_capture(IDLE_OPENCODE_CAPTURE);
 
         assert_eq!(input, "");
-        assert!(!pane_input_meaningful(&input));
+        assert!(!pane_input_should_restore(&input));
     }
 
     #[test]
@@ -1390,7 +1468,130 @@ mod tests {
         let input = extract_opencode_input_from_capture(capture);
 
         assert_eq!(input, "fix the scheduler deferral bug");
-        assert!(pane_input_meaningful(&input));
+        assert!(pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn claude_idle_capture_extracts_no_restorable_input() {
+        let capture = r#" ▐▛███▜▌   Claude Code v2.1.136
+▝▜█████▛▘  Opus 4.7 with low effort · Claude Max
+  ▘▘ ▝▝    ~/Documents/research/omar
+
+────────────────────────────────────────────────────────────────
+❯ Try "refactor dashboard.rs"
+────────────────────────────────────────────────────────────────
+  PR #133
+"#;
+
+        let input = extract_claude_input_from_capture(capture);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn claude_capture_extracts_typed_input_for_restore() {
+        let capture = r#"
+────────────────────────────────────────────────────────────────
+❯ fix the scheduler restore bug
+────────────────────────────────────────────────────────────────
+  ? for shortcuts
+"#;
+
+        let input = extract_claude_input_from_capture(capture);
+
+        assert_eq!(input, "fix the scheduler restore bug");
+        assert!(pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn claude_capture_keeps_three_char_stub_trivial() {
+        let capture = r#"
+────────────────────────────────────────────────────────────────
+❯ abc
+────────────────────────────────────────────────────────────────
+"#;
+
+        let input = extract_claude_input_from_capture(capture);
+
+        assert_eq!(input, "abc");
+        assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn codex_capture_extracts_typed_input_for_restore() {
+        let capture = r#"
+╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.133.0)                     │
+╰────────────────────────────────────────────────╯
+
+› Improve documentation in @filename
+
+  gpt-5.5 medium · ~/Documents/Cal/research/omar
+
+› hello world
+
+  gpt-5.5 medium · ~/Documents/Cal/research/omar
+"#;
+
+        let input = extract_prefixed_input_from_capture(capture, "›", is_codex_input_chrome);
+
+        assert_eq!(input, "hello world");
+        assert!(pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn codex_idle_capture_ignores_placeholder() {
+        let capture = r#"
+╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.133.0)                     │
+╰────────────────────────────────────────────────╯
+
+› Improve documentation in @filename
+
+  gpt-5.5 medium · ~/Documents/Cal/research/omar
+"#;
+
+        let input = extract_prefixed_input_from_capture(capture, "›", is_codex_input_chrome);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn cursor_capture_extracts_typed_input_for_restore() {
+        let capture = r#"
+  Cursor Agent
+  v2026.05.24-dda726e
+
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  → hello world
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  Composer 2.5 Fast                                                   Auto-run
+"#;
+
+        let input = extract_prefixed_input_from_capture(capture, "→", |_| false);
+
+        assert_eq!(input, "hello world");
+        assert!(pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn gemini_capture_extracts_typed_input_for_restore() {
+        let capture = r#"
+ ▝▜▄     Gemini CLI v0.40.1
+
+────────────────────────────────────────────────────────────────────────────────
+ YOLO Ctrl+Y                                                      2 MCP servers
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+ * hello world
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+"#;
+
+        let input = extract_prefixed_input_from_capture(capture, "*", |_| false);
+
+        assert_eq!(input, "hello world");
+        assert!(pane_input_should_restore(&input));
     }
 
     // ── Popup-defer decision (pure helper) ──
