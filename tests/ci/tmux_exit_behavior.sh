@@ -28,7 +28,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$home_dir/.omar"
+mkdir -p \
+  "$home_dir/.omar/ea/0/status" \
+  "$home_dir/.omar/mcp/ea-0" \
+  "$home_dir/.omar/slack_outbox" \
+  "$home_dir/.omar/logs/panics"
+
 cat >"$home_dir/.omar/config.toml" <<'EOF'
 [dashboard]
 refresh_interval = 1
@@ -38,6 +43,25 @@ session_prefix = "omar-agent-"
 default_command = "bash"
 default_workdir = "."
 EOF
+
+cat >"$home_dir/.omar/eas.json" <<'EOF'
+[
+  {
+    "id": 0,
+    "name": "OldSessionName",
+    "description": null,
+    "created_at": 1
+  }
+]
+EOF
+printf '0' >"$home_dir/.omar/active_ea"
+printf '1' >"$home_dir/.omar/ea_next_id"
+printf '[]' >"$home_dir/.omar/scheduled_events.json"
+printf 'keep task\n' >"$home_dir/.omar/ea/0/tasks.md"
+printf 'keep action log\n' >"$home_dir/.omar/ea/0/action_log.jsonl"
+printf 'keep manager notes\n' >"$home_dir/.omar/manager_notes_ea0.md"
+printf 'keep slack\n' >"$home_dir/.omar/slack_outbox/keep"
+printf 'keep panic\n' >"$home_dir/.omar/logs/panics/keep.log"
 
 tmux_cmd() {
   HOME="$home_dir" OMAR_TMUX_SERVER="$server" tmux -L "$server" "$@"
@@ -62,15 +86,16 @@ tmux -L "$server" new-session -d -s omar-dashboard \
 wait_for_session omar-dashboard
 wait_for_session omar-agent-ea-0
 
-python3 - "$server" <<'PY'
+python3 - "$server" "$home_dir" <<'PY'
 import os
-import pty
-import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 server = sys.argv[1]
+home_dir = Path(sys.argv[2])
+omar_dir = home_dir / ".omar"
 
 
 def tmux(*args):
@@ -98,11 +123,6 @@ def sessions():
         name, attached, command = parts
         result[name] = {"attached": attached == "1", "command": command}
     return result
-
-
-def session_attached(name):
-    session = sessions().get(name)
-    return bool(session and session["attached"])
 
 
 def session_exists(name):
@@ -137,76 +157,110 @@ def fail(message):
     sys.exit(1)
 
 
-def open_dashboard():
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.environ.setdefault("TERM", "xterm-256color")
-        os.execvp("tmux", ["tmux", "-L", server, "attach-session", "-t", "omar-dashboard"])
-    return pid, fd
+def send_keys(*keys):
+    result = tmux("send-keys", "-t", "omar-dashboard:0.0", *keys)
+    if result.returncode != 0:
+        fail(f"Failed to send keys {keys}: {result.stderr}")
 
 
-def close_dashboard(pid, fd):
-    try:
-        os.kill(pid, signal.SIGHUP)
-    except ProcessLookupError:
-        pass
-    try:
-        os.close(fd)
-    except OSError:
-        pass
-    try:
-        os.waitpid(pid, os.WNOHANG)
-    except OSError:
-        pass
+def assert_exists(path):
+    if not (omar_dir / path).exists():
+        fail(f"Expected path to exist: {path}")
 
 
-def wait_for_attached(session, timeout=5.0):
-    if not wait_for(lambda: session_attached(session), timeout=timeout):
-        fail(f"Session was not attached when expected: {session}")
+def assert_missing(path):
+    if (omar_dir / path).exists():
+        fail(f"Expected path to be removed: {path}")
 
 
-def wait_for_detached(session, timeout=5.0):
-    if not wait_for(
-        lambda: session_exists(session) and not session_attached(session),
-        timeout=timeout,
-    ):
-        fail(f"Session did not detach within timeout: {session}")
+def assert_runtime_state_present(label):
+    for path in [
+        "config.toml",
+        "eas.json",
+        "active_ea",
+        "ea_next_id",
+        "scheduled_events.json",
+        "ea/0/tasks.md",
+        "ea/0/action_log.jsonl",
+        "manager_notes_ea0.md",
+        "mcp/ea-0",
+        "slack_outbox/keep",
+        "logs/panics/keep.log",
+    ]:
+        assert_exists(path)
+    print(f"PASS: {label} preserves persisted runtime state")
 
 
 def test_detach_key():
-    pid, fd = open_dashboard()
-    try:
-        wait_for_attached("omar-dashboard")
-        os.write(fd, b"z")
+    send_keys("z")
+    time.sleep(0.2)
+    if not session_exists("omar-dashboard"):
+        fail("Dashboard session disappeared after detach; expected session to persist")
 
-        wait_for_detached("omar-dashboard")
-        if not session_exists("omar-dashboard"):
-            fail("Dashboard session disappeared after detach; expected session to persist")
-
-        print("PASS: z detaches without terminating dashboard session")
-    finally:
-        close_dashboard(pid, fd)
+    assert_runtime_state_present("z")
+    print("PASS: z preserves dashboard session and runtime state")
 
 
-def test_quit_key_kills_all_sessions():
-    pid, fd = open_dashboard()
-    try:
-        wait_for_attached("omar-dashboard")
-        os.write(fd, b"Q")
-        time.sleep(0.1)
-        os.write(fd, b"y")
+def test_ctrl_c_is_ignored():
+    send_keys("C-c")
+    time.sleep(0.2)
 
-        if not wait_for(lambda: not session_exists("omar-dashboard"), timeout=10.0):
-            fail("Dashboard session did not terminate after Q+y")
+    if not session_exists("omar-dashboard"):
+        fail("Dashboard session disappeared after Ctrl+C; expected Ctrl+C to be ignored")
+    if not session_exists("omar-agent-ea-0"):
+        fail("EA manager session disappeared after Ctrl+C; expected Ctrl+C to be ignored")
 
-        if has_prefix_session("omar-agent-"):
-            fail("OMAR agent sessions still exist after Q+y; expected cleanup on quit")
+    assert_runtime_state_present("Ctrl+C")
+    print("PASS: Ctrl+C is ignored")
 
-        print("PASS: Q+y exits dashboard and kills OMAR sessions")
-    finally:
-        close_dashboard(pid, fd)
+
+def test_quit_key_kills_all_sessions_and_resets_runtime_state():
+    send_keys("Q")
+    time.sleep(0.1)
+    send_keys("y")
+
+    if not wait_for(lambda: not session_exists("omar-dashboard"), timeout=10.0):
+        fail("Dashboard session did not terminate after Q+y")
+
+    if has_prefix_session("omar-agent-"):
+        fail("OMAR agent sessions still exist after Q+y; expected cleanup on quit")
+
+    for path in [
+        "eas.json",
+        "active_ea",
+        "ea_next_id",
+        "scheduled_events.json",
+        "ea",
+        "mcp",
+        "manager_notes_ea0.md",
+    ]:
+        assert_missing(path)
+
+    for path in ["config.toml", "slack_outbox/keep", "logs/panics/keep.log"]:
+        assert_exists(path)
+
+    action_logs = sorted((omar_dir / "logs" / "action_logs").iterdir())
+    if len(action_logs) != 1:
+        fail(f"Expected one archived action log, found {len(action_logs)}")
+    action_name = action_logs[0].name
+    if not (action_name.startswith("ea-0-") and action_name.endswith(".jsonl")):
+        fail(f"Unexpected archived action log name: {action_name}")
+    if action_logs[0].read_text() != "keep action log\n":
+        fail("Archived action log content did not match")
+
+    manager_notes = sorted((omar_dir / "logs" / "manager_notes").iterdir())
+    if len(manager_notes) != 1:
+        fail(f"Expected one archived manager notes file, found {len(manager_notes)}")
+    notes_name = manager_notes[0].name
+    if not (notes_name.startswith("manager_notes_ea0-") and notes_name.endswith(".md")):
+        fail(f"Unexpected archived manager notes name: {notes_name}")
+    if manager_notes[0].read_text() != "keep manager notes\n":
+        fail("Archived manager notes content did not match")
+
+    print("PASS: Q+y exits dashboard, kills OMAR sessions, and resets runtime state")
 
 
 test_detach_key()
-test_quit_key_kills_all_sessions()
+test_ctrl_c_is_ignored()
+test_quit_key_kills_all_sessions_and_resets_runtime_state()
 PY

@@ -1032,7 +1032,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         continue;
                     }
 
-                    // Handle confirmation dialog (kill, quit, or delete EA)
+                    // Handle confirmation dialog (kill, quit, reset quit, or delete EA)
                     if let Some(action) = app.pending_confirm {
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') => match action {
@@ -1045,6 +1045,11 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     }
                                 }
                                 app::ConfirmAction::Quit => {
+                                    app.reset_on_quit = false;
+                                    app.should_quit = true;
+                                }
+                                app::ConfirmAction::ResetQuit => {
+                                    app.reset_on_quit = true;
                                     app.should_quit = true;
                                 }
                                 app::ConfirmAction::DeleteEa => {
@@ -1172,7 +1177,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     // Normal key handling
                     match key.code {
                         KeyCode::Char('Q') => {
-                            app.pending_confirm = Some(app::ConfirmAction::Quit);
+                            app.pending_confirm = Some(app::ConfirmAction::ResetQuit);
                         }
                         KeyCode::Esc => {
                             app.drill_up();
@@ -1220,9 +1225,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('[') => {
                             app.cycle_previous_ea();
-                        }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.pending_confirm = Some(app::ConfirmAction::Quit);
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
                             if app.sidebar_focused {
@@ -1471,19 +1473,15 @@ async fn run_dashboard(config: Config) -> Result<()> {
         }
 
         // Check quit flag
-        let should_quit = {
+        let quit_request = {
             let app = shared_app.lock().await;
             if app.should_quit {
-                Some(app.omar_dir.clone())
+                Some((app.omar_dir.clone(), app.reset_on_quit))
             } else {
                 None
             }
         };
-        if let Some(omar_dir) = should_quit {
-            // Compact EA ID counter on clean quit so next session starts from a compact point
-            if let Err(e) = ea::compact_id_counter(&omar_dir) {
-                eprintln!("compact_id_counter failed: {}", e);
-            }
+        if quit_request.is_some() {
             break;
         }
     }
@@ -1521,12 +1519,215 @@ async fn run_dashboard(config: Config) -> Result<()> {
         kill_child_gracefully(child, Duration::from_secs(3));
     }
 
+    let reset_on_quit = {
+        let app = shared_app.lock().await;
+        app.reset_on_quit
+    };
+    if reset_on_quit {
+        let omar_dir = {
+            let app = shared_app.lock().await;
+            app.omar_dir.clone()
+        };
+        purge_persisted_runtime_state_on_quit(&omar_dir)?;
+    }
+
     Ok(())
+}
+
+fn purge_persisted_runtime_state_on_quit(omar_dir: &std::path::Path) -> io::Result<()> {
+    archive_action_logs(omar_dir)?;
+    archive_manager_notes(omar_dir)?;
+
+    for file in [
+        "eas.json",
+        "eas.json.tmp",
+        "active_ea",
+        "ea_next_id",
+        "scheduled_events.json",
+        "scheduled_events.lock",
+        "scheduled_events.tmp",
+    ] {
+        remove_file_if_exists(&omar_dir.join(file))?;
+    }
+
+    remove_dir_if_exists(&omar_dir.join("ea"))?;
+    remove_dir_if_exists(&omar_dir.join("mcp"))?;
+
+    Ok(())
+}
+
+fn archive_action_logs(omar_dir: &std::path::Path) -> io::Result<()> {
+    let ea_dir = omar_dir.join("ea");
+    if !ea_dir.exists() {
+        return Ok(());
+    }
+
+    let archive_dir = omar_dir.join("logs").join("action_logs");
+    std::fs::create_dir_all(&archive_dir)?;
+
+    for entry in std::fs::read_dir(ea_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let ea_id = entry.file_name().to_string_lossy().into_owned();
+        let source = entry.path().join("action_log.jsonl");
+        if !source.exists() {
+            continue;
+        }
+
+        let archive_path =
+            unique_archive_path(&archive_dir, &format!("ea-{}-{}", ea_id, now_ns()), "jsonl");
+        std::fs::rename(source, archive_path)?;
+    }
+
+    Ok(())
+}
+
+fn archive_manager_notes(omar_dir: &std::path::Path) -> io::Result<()> {
+    let archive_dir = omar_dir.join("logs").join("manager_notes");
+    std::fs::create_dir_all(&archive_dir)?;
+
+    let prefix = "manager_notes_ea";
+    for entry in std::fs::read_dir(omar_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if !file_name.starts_with(prefix) || !file_name.ends_with(".md") {
+            continue;
+        }
+
+        let ea_id = file_name
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(".md"))
+            .unwrap_or("unknown");
+        let archive_path = unique_archive_path(
+            &archive_dir,
+            &format!("manager_notes_ea{}-{}", ea_id, now_ns()),
+            "md",
+        );
+        std::fs::rename(entry.path(), archive_path)?;
+    }
+
+    Ok(())
+}
+
+fn unique_archive_path(dir: &std::path::Path, stem: &str, extension: &str) -> PathBuf {
+    let mut candidate = dir.join(format!("{}.{}", stem, extension));
+    let mut attempt = 1;
+    while candidate.exists() {
+        candidate = dir.join(format!("{}-{}.{}", stem, attempt, extension));
+        attempt += 1;
+    }
+    candidate
+}
+
+fn remove_file_if_exists(path: &std::path::Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn remove_dir_if_exists(path: &std::path::Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purge_persisted_runtime_state_archives_logs_and_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let omar_dir = dir.path();
+
+        std::fs::create_dir_all(omar_dir.join("ea/7")).unwrap();
+        std::fs::create_dir_all(omar_dir.join("mcp")).unwrap();
+        std::fs::create_dir_all(omar_dir.join("slack_outbox")).unwrap();
+        std::fs::create_dir_all(omar_dir.join("logs/panics")).unwrap();
+
+        std::fs::write(omar_dir.join("config.toml"), "keep config").unwrap();
+        std::fs::write(omar_dir.join("eas.json"), "wipe registry").unwrap();
+        std::fs::write(omar_dir.join("eas.json.tmp"), "wipe registry tmp").unwrap();
+        std::fs::write(omar_dir.join("active_ea"), "7").unwrap();
+        std::fs::write(omar_dir.join("ea_next_id"), "8").unwrap();
+        std::fs::write(omar_dir.join("scheduled_events.json"), "wipe events").unwrap();
+        std::fs::write(omar_dir.join("scheduled_events.lock"), "wipe lock").unwrap();
+        std::fs::write(omar_dir.join("scheduled_events.tmp"), "wipe tmp").unwrap();
+        std::fs::write(omar_dir.join("ea/7/action_log.jsonl"), "keep action\n").unwrap();
+        std::fs::write(omar_dir.join("ea/7/tasks.md"), "wipe task").unwrap();
+        std::fs::write(omar_dir.join("manager_notes_ea7.md"), "keep notes\n").unwrap();
+        std::fs::write(omar_dir.join("mcp/state.json"), "wipe mcp").unwrap();
+        std::fs::write(omar_dir.join("slack_outbox/keep"), "keep slack").unwrap();
+        std::fs::write(omar_dir.join("logs/panics/keep.log"), "keep panic").unwrap();
+
+        purge_persisted_runtime_state_on_quit(omar_dir).unwrap();
+
+        for wiped in [
+            "eas.json",
+            "eas.json.tmp",
+            "active_ea",
+            "ea_next_id",
+            "scheduled_events.json",
+            "scheduled_events.lock",
+            "scheduled_events.tmp",
+            "ea",
+            "mcp",
+            "manager_notes_ea7.md",
+        ] {
+            assert!(
+                !omar_dir.join(wiped).exists(),
+                "{wiped} should be removed by Q reset"
+            );
+        }
+
+        for kept in ["config.toml", "slack_outbox/keep", "logs/panics/keep.log"] {
+            assert!(
+                omar_dir.join(kept).exists(),
+                "{kept} should survive Q reset"
+            );
+        }
+
+        let action_logs: Vec<_> = std::fs::read_dir(omar_dir.join("logs/action_logs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(action_logs.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&action_logs[0]).unwrap(),
+            "keep action\n"
+        );
+        assert!(action_logs[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("ea-7-"));
+
+        let manager_notes: Vec<_> = std::fs::read_dir(omar_dir.join("logs/manager_notes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(manager_notes.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&manager_notes[0]).unwrap(),
+            "keep notes\n"
+        );
+        assert!(manager_notes[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("manager_notes_ea7-"));
+    }
 
     /// Regression: `extended-keys always` forces tmux to emit modify-other-keys
     /// sequences to every client, including omar's dashboard, which doesn't
