@@ -826,7 +826,7 @@ mod tests {
         // from an idle Claude Code v2.1.136 pane.
         const IDLE_CLAUDE_CAPTURE: &str = r#" ▐▛███▜▌   Claude Code v2.1.136
 ▝▜█████▛▘  Opus 4.7 with low effort · Claude Max
-  ▘▘ ▝▝    ~/Documents/research/omar
+  ▘▘ ▝▝    /workspace/omar
 
 ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯ Try "refactor dashboard.rs"
