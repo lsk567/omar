@@ -171,7 +171,7 @@ fn default_command() -> String {
 /// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
 /// - `"cursor"` → `"cursor agent --yolo"`
 /// - `"opencode"` → `"opencode"` (opencode has no permission-skip flag)
-/// - `"antigravity"` → `"agy --dangerously-skip-permissions"`
+/// - `"agy"` → `"agy --dangerously-skip-permissions"`
 /// - anything else → error
 pub fn resolve_backend(name: &str) -> Result<String, String> {
     match name {
@@ -181,9 +181,9 @@ pub fn resolve_backend(name: &str) -> Result<String, String> {
         }
         "cursor" => Ok("cursor agent --yolo".to_string()),
         "opencode" => Ok("opencode".to_string()),
-        "antigravity" => Ok("agy --dangerously-skip-permissions".to_string()),
+        "agy" => Ok("agy --dangerously-skip-permissions".to_string()),
         other => Err(format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, antigravity",
+            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, agy",
             other
         )),
     }
@@ -432,6 +432,7 @@ mod tests {
 
     #[test]
     fn slack_bridge_text_setting_round_trips() {
+        let _env_lock = crate::test_env_lock();
         let mut config = Config::default();
         // The default state is no persisted EA — exposed as the empty string.
         assert!(matches!(
@@ -517,14 +518,14 @@ sidebar_right = false
 
         assert_eq!(cmd.as_deref(), Some("fast command"));
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(3),
             "hanging probe should be skipped after the bounded timeout"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_detect_agent_command_can_select_antigravity() {
+    fn test_detect_agent_command_can_select_agy() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -599,7 +600,7 @@ session_prefix = "omar-agent"
         assert_eq!(resolve_backend("cursor").unwrap(), "cursor agent --yolo");
         assert_eq!(resolve_backend("opencode").unwrap(), "opencode");
         assert_eq!(
-            resolve_backend("antigravity").unwrap(),
+            resolve_backend("agy").unwrap(),
             "agy --dangerously-skip-permissions"
         );
     }

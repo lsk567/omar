@@ -180,7 +180,7 @@ pub fn load_memory_from(state_dir: &Path) -> String {
 // the EA prompt template (~5 KB) and framing ≈ 117 KB worst case. That
 // leaves ~11 KB headroom under the 128 KB MAX_ARG_STRLEN limit for the
 // surrounding shell expansion (`developer_instructions='''…'''`,
-// `--system-prompt "…"`, etc.) used by codex / antigravity / opencode
+// `--system-prompt "…"`, etc.) used by codex / agy / opencode
 // managers and by every worker spawn. The EA prompt teaches managers to keep notes
 // well under this hard cap (soft target 16 KB), so truncation should be
 // a rare safety backstop rather than a routine occurrence.

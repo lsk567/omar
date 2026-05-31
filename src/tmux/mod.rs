@@ -30,7 +30,7 @@ pub fn backend_readiness_markers(backend: &str) -> &'static [&'static str] {
         // `agy` is not available in CI/local discovery here, so avoid
         // overfitting to an unverified banner and let delivery use the
         // existing stable-pane fallback.
-        "antigravity" => &[],
+        "agy" => &[],
         "claude" => &["Claude Code", "❯"],
         "opencode" => &["tab agents", "ctrl+p commands"],
         _ => &[],

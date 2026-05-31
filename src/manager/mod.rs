@@ -5,8 +5,6 @@ pub mod protocol;
 use anyhow::Result;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -125,13 +123,12 @@ fn current_tmux_server() -> Option<String> {
 
 #[cfg(test)]
 fn global_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    crate::test_env_lock()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
-    Antigravity,
+    Agy,
     Claude,
     Codex,
     Cursor,
@@ -141,7 +138,7 @@ enum BackendKind {
 impl BackendKind {
     fn canonical_name(self) -> &'static str {
         match self {
-            BackendKind::Antigravity => "antigravity",
+            BackendKind::Agy => "agy",
             BackendKind::Claude => "claude",
             BackendKind::Codex => "codex",
             BackendKind::Cursor => "cursor",
@@ -158,7 +155,7 @@ fn detect_backend_token(token: &str) -> Option<BackendKind> {
         .unwrap_or(token);
 
     match executable {
-        "agy" => Some(BackendKind::Antigravity),
+        "agy" => Some(BackendKind::Agy),
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
         "cursor" => Some(BackendKind::Cursor),
@@ -171,6 +168,17 @@ fn detect_backend(base_command: &str) -> Option<BackendKind> {
     base_command
         .split_whitespace()
         .find_map(detect_backend_token)
+}
+
+pub fn command_backend_name(command: &str) -> Option<&'static str> {
+    detect_backend(command).map(BackendKind::canonical_name)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerEnsureResult {
+    AlreadyRunning,
+    Started,
+    ReplacedBackend,
 }
 
 fn ensure_codex_runtime_flags(base_command: &str) -> String {
@@ -460,80 +468,182 @@ fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
 }
 
 fn ensure_antigravity_mcp_config(context: &McpLaunchContext) -> Option<()> {
-    // Antigravity CLI discovers global MCP servers from its own sparse config.
-    // Keep OMAR's entry EA-scoped and preserve all user servers.
+    // Antigravity CLI loads MCP servers from native plugin bundles. Keep OMAR's
+    // plugin EA-scoped so lifecycle and cleanup do not touch user plugins.
+    // `agy plugin install` stages active plugins under ~/.gemini/config/plugins
+    // and records them in ~/.gemini/config/import_manifest.json.
     let server_exe = std::env::current_exe().ok()?;
     let context_file = materialize_mcp_context_file(context)?;
     let home = std::env::var("HOME").ok()?;
-    let config_dir = PathBuf::from(home).join(".gemini").join("antigravity-cli");
-    std::fs::create_dir_all(&config_dir).ok()?;
-    let path = config_dir.join("mcp_config.json");
+    let config_dir = PathBuf::from(home).join(".gemini").join("config");
+    let plugins_dir = config_dir.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).ok()?;
+    let key = format!("omar-ea-{}", context.ea_id);
+    let plugin_dir = plugins_dir.join(&key);
+    std::fs::create_dir_all(&plugin_dir).ok()?;
 
-    let mut root = match std::fs::read_to_string(&path)
+    if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == plugin_dir {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("omar-ea-") {
+                    let ctx_path = path
+                        .join("mcp_config.json")
+                        .canonicalize()
+                        .ok()
+                        .and_then(|config| std::fs::read_to_string(config).ok())
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| {
+                            v.get("mcpServers")
+                                .and_then(|servers| servers.get(name))
+                                .and_then(|server| server.get("args"))
+                                .and_then(|args| args.as_array())
+                                .and_then(|args| args.last())
+                                .and_then(|arg| arg.as_str())
+                                .map(PathBuf::from)
+                        });
+                    if ctx_path.map(|p| !p.exists()).unwrap_or(false) {
+                        let _ = std::fs::remove_dir_all(path);
+                    }
+                }
+            }
+        }
+    }
+
+    let plugin = serde_json::json!({
+        "name": key.clone(),
+        "version": "0.0.0",
+        "description": "OMAR MCP server registration for this Executive Assistant"
+    });
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        key.clone(),
+        serde_json::json!({
+        "command": server_exe.display().to_string(),
+        "args": ["mcp-server", "--context-file", context_file.display().to_string()],
+        }),
+    );
+    let config = serde_json::json!({
+        "mcpServers": servers
+    });
+
+    let plugin_path = plugin_dir.join("plugin.json");
+    let config_path = plugin_dir.join("mcp_config.json");
+    let manifest_path = config_dir.join("import_manifest.json");
+    let plugin_payload = serde_json::to_vec_pretty(&plugin).ok()?;
+    let config_payload = serde_json::to_vec_pretty(&config).ok()?;
+    write_private_file(&plugin_path, &plugin_payload).ok()?;
+    write_private_file(&config_path, &config_payload).ok()?;
+
+    let mut manifest = match std::fs::read_to_string(&manifest_path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
     {
         Some(v) if v.is_object() => v,
         _ => serde_json::json!({}),
     };
-
-    if !root
-        .get("mcpServers")
-        .map(|v| v.is_object())
-        .unwrap_or(false)
-    {
-        root["mcpServers"] = serde_json::json!({});
-    }
-
-    if let Some(servers) = root["mcpServers"].as_object_mut() {
-        let stale_keys: Vec<String> = servers
-            .iter()
-            .filter_map(|(k, v)| {
-                if k.starts_with("omar-ea-") {
-                    let ctx_path = v
-                        .get("args")
-                        .and_then(|a| a.as_array())
-                        .and_then(|a| a.last())
-                        .and_then(|p| p.as_str())
-                        .map(PathBuf::from);
-                    if let Some(p) = ctx_path {
-                        if !p.exists() {
-                            return Some(k.clone());
-                        }
-                    }
-                }
-                None
-            })
-            .collect();
-        for k in stale_keys {
-            servers.remove(&k);
+    let mut imports = manifest
+        .get("imports")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    imports.retain(|entry| {
+        let Some(name) = entry.get("name").and_then(|name| name.as_str()) else {
+            return true;
+        };
+        if name == key {
+            return false;
         }
-    }
-
-    let key = format!("omar-ea-{}", context.ea_id);
-    root["mcpServers"][&key] = serde_json::json!({
-        "command": server_exe.display().to_string(),
-        "args": ["mcp-server", "--context-file", context_file.display().to_string()],
+        if let Some(ea) = name.strip_prefix("omar-ea-") {
+            return plugins_dir.join(format!("omar-ea-{ea}")).exists();
+        }
+        true
     });
+    imports.push(serde_json::json!({
+        "name": key,
+        "source": "local-install",
+        "importedAt": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        "components": ["installed"],
+    }));
+    manifest["imports"] = serde_json::Value::Array(imports);
+    let manifest_payload = serde_json::to_vec_pretty(&manifest).ok()?;
+    write_private_file(&manifest_path, &manifest_payload).ok()?;
+    Some(())
+}
 
-    if let Ok(entries) = std::fs::read_dir(&config_dir) {
+fn antigravity_config_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".gemini").join("config"))
+}
+
+fn rewrite_antigravity_manifest_without<F>(keep_import: F) -> Result<()>
+where
+    F: Fn(&str) -> bool,
+{
+    let Some(config_dir) = antigravity_config_dir() else {
+        return Ok(());
+    };
+    let manifest_path = config_dir.join("import_manifest.json");
+    let Some(mut manifest) = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+    else {
+        return Ok(());
+    };
+    let Some(imports) = manifest.get("imports").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    let retained: Vec<_> = imports
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("name")
+                .and_then(|name| name.as_str())
+                .map(&keep_import)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    manifest["imports"] = serde_json::Value::Array(retained);
+    write_private_file(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
+    Ok(())
+}
+
+pub(crate) fn remove_omar_antigravity_mcp_config(ea_id: EaId) -> Result<()> {
+    let Some(config_dir) = antigravity_config_dir() else {
+        return Ok(());
+    };
+    let key = format!("omar-ea-{ea_id}");
+    let plugin_dir = config_dir.join("plugins").join(&key);
+    if plugin_dir.exists() {
+        std::fs::remove_dir_all(&plugin_dir)?;
+    }
+    rewrite_antigravity_manifest_without(|name| name != key)
+}
+
+pub(crate) fn remove_all_omar_antigravity_mcp_configs() -> Result<()> {
+    let Some(config_dir) = antigravity_config_dir() else {
+        return Ok(());
+    };
+    let plugins_dir = config_dir.join("plugins");
+    if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
         for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("mcp_config.json.omar-") && name.ends_with(".tmp") {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+            if entry
+                .file_name()
+                .to_str()
+                .map(|name| name.starts_with("omar-ea-"))
+                .unwrap_or(false)
+            {
+                std::fs::remove_dir_all(entry.path())?;
             }
         }
     }
-
-    let payload = serde_json::to_vec_pretty(&root).ok()?;
-    let tmp = config_dir.join(format!("mcp_config.json.omar-{}.tmp", Uuid::new_v4()));
-    std::fs::write(&tmp, &payload).ok()?;
-    if std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return None;
-    }
-    Some(())
+    rewrite_antigravity_manifest_without(|name| !name.starts_with("omar-ea-"))
 }
 
 /// Build a CLI command with system prompt loaded from a file via native flag.
@@ -545,8 +655,8 @@ fn ensure_antigravity_mcp_config(context: &McpLaunchContext) -> Option<()> {
 ///   - claude  → `--system-prompt "$(cat '<path>')"` plus native wake-tool denylist
 ///   - codex   → `-c "developer_instructions='''$(cat '<path>')'''"` plus scheduled-task disable
 ///   - cursor  → positional arg `"Load the <path> file and follow the instructions."`
-///   - antigravity → `-i "$(cat '<path>')"` with an EA-scoped MCP entry in
-///     `~/.gemini/antigravity-cli/mcp_config.json`
+///   - agy → `-i "$(cat '<path>')"` with an EA-scoped MCP entry in
+///     `~/.gemini/config/plugins/omar-ea-<id>/mcp_config.json`
 ///   - opencode → MCP env only (no `--prompt`); the agent prompt is delivered
 ///     after spawn via tmux because opencode's `--prompt` is treated as the
 ///     first **user** message (not system role) and the LLM responds by
@@ -578,7 +688,7 @@ pub fn build_agent_command(
     // session can still come up and the human operator sees the problem
     // via a degraded but visible agent, rather than a launch failure.
     match detect_backend(&base_command) {
-        Some(BackendKind::Antigravity) => {
+        Some(BackendKind::Agy) => {
             let _ = ensure_antigravity_mcp_config(mcp_context);
             format!("TERM=xterm-256color {} -i \"{}\"", base_command, shell_expr)
         }
@@ -646,7 +756,7 @@ pub fn build_agent_command(
 ///
 /// 1. **claude** uses the native `--system-prompt-file <path>` flag, so
 ///    the prompt never touches argv at all and is unbounded.
-/// 2. **codex / antigravity / opencode** keep the legacy inline shell-expansion
+/// 2. **codex / agy / opencode** keep the legacy inline shell-expansion
 ///    path because their auto-loaded prompt/config files are anchored at the
 ///    agent's *working root*, not at the process cwd. Setting cwd = a per-EA
 ///    workspace dir would either silently load the wrong project context (the
@@ -727,7 +837,7 @@ pub fn build_ea_command(
             (cmd, None)
         }
         _ => {
-            // Inline path for codex/antigravity/opencode/cursor/unknown. The
+            // Inline path for codex/agy/opencode/cursor/unknown. The
             // truncation cap in memory.rs keeps the rendered prompt under
             // `MAX_ARG_STRLEN` even when notes/memory grow large.
             let cmd = build_agent_command(
@@ -752,20 +862,72 @@ pub fn start_manager(
     options: &ManagerRuntimeOptions,
 ) -> Result<()> {
     let start = Instant::now();
-    let session = ea::ea_manager_session(ea_id, base_prefix);
+    let (session, result) = ensure_manager_session(
+        client,
+        command,
+        ea_id,
+        ea_name,
+        omar_dir,
+        base_prefix,
+        options,
+    )?;
 
-    // Check if manager already exists
+    if result == ManagerEnsureResult::AlreadyRunning {
+        println!("Manager session already exists. Attaching...");
+    } else {
+        metrics::record_manager_start(ea_id, &session, true, start.elapsed().as_millis() as u64);
+        println!("Attaching to manager session...");
+    }
+    client.attach_session(&session)?;
+
+    Ok(())
+}
+
+/// Ensure the manager agent session for a specific EA exists, without
+/// attaching to it. If the existing manager is live but running a different
+/// known backend than requested, replace only that manager session.
+pub fn ensure_manager_session(
+    client: &TmuxClient,
+    command: &str,
+    ea_id: EaId,
+    ea_name: &str,
+    omar_dir: &Path,
+    base_prefix: &str,
+    options: &ManagerRuntimeOptions,
+) -> Result<(String, ManagerEnsureResult)> {
+    let session = ea::ea_manager_session(ea_id, base_prefix);
+    let mut result = ManagerEnsureResult::Started;
+
     if client.has_session(&session)? {
         if client.session_has_live_pane(&session)? {
-            println!("Manager session already exists. Attaching...");
-            client.attach_session(&session)?;
-            return Ok(());
+            let requested_backend = command_backend_name(command);
+            let existing_backend = client
+                .get_pane_command(&session)
+                .ok()
+                .and_then(|pane_command| command_backend_name(&pane_command))
+                .or_else(|| {
+                    client
+                        .get_pane_process_command(&session)
+                        .ok()
+                        .and_then(|process_command| command_backend_name(&process_command))
+                });
+
+            if requested_backend.is_some()
+                && existing_backend.is_some()
+                && requested_backend != existing_backend
+            {
+                client.kill_session(&session)?;
+                result = ManagerEnsureResult::ReplacedBackend;
+            } else {
+                return Ok((session, ManagerEnsureResult::AlreadyRunning));
+            }
+        } else {
+            client.kill_session(&session)?;
         }
-        client.kill_session(&session)?;
     }
 
     // Build command with EA system prompt + memory baked in. For backends
-    // whose prompt is now loaded from a workspace file (codex/antigravity/opencode)
+    // whose prompt is now loaded from a workspace file (codex/agy/opencode)
     // the build also returns the cwd that backend must be launched in for
     // auto-discovery to work.
     let (cmd, workspace_cwd) = build_ea_command(
@@ -794,13 +956,7 @@ pub fn start_manager(
 
     // Give it time to start
     thread::sleep(Duration::from_secs(2));
-    metrics::record_manager_start(ea_id, &session, true, start.elapsed().as_millis() as u64);
-
-    // Attach to the session
-    println!("Attaching to manager session...");
-    client.attach_session(&session)?;
-
-    Ok(())
+    Ok((session, result))
 }
 
 /// Run the manager in orchestration mode (interactive)
@@ -1307,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_agent_command_antigravity() {
+    fn test_build_agent_command_agy() {
         let _env_lock = global_home_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let _home = EnvVarGuard::set("HOME", dir.path());
@@ -1320,11 +1476,22 @@ mod tests {
         assert!(cmd.contains(
             "TERM=xterm-256color agy --dangerously-skip-permissions -i \"$(cat '/tmp/prompts/ea.md')\""
         ));
-        let config = dir.path().join(".gemini/antigravity-cli/mcp_config.json");
+        let plugin = dir
+            .path()
+            .join(".gemini/config/plugins/omar-ea-0/plugin.json");
+        let plugin = std::fs::read_to_string(plugin).unwrap();
+        assert!(plugin.contains("\"omar-ea-0\""));
+        let config = dir
+            .path()
+            .join(".gemini/config/plugins/omar-ea-0/mcp_config.json");
         let config = std::fs::read_to_string(config).unwrap();
         assert!(config.contains("\"omar-ea-0\""));
         assert!(config.contains("\"mcp-server\""));
         assert!(config.contains("\"--context-file\""));
+        let manifest = dir.path().join(".gemini/config/import_manifest.json");
+        let manifest = std::fs::read_to_string(manifest).unwrap();
+        assert!(manifest.contains("\"omar-ea-0\""));
+        assert!(manifest.contains("\"local-install\""));
         assert!(
             !cmd.contains("--allowed-mcp-server-names"),
             "agy does not advertise MCP config CLI flags"
@@ -1333,6 +1500,86 @@ mod tests {
             !cmd.contains("--policy"),
             "agy does not advertise policy CLI flags"
         );
+    }
+
+    #[test]
+    fn command_backend_name_detects_executable_tokens() {
+        assert_eq!(
+            command_backend_name("agy --dangerously-skip-permissions"),
+            Some("agy")
+        );
+        assert_eq!(
+            command_backend_name("env FOO=bar /opt/bin/codex --no-alt-screen"),
+            Some("codex")
+        );
+        assert_eq!(command_backend_name("bash -lc 'echo hi'"), None);
+    }
+
+    #[test]
+    fn test_remove_omar_antigravity_mcp_config_updates_plugin_and_manifest() {
+        let _env_lock = global_home_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let plugins_dir = dir.path().join(".gemini/config/plugins");
+        std::fs::create_dir_all(plugins_dir.join("omar-ea-7")).unwrap();
+        std::fs::create_dir_all(plugins_dir.join("other-plugin")).unwrap();
+        let manifest_path = dir.path().join(".gemini/config/import_manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "imports": [
+                    {"name": "omar-ea-7", "source": "local-install"},
+                    {"name": "other-plugin", "source": "local-install"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        remove_omar_antigravity_mcp_config(7).unwrap();
+
+        assert!(!plugins_dir.join("omar-ea-7").exists());
+        assert!(plugins_dir.join("other-plugin").exists());
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        let imports = manifest["imports"].as_array().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0]["name"], "other-plugin");
+    }
+
+    #[test]
+    fn test_remove_all_omar_antigravity_mcp_configs_preserves_user_plugins() {
+        let _env_lock = global_home_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let plugins_dir = dir.path().join(".gemini/config/plugins");
+        std::fs::create_dir_all(plugins_dir.join("omar-ea-1")).unwrap();
+        std::fs::create_dir_all(plugins_dir.join("omar-ea-2")).unwrap();
+        std::fs::create_dir_all(plugins_dir.join("user-plugin")).unwrap();
+        let manifest_path = dir.path().join(".gemini/config/import_manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "imports": [
+                    {"name": "omar-ea-1", "source": "local-install"},
+                    {"name": "omar-ea-2", "source": "local-install"},
+                    {"name": "user-plugin", "source": "local-install"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        remove_all_omar_antigravity_mcp_configs().unwrap();
+
+        assert!(!plugins_dir.join("omar-ea-1").exists());
+        assert!(!plugins_dir.join("omar-ea-2").exists());
+        assert!(plugins_dir.join("user-plugin").exists());
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        let imports = manifest["imports"].as_array().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0]["name"], "user-plugin");
     }
 
     #[test]

@@ -300,6 +300,29 @@ impl TmuxClient {
         Ok(output.trim().to_string())
     }
 
+    /// Get the pane process id.
+    pub fn get_pane_pid(&self, target: &str) -> Result<u32> {
+        let target = exact_pane_target(target);
+        let output = self.run(&["display-message", "-t", &target, "-p", "#{pane_pid}"])?;
+        output.trim().parse().context("Failed to parse pane pid")
+    }
+
+    /// Get the full command line for the process running in a pane.
+    pub fn get_pane_process_command(&self, target: &str) -> Result<String> {
+        let pid = self.get_pane_pid(target)?;
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .context("Failed to execute ps")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "ps failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     /// Get the activity timestamp of a pane.
     ///
     /// Uses `#{window_activity}` — the per-pane `#{pane_activity}` format is
@@ -335,7 +358,7 @@ impl TmuxClient {
     pub fn send_keys_literal(&self, target: &str, text: &str) -> Result<()> {
         let target = exact_pane_target(target);
         if text.len() < Self::LARGE_PAYLOAD_THRESHOLD {
-            self.run(&["send-keys", "-t", &target, "-l", text])?;
+            self.run(&["send-keys", "-t", &target, "-l", "--", text])?;
         } else {
             // Write to a temp file, load into tmux buffer, paste, then clean up.
             // This avoids passing large text as a command-line argument.

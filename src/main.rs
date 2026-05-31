@@ -41,6 +41,14 @@ use config::Config;
 use event::{AppEvent, EventHandler};
 use tmux::{tmux_command, TmuxClient};
 
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Tmux session name used when omar auto-launches into tmux
 pub const DASHBOARD_SESSION: &str = "omar-dashboard";
 
@@ -56,7 +64,7 @@ struct Cli {
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Agent backend to use: claude, codex, cursor, opencode, antigravity
+    /// Agent backend to use: claude, codex, cursor, opencode, agy
     #[arg(short, long)]
     agent: Option<String>,
 
@@ -213,13 +221,16 @@ async fn async_main() -> Result<()> {
     }
     metrics::configure(config.metrics.spawn_metrics_enabled);
     let omar_dir = omar_dir();
+    let defer_active_ea_save = cli.command.is_none() && cli.agent.is_some();
 
-    if let Some(ref selector) = cli.ea {
-        let (ea_info, created) = ea::resolve_or_create_ea_selector(&omar_dir, Some(selector))?;
-        if created {
-            eprintln!("Created EA '{}' (id={})", ea_info.name, ea_info.id);
+    if !defer_active_ea_save {
+        if let Some(ref selector) = cli.ea {
+            let (ea_info, created) = ea::resolve_or_create_ea_selector(&omar_dir, Some(selector))?;
+            if created {
+                eprintln!("Created EA '{}' (id={})", ea_info.name, ea_info.id);
+            }
+            ea::save_active_ea(&omar_dir, ea_info.id)?;
         }
-        ea::save_active_ea(&omar_dir, ea_info.id)?;
     }
 
     match cli.command {
@@ -320,6 +331,37 @@ async fn async_main() -> Result<()> {
             None => mcp::run_server_with_default_context(),
         },
         None => {
+            if cli.agent.is_some() {
+                let (target, created) =
+                    ea::resolve_or_create_ea_selector(&omar_dir, cli.ea.as_deref())?;
+                if created {
+                    eprintln!("Created EA '{}' (id={})", target.name, target.id);
+                }
+                let client =
+                    TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
+                let (_, result) = manager::ensure_manager_session(
+                    &client,
+                    &config.agent.default_command,
+                    target.id,
+                    &target.name,
+                    &omar_dir,
+                    &config.dashboard.session_prefix,
+                    &manager::ManagerRuntimeOptions {
+                        default_workdir: config.agent.default_workdir.clone(),
+                        health_idle_warning: config.health.idle_warning,
+                    },
+                )?;
+                match result {
+                    manager::ManagerEnsureResult::Started => {
+                        eprintln!("Started EA '{}' with requested backend", target.name);
+                    }
+                    manager::ManagerEnsureResult::ReplacedBackend => {
+                        eprintln!("Replaced EA '{}' with requested backend", target.name);
+                    }
+                    manager::ManagerEnsureResult::AlreadyRunning => {}
+                }
+                ea::save_active_ea(&omar_dir, target.id)?;
+            }
             if std::env::var("TMUX").is_err() {
                 relaunch_in_tmux()
             } else {
@@ -550,8 +592,6 @@ fn relaunch_in_tmux() -> Result<()> {
 
     let client = TmuxClient::new("");
 
-    // Preserve a live dashboard across detach/reattach cycles.
-    // Only kill the session if attach fails, which indicates a stale tmux session.
     if client.has_session(DASHBOARD_SESSION)? {
         let status = tmux_command()
             .args(["-2", "attach-session", "-t", DASHBOARD_SESSION])
@@ -1043,10 +1083,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     } else if let Some(name) = short_name {
                                         scheduler.cancel_by_receiver_and_ea(&name, app.active_ea);
                                     }
-                                }
-                                app::ConfirmAction::Quit => {
-                                    app.reset_on_quit = false;
-                                    app.should_quit = true;
                                 }
                                 app::ConfirmAction::ResetQuit => {
                                     app.reset_on_quit = true;
@@ -1545,6 +1581,7 @@ fn purge_persisted_runtime_state_on_quit(omar_dir: &std::path::Path) -> Result<(
 
     remove_dir_if_exists(omar_dir.join("ea"))?;
     remove_dir_if_exists(omar_dir.join("mcp"))?;
+    manager::remove_all_omar_antigravity_mcp_configs()?;
 
     Ok(())
 }
@@ -1643,6 +1680,27 @@ fn remove_dir_if_exists(path: PathBuf) -> Result<()> {
 mod tests {
     use super::*;
 
+    struct HomeEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeEnvGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     /// Regression: `extended-keys always` forces tmux to emit modify-other-keys
     /// sequences to every client, including omar's dashboard, which doesn't
     /// push the kitty flag. Crossterm can't parse those sequences and silently
@@ -1668,8 +1726,25 @@ mod tests {
 
     #[test]
     fn purge_persisted_runtime_state_archives_logs_and_notes() {
+        let _env_lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
+        let _home = HomeEnvGuard::set(dir.path());
         let omar_dir = dir.path();
+        let agy_plugins_dir = dir.path().join(".gemini/config/plugins");
+        std::fs::create_dir_all(agy_plugins_dir.join("omar-ea-7")).unwrap();
+        std::fs::create_dir_all(agy_plugins_dir.join("user-plugin")).unwrap();
+        let agy_manifest_path = dir.path().join(".gemini/config/import_manifest.json");
+        std::fs::write(
+            &agy_manifest_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "imports": [
+                    {"name": "omar-ea-7", "source": "local-install"},
+                    {"name": "user-plugin", "source": "local-install"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         std::fs::create_dir_all(omar_dir.join("ea/7/status")).unwrap();
         std::fs::create_dir_all(omar_dir.join("mcp/ea-7")).unwrap();
         std::fs::create_dir_all(omar_dir.join("slack_outbox")).unwrap();
@@ -1697,6 +1772,12 @@ mod tests {
         assert!(!omar_dir.join("ea").exists());
         assert!(!omar_dir.join("mcp").exists());
         assert!(!omar_dir.join("manager_notes_ea7.md").exists());
+        assert!(!agy_plugins_dir.join("omar-ea-7").exists());
+        assert!(agy_plugins_dir.join("user-plugin").exists());
+        let agy_manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(agy_manifest_path).unwrap()).unwrap();
+        assert_eq!(agy_manifest["imports"].as_array().unwrap().len(), 1);
+        assert_eq!(agy_manifest["imports"][0]["name"], "user-plugin");
 
         let action_logs: Vec<_> = std::fs::read_dir(omar_dir.join("logs/action_logs"))
             .unwrap()

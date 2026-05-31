@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 /// EA identifier. Simple integer.
 pub type EaId = u32;
@@ -263,12 +264,15 @@ pub fn unregister_ea(base_dir: &Path, ea_id: EaId) -> anyhow::Result<()> {
 
 fn save_registry(base_dir: &Path, eas: &[EaInfo]) -> anyhow::Result<()> {
     let path = base_dir.join("eas.json");
-    fs::create_dir_all(base_dir).ok();
+    fs::create_dir_all(base_dir)?;
     let json = serde_json::to_string_pretty(eas)?;
     // Atomic write: write to temp file, then rename
-    let tmp = path.with_extension("json.tmp");
+    let tmp = base_dir.join(format!(".eas.{}.json.tmp", Uuid::new_v4()));
     fs::write(&tmp, &json)?;
-    fs::rename(&tmp, &path)?;
+    if let Err(err) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
     Ok(())
 }
 

@@ -1307,13 +1307,6 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
                 .unwrap_or_else(|| "?".to_string());
             (" Confirm ", "Kill this agent?", name, String::new(), 40)
         }
-        ConfirmAction::Quit => (
-            " Confirm Quit ",
-            "Quit omar?",
-            "This will kill ALL EA sessions and agents.".to_string(),
-            "Persisted EA state, projects, notes, and events will be kept.".to_string(),
-            50,
-        ),
         ConfirmAction::ResetQuit => (
             " Confirm Quit ",
             "Quit omar?",
