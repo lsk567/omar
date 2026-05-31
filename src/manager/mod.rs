@@ -5,6 +5,8 @@ pub mod protocol;
 use anyhow::Result;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -121,22 +123,28 @@ fn current_tmux_server() -> Option<String> {
         .filter(|server| !server.is_empty())
 }
 
+#[cfg(test)]
+fn global_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
+    Antigravity,
     Claude,
     Codex,
     Cursor,
-    Gemini,
     Opencode,
 }
 
 impl BackendKind {
     fn canonical_name(self) -> &'static str {
         match self {
+            BackendKind::Antigravity => "antigravity",
             BackendKind::Claude => "claude",
             BackendKind::Codex => "codex",
             BackendKind::Cursor => "cursor",
-            BackendKind::Gemini => "gemini",
             BackendKind::Opencode => "opencode",
         }
     }
@@ -150,10 +158,10 @@ fn detect_backend_token(token: &str) -> Option<BackendKind> {
         .unwrap_or(token);
 
     match executable {
+        "agy" => Some(BackendKind::Antigravity),
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
         "cursor" => Some(BackendKind::Cursor),
-        "gemini" => Some(BackendKind::Gemini),
         "opencode" => Some(BackendKind::Opencode),
         _ => None,
     }
@@ -187,20 +195,6 @@ fn ensure_codex_runtime_flags(base_command: &str) -> String {
     }
 
     command
-}
-
-fn backend_token(base_command: &str, kind: BackendKind) -> Option<String> {
-    base_command.split_whitespace().find_map(|token| {
-        if detect_backend_token(token) == Some(kind) {
-            Some(
-                token
-                    .trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')'))
-                    .to_string(),
-            )
-        } else {
-            None
-        }
-    })
 }
 
 fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -> PathBuf {
@@ -341,49 +335,6 @@ fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
     ))
 }
 
-fn materialize_gemini_deny_policy(context: &McpLaunchContext) -> Option<PathBuf> {
-    let dir = mcp_ea_dir(context)?;
-    let path = dir.join("gemini-deny-native-tools.toml");
-    let mut policy = String::new();
-    let entries = BACKEND_NATIVE_WAKE_TOOLS
-        .iter()
-        .map(|t| (*t, "Use the OMAR MCP tool schedule_omar_event instead."))
-        .chain(
-            BACKEND_NATIVE_AGENT_TOOLS
-                .iter()
-                .map(|t| (*t, "Use the OMAR MCP tool spawn_agent instead.")),
-        );
-    for (tool, message) in entries {
-        policy.push_str(&format!(
-            r#"[[rule]]
-toolName = "{tool}"
-decision = "deny"
-priority = 999
-denyMessage = "{message}"
-
-"#
-        ));
-    }
-    write_private_file(&path, policy.as_bytes()).ok()?;
-    Some(path)
-}
-
-fn gemini_mcp_bootstrap(base_command: &str, context: &McpLaunchContext) -> Option<String> {
-    let server_exe = std::env::current_exe().ok()?;
-    let context_file = materialize_mcp_context_file(context)?;
-    let gemini_exec =
-        backend_token(base_command, BackendKind::Gemini).unwrap_or_else(|| "gemini".to_string());
-    let server_exe = shell_single_quote(&server_exe.display().to_string());
-    let context_file = shell_single_quote(&context_file.display().to_string());
-    Some(format!(
-        "({gemini} mcp remove omar >/dev/null 2>&1 || true; \
-         {gemini} mcp add -s user omar {server} mcp-server --context-file {context} >/dev/null 2>&1 || true)",
-        gemini = gemini_exec,
-        server = server_exe,
-        context = context_file
-    ))
-}
-
 fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
     let server_exe = std::env::current_exe().ok()?;
     let context_file = materialize_mcp_context_file(context)?;
@@ -508,6 +459,83 @@ fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
     Some(())
 }
 
+fn ensure_antigravity_mcp_config(context: &McpLaunchContext) -> Option<()> {
+    // Antigravity CLI discovers global MCP servers from its own sparse config.
+    // Keep OMAR's entry EA-scoped and preserve all user servers.
+    let server_exe = std::env::current_exe().ok()?;
+    let context_file = materialize_mcp_context_file(context)?;
+    let home = std::env::var("HOME").ok()?;
+    let config_dir = PathBuf::from(home).join(".gemini").join("antigravity-cli");
+    std::fs::create_dir_all(&config_dir).ok()?;
+    let path = config_dir.join("mcp_config.json");
+
+    let mut root = match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    {
+        Some(v) if v.is_object() => v,
+        _ => serde_json::json!({}),
+    };
+
+    if !root
+        .get("mcpServers")
+        .map(|v| v.is_object())
+        .unwrap_or(false)
+    {
+        root["mcpServers"] = serde_json::json!({});
+    }
+
+    if let Some(servers) = root["mcpServers"].as_object_mut() {
+        let stale_keys: Vec<String> = servers
+            .iter()
+            .filter_map(|(k, v)| {
+                if k.starts_with("omar-ea-") {
+                    let ctx_path = v
+                        .get("args")
+                        .and_then(|a| a.as_array())
+                        .and_then(|a| a.last())
+                        .and_then(|p| p.as_str())
+                        .map(PathBuf::from);
+                    if let Some(p) = ctx_path {
+                        if !p.exists() {
+                            return Some(k.clone());
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+        for k in stale_keys {
+            servers.remove(&k);
+        }
+    }
+
+    let key = format!("omar-ea-{}", context.ea_id);
+    root["mcpServers"][&key] = serde_json::json!({
+        "command": server_exe.display().to_string(),
+        "args": ["mcp-server", "--context-file", context_file.display().to_string()],
+    });
+
+    if let Ok(entries) = std::fs::read_dir(&config_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("mcp_config.json.omar-") && name.ends_with(".tmp") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    let payload = serde_json::to_vec_pretty(&root).ok()?;
+    let tmp = config_dir.join(format!("mcp_config.json.omar-{}.tmp", Uuid::new_v4()));
+    std::fs::write(&tmp, &payload).ok()?;
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    Some(())
+}
+
 /// Build a CLI command with system prompt loaded from a file via native flag.
 ///
 /// - `prompt_file`: absolute path to the prompt .md file
@@ -517,7 +545,8 @@ fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
 ///   - claude  → `--system-prompt "$(cat '<path>')"` plus native wake-tool denylist
 ///   - codex   → `-c "developer_instructions='''$(cat '<path>')'''"` plus scheduled-task disable
 ///   - cursor  → positional arg `"Load the <path> file and follow the instructions."`
-///   - gemini  → `-i "$(cat '<path>')"` plus native wake-tool deny policy
+///   - antigravity → `-i "$(cat '<path>')"` with an EA-scoped MCP entry in
+///     `~/.gemini/antigravity-cli/mcp_config.json`
 ///   - opencode → MCP env only (no `--prompt`); the agent prompt is delivered
 ///     after spawn via tmux because opencode's `--prompt` is treated as the
 ///     first **user** message (not system role) and the LLM responds by
@@ -549,6 +578,10 @@ pub fn build_agent_command(
     // session can still come up and the human operator sees the problem
     // via a degraded but visible agent, rather than a launch failure.
     match detect_backend(&base_command) {
+        Some(BackendKind::Antigravity) => {
+            let _ = ensure_antigravity_mcp_config(mcp_context);
+            format!("TERM=xterm-256color {} -i \"{}\"", base_command, shell_expr)
+        }
         Some(BackendKind::Claude) => match materialize_claude_mcp_config(mcp_context) {
             Some(mcp_config) => format!(
                 "{} --system-prompt \"{}\" --mcp-config {} --disallowedTools {}",
@@ -582,23 +615,6 @@ pub fn build_agent_command(
                 rendered.display()
             )
         }
-        Some(BackendKind::Gemini) => {
-            let mut cmd = format!(
-                "TERM=xterm-256color {} --allowed-mcp-server-names omar -i \"{}\"",
-                base_command, shell_expr
-            );
-            if let Some(policy) = materialize_gemini_deny_policy(mcp_context) {
-                cmd = format!(
-                    "{} --policy {}",
-                    cmd,
-                    shell_single_quote(&policy.display().to_string())
-                );
-            }
-            if let Some(setup) = gemini_mcp_bootstrap(&base_command, mcp_context) {
-                cmd = format!("{}; {}", setup, cmd);
-            }
-            cmd
-        }
         Some(BackendKind::Opencode) => {
             // opencode has no `--system-prompt`; `--prompt` is treated as the
             // first user message, which makes the LLM read agent.md
@@ -630,13 +646,12 @@ pub fn build_agent_command(
 ///
 /// 1. **claude** uses the native `--system-prompt-file <path>` flag, so
 ///    the prompt never touches argv at all and is unbounded.
-/// 2. **codex / gemini / opencode** keep the legacy inline shell-expansion
-///    path because their auto-loaded prompt files (`AGENTS.md` /
-///    `GEMINI.md`) are anchored at the agent's *working root*, not at the
-///    process cwd. Setting cwd = a per-EA workspace dir would either
-///    silently load the wrong `AGENTS.md` (the one at the user's working
-///    root) or force the manager to operate in a dir that isn't the
-///    user's project. A bounded truncation cap in `memory.rs`
+/// 2. **codex / antigravity / opencode** keep the legacy inline shell-expansion
+///    path because their auto-loaded prompt/config files are anchored at the
+///    agent's *working root*, not at the process cwd. Setting cwd = a per-EA
+///    workspace dir would either silently load the wrong project context (the
+///    one at the user's working root) or force the manager to operate in a dir
+///    that isn't the user's project. A bounded truncation cap in `memory.rs`
 ///    (see `truncate_for_prompt`) keeps the inlined prompt comfortably
 ///    under `MAX_ARG_STRLEN`.
 ///
@@ -712,7 +727,7 @@ pub fn build_ea_command(
             (cmd, None)
         }
         _ => {
-            // Inline path for codex/gemini/opencode/cursor/unknown. The
+            // Inline path for codex/antigravity/opencode/cursor/unknown. The
             // truncation cap in memory.rs keeps the rendered prompt under
             // `MAX_ARG_STRLEN` even when notes/memory grow large.
             let cmd = build_agent_command(
@@ -750,7 +765,7 @@ pub fn start_manager(
     }
 
     // Build command with EA system prompt + memory baked in. For backends
-    // whose prompt is now loaded from a workspace file (codex/gemini/opencode)
+    // whose prompt is now loaded from a workspace file (codex/antigravity/opencode)
     // the build also returns the cwd that backend must be launched in for
     // auto-discovery to work.
     let (cmd, workspace_cwd) = build_ea_command(
@@ -1168,6 +1183,28 @@ mod tests {
         }
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn embedded_prompts_forbid_backend_native_wake_tools() {
         for prompt in [PROMPT_EA, PROMPT_AGENT] {
@@ -1270,30 +1307,32 @@ mod tests {
     }
 
     #[test]
-    fn test_build_agent_command_gemini() {
+    fn test_build_agent_command_antigravity() {
+        let _env_lock = global_home_env_lock();
         let dir = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let cmd = build_agent_command(
-            "gemini --yolo",
+            "agy --dangerously-skip-permissions",
             Path::new("/tmp/prompts/ea.md"),
             &[],
             &test_mcp_context(dir.path()),
         );
-        assert!(cmd.contains("gemini mcp remove omar"));
-        assert!(cmd.contains("gemini mcp add -s user omar"));
-        assert!(cmd.contains("mcp-server --context-file"));
-        assert!(cmd.contains("--policy"));
         assert!(cmd.contains(
-            "TERM=xterm-256color gemini --yolo --allowed-mcp-server-names omar -i \"$(cat '/tmp/prompts/ea.md')\""
+            "TERM=xterm-256color agy --dangerously-skip-permissions -i \"$(cat '/tmp/prompts/ea.md')\""
         ));
-        let policy = dir.path().join("mcp/ea-0/gemini-deny-native-tools.toml");
-        let policy = std::fs::read_to_string(policy).unwrap();
-        // Wake/timer overlap rules.
-        assert!(policy.contains("toolName = \"ScheduleWakeup\""));
-        assert!(policy.contains("Use the OMAR MCP tool schedule_omar_event instead."));
-        // Subagent-dispatcher overlap rules.
-        assert!(policy.contains("toolName = \"Task\""));
-        assert!(policy.contains("Use the OMAR MCP tool spawn_agent instead."));
-        assert!(policy.contains("decision = \"deny\""));
+        let config = dir.path().join(".gemini/antigravity-cli/mcp_config.json");
+        let config = std::fs::read_to_string(config).unwrap();
+        assert!(config.contains("\"omar-ea-0\""));
+        assert!(config.contains("\"mcp-server\""));
+        assert!(config.contains("\"--context-file\""));
+        assert!(
+            !cmd.contains("--allowed-mcp-server-names"),
+            "agy does not advertise MCP config CLI flags"
+        );
+        assert!(
+            !cmd.contains("--policy"),
+            "agy does not advertise policy CLI flags"
+        );
     }
 
     #[test]
@@ -1347,8 +1386,8 @@ mod tests {
         for backend in [
             "claude",
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
-            "gemini --yolo",
             "opencode",
+            "agy --dangerously-skip-permissions",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let omar_dir = dir.path();

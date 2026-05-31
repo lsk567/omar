@@ -1067,6 +1067,12 @@ fn test_omar_mcp_server_tools_list_via_cli() {
         "spawn_agent schema must advertise Codex reasoning effort enum: {}",
         spawn_agent["inputSchema"]
     );
+    assert_eq!(
+        props["backend"]["enum"],
+        json!(["claude", "codex", "cursor", "opencode", "antigravity"]),
+        "spawn_agent schema must advertise supported backend enum: {}",
+        spawn_agent["inputSchema"]
+    );
     // Sanity-check required fields.
     let required: Vec<&str> = spawn_agent["inputSchema"]["required"]
         .as_array()

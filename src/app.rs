@@ -22,8 +22,10 @@ pub type SharedApp = App;
 pub enum ConfirmAction {
     /// Kill the selected agent
     Kill,
-    /// Quit the dashboard while leaving EA sessions and persisted state intact.
+    /// Quit the dashboard while leaving persisted state intact.
     Quit,
+    /// Quit and reset persisted OMAR runtime state.
+    ResetQuit,
     /// Delete the currently active EA (blocked only if it is the last one)
     DeleteEa,
 }
@@ -88,6 +90,7 @@ pub struct App {
     pub selected: usize,
     pub manager_selected: bool,
     pub should_quit: bool,
+    pub reset_on_quit: bool,
     pub show_help: bool,
     pub pending_confirm: Option<ConfirmAction>,
     pub filter: String,
@@ -186,6 +189,7 @@ impl App {
             selected: 0,
             manager_selected: true,
             should_quit: false,
+            reset_on_quit: false,
             show_help: false,
             pending_confirm: None,
             filter: String::new(),
@@ -585,7 +589,7 @@ impl App {
         };
 
         // For backends whose manager prompt is now loaded from an auto-
-        // discovered file (codex `AGENTS.md`, gemini `GEMINI.md`, opencode
+        // discovered file (codex `AGENTS.md`, antigravity shared MCP config, opencode
         // `AGENTS.md`), build_ea_command returns the workspace dir we must
         // launch in. Fall back to the user's workdir for claude/cursor.
         let launch_cwd = workspace_cwd
@@ -2055,7 +2059,7 @@ mod tests {
         let scheduler = Arc::new(Scheduler::new());
         let mut app = App::new(&config, TickerBuffer::new(), scheduler);
 
-        let mut commands: Vec<String> = ["claude", "codex", "cursor", "gemini", "opencode"]
+        let mut commands: Vec<String> = ["claude", "codex", "cursor", "opencode", "antigravity"]
             .iter()
             .map(|name| crate::config::resolve_backend(name).unwrap())
             .collect();

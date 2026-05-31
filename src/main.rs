@@ -56,7 +56,7 @@ struct Cli {
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Agent backend to use: claude, codex, cursor, gemini, opencode
+    /// Agent backend to use: claude, codex, cursor, opencode, antigravity
     #[arg(short, long)]
     agent: Option<String>,
 
@@ -1045,6 +1045,11 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     }
                                 }
                                 app::ConfirmAction::Quit => {
+                                    app.reset_on_quit = false;
+                                    app.should_quit = true;
+                                }
+                                app::ConfirmAction::ResetQuit => {
+                                    app.reset_on_quit = true;
                                     app.should_quit = true;
                                 }
                                 app::ConfirmAction::DeleteEa => {
@@ -1172,7 +1177,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                     // Normal key handling
                     match key.code {
                         KeyCode::Char('Q') => {
-                            app.pending_confirm = Some(app::ConfirmAction::Quit);
+                            app.pending_confirm = Some(app::ConfirmAction::ResetQuit);
                         }
                         KeyCode::Esc => {
                             app.drill_up();
@@ -1220,9 +1225,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('[') => {
                             app.cycle_previous_ea();
-                        }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.pending_confirm = Some(app::ConfirmAction::Quit);
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
                             if app.sidebar_focused {
@@ -1473,17 +1475,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
         // Check quit flag
         let should_quit = {
             let app = shared_app.lock().await;
-            if app.should_quit {
-                Some(app.omar_dir.clone())
-            } else {
-                None
-            }
+            app.should_quit
         };
-        if let Some(omar_dir) = should_quit {
-            // Compact EA ID counter on clean quit so next session starts from a compact point
-            if let Err(e) = ea::compact_id_counter(&omar_dir) {
-                eprintln!("compact_id_counter failed: {}", e);
-            }
+        if should_quit {
             break;
         }
     }
@@ -1521,7 +1515,128 @@ async fn run_dashboard(config: Config) -> Result<()> {
         kill_child_gracefully(child, Duration::from_secs(3));
     }
 
+    let reset_on_quit = {
+        let app = shared_app.lock().await;
+        app.reset_on_quit
+    };
+    if reset_on_quit {
+        purge_persisted_runtime_state_on_quit(&omar_dir)?;
+    }
+
     Ok(())
+}
+
+fn purge_persisted_runtime_state_on_quit(omar_dir: &std::path::Path) -> Result<()> {
+    let archive_timestamp = now_ns();
+    archive_action_logs(omar_dir, archive_timestamp)?;
+    archive_manager_notes(omar_dir, archive_timestamp)?;
+
+    for file in [
+        "active_ea",
+        "ea_next_id",
+        "eas.json",
+        "eas.json.tmp",
+        "scheduled_events.json",
+        "scheduled_events.lock",
+        "scheduled_events.tmp",
+    ] {
+        remove_file_if_exists(omar_dir.join(file))?;
+    }
+
+    remove_dir_if_exists(omar_dir.join("ea"))?;
+    remove_dir_if_exists(omar_dir.join("mcp"))?;
+
+    Ok(())
+}
+
+fn archive_action_logs(omar_dir: &std::path::Path, archive_timestamp: u64) -> Result<()> {
+    let ea_dir = omar_dir.join("ea");
+    let Ok(entries) = std::fs::read_dir(&ea_dir) else {
+        return Ok(());
+    };
+
+    let archive_dir = omar_dir.join("logs").join("action_logs");
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let action_log = path.join("action_log.jsonl");
+        if !action_log.exists() {
+            continue;
+        }
+
+        std::fs::create_dir_all(&archive_dir)?;
+        let ea_id = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
+        let archive_path = unique_archive_path(
+            &archive_dir,
+            &format!("ea-{}-{}", ea_id, archive_timestamp),
+            "jsonl",
+        );
+        std::fs::rename(action_log, archive_path)?;
+    }
+
+    Ok(())
+}
+
+fn archive_manager_notes(omar_dir: &std::path::Path, archive_timestamp: u64) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(omar_dir) else {
+        return Ok(());
+    };
+
+    let archive_dir = omar_dir.join("logs").join("manager_notes");
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !file_name.starts_with("manager_notes_ea") || !file_name.ends_with(".md") {
+            continue;
+        }
+
+        std::fs::create_dir_all(&archive_dir)?;
+        let stem = file_name.strip_suffix(".md").unwrap_or(file_name);
+        let archive_path = unique_archive_path(
+            &archive_dir,
+            &format!("{}-{}", stem, archive_timestamp),
+            "md",
+        );
+        std::fs::rename(path, archive_path)?;
+    }
+
+    Ok(())
+}
+
+fn unique_archive_path(dir: &std::path::Path, stem: &str, extension: &str) -> PathBuf {
+    let mut path = dir.join(format!("{}.{}", stem, extension));
+    let mut suffix = 1;
+    while path.exists() {
+        path = dir.join(format!("{}-{}.{}", stem, suffix, extension));
+        suffix += 1;
+    }
+    path
+}
+
+fn remove_file_if_exists(path: PathBuf) -> Result<()> {
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn remove_dir_if_exists(path: PathBuf) -> Result<()> {
+    match std::fs::remove_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 #[cfg(test)]
@@ -1548,6 +1663,59 @@ mod tests {
             "extended-keys must be `on`, not `{}` — `always` breaks Shift+Tab \
              in the dashboard (see tests comment)",
             value
+        );
+    }
+
+    #[test]
+    fn purge_persisted_runtime_state_archives_logs_and_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let omar_dir = dir.path();
+        std::fs::create_dir_all(omar_dir.join("ea/7/status")).unwrap();
+        std::fs::create_dir_all(omar_dir.join("mcp/ea-7")).unwrap();
+        std::fs::create_dir_all(omar_dir.join("slack_outbox")).unwrap();
+        std::fs::create_dir_all(omar_dir.join("logs/panics")).unwrap();
+        std::fs::write(omar_dir.join("config.toml"), "[dashboard]\n").unwrap();
+        std::fs::write(omar_dir.join("slack_outbox/keep"), "queued").unwrap();
+        std::fs::write(omar_dir.join("logs/panics/panic.log"), "panic").unwrap();
+        std::fs::write(omar_dir.join("eas.json"), "[]").unwrap();
+        std::fs::write(omar_dir.join("active_ea"), "7").unwrap();
+        std::fs::write(omar_dir.join("ea_next_id"), "7").unwrap();
+        std::fs::write(omar_dir.join("scheduled_events.json"), "[]").unwrap();
+        std::fs::write(omar_dir.join("ea/7/tasks.md"), "- [1] stale\n").unwrap();
+        std::fs::write(omar_dir.join("ea/7/action_log.jsonl"), "action log\n").unwrap();
+        std::fs::write(omar_dir.join("manager_notes_ea7.md"), "manager notes\n").unwrap();
+
+        purge_persisted_runtime_state_on_quit(omar_dir).unwrap();
+
+        assert!(omar_dir.join("config.toml").exists());
+        assert!(omar_dir.join("slack_outbox/keep").exists());
+        assert!(omar_dir.join("logs/panics/panic.log").exists());
+        assert!(!omar_dir.join("eas.json").exists());
+        assert!(!omar_dir.join("active_ea").exists());
+        assert!(!omar_dir.join("ea_next_id").exists());
+        assert!(!omar_dir.join("scheduled_events.json").exists());
+        assert!(!omar_dir.join("ea").exists());
+        assert!(!omar_dir.join("mcp").exists());
+        assert!(!omar_dir.join("manager_notes_ea7.md").exists());
+
+        let action_logs: Vec<_> = std::fs::read_dir(omar_dir.join("logs/action_logs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(action_logs.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&action_logs[0]).unwrap(),
+            "action log\n"
+        );
+
+        let manager_notes: Vec<_> = std::fs::read_dir(omar_dir.join("logs/manager_notes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(manager_notes.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&manager_notes[0]).unwrap(),
+            "manager notes\n"
         );
     }
 

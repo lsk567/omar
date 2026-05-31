@@ -551,7 +551,7 @@ fn get_pane_input(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Option<
         ));
     }
 
-    if pane_capture.contains("Gemini CLI") {
+    if pane_capture.contains("Antigravity CLI") {
         return Some(extract_prefixed_input_from_capture(
             &pane_capture,
             "*",
@@ -1577,9 +1577,9 @@ mod tests {
     }
 
     #[test]
-    fn gemini_capture_extracts_typed_input_for_restore() {
+    fn antigravity_capture_extracts_typed_input_for_restore() {
         let capture = r#"
- ▝▜▄     Gemini CLI v0.40.1
+      ▄▀▀▄        Antigravity CLI 1.0.3
 
 ────────────────────────────────────────────────────────────────────────────────
  YOLO Ctrl+Y                                                      2 MCP servers
