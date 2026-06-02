@@ -72,14 +72,14 @@ fn coalesce_alt_arrow(first: KeyEvent, next: Option<Event>) -> (AppEvent, Option
 
 /// Handles input events and tick timing
 pub struct EventHandler {
-    rx: mpsc::UnboundedReceiver<AppEvent>,
-    _tx: mpsc::UnboundedSender<AppEvent>,
+    rx: mpsc::Receiver<AppEvent>,
+    _tx: mpsc::Sender<AppEvent>,
 }
 
 impl EventHandler {
     /// Create a new event handler with the given tick rate
     pub fn new(tick_rate: Duration) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1024);
         let event_tx = tx.clone();
 
         // Spawn event polling task
@@ -90,7 +90,7 @@ impl EventHandler {
 
             loop {
                 if let Some(event) = pending_event.take() {
-                    if event_tx.send(event).is_err() {
+                    if event_tx.send(event).await.is_err() {
                         break;
                     }
                     continue;
@@ -129,7 +129,7 @@ impl EventHandler {
                     }
                 };
 
-                if event_tx.send(event).is_err() {
+                if event_tx.send(event).await.is_err() {
                     break;
                 }
             }
