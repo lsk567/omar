@@ -504,7 +504,7 @@ fn pane_target_name(receiver: &str, ea_id: ea::EaId, base_prefix: &str) -> Strin
     }
 }
 
-/// Capture the current user input in the agent's pane (plain text, no ANSI).
+/// Capture the current user input in the agent's pane.
 /// Returns `None` if the pane cannot be read (agent not running, tmux absent).
 ///
 /// TUI backends render status bars and input boxes differently, so special
@@ -532,12 +532,24 @@ fn get_pane_input(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Option<
         || pane_cmd.ends_with("/claude.exe")
         || pane_capture.contains("Claude Code")
     {
-        return Some(extract_claude_input_from_capture(&pane_capture));
+        let ansi_capture = client
+            .capture_pane(&target, 120)
+            .unwrap_or_else(|_| pane_capture.clone());
+        return Some(extract_claude_input_from_capture(&ansi_capture));
     }
 
-    if pane_capture.contains("OpenAI Codex") {
+    if pane_cmd == "codex"
+        || pane_cmd == "codex.exe"
+        || pane_cmd.ends_with("/codex")
+        || pane_cmd.ends_with("/codex.exe")
+        || pane_capture.contains("OpenAI Codex")
+        || pane_capture.lines().any(is_codex_status_line)
+    {
+        let ansi_capture = client
+            .capture_pane(&target, 120)
+            .unwrap_or_else(|_| pane_capture.clone());
         return Some(extract_prefixed_input_from_capture(
-            &pane_capture,
+            &ansi_capture,
             "›",
             is_codex_input_chrome,
         ));
@@ -560,10 +572,13 @@ fn get_pane_input(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Option<
     }
 
     // Standard CLI: last line is the prompt/input line.
-    pane_capture
-        .lines()
-        .last()
-        .map(|line| strip_prompt_prefix(line).to_string())
+    pane_capture.lines().last().map(|line| {
+        if is_agent_status_line(line) {
+            String::new()
+        } else {
+            strip_prompt_prefix(line).to_string()
+        }
+    })
 }
 
 fn extract_claude_input_from_capture(content: &str) -> String {
@@ -576,7 +591,11 @@ fn extract_claude_input_from_capture(content: &str) -> String {
 
 fn extract_claude_prompt_line(line: &str) -> Option<String> {
     let (_, after_prompt) = line.split_once('❯')?;
-    let input = after_prompt.trim();
+    if input_starts_suggestion_styled(after_prompt) {
+        return Some(String::new());
+    }
+    let stripped = strip_ansi(after_prompt);
+    let input = stripped.trim();
     if is_claude_input_chrome(input) {
         return Some(String::new());
     }
@@ -601,11 +620,113 @@ fn extract_prefixed_input_line(
     is_chrome: &impl Fn(&str) -> bool,
 ) -> Option<String> {
     let trimmed = line.trim_start();
-    let input = trimmed.strip_prefix(prefix)?.trim();
+    let after_prefix = trimmed.strip_prefix(prefix)?;
+    if input_starts_suggestion_styled(after_prefix) {
+        return Some(String::new());
+    }
+    let stripped = strip_ansi(after_prefix);
+    let input = stripped.trim();
     if is_chrome(input) {
         return Some(String::new());
     }
     Some(input.to_string())
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if ('@'..='~').contains(&code) {
+                    break;
+                }
+            }
+            continue;
+        }
+        output.push(ch);
+    }
+    output
+}
+
+fn input_starts_suggestion_styled(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut dimmed = false;
+    let mut reverse_video = false;
+
+    while i < bytes.len() {
+        if let Some(ch) = input[i..].chars().next() {
+            if ch.is_whitespace() {
+                i += ch.len_utf8();
+                continue;
+            }
+        }
+
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            if let Some((end, is_sgr)) = ansi_sequence_end(bytes, i + 2) {
+                if is_sgr {
+                    update_suggestion_style_state(
+                        &input[i + 2..end],
+                        &mut dimmed,
+                        &mut reverse_video,
+                    );
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+
+        return dimmed || reverse_video;
+    }
+
+    false
+}
+
+fn ansi_sequence_end(bytes: &[u8], mut i: usize) -> Option<(usize, bool)> {
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if (0x40..=0x7e).contains(&byte) {
+            return Some((i, byte == b'm'));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn update_suggestion_style_state(params: &str, dimmed: &mut bool, reverse_video: &mut bool) {
+    let codes: Vec<u16> = if params.is_empty() {
+        vec![0]
+    } else {
+        params
+            .split(';')
+            .filter_map(|part| part.parse::<u16>().ok())
+            .collect()
+    };
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            0 => {
+                *dimmed = false;
+                *reverse_video = false;
+            }
+            22 | 39 => *dimmed = false,
+            7 => *reverse_video = true,
+            27 => *reverse_video = false,
+            2 | 90 => *dimmed = true,
+            38 if codes.get(i + 1) == Some(&5) => {
+                if let Some(color) = codes.get(i + 2) {
+                    if *color == 8 || (232..=255).contains(color) {
+                        *dimmed = true;
+                    }
+                }
+                i += 2;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
 }
 
 fn extract_opencode_input_from_capture(content: &str) -> String {
@@ -701,12 +822,29 @@ fn is_opencode_input_chrome(line: &str) -> bool {
 
 fn is_claude_input_chrome(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed.is_empty() || trimmed.starts_with("Try \"")
+    trimmed.is_empty()
 }
 
 fn is_codex_input_chrome(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed.is_empty() || trimmed.starts_with("Improve documentation in @filename")
+    trimmed.is_empty()
+}
+
+fn is_codex_status_line(line: &str) -> bool {
+    is_agent_status_line(line)
+}
+
+fn is_agent_status_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some((left, right)) = trimmed.rsplit_once(" · ") else {
+        return false;
+    };
+    let pathish = right.starts_with("~/")
+        || right.starts_with('/')
+        || right.starts_with("./")
+        || right.starts_with("../")
+        || right.contains(":\\");
+    pathish && !left.trim().is_empty() && !left.contains(['›', '❯', '→', '*'])
 }
 
 fn has_tui_vertical_border(line: &str) -> bool {
@@ -1443,7 +1581,7 @@ mod tests {
 
 
 
-  ~/Documents/research/omar:fix/smart-popup-event-deferral                                                                                                                            1.14.41
+  /workspace/omar:fix/smart-popup-event-deferral                                                                                                                            1.14.41
 "#;
 
         let input = extract_opencode_input_from_capture(IDLE_OPENCODE_CAPTURE);
@@ -1473,15 +1611,15 @@ mod tests {
 
     #[test]
     fn claude_idle_capture_extracts_no_restorable_input() {
-        let capture = r#" ▐▛███▜▌   Claude Code v2.1.136
+        let capture = " ▐▛███▜▌   Claude Code v2.1.136
 ▝▜█████▛▘  Opus 4.7 with low effort · Claude Max
-  ▘▘ ▝▝    ~/Documents/research/omar
+  ▘▘ ▝▝    /workspace/omar
 
 ────────────────────────────────────────────────────────────────
-❯ Try "refactor dashboard.rs"
+❯ \x1b[7mT\x1b[0mry \"refactor dashboard.rs\"
 ────────────────────────────────────────────────────────────────
   PR #133
-"#;
+";
 
         let input = extract_claude_input_from_capture(capture);
 
@@ -1505,6 +1643,26 @@ mod tests {
     }
 
     #[test]
+    fn claude_capture_ignores_dimmed_autocomplete_suggestion() {
+        let capture = "\n────────────────────────────────────────────────────────────────\n❯ \x1b[2mwrite the next task summary\x1b[0m\n────────────────────────────────────────────────────────────────\n";
+
+        let input = extract_claude_input_from_capture(capture);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn claude_capture_ignores_reverse_video_autocomplete_suggestion() {
+        let capture = "\n────────────────────────────────────────────────────────────────\n❯ \x1b[7mw\x1b[0mrite the next task summary\n────────────────────────────────────────────────────────────────\n";
+
+        let input = extract_claude_input_from_capture(capture);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
     fn claude_capture_keeps_three_char_stub_trivial() {
         let capture = r#"
 ────────────────────────────────────────────────────────────────
@@ -1525,13 +1683,13 @@ mod tests {
 │ >_ OpenAI Codex (v0.133.0)                     │
 ╰────────────────────────────────────────────────╯
 
-› Improve documentation in @filename
+› hello world
 
-  gpt-5.5 medium · ~/Documents/Cal/research/omar
+  gpt-5.5 medium · /workspace/omar
 
 › hello world
 
-  gpt-5.5 medium · ~/Documents/Cal/research/omar
+  gpt-5.5 medium · /workspace/omar
 "#;
 
         let input = extract_prefixed_input_from_capture(capture, "›", is_codex_input_chrome);
@@ -1541,18 +1699,70 @@ mod tests {
     }
 
     #[test]
-    fn codex_idle_capture_ignores_placeholder() {
+    fn codex_capture_ignores_dimmed_autocomplete_suggestion() {
+        let capture = "\n╭────────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.133.0)                     │\n╰────────────────────────────────────────────────╯\n\n› \x1b[2mwrite the next task summary\x1b[0m\n\n  gpt-5.5 medium · /workspace/omar\n";
+
+        let input = extract_prefixed_input_from_capture(capture, "›", is_codex_input_chrome);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn codex_capture_ignores_gray_autocomplete_suggestion() {
+        let capture = "\n› \x1b[38;5;245mwrite the next task summary\x1b[0m\n\n  gpt-5.5 medium · /workspace/omar\n";
+
+        let input = extract_prefixed_input_from_capture(capture, "›", is_codex_input_chrome);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn codex_scrolled_capture_ignores_status_line_without_banner() {
         let capture = r#"
+  gpt-5.5 medium · /workspace/omar
+"#;
+
+        let input = extract_prefixed_input_from_capture(capture, "›", is_codex_input_chrome);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn codex_idle_capture_ignores_dimmed_placeholder() {
+        let capture = "\
 ╭────────────────────────────────────────────────╮
 │ >_ OpenAI Codex (v0.133.0)                     │
 ╰────────────────────────────────────────────────╯
 
-› Improve documentation in @filename
+› \x1b[2mwrite the next task summary\x1b[0m
 
-  gpt-5.5 medium · ~/Documents/Cal/research/omar
-"#;
+  gpt-5.5 medium · /workspace/omar
+";
 
         let input = extract_prefixed_input_from_capture(capture, "›", is_codex_input_chrome);
+
+        assert_eq!(input, "");
+        assert!(!pane_input_should_restore(&input));
+    }
+
+    #[test]
+    fn shell_fallback_ignores_agent_status_line() {
+        let input = r#"
+  gpt-5.5 medium · /workspace/omar
+"#
+        .lines()
+        .last()
+        .map(|line| {
+            if is_agent_status_line(line) {
+                String::new()
+            } else {
+                strip_prompt_prefix(line).to_string()
+            }
+        })
+        .unwrap();
 
         assert_eq!(input, "");
         assert!(!pane_input_should_restore(&input));
