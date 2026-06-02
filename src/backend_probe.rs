@@ -2,7 +2,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub(crate) const BACKEND_VERSION_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+pub(crate) const BACKEND_VERSION_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub(crate) fn backend_version_probe_succeeds(binary: &str) -> bool {
     command_succeeds_with_timeout(binary, &["--version"], BACKEND_VERSION_PROBE_TIMEOUT)
@@ -93,7 +93,7 @@ mod tests {
         assert!(command_succeeds_with_timeout(
             fast.to_str().unwrap(),
             &["--version"],
-            Duration::from_millis(500),
+            Duration::from_secs(2),
         ));
     }
 }

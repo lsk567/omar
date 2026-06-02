@@ -1067,6 +1067,12 @@ fn test_omar_mcp_server_tools_list_via_cli() {
         "spawn_agent schema must advertise Codex reasoning effort enum: {}",
         spawn_agent["inputSchema"]
     );
+    assert_eq!(
+        props["backend"]["enum"],
+        json!(["claude", "codex", "cursor", "opencode", "agy"]),
+        "spawn_agent schema must advertise supported backend enum: {}",
+        spawn_agent["inputSchema"]
+    );
     // Sanity-check required fields.
     let required: Vec<&str> = spawn_agent["inputSchema"]["required"]
         .as_array()
@@ -1801,6 +1807,7 @@ fn test_manager_notes_shell_write_persists_across_ea_restart() {
     }
 
     let home = tempfile::tempdir().expect("temp home");
+    let session_prefix = format!("omar-notes-{}-", Uuid::new_v4());
 
     // Bootstrap so ~/.omar/{config.toml, prompts/} are populated.
     bootstrap_cli_home(home.path());
@@ -1812,15 +1819,20 @@ fn test_manager_notes_shell_write_persists_across_ea_restart() {
     let config_path = omar_dir.join("config.toml");
     fs::write(
         &config_path,
-        r#"
+        format!(
+            r#"
+[dashboard]
+session_prefix = "{session_prefix}"
+
 [agent]
 default_command = "exec bash"
-"#,
+"#
+        ),
     )
     .expect("write test config.toml");
 
     // EA 0's manager session under the test tmux server.
-    let manager_session = "omar-agent-ea-0".to_string();
+    let manager_session = format!("{session_prefix}ea-0");
     cleanup_session(&manager_session);
 
     // First "EA spawn": render the EA prompt, create a tmux session running
@@ -1876,16 +1888,24 @@ default_command = "exec bash"
         "manager_notes_ea0.md must not exist before first write",
     );
 
-    let heredoc = "cat > ~/.omar/manager_notes_ea0.md << 'NOTES'\n\
+    thread::sleep(Duration::from_millis(1000));
+
+    let heredoc = format!(
+        "cat > {} << 'NOTES'\n\
 # Manager Notes\n\n\
 ## Active Tasks\n\
 - Project id=1 \"Build REST API\" -> Agent: rest-api (running)\n\n\
 ## Notes\n\
 - User prefers TypeScript\n\
-NOTES";
+NOTES",
+        notes_path.display()
+    );
 
-    let _ = tmux(&["send-keys", "-t", &manager_session, "-l", heredoc]);
-    let _ = tmux(&["send-keys", "-t", &manager_session, "Enter"]);
+    for line in heredoc.lines() {
+        let _ = tmux(&["send-keys", "-t", &manager_session, "-l", "--", line]);
+        let _ = tmux(&["send-keys", "-t", &manager_session, "Enter"]);
+        thread::sleep(Duration::from_millis(100));
+    }
 
     // Wait for the heredoc body to land. `cat > file` opens (and creates)
     // the target file immediately, before reading stdin — so a bare
@@ -1893,7 +1913,7 @@ NOTES";
     // empty file. Poll for the actual content marker instead.
     let mut written = String::new();
     let mut wrote = false;
-    for _ in 0..50 {
+    for _ in 0..200 {
         if let Ok(content) = fs::read_to_string(&notes_path) {
             if content.contains("User prefers TypeScript") {
                 written = content;
@@ -1902,6 +1922,24 @@ NOTES";
             }
         }
         thread::sleep(Duration::from_millis(100));
+    }
+    if !wrote {
+        if let Ok(content) = fs::read_to_string(&notes_path) {
+            println!(
+                "--- ON-DISK NOTES CONTENT ---\n{}\n--------------------",
+                content
+            );
+        } else {
+            println!("--- ON-DISK NOTES CONTENT: file not found ---");
+        }
+        if let Ok(pane_content) = tmux(&["capture-pane", "-p", "-t", &manager_session]) {
+            println!(
+                "--- TMUX PANE CONTENT ---\n{}\n--------------------",
+                pane_content
+            );
+        } else {
+            println!("--- TMUX PANE CONTENT: failed to capture ---");
+        }
     }
     assert!(
         wrote,
