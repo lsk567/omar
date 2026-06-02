@@ -1260,7 +1260,7 @@ fn render_help_popup(frame: &mut Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  Q           Quit"),
+        Line::from("  Q           Quit and reset runtime state"),
         Line::from("  ←/→, h/l   Switch panel (sidebar ↔ main)"),
         Line::from("  ↑/↓, j/k   Move selection up/down"),
         Line::from("  Tab         Drill into selected agent"),
@@ -1308,6 +1308,13 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
             (" Confirm ", "Kill this agent?", name, String::new(), 40)
         }
         ConfirmAction::Quit => (
+            " Confirm Quit ",
+            "Quit omar?",
+            "This will kill ALL EA sessions and agents.".to_string(),
+            "Persisted EA state, projects, notes, and events will be kept.".to_string(),
+            62,
+        ),
+        ConfirmAction::ResetQuit => (
             " Confirm Quit ",
             "Quit omar?",
             "This will kill ALL EA sessions and agents.".to_string(),

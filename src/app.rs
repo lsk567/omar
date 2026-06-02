@@ -24,6 +24,8 @@ pub enum ConfirmAction {
     Kill,
     /// Quit the dashboard while leaving EA sessions and persisted state intact.
     Quit,
+    /// Quit OMAR and reset persisted runtime state.
+    ResetQuit,
     /// Delete the currently active EA (blocked only if it is the last one)
     DeleteEa,
 }
@@ -88,6 +90,7 @@ pub struct App {
     pub selected: usize,
     pub manager_selected: bool,
     pub should_quit: bool,
+    pub reset_on_quit: bool,
     pub show_help: bool,
     pub pending_confirm: Option<ConfirmAction>,
     pub filter: String,
@@ -186,6 +189,7 @@ impl App {
             selected: 0,
             manager_selected: true,
             should_quit: false,
+            reset_on_quit: false,
             show_help: false,
             pending_confirm: None,
             filter: String::new(),
