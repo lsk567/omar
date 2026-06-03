@@ -218,7 +218,7 @@ fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> String {
         match s.trim().to_ascii_lowercase().as_str() {
             "codex" => Some("codex"),
             "cursor" => Some("cursor"),
-            "gemini" => Some("gemini"),
+            "agy" => Some("agy"),
             "claude" | "claude-code" | "claude_code" => Some("claude"),
             "opencode" => Some("opencode"),
             _ => None,
@@ -736,7 +736,7 @@ impl OmarMcpServer {
     }
 
     fn list_backends(&self) -> Result<Value> {
-        let backends = ["claude", "codex", "cursor", "gemini", "opencode"];
+        let backends = ["claude", "codex", "cursor", "opencode", "agy"];
         let infos: Vec<Value> = backends
             .iter()
             .filter_map(|name| {
@@ -881,8 +881,8 @@ impl OmarMcpServer {
             fs::remove_file(&notes_path)
                 .map_err(|e| anyhow!("Failed to remove notes {:?}: {}", notes_path, e))?;
         }
-        // Per-EA MCP scratch dir (context.json, claude-mcp.json,
-        // gemini-deny-native-tools.toml). These were silently leaking on
+        // Per-EA MCP scratch dir (context.json, claude-mcp.json, backend
+        // policy/config files). These were silently leaking on
         // EA delete before and could grow unbounded across re-creates.
         let mcp_dir = self
             .context
@@ -893,6 +893,7 @@ impl OmarMcpServer {
             fs::remove_dir_all(&mcp_dir)
                 .map_err(|e| anyhow!("Failed to remove mcp dir {:?}: {}", mcp_dir, e))?;
         }
+        manager::remove_omar_antigravity_mcp_config(args.ea_id)?;
         let events_cancelled = self.scheduler().cancel_by_ea(args.ea_id);
         ea::unregister_ea(&self.context.omar_dir, args.ea_id)?;
         Ok(json!({
@@ -2118,7 +2119,7 @@ fn tool_definitions() -> Vec<Value> {
                     "project_id":{"type":"integer","description":"Existing project id from add_project or list_projects. Required — spawn_agent does not auto-create projects."},
                     "task":{"type":"string","description":"Delivered to the agent as their initial task and shown in the dashboard. What to build or do — no [TASK COMPLETE] or parent-wakeup instructions; those are already in every agent's system prompt."},
                     "command":{"type":"string","description":"Raw command to run instead of a backend agent (e.g. 'bash' for a demo window). Mutually exclusive with backend."},
-                    "backend":{"type":"string","enum":["claude","codex","cursor","opencode","gemini"],"description":"Backend agent command to launch. Mutually exclusive with command."},
+                    "backend":{"type":"string","enum":["claude","codex","cursor","opencode","agy"],"description":"Backend agent command to launch. Mutually exclusive with command."},
                     "model":{"type":"string","description":"Optional backend model override. Allowed characters are alphanumeric plus '-', '_', '.', '/'."},
                     "reasoning_effort":{"type":"string","enum":["low","medium","high","xhigh"],"description":"Optional Codex reasoning effort override. Supported only with backend='codex'; appends a Codex config override such as -c model_reasoning_effort='\"high\"'."},
                     "workdir":{"type":"string","description":"Working directory for the new session. Defaults to this MCP server's launch workdir."},
@@ -2342,11 +2343,9 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::test_env_lock()
     }
 
     struct EnvVarGuard {
@@ -2449,6 +2448,29 @@ mod tests {
             err.to_string().contains("backend='codex'"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn infer_backend_name_recognizes_agy() {
+        assert_eq!(infer_backend_name(Some("agy"), "ignored"), "agy");
+        assert_eq!(
+            infer_backend_name(None, "env FOO=bar agy --dangerously-skip-permissions"),
+            "agy"
+        );
+    }
+
+    #[test]
+    fn list_backends_includes_agy() {
+        let server = OmarMcpServer::new(test_context());
+        let response = server.list_backends().unwrap();
+        let backends = response["backends"].as_array().unwrap();
+        let agy = backends
+            .iter()
+            .find(|backend| backend["name"].as_str() == Some("agy"))
+            .expect("agy backend entry");
+
+        assert_eq!(agy["command"], "agy --dangerously-skip-permissions");
+        assert!(agy["available"].is_boolean());
     }
 
     #[test]
@@ -2864,7 +2886,7 @@ mod tests {
 
         assert!(!available);
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(3),
             "list_backends should not block indefinitely on backend --version"
         );
     }

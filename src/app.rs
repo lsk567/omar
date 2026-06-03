@@ -22,8 +22,8 @@ pub type SharedApp = App;
 pub enum ConfirmAction {
     /// Kill the selected agent
     Kill,
-    /// Quit the dashboard while leaving EA sessions and persisted state intact.
-    Quit,
+    /// Quit and reset persisted OMAR runtime state.
+    ResetQuit,
     /// Delete the currently active EA (blocked only if it is the last one)
     DeleteEa,
 }
@@ -88,6 +88,7 @@ pub struct App {
     pub selected: usize,
     pub manager_selected: bool,
     pub should_quit: bool,
+    pub reset_on_quit: bool,
     pub show_help: bool,
     pub pending_confirm: Option<ConfirmAction>,
     pub filter: String,
@@ -186,6 +187,7 @@ impl App {
             selected: 0,
             manager_selected: true,
             should_quit: false,
+            reset_on_quit: false,
             show_help: false,
             pending_confirm: None,
             filter: String::new(),
@@ -585,7 +587,7 @@ impl App {
         };
 
         // For backends whose manager prompt is now loaded from an auto-
-        // discovered file (codex `AGENTS.md`, gemini `GEMINI.md`, opencode
+        // discovered file (codex `AGENTS.md`, agy MCP plugin config, opencode
         // `AGENTS.md`), build_ea_command returns the workspace dir we must
         // launch in. Fall back to the user's workdir for claude/cursor.
         let launch_cwd = workspace_cwd
@@ -1503,6 +1505,7 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         if notes_path.exists() {
             std::fs::remove_file(&notes_path)?;
         }
+        crate::manager::remove_omar_antigravity_mcp_config(ea_id)?;
 
         let events_cancelled = self.scheduler.cancel_by_ea(ea_id);
 
@@ -1901,15 +1904,12 @@ mod tests {
     use crate::projects;
     use crate::scheduler;
     use crate::tmux::{HealthInfo, HealthState, Session, TmuxClient};
-    use std::sync::{Mutex, MutexGuard};
 
     /// Manager session name used in tests (EA 0 with "omar-agent-" prefix)
     const TEST_MANAGER: &str = "omar-agent-ea-0";
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env_lock()
     }
 
     struct HomeEnvGuard {
@@ -2055,7 +2055,7 @@ mod tests {
         let scheduler = Arc::new(Scheduler::new());
         let mut app = App::new(&config, TickerBuffer::new(), scheduler);
 
-        let mut commands: Vec<String> = ["claude", "codex", "cursor", "gemini", "opencode"]
+        let mut commands: Vec<String> = ["claude", "codex", "cursor", "opencode", "agy"]
             .iter()
             .map(|name| crate::config::resolve_backend(name).unwrap())
             .collect();

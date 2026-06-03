@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 /// EA identifier. Simple integer.
 pub type EaId = u32;
@@ -261,24 +262,17 @@ pub fn unregister_ea(base_dir: &Path, ea_id: EaId) -> anyhow::Result<()> {
     save_registry(base_dir, &eas)
 }
 
-/// Compact the ID counter on clean quit.
-/// Resets ea_next_id to max(registered_ids) so the next session starts
-/// numbering from a compact point rather than the old high-water mark.
-/// Safe to call only on graceful exit — not during crash recovery.
-pub fn compact_id_counter(base_dir: &Path) -> anyhow::Result<()> {
-    let eas = load_registry(base_dir);
-    let max_id = eas.iter().map(|e| e.id).max().unwrap_or(0);
-    save_next_id_counter(base_dir, max_id)
-}
-
 fn save_registry(base_dir: &Path, eas: &[EaInfo]) -> anyhow::Result<()> {
     let path = base_dir.join("eas.json");
-    fs::create_dir_all(base_dir).ok();
+    fs::create_dir_all(base_dir)?;
     let json = serde_json::to_string_pretty(eas)?;
     // Atomic write: write to temp file, then rename
-    let tmp = path.with_extension("json.tmp");
+    let tmp = base_dir.join(format!(".eas.{}.json.tmp", Uuid::new_v4()));
     fs::write(&tmp, &json)?;
-    fs::rename(&tmp, &path)?;
+    if let Err(err) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -573,25 +567,6 @@ mod tests {
         // Create another — should get ID 4, NOT 1 or 2
         let id4 = register_ea(dir.path(), "Delta", None).unwrap();
         assert_eq!(id4, 4, "ID should be 4 (monotonic), not a reused ID");
-    }
-
-    #[test]
-    fn test_compact_id_counter() {
-        let dir = tempfile::tempdir().unwrap();
-        // Create EAs 1, 2, 3; delete 2 and 3
-        let _id1 = register_ea(dir.path(), "Alpha", None).unwrap();
-        let id2 = register_ea(dir.path(), "Beta", None).unwrap();
-        let id3 = register_ea(dir.path(), "Gamma", None).unwrap();
-        unregister_ea(dir.path(), id2).unwrap();
-        unregister_ea(dir.path(), id3).unwrap();
-        // Counter is at 3 (high-water mark)
-        assert_eq!(load_next_id_counter(dir.path()), 3);
-        // Compact: counter should drop to max registered (which is 1)
-        compact_id_counter(dir.path()).unwrap();
-        assert_eq!(load_next_id_counter(dir.path()), 1);
-        // Next register should get ID 2, not 4
-        let id_next = register_ea(dir.path(), "Delta", None).unwrap();
-        assert_eq!(id_next, 2);
     }
 
     #[test]

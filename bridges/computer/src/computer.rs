@@ -495,14 +495,14 @@ pub fn is_xdotool_available() -> bool {
                 cmd.env("XAUTHORITY", &xauth);
             }
             cmd.arg("version");
-            match cmd.output() {
-                Ok(o) => {
+            match command_output_with_timeout(cmd) {
+                Some(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
                     !stderr.contains("Can't open display")
                         && !stderr.contains("Authorization required")
                         && (!o.stdout.is_empty() || o.status.success())
                 }
-                Err(_) => false,
+                None => false,
             }
         }
     }
@@ -512,23 +512,23 @@ pub fn is_xdotool_available() -> bool {
 /// `xwd` + Python PIL).
 pub fn is_screenshot_available() -> bool {
     // ImageMagick import
-    if x11_command("import")
-        .arg("-version")
-        .output()
+    let mut import_cmd = x11_command("import");
+    import_cmd.arg("-version");
+    if command_output_with_timeout(import_cmd)
         .map(|o| o.status.success() || !o.stderr.is_empty())
         .unwrap_or(false)
     {
         return true;
     }
     // xwd + python3 Pillow
-    let xwd_ok = x11_command("xwd")
-        .arg("--help")
-        .output()
+    let mut xwd_cmd = x11_command("xwd");
+    xwd_cmd.arg("--help");
+    let xwd_ok = command_output_with_timeout(xwd_cmd)
         .map(|_| true)
         .unwrap_or(false);
-    let py_ok = Command::new("python3")
-        .args(["-c", "from PIL import Image"])
-        .output()
+    let mut py_cmd = Command::new("python3");
+    py_cmd.args(["-c", "from PIL import Image"]);
+    let py_ok = command_output_with_timeout(py_cmd)
         .map(|o| o.status.success())
         .unwrap_or(false);
     xwd_ok && py_ok
