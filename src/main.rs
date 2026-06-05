@@ -363,7 +363,8 @@ async fn async_main() -> Result<()> {
                 ea::save_active_ea(&omar_dir, target.id)?;
             }
             if std::env::var("TMUX").is_err() {
-                relaunch_in_tmux()
+                let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+                relaunch_in_tmux(&config, &omar_dir, target.id, cli.agent.is_some())
             } else {
                 run_dashboard(config).await
             }
@@ -583,18 +584,34 @@ fn cancel_cli_event(
 /// Called when the dashboard is started outside of tmux so that popups,
 /// attach, and other tmux-dependent features work correctly.
 ///
-/// If an existing dashboard session exists, tries to attach to it.
-/// This preserves the in-memory scheduler (cron jobs, pending events)
-/// across detach/reattach cycles. If attach fails (stale session),
-/// kills the session and creates a fresh one.
-fn relaunch_in_tmux() -> Result<()> {
+/// If the dashboard is already running, hands this invocation's EA/backend/cwd
+/// to it and attaches. This preserves the in-memory scheduler (cron jobs,
+/// pending events) across detach/reattach cycles. If attach fails (stale
+/// session), kills the stale session and creates a fresh one.
+fn relaunch_in_tmux(
+    config: &Config,
+    omar_dir: &std::path::Path,
+    active_ea: ea::EaId,
+    restart_manager: bool,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let client = TmuxClient::new("");
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     if client.has_session(DASHBOARD_SESSION)? {
+        let handoff = ea::DashboardLaunchHandoff {
+            active_ea,
+            default_command: config.agent.default_command.clone(),
+            default_workdir: current_dir.to_string_lossy().into_owned(),
+            restart_manager,
+        };
+        ea::save_dashboard_launch_handoff(omar_dir, &handoff)?;
+        let target = format!("={}", DASHBOARD_SESSION);
         let status = tmux_command()
-            .args(["-2", "attach-session", "-t", DASHBOARD_SESSION])
+            .args(["-2", "attach-session", "-t", &target])
             .status();
 
         match status {
@@ -605,13 +622,11 @@ fn relaunch_in_tmux() -> Result<()> {
         }
     }
 
-    let exe = std::env::current_exe()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
     let mut cmd = tmux_command();
     // Force 256-color mode when launching the dashboard session.
     cmd.arg("-2");
-    cmd.args(["new-session", "-s", DASHBOARD_SESSION]);
+    cmd.args(["new-session", "-s", DASHBOARD_SESSION, "-c"]);
+    cmd.arg(&current_dir);
     cmd.arg(&exe);
     cmd.args(&args);
 

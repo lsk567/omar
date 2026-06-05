@@ -284,6 +284,7 @@ impl App {
 
     /// Refresh the list of agents (scoped to active EA)
     pub fn refresh(&mut self) -> Result<()> {
+        self.apply_dashboard_launch_handoff()?;
         self.registered_eas = ea::load_registry(&self.omar_dir);
 
         // Pick up out-of-band EA switches (e.g. via the MCP `switch_ea` tool)
@@ -520,6 +521,34 @@ impl App {
         Ok(())
     }
 
+    fn apply_dashboard_launch_handoff(&mut self) -> Result<()> {
+        let Some(handoff) = ea::take_dashboard_launch_handoff(&self.omar_dir) else {
+            return Ok(());
+        };
+
+        // Capture the pre-handoff backend so we only restart the manager when
+        // the user actually switched backends. `omar -a claude` while already
+        // on claude shouldn't kill the running EA — that throws away the
+        // backend's in-memory conversation for nothing.
+        let backend_changed = self.default_command != handoff.default_command;
+
+        self.config.agent.default_command = handoff.default_command.clone();
+        self.config.agent.default_workdir = handoff.default_workdir.clone();
+        self.default_command = handoff.default_command;
+        self.default_workdir = handoff.default_workdir;
+        self.activate_ea_local(handoff.active_ea)?;
+        ea::save_active_ea(&self.omar_dir, handoff.active_ea)?;
+
+        if handoff.restart_manager && backend_changed {
+            let manager_session = ea::ea_manager_session(handoff.active_ea, &self.base_prefix);
+            if self.client.has_session(&manager_session)? {
+                self.client.kill_session(&manager_session)?;
+                self.manager = None;
+            }
+        }
+        Ok(())
+    }
+
     /// Build the startup command attempts for the manager.
     ///
     /// In strict mode we issue exactly one launch command so behavior matches
@@ -551,9 +580,7 @@ impl App {
             .map(|ea| ea.name.as_str())
             .unwrap_or("Default");
 
-        let workdir = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let workdir = self.default_workdir.clone();
 
         let (default_command, inject_prompt) = self
             .manager_startup_attempts()
@@ -1342,30 +1369,8 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
 
     /// Switch the dashboard to a different EA. Full reload of all state.
     pub fn switch_ea(&mut self, ea_id: EaId) -> Result<()> {
-        // Reload registry and validate that the target EA exists
-        self.registered_eas = ea::load_registry(&self.omar_dir);
-        if !self.registered_eas.iter().any(|e| e.id == ea_id) {
-            anyhow::bail!("EA {} not registered", ea_id);
-        }
-
-        self.active_ea = ea_id;
+        self.activate_ea_local(ea_id)?;
         ea::save_active_ea(&self.omar_dir, ea_id)?;
-
-        // Reconstruct tmux client with new EA's prefix
-        let new_prefix = ea::ea_prefix(ea_id, &self.base_prefix);
-        self.client = TmuxClient::new(&new_prefix);
-        self.health_checker = HealthChecker::new(self.client.clone(), self.health_threshold)
-            .with_auth_failure_patterns(self.config.watchdog.auth_failure_patterns.clone());
-
-        // Reset all view state
-        self.focus_parent = ea::ea_manager_session(ea_id, &self.base_prefix);
-        self.focus_stack.clear();
-        self.selected = 0;
-        self.manager_selected = true;
-
-        // Ensure EA state directory exists; refresh() will reload projects/parents/tasks
-        let state_dir = ea::ea_state_dir(ea_id, &self.omar_dir);
-        std::fs::create_dir_all(&state_dir).ok();
 
         // Refresh discovers agents via the new prefix and reloads all EA state
         self.refresh()?;
@@ -1386,6 +1391,27 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         self.settings_edit_buffer = None;
         self.sidebar_popup = None;
         self.pending_confirm = None;
+        Ok(())
+    }
+
+    fn activate_ea_local(&mut self, ea_id: EaId) -> Result<()> {
+        self.registered_eas = ea::load_registry(&self.omar_dir);
+        if !self.registered_eas.iter().any(|e| e.id == ea_id) {
+            anyhow::bail!("EA {} not registered", ea_id);
+        }
+
+        self.active_ea = ea_id;
+        let new_prefix = ea::ea_prefix(ea_id, &self.base_prefix);
+        self.client = TmuxClient::new(&new_prefix);
+        self.health_checker = HealthChecker::new(self.client.clone(), self.health_threshold)
+            .with_auth_failure_patterns(self.config.watchdog.auth_failure_patterns.clone());
+        self.focus_parent = ea::ea_manager_session(ea_id, &self.base_prefix);
+        self.focus_stack.clear();
+        self.selected = 0;
+        self.manager_selected = true;
+
+        let state_dir = ea::ea_state_dir(ea_id, &self.omar_dir);
+        std::fs::create_dir_all(&state_dir).ok();
         Ok(())
     }
 
@@ -2068,6 +2094,172 @@ mod tests {
             assert_eq!(&attempts[0].0, cmd);
             assert!(attempts[0].1);
         }
+    }
+
+    #[test]
+    fn dashboard_launch_handoff_updates_runtime_command_and_workdir() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = HomeEnvGuard::set(dir.path());
+        let config = test_config_with_prefix(format!("omar-test-{}-", uuid::Uuid::new_v4()));
+        let scheduler = Arc::new(Scheduler::new());
+        let mut app = App::new(&config, TickerBuffer::new(), scheduler);
+        let handoff = ea::DashboardLaunchHandoff {
+            active_ea: 0,
+            default_command: crate::config::resolve_backend("claude").unwrap(),
+            default_workdir: "/tmp/omar-launch".to_string(),
+            restart_manager: false,
+        };
+        ea::save_dashboard_launch_handoff(&app.omar_dir, &handoff).unwrap();
+
+        app.apply_dashboard_launch_handoff().unwrap();
+
+        assert_eq!(app.default_command(), handoff.default_command);
+        assert_eq!(app.default_workdir, handoff.default_workdir);
+        assert_eq!(app.config.agent.default_command, handoff.default_command);
+        assert_eq!(app.config.agent.default_workdir, handoff.default_workdir);
+        assert!(ea::take_dashboard_launch_handoff(&app.omar_dir).is_none());
+    }
+
+    #[test]
+    fn dashboard_launch_handoff_preserves_manager_when_backend_unchanged() {
+        // Regression guard for the no-op case: `omar -a claude` typed while
+        // the EA is already running under claude must NOT kill the manager
+        // tmux session, since that throws away the backend's in-memory
+        // conversation for no behavioral change.
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = HomeEnvGuard::set(dir.path());
+        let tmux_server = format!("omar-handoff-noop-{}", uuid::Uuid::new_v4());
+        let _tmux = TmuxServerEnvGuard::set(&tmux_server);
+        let prefix = format!("omar-test-{}-", uuid::Uuid::new_v4());
+        let config = test_config_with_prefix(prefix.clone());
+        let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
+
+        let claude = crate::config::resolve_backend("claude").unwrap();
+        app.default_command = claude.clone();
+        app.config.agent.default_command = claude.clone();
+
+        let manager_session = ea::ea_manager_session(0, &prefix);
+        let spawned = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "new-session",
+                "-d",
+                "-s",
+                &manager_session,
+                "sleep 600",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !spawned {
+            eprintln!("Skipping test: failed to create tmux session");
+            return;
+        }
+        assert!(app.client.has_session(&manager_session).unwrap());
+
+        let handoff = ea::DashboardLaunchHandoff {
+            active_ea: 0,
+            default_command: claude.clone(),
+            default_workdir: "/tmp/omar-noop".to_string(),
+            restart_manager: true,
+        };
+        ea::save_dashboard_launch_handoff(&app.omar_dir, &handoff).unwrap();
+
+        app.apply_dashboard_launch_handoff().unwrap();
+
+        assert!(
+            app.client.has_session(&manager_session).unwrap(),
+            "no-op handoff (same backend) must not kill the manager session"
+        );
+
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &tmux_server, "kill-session", "-t", &manager_session])
+            .status();
+    }
+
+    #[test]
+    fn dashboard_launch_handoff_kills_manager_when_backend_changes() {
+        // Positive case: a real backend swap (claude -> opencode) must kill
+        // the manager session so it respawns under the new backend.
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = HomeEnvGuard::set(dir.path());
+        let tmux_server = format!("omar-handoff-swap-{}", uuid::Uuid::new_v4());
+        let _tmux = TmuxServerEnvGuard::set(&tmux_server);
+        let prefix = format!("omar-test-{}-", uuid::Uuid::new_v4());
+        let config = test_config_with_prefix(prefix.clone());
+        let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
+
+        let claude = crate::config::resolve_backend("claude").unwrap();
+        let opencode = crate::config::resolve_backend("opencode").unwrap();
+        assert_ne!(
+            claude, opencode,
+            "backends must resolve to distinct commands"
+        );
+        app.default_command = claude.clone();
+        app.config.agent.default_command = claude.clone();
+
+        let manager_session = ea::ea_manager_session(0, &prefix);
+        let spawned = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "new-session",
+                "-d",
+                "-s",
+                &manager_session,
+                "sleep 600",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !spawned {
+            eprintln!("Skipping test: failed to create tmux session");
+            return;
+        }
+        assert!(app.client.has_session(&manager_session).unwrap());
+
+        let handoff = ea::DashboardLaunchHandoff {
+            active_ea: 0,
+            default_command: opencode.clone(),
+            default_workdir: "/tmp/omar-swap".to_string(),
+            restart_manager: true,
+        };
+        ea::save_dashboard_launch_handoff(&app.omar_dir, &handoff).unwrap();
+
+        app.apply_dashboard_launch_handoff().unwrap();
+
+        assert!(
+            !app.client.has_session(&manager_session).unwrap(),
+            "real backend swap must kill the manager session so it respawns under the new backend"
+        );
+        assert!(
+            app.manager.is_none(),
+            "App::manager must be cleared after kill"
+        );
     }
 
     #[test]
