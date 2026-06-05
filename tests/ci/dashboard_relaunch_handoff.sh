@@ -107,7 +107,7 @@ rm -f "$handoff_file"
 )
 
 if [ ! -f "$handoff_file" ]; then
-  fail "dashboard_handoff.json was not written by omar -a bash"
+  fail "dashboard_handoff.json was not written by omar -a claude"
 fi
 
 python3 - "$handoff_file" "$work_dir" <<'PY'
