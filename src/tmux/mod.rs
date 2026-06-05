@@ -27,7 +27,10 @@ pub fn backend_readiness_markers(backend: &str) -> &'static [&'static str] {
     match backend {
         "codex" => &["OpenAI Codex"],
         "cursor" => &["Cursor Agent"],
-        "gemini" => &["Gemini CLI"],
+        // `agy` is not available in CI/local discovery here, so avoid
+        // overfitting to an unverified banner and let delivery use the
+        // existing stable-pane fallback.
+        "agy" => &[],
         "claude" => &["Claude Code", "❯"],
         "opencode" => &["tab agents", "ctrl+p commands"],
         _ => &[],

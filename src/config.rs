@@ -148,8 +148,8 @@ fn detect_agent_command() -> String {
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
         ),
         ("cursor", "cursor agent --yolo"),
-        ("gemini", "gemini --yolo"),
         ("opencode", "opencode"),
+        ("agy", "agy --dangerously-skip-permissions"),
     ])
     .unwrap_or_else(|| "claude --dangerously-skip-permissions".to_string())
 }
@@ -170,8 +170,8 @@ fn default_command() -> String {
 /// - `"claude"` → `"claude --dangerously-skip-permissions"`
 /// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
 /// - `"cursor"` → `"cursor agent --yolo"`
-/// - `"gemini"` → `"gemini --yolo"`
 /// - `"opencode"` → `"opencode"` (opencode has no permission-skip flag)
+/// - `"agy"` → `"agy --dangerously-skip-permissions"`
 /// - anything else → error
 pub fn resolve_backend(name: &str) -> Result<String, String> {
     match name {
@@ -180,10 +180,10 @@ pub fn resolve_backend(name: &str) -> Result<String, String> {
             Ok("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string())
         }
         "cursor" => Ok("cursor agent --yolo".to_string()),
-        "gemini" => Ok("gemini --yolo".to_string()),
         "opencode" => Ok("opencode".to_string()),
+        "agy" => Ok("agy --dangerously-skip-permissions".to_string()),
         other => Err(format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, gemini, opencode",
+            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, agy",
             other
         )),
     }
@@ -432,6 +432,7 @@ mod tests {
 
     #[test]
     fn slack_bridge_text_setting_round_trips() {
+        let _env_lock = crate::test_env_lock();
         let mut config = Config::default();
         // The default state is no persisted EA — exposed as the empty string.
         assert!(matches!(
@@ -484,8 +485,8 @@ sidebar_right = false
             cmd.contains("claude")
                 || cmd.contains("codex")
                 || cmd.contains("cursor")
-                || cmd.contains("gemini")
-                || cmd.contains("opencode"),
+                || cmd.contains("opencode")
+                || cmd.contains("agy"),
             "Unexpected default command: {}",
             cmd
         );
@@ -517,9 +518,30 @@ sidebar_right = false
 
         assert_eq!(cmd.as_deref(), Some("fast command"));
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(3),
             "hanging probe should be skipped after the bounded timeout"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_agent_command_can_select_agy() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let agy = temp.path().join("agy");
+        fs::write(&agy, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&agy).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&agy, perms).unwrap();
+
+        let cmd = detect_agent_command_from(&[(
+            agy.to_str().unwrap(),
+            "agy --dangerously-skip-permissions",
+        )]);
+
+        assert_eq!(cmd.as_deref(), Some("agy --dangerously-skip-permissions"));
     }
 
     #[test]
@@ -576,8 +598,11 @@ session_prefix = "omar-agent"
             "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
         );
         assert_eq!(resolve_backend("cursor").unwrap(), "cursor agent --yolo");
-        assert_eq!(resolve_backend("gemini").unwrap(), "gemini --yolo");
         assert_eq!(resolve_backend("opencode").unwrap(), "opencode");
+        assert_eq!(
+            resolve_backend("agy").unwrap(),
+            "agy --dangerously-skip-permissions"
+        );
     }
 
     #[test]

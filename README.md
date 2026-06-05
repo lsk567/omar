@@ -36,7 +36,7 @@ Other features include messaging systems integration (e.g., Slack), computer use
 - tmux 3.0+
 - Rust 1.70+
 - GNU Make
-- One or more coding agents: [Claude](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex](https://developers.openai.com/codex/cli), [Cursor](https://cursor.com/cli), [Gemini](https://geminicli.com), [Opencode](https://github.com/anomalyco/opencode)
+- One or more coding agents: [Claude](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), [Codex](https://developers.openai.com/codex/cli), [Cursor](https://cursor.com/cli), [Opencode](https://github.com/anomalyco/opencode), or Google Antigravity CLI (`agy`)
 
 ### One-liner (recommended)
 
@@ -96,8 +96,17 @@ Shutdown the test project and its agents.
 | [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar -a claude` (default) |
 | [Codex CLI](https://developers.openai.com/codex/cli) | `omar -a codex` |
 | [Cursor CLI](https://cursor.com/cli) | `omar -a cursor` |
-| [Gemini CLI](https://geminicli.com) | `omar -a gemini` |
 | [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode` |
+| Google Antigravity CLI (`agy`) | `omar -a agy` |
+
+Antigravity CLI must be installed and authenticated separately. OMAR does not
+run the installer automatically; install `agy` with Google's installer and log
+in before launching `omar -a agy`. OMAR launches it with
+`--dangerously-skip-permissions`, the CLI's YOLO-style permission mode, and
+registers an EA-scoped OMAR MCP server as a native Antigravity CLI plugin under
+`~/.gemini/config/plugins/omar-ea-<id>/` and records it in
+`~/.gemini/config/import_manifest.json`. OMAR creates the plugin files when they
+do not already exist.
 
 When spawning Codex workers through OMAR's MCP `spawn_agent` tool, pass
 `backend: "codex"`, optional `model` (for example `gpt-5.5`), and optional
@@ -110,7 +119,13 @@ BSD 3-Clause
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=lsk567/omar&type=date&legend=top-left)](https://www.star-history.com/#lsk567/omar&type=date&legend=top-left)
+<a href="https://www.star-history.com/?type=date&legend=top-left&repos=lsk567%2Fomar">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lsk567/omar&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=lsk567/omar&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=lsk567/omar&type=date&legend=top-left" />
+ </picture>
+</a>
 
 ---
 

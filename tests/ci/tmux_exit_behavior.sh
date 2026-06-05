@@ -38,6 +38,20 @@ session_prefix = "omar-agent-"
 default_command = "bash"
 default_workdir = "."
 EOF
+mkdir -p "$home_dir/.omar/ea/0/status" "$home_dir/.omar/mcp/ea-0" "$home_dir/.omar/slack_outbox" "$home_dir/.omar/logs/panics"
+cat >"$home_dir/.omar/eas.json" <<'EOF'
+[
+  {"id": 0, "name": "OldSessionName", "description": "old session", "created_at": 1}
+]
+EOF
+printf '0' >"$home_dir/.omar/active_ea"
+printf '0' >"$home_dir/.omar/ea_next_id"
+printf '[]' >"$home_dir/.omar/scheduled_events.json"
+printf '%s\n' '1. Keep project' >"$home_dir/.omar/ea/0/tasks.md"
+printf 'keep action log\n' >"$home_dir/.omar/ea/0/action_log.jsonl"
+printf 'keep manager notes\n' >"$home_dir/.omar/manager_notes_ea0.md"
+printf 'queued slack\n' >"$home_dir/.omar/slack_outbox/keep"
+printf 'panic log\n' >"$home_dir/.omar/logs/panics/keep.log"
 
 tmux_cmd() {
   HOME="$home_dir" OMAR_TMUX_SERVER="$server" tmux -L "$server" "$@"
@@ -62,7 +76,7 @@ tmux -L "$server" new-session -d -s omar-dashboard \
 wait_for_session omar-dashboard
 wait_for_session omar-agent-ea-0
 
-python3 - "$server" <<'PY'
+REPO_ROOT="$REPO_ROOT" OMAR_BIN="$OMAR_BIN" python3 - "$server" "$home_dir" <<'PY'
 import os
 import pty
 import signal
@@ -71,6 +85,7 @@ import sys
 import time
 
 server = sys.argv[1]
+home_dir = sys.argv[2]
 
 
 def tmux(*args):
@@ -79,6 +94,25 @@ def tmux(*args):
         text=True,
         capture_output=True,
     )
+
+
+def start_dashboard():
+    command = (
+        f"cd {sh_quote(os.environ['REPO_ROOT'])} && "
+        f"HOME={sh_quote(home_dir)} OMAR_TMUX_SERVER={sh_quote(server)} "
+        f"{sh_quote(os.environ['OMAR_BIN'])}"
+    )
+    result = tmux("new-session", "-d", "-s", "omar-dashboard", command)
+    if result.returncode != 0:
+        fail(f"Failed to restart dashboard: {result.stderr}")
+    if not wait_for(lambda: session_exists("omar-dashboard"), timeout=5.0):
+        fail("Dashboard session did not restart")
+    if not wait_for(lambda: session_exists("omar-agent-ea-0"), timeout=5.0):
+        fail("EA manager session did not restart")
+
+
+def sh_quote(value):
+    return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
 def sessions():
@@ -182,8 +216,43 @@ def test_detach_key():
         wait_for_detached("omar-dashboard")
         if not session_exists("omar-dashboard"):
             fail("Dashboard session disappeared after detach; expected session to persist")
+        assert_runtime_state_present("z")
 
         print("PASS: z detaches without terminating dashboard session")
+    finally:
+        close_dashboard(pid, fd)
+
+
+def assert_runtime_state_present(label):
+    omar_dir = os.path.join(home_dir, ".omar")
+    expected = [
+        "eas.json",
+        "active_ea",
+        "ea_next_id",
+        "scheduled_events.json",
+        os.path.join("ea", "0", "tasks.md"),
+        os.path.join("ea", "0", "action_log.jsonl"),
+        "manager_notes_ea0.md",
+        "mcp",
+    ]
+    missing = [path for path in expected if not os.path.exists(os.path.join(omar_dir, path))]
+    if missing:
+        fail(f"{label} unexpectedly removed persisted runtime state: {missing}")
+
+
+def test_ctrl_c_is_ignored():
+    pid, fd = open_dashboard()
+    try:
+        wait_for_attached("omar-dashboard")
+        os.write(fd, b"\x03")
+        time.sleep(0.1)
+
+        if not session_exists("omar-dashboard"):
+            fail("Dashboard session terminated after Ctrl+C; expected Ctrl+C to be ignored")
+        if not session_exists("omar-agent-ea-0"):
+            fail("EA manager session disappeared after Ctrl+C; expected Ctrl+C to be ignored")
+        assert_runtime_state_present("Ctrl+C")
+        print("PASS: Ctrl+C is ignored")
     finally:
         close_dashboard(pid, fd)
 
@@ -202,11 +271,63 @@ def test_quit_key_kills_all_sessions():
         if has_prefix_session("omar-agent-"):
             fail("OMAR agent sessions still exist after Q+y; expected cleanup on quit")
 
+        omar_dir = os.path.join(home_dir, ".omar")
+        wiped_paths = [
+            "eas.json",
+            "active_ea",
+            "ea_next_id",
+            "scheduled_events.json",
+            "ea",
+            "mcp",
+            "manager_notes_ea0.md",
+        ]
+        leftovers = [path for path in wiped_paths if os.path.exists(os.path.join(omar_dir, path))]
+        if leftovers:
+            fail(f"Persisted runtime state survived Q+y: {leftovers}")
+
+        kept_paths = [
+            "config.toml",
+            os.path.join("slack_outbox", "keep"),
+            os.path.join("logs", "panics", "keep.log"),
+        ]
+        missing = [path for path in kept_paths if not os.path.exists(os.path.join(omar_dir, path))]
+        if missing:
+            fail(f"Expected preserved files missing after Q+y: {missing}")
+
+        action_log_dir = os.path.join(omar_dir, "logs", "action_logs")
+        action_logs = []
+        if os.path.isdir(action_log_dir):
+            action_logs = [
+                name
+                for name in os.listdir(action_log_dir)
+                if name.startswith("ea-0-") and name.endswith(".jsonl")
+            ]
+        if len(action_logs) != 1:
+            fail(f"Q+y did not archive exactly one action log: {action_logs}")
+        with open(os.path.join(action_log_dir, action_logs[0]), encoding="utf-8") as handle:
+            if handle.read() != "keep action log\n":
+                fail("Archived action log content did not match expected content")
+
+        notes_dir = os.path.join(omar_dir, "logs", "manager_notes")
+        notes = []
+        if os.path.isdir(notes_dir):
+            notes = [
+                name
+                for name in os.listdir(notes_dir)
+                if name.startswith("manager_notes_ea0-") and name.endswith(".md")
+            ]
+        if len(notes) != 1:
+            fail(f"Q+y did not archive exactly one manager notes file: {notes}")
+        with open(os.path.join(notes_dir, notes[0]), encoding="utf-8") as handle:
+            if handle.read() != "keep manager notes\n":
+                fail("Archived manager notes content did not match expected content")
+
         print("PASS: Q+y exits dashboard and kills OMAR sessions")
     finally:
         close_dashboard(pid, fd)
 
 
 test_detach_key()
+test_ctrl_c_is_ignored()
 test_quit_key_kills_all_sessions()
 PY

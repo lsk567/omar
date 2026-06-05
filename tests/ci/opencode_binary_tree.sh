@@ -161,13 +161,17 @@ for s in "$leaf1_session" "$leaf2_session"; do
 done
 
 # Positive assertion: each leaf pane should show that opencode came up.
-# We look for the opencode TUI banner, normal prompt/status text, or the
-# opencode-owned update modal. Any of these indicates the worker is alive
-# and not crashed; the wizard-regression check above remains the behavioral
-# failure signal this test exists to catch.
+# Match stable TUI chrome that opencode renders whenever its UI is alive,
+# independent of provider-auth state (an unauthenticated TUI still draws the
+# input placeholder and footer), plus opencode's own update modal. Any of
+# these indicates the worker is alive and not crashed. Case-insensitive on
+# purpose: recent opencode brands the provider as "OpenCode Zen" (capital C)
+# and draws the logo as box-art, so the old case-sensitive 'opencode' marker
+# no longer matched a healthy pane. The wizard-regression check above remains
+# the behavioral failure signal this test exists to catch.
 for s in "$leaf1_session" "$leaf2_session"; do
   text="$(pane_text "$s")"
-  if ! grep -qiE 'opencode|chat|prompt|update available|new release' <<<"$text"; then
+  if ! grep -qiE 'opencode|ask anything|tab agents|ctrl\+p|commands|update available|new release' <<<"$text"; then
     fail "$s pane does not show opencode UI markers"
   fi
 done
