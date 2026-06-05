@@ -526,6 +526,12 @@ impl App {
             return Ok(());
         };
 
+        // Capture the pre-handoff backend so we only restart the manager when
+        // the user actually switched backends. `omar -a claude` while already
+        // on claude shouldn't kill the running EA — that throws away the
+        // backend's in-memory conversation for nothing.
+        let backend_changed = self.default_command != handoff.default_command;
+
         self.config.agent.default_command = handoff.default_command.clone();
         self.config.agent.default_workdir = handoff.default_workdir.clone();
         self.default_command = handoff.default_command;
@@ -533,7 +539,7 @@ impl App {
         self.activate_ea_local(handoff.active_ea)?;
         ea::save_active_ea(&self.omar_dir, handoff.active_ea)?;
 
-        if handoff.restart_manager {
+        if handoff.restart_manager && backend_changed {
             let manager_session = ea::ea_manager_session(handoff.active_ea, &self.base_prefix);
             if self.client.has_session(&manager_session)? {
                 self.client.kill_session(&manager_session)?;
@@ -2113,6 +2119,147 @@ mod tests {
         assert_eq!(app.config.agent.default_command, handoff.default_command);
         assert_eq!(app.config.agent.default_workdir, handoff.default_workdir);
         assert!(ea::take_dashboard_launch_handoff(&app.omar_dir).is_none());
+    }
+
+    #[test]
+    fn dashboard_launch_handoff_preserves_manager_when_backend_unchanged() {
+        // Regression guard for the no-op case: `omar -a claude` typed while
+        // the EA is already running under claude must NOT kill the manager
+        // tmux session, since that throws away the backend's in-memory
+        // conversation for no behavioral change.
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = HomeEnvGuard::set(dir.path());
+        let tmux_server = format!("omar-handoff-noop-{}", uuid::Uuid::new_v4());
+        let _tmux = TmuxServerEnvGuard::set(&tmux_server);
+        let prefix = format!("omar-test-{}-", uuid::Uuid::new_v4());
+        let config = test_config_with_prefix(prefix.clone());
+        let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
+
+        let claude = crate::config::resolve_backend("claude").unwrap();
+        app.default_command = claude.clone();
+        app.config.agent.default_command = claude.clone();
+
+        let manager_session = ea::ea_manager_session(0, &prefix);
+        let spawned = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "new-session",
+                "-d",
+                "-s",
+                &manager_session,
+                "sleep 600",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !spawned {
+            eprintln!("Skipping test: failed to create tmux session");
+            return;
+        }
+        assert!(app.client.has_session(&manager_session).unwrap());
+
+        let handoff = ea::DashboardLaunchHandoff {
+            active_ea: 0,
+            default_command: claude.clone(),
+            default_workdir: "/tmp/omar-noop".to_string(),
+            restart_manager: true,
+        };
+        ea::save_dashboard_launch_handoff(&app.omar_dir, &handoff).unwrap();
+
+        app.apply_dashboard_launch_handoff().unwrap();
+
+        assert!(
+            app.client.has_session(&manager_session).unwrap(),
+            "no-op handoff (same backend) must not kill the manager session"
+        );
+
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &tmux_server, "kill-session", "-t", &manager_session])
+            .status();
+    }
+
+    #[test]
+    fn dashboard_launch_handoff_kills_manager_when_backend_changes() {
+        // Positive case: a real backend swap (claude -> opencode) must kill
+        // the manager session so it respawns under the new backend.
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let _home = HomeEnvGuard::set(dir.path());
+        let tmux_server = format!("omar-handoff-swap-{}", uuid::Uuid::new_v4());
+        let _tmux = TmuxServerEnvGuard::set(&tmux_server);
+        let prefix = format!("omar-test-{}-", uuid::Uuid::new_v4());
+        let config = test_config_with_prefix(prefix.clone());
+        let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
+
+        let claude = crate::config::resolve_backend("claude").unwrap();
+        let opencode = crate::config::resolve_backend("opencode").unwrap();
+        assert_ne!(
+            claude, opencode,
+            "backends must resolve to distinct commands"
+        );
+        app.default_command = claude.clone();
+        app.config.agent.default_command = claude.clone();
+
+        let manager_session = ea::ea_manager_session(0, &prefix);
+        let spawned = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_server,
+                "new-session",
+                "-d",
+                "-s",
+                &manager_session,
+                "sleep 600",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !spawned {
+            eprintln!("Skipping test: failed to create tmux session");
+            return;
+        }
+        assert!(app.client.has_session(&manager_session).unwrap());
+
+        let handoff = ea::DashboardLaunchHandoff {
+            active_ea: 0,
+            default_command: opencode.clone(),
+            default_workdir: "/tmp/omar-swap".to_string(),
+            restart_manager: true,
+        };
+        ea::save_dashboard_launch_handoff(&app.omar_dir, &handoff).unwrap();
+
+        app.apply_dashboard_launch_handoff().unwrap();
+
+        assert!(
+            !app.client.has_session(&manager_session).unwrap(),
+            "real backend swap must kill the manager session so it respawns under the new backend"
+        );
+        assert!(
+            app.manager.is_none(),
+            "App::manager must be cleared after kill"
+        );
     }
 
     #[test]
