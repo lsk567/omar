@@ -244,6 +244,35 @@ jobs:
       - name: Run EA zero-selector integration
         run: bash tests/ci/tmux_ea_selector_zero.sh
 
+  dashboard-relaunch-handoff-integration:
+    name: Dashboard Relaunch Handoff Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build omar
+        run: cargo build --bin omar
+
+      - name: Run dashboard relaunch handoff integration
+        run: bash tests/ci/dashboard_relaunch_handoff.sh
+
   opencode-compat:
     name: Opencode Compatibility
     runs-on: ubuntu-latest
@@ -323,7 +352,7 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, popup-quote-integration, exit-behavior-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, opencode-compat, build]
+    needs: [check, fmt, clippy, test, popup-quote-integration, exit-behavior-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, build]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -338,6 +367,7 @@ jobs:
              [[ "${{ needs.unresolved-session-integration.result }}" != "success" ]] || \
              [[ "${{ needs.codex-yolo-integration.result }}" != "success" ]] || \
              [[ "${{ needs.ea-zero-selector-integration.result }}" != "success" ]] || \
+             [[ "${{ needs.dashboard-relaunch-handoff-integration.result }}" != "success" ]] || \
              [[ "${{ needs.opencode-compat.result }}" != "success" ]] || \
              [[ "${{ needs.build.result }}" != "success" ]]; then
             echo "One or more jobs failed"
