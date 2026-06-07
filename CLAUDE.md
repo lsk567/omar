@@ -65,7 +65,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
 
-## OMAR-Specific Development Guideline
+## OMAR-Specific Development Guidelines
 
 1. Never push to the master / main branch, always push to a feature branch.
 2. For a major feature requested by the user, you can push to a feature branch and file a PR. That way the PR can trigger CI.
