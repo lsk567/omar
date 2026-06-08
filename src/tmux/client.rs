@@ -398,28 +398,15 @@ impl TmuxClient {
         let target = exact_pane_target(target);
         let buffer_name = format!("omar-paste-{}", uuid::Uuid::new_v4());
 
-        // Load text into a uniquely-named tmux buffer via stdin.
-        let child = tmux_command()
-            .args(["load-buffer", "-b", &buffer_name, "-"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("Failed to spawn tmux load-buffer")?;
-        use std::io::Write;
-        child
-            .stdin
-            .as_ref()
-            .unwrap()
-            .write_all(text.as_bytes())
-            .context("Failed to write to tmux load-buffer stdin")?;
-        let output = child
-            .wait_with_output()
-            .context("Failed to wait for tmux load-buffer")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "tmux load-buffer failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+        let tmp_path =
+            std::env::temp_dir().join(format!("omar-paste-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp_path, text).context("Failed to write paste text to temp file")?;
+        let path_str = tmp_path
+            .to_str()
+            .context("Temp file path is not valid UTF-8")?;
+        let load_result = self.run(&["load-buffer", "-b", &buffer_name, path_str]);
+        std::fs::remove_file(&tmp_path).ok(); // best-effort cleanup
+        load_result?;
         // Paste from the named buffer using bracketed paste mode so the
         // target pane treats it as a single paste operation. `-d` deletes
         // the buffer after pasting. `-r` preserves LFs verbatim — see the
