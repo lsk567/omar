@@ -215,9 +215,6 @@ fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -
         content = content.replace(pattern, replacement);
     }
 
-    let dir = std::env::temp_dir().join("omar-prompts");
-    std::fs::create_dir_all(&dir).ok();
-
     let stem = prompt_file
         .file_stem()
         .and_then(|s| s.to_str())
@@ -226,12 +223,23 @@ fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("md");
-    let rendered = dir.join(format!("{}-{}.{}", stem, Uuid::new_v4(), ext));
 
-    if std::fs::write(&rendered, content).is_ok() {
-        rendered
-    } else {
-        prompt_file.to_path_buf()
+    // Backend reads this later, so no self-deleting guard; 0600 in the private dir.
+    let rendered = match crate::paths::private_temp_dir() {
+        Ok(dir) => dir.join(format!("{}-{}.{}", stem, Uuid::new_v4(), ext)),
+        Err(_) => return prompt_file.to_path_buf(),
+    };
+
+    match crate::paths::create_private_file(&rendered) {
+        Ok(mut file) => {
+            if file.write_all(content.as_bytes()).is_ok() {
+                rendered
+            } else {
+                let _ = std::fs::remove_file(&rendered);
+                prompt_file.to_path_buf()
+            }
+        }
+        Err(_) => prompt_file.to_path_buf(),
     }
 }
 

@@ -9,6 +9,7 @@ mod mcp;
 mod memory;
 mod metrics;
 mod panic_hook;
+mod paths;
 mod process;
 mod projects;
 mod scheduler;

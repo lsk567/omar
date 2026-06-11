@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
+use std::io::Write;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -360,16 +361,17 @@ impl TmuxClient {
         if text.len() < Self::LARGE_PAYLOAD_THRESHOLD {
             self.run(&["send-keys", "-t", &target, "-l", "--", text])?;
         } else {
-            // Write to a temp file, load into tmux buffer, paste, then clean up.
-            // This avoids passing large text as a command-line argument.
-            let tmp_path =
-                std::env::temp_dir().join(format!("omar-task-{}.txt", uuid::Uuid::new_v4()));
-            std::fs::write(&tmp_path, text).context("Failed to write task to temp file")?;
-            let path_str = tmp_path
+            // Avoid passing large text as a CLI arg; owner-only temp file is
+            // removed when `tmp` drops.
+            let mut tmp = crate::paths::create_private_temp_file("omar-task", "txt")
+                .context("Failed to create temp file for task payload")?;
+            tmp.write_all(text.as_bytes())
+                .context("Failed to write task to temp file")?;
+            let path_str = tmp
+                .path()
                 .to_str()
                 .context("Temp file path is not valid UTF-8")?;
             self.run(&["load-buffer", path_str])?;
-            std::fs::remove_file(&tmp_path).ok(); // best-effort cleanup
             self.run(&["paste-buffer", "-t", &target])?;
         }
         Ok(())
@@ -398,15 +400,17 @@ impl TmuxClient {
         let target = exact_pane_target(target);
         let buffer_name = format!("omar-paste-{}", uuid::Uuid::new_v4());
 
-        let tmp_path =
-            std::env::temp_dir().join(format!("omar-paste-{}.txt", uuid::Uuid::new_v4()));
-        std::fs::write(&tmp_path, text).context("Failed to write paste text to temp file")?;
-        let path_str = tmp_path
+        // Owner-only temp file (payloads can carry pasted secrets), removed
+        // when `tmp` drops.
+        let mut tmp = crate::paths::create_private_temp_file("omar-paste", "txt")
+            .context("Failed to create temp file for paste payload")?;
+        tmp.write_all(text.as_bytes())
+            .context("Failed to write paste text to temp file")?;
+        let path_str = tmp
+            .path()
             .to_str()
             .context("Temp file path is not valid UTF-8")?;
-        let load_result = self.run(&["load-buffer", "-b", &buffer_name, path_str]);
-        std::fs::remove_file(&tmp_path).ok(); // best-effort cleanup
-        load_result?;
+        self.run(&["load-buffer", "-b", &buffer_name, path_str])?;
         // Paste from the named buffer using bracketed paste mode so the
         // target pane treats it as a single paste operation. `-d` deletes
         // the buffer after pasting. `-r` preserves LFs verbatim — see the
