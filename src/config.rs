@@ -18,9 +18,6 @@ pub struct Config {
     pub agent: AgentConfig,
 
     #[serde(default)]
-    pub watchdog: WatchdogConfig,
-
-    #[serde(default)]
     pub metrics: MetricsConfig,
 
     #[serde(default)]
@@ -74,23 +71,6 @@ pub struct AgentConfig {
     /// Default working directory
     #[serde(default = "default_workdir")]
     pub default_workdir: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WatchdogConfig {
-    /// Command to run the watchdog agent (empty = watchdog disabled).
-    /// Should be an untrusted/free backend — no secrets will be passed.
-    /// Example: "opencode --model openrouter/openrouter/free"
-    #[serde(default)]
-    pub command: String,
-
-    /// Patterns in agent output that indicate an authentication failure
-    #[serde(default = "default_auth_failure_patterns")]
-    pub auth_failure_patterns: Vec<String>,
-
-    /// Slack channel ID for watchdog alerts (empty = no Slack alerts)
-    #[serde(default)]
-    pub slack_channel: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -193,17 +173,6 @@ fn default_workdir() -> String {
     ".".to_string()
 }
 
-fn default_auth_failure_patterns() -> Vec<String> {
-    vec![
-        // Claude Code
-        "please run /login".to_string(),
-        // Codex
-        "401 unauthorized".to_string(),
-        // TODO: opencode
-        // TODO: cursor
-    ]
-}
-
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
@@ -231,16 +200,6 @@ impl Default for AgentConfig {
         Self {
             default_command: default_command(),
             default_workdir: default_workdir(),
-        }
-    }
-}
-
-impl Default for WatchdogConfig {
-    fn default() -> Self {
-        Self {
-            command: String::new(),
-            auth_failure_patterns: default_auth_failure_patterns(),
-            slack_channel: String::new(),
         }
     }
 }
@@ -639,47 +598,6 @@ default_command = "aider --yes"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.agent.default_command, "aider --yes");
-    }
-
-    #[test]
-    fn test_default_watchdog_config() {
-        let config = Config::default();
-        assert!(config.watchdog.command.is_empty());
-        assert!(config.watchdog.slack_channel.is_empty());
-        assert!(!config.watchdog.auth_failure_patterns.is_empty());
-        assert!(config
-            .watchdog
-            .auth_failure_patterns
-            .iter()
-            .any(|p| p == "please run /login"));
-    }
-
-    #[test]
-    fn test_parse_watchdog_config() {
-        let toml = r#"
-[watchdog]
-command = "claude --dangerously-skip-permissions"
-slack_channel = "C0123456789"
-auth_failure_patterns = ["session expired", "login required"]
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(
-            config.watchdog.command,
-            "claude --dangerously-skip-permissions"
-        );
-        assert_eq!(config.watchdog.slack_channel, "C0123456789");
-        assert_eq!(config.watchdog.auth_failure_patterns.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_config_without_watchdog_uses_defaults() {
-        let toml = r#"
-[agent]
-default_command = "claude --dangerously-skip-permissions"
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(config.watchdog.command.is_empty());
-        assert!(!config.watchdog.auth_failure_patterns.is_empty());
     }
 
     #[test]

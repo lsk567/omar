@@ -36,7 +36,6 @@ pub struct ManagerRuntimeOptions {
 // Embed prompt files at compile time so they work regardless of CWD.
 const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
 const PROMPT_AGENT: &str = include_str!("../../prompts/agent.md");
-const PROMPT_WATCHDOG: &str = include_str!("../../prompts/watchdog.md");
 
 // Backend-native wake/reminder tools bypass OMAR's durable, EA-scoped scheduler.
 // Deny these names where a backend exposes per-session tool controls.
@@ -66,7 +65,6 @@ const BACKEND_NATIVE_AGENT_TOOLS: &[&str] = &[
 const EMBEDDED_PROMPTS: &[(&str, &str)] = &[
     ("executive-assistant.md", PROMPT_EA),
     ("agent.md", PROMPT_AGENT),
-    ("watchdog.md", PROMPT_WATCHDOG),
 ];
 
 /// Return the `{omar_dir}/prompts/` directory, writing embedded prompts into it.

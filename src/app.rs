@@ -138,8 +138,6 @@ pub struct App {
     default_command: String,
     default_workdir: String,
     pub scheduler: Arc<Scheduler>,
-    /// Whether the watchdog agent has been spawned
-    watchdog_spawned: bool,
 }
 
 impl App {
@@ -170,8 +168,7 @@ impl App {
         let manager_session = ea::ea_manager_session(active_ea, &base_prefix);
 
         let client = TmuxClient::new(&session_prefix);
-        let health_checker = HealthChecker::new(client.clone(), config.health.idle_warning)
-            .with_auth_failure_patterns(config.watchdog.auth_failure_patterns.clone());
+        let health_checker = HealthChecker::new(client.clone(), config.health.idle_warning);
 
         let state_dir = ea::ea_state_dir(active_ea, &omar_dir);
         std::fs::create_dir_all(state_dir.join("status")).ok();
@@ -240,7 +237,6 @@ impl App {
             default_command: config.agent.default_command.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             scheduler,
-            watchdog_spawned: false,
         }
     }
 
@@ -1121,114 +1117,6 @@ impl App {
         Ok(())
     }
 
-    /// Check all agents for auth failures and spawn a single watchdog agent
-    /// to monitor errors and notify the user via Slack. Returns true if the
-    /// watchdog was spawned.
-    pub fn check_auth_failures(&mut self, ticker: &TickerBuffer) -> bool {
-        if self.config.watchdog.command.is_empty() || self.watchdog_spawned {
-            return false;
-        }
-
-        // Collect names of agents with auth failures
-        let mut failed_agents: Vec<String> = Vec::new();
-
-        if let Some(ref mgr) = self.manager {
-            if mgr.health_info.auth_failure {
-                failed_agents.push(self.short_session_name(&mgr.session.name).to_string());
-            }
-        }
-
-        for agent in &self.agents {
-            if agent.health_info.auth_failure {
-                failed_agents.push(self.short_session_name(&agent.session.name).to_string());
-            }
-        }
-
-        if failed_agents.is_empty() {
-            return false;
-        }
-
-        let watchdog_session = format!("{}watchdog", self.client.prefix());
-
-        // Skip if watchdog already exists
-        if self.client.has_session(&watchdog_session).unwrap_or(false) {
-            self.watchdog_spawned = true;
-            return false;
-        }
-
-        ticker.push(format!(
-            "AUTH FAILURE in {} agent(s) — spawning watchdog",
-            failed_agents.len()
-        ));
-
-        let watchdog_cmd = &self.config.watchdog.command;
-        let prompt_file = crate::manager::prompts_dir(&self.omar_dir).join("watchdog.md");
-        let cmd = crate::manager::build_agent_command(
-            watchdog_cmd,
-            &prompt_file,
-            &[],
-            &crate::manager::McpLaunchContext {
-                omar_dir: self.omar_dir.clone(),
-                ea_id: self.active_ea,
-                session_prefix: self.base_prefix.clone(),
-                default_command: self.default_command.clone(),
-                default_workdir: self.default_workdir.clone(),
-                health_idle_warning: self.health_threshold,
-                tmux_server: std::env::var("OMAR_TMUX_SERVER")
-                    .ok()
-                    .map(|server| server.trim().to_string())
-                    .filter(|server| !server.is_empty()),
-            },
-        );
-
-        let workdir = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-
-        if let Err(e) = self
-            .client
-            .new_session(&watchdog_session, &cmd, Some(&workdir))
-        {
-            ticker.push(format!("Failed to spawn watchdog: {}", e));
-            return false;
-        }
-
-        // Build the initial task message for the watchdog.
-        // No secrets — only localhost URLs and the Slack channel ID.
-        let slack_channel = &self.config.watchdog.slack_channel;
-        let failed_list = failed_agents.join(", ");
-        let slack_display = if slack_channel.is_empty() {
-            "(not configured)"
-        } else {
-            slack_channel
-        };
-        let task_msg = format!(
-            "AUTH FAILURE DETECTED.\n\
-Failed agents: {}\n\
-Slack channel: {}\n\
-Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack_reply` MCP tool.",
-            failed_list, slack_display,
-        );
-
-        let client = self.client.clone();
-        let session = watchdog_session;
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let _ = client.send_keys_literal(&session, &task_msg);
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = client.send_keys(&session, "Enter");
-        });
-
-        self.watchdog_spawned = true;
-
-        self.set_persistent_warning(format!(
-            "⚠ Auth failure in {} agent(s) — watchdog monitoring",
-            failed_agents.len()
-        ));
-
-        true
-    }
-
     /// Set status message (persists for 3 seconds before auto-clearing)
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
@@ -1403,8 +1291,7 @@ Use the OMAR MCP tools for inspection/control. To post to Slack, call the `slack
         self.active_ea = ea_id;
         let new_prefix = ea::ea_prefix(ea_id, &self.base_prefix);
         self.client = TmuxClient::new(&new_prefix);
-        self.health_checker = HealthChecker::new(self.client.clone(), self.health_threshold)
-            .with_auth_failure_patterns(self.config.watchdog.auth_failure_patterns.clone());
+        self.health_checker = HealthChecker::new(self.client.clone(), self.health_threshold);
         self.focus_parent = ea::ea_manager_session(ea_id, &self.base_prefix);
         self.focus_stack.clear();
         self.selected = 0;
@@ -1924,9 +1811,7 @@ fn parse_ea_session_owner(session_name: &str, base_prefix: &str) -> Option<Parse
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        AgentConfig, DashboardConfig, HealthConfig, MetricsConfig, WatchdogConfig,
-    };
+    use crate::config::{AgentConfig, DashboardConfig, HealthConfig, MetricsConfig};
     use crate::projects;
     use crate::scheduler;
     use crate::tmux::{HealthInfo, HealthState, Session, TmuxClient};
@@ -1992,7 +1877,6 @@ mod tests {
             health_info: HealthInfo {
                 state: health,
                 last_output: String::new(),
-                auth_failure: false,
             },
             is_unresolved: false,
         }
@@ -2292,7 +2176,6 @@ mod tests {
                 default_command: "true".to_string(),
                 default_workdir: ".".to_string(),
             },
-            watchdog: WatchdogConfig::default(),
             metrics: MetricsConfig::default(),
             slack_bridge: crate::config::SlackBridgeConfig::default(),
         }
