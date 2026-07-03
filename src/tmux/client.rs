@@ -134,10 +134,6 @@ fn exact_pane_target(target: &str) -> String {
     }
 }
 
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 fn popup_attach_command(target: &str) -> String {
     let tmux_server = std::env::var("OMAR_TMUX_SERVER")
         .ok()
@@ -761,15 +757,6 @@ impl TmuxClient {
         }
         Ok(())
     }
-
-    /// Check if tmux server is running
-    pub fn is_server_running(&self) -> bool {
-        tmux_command()
-            .args(["list-sessions"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
 }
 
 #[cfg(test)]
@@ -918,12 +905,6 @@ mod tests {
         );
         assert_eq!(exact_pane_target("=already-exact"), "=already-exact:");
         assert_eq!(exact_pane_target("session:1.0"), "session:1.0");
-    }
-
-    #[test]
-    fn test_shell_single_quote_keeps_exact_tmux_target_literal() {
-        assert_eq!(shell_single_quote("=omar-agent-ea-0"), "'=omar-agent-ea-0'");
-        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]

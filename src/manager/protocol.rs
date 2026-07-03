@@ -14,15 +14,6 @@ pub struct ProposedAgent {
     pub depends_on: Vec<String>,
 }
 
-/// A plan proposed by the manager
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Plan {
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    pub description: String,
-    pub agents: Vec<ProposedAgent>,
-}
-
 /// Messages from manager to OMA
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -38,26 +29,6 @@ pub enum ManagerMessage {
     Query { target: String },
     #[serde(rename = "complete")]
     Complete { summary: String },
-}
-
-/// Messages from OMA to manager
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum OmaMessage {
-    #[serde(rename = "plan_approved")]
-    PlanApproved { modifications: Vec<String> },
-    #[serde(rename = "plan_rejected")]
-    PlanRejected { reason: String },
-    #[serde(rename = "status")]
-    Status {
-        agent: String,
-        state: String,
-        last_output: String,
-    },
-    #[serde(rename = "agent_complete")]
-    AgentComplete { agent: String, summary: String },
-    #[serde(rename = "agent_blocked")]
-    AgentBlocked { agent: String, reason: String },
 }
 
 /// Try to parse a manager message from text

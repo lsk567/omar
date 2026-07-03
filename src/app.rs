@@ -11,11 +11,8 @@ use crate::ea::{self, EaId, EaInfo};
 use crate::memory;
 use crate::projects::{self, Project};
 use crate::scheduler::{ScheduledEvent, Scheduler, TickerBuffer};
-use crate::tmux::{HealthChecker, HealthInfo, HealthState, Session, TmuxClient};
+use crate::tmux::{HealthChecker, HealthState, Session, TmuxClient};
 use crate::DASHBOARD_SESSION;
-
-/// Shared app state for dashboard and control surfaces.
-pub type SharedApp = App;
 
 /// What kind of confirmation the user is being prompted for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +38,6 @@ pub enum SidebarPanel {
 pub struct AgentInfo {
     pub session: Session,
     pub health: HealthState,
-    pub health_info: HealthInfo,
     pub is_unresolved: bool,
 }
 
@@ -63,14 +59,6 @@ pub struct CommandTreeNode {
     pub ancestor_is_last: Vec<bool>,
     /// Whether this node came from a non-canonical OMAR session name.
     pub is_unresolved: bool,
-}
-
-/// A group of agents: a PM and its workers, or unassigned workers
-pub struct AgentGroup<'a> {
-    /// The PM agent, if any (None for unassigned group)
-    pub pm: Option<&'a AgentInfo>,
-    /// Workers under this PM (or unassigned)
-    pub workers: Vec<&'a AgentInfo>,
 }
 
 /// Application state
@@ -125,13 +113,10 @@ pub struct App {
     pub focus_child_indices: Vec<usize>,
     agent_parents: HashMap<String, String>,
     worker_tasks: HashMap<String, String>,
-    agent_statuses: HashMap<String, String>,
     /// Whether the left sidebar is focused (vs the right agent panels)
     pub sidebar_focused: bool,
     /// Which sidebar panel is active
     pub sidebar_panel: SidebarPanel,
-    /// Selected index within the active sidebar panel
-    pub sidebar_selected: usize,
     client: TmuxClient,
     health_checker: HealthChecker,
     health_threshold: i64,
@@ -227,10 +212,8 @@ impl App {
             focus_child_indices: Vec::new(),
             agent_parents: HashMap::new(),
             worker_tasks: HashMap::new(),
-            agent_statuses: HashMap::new(),
             sidebar_focused: false,
             sidebar_panel: SidebarPanel::Projects,
-            sidebar_selected: 0,
             client,
             health_checker,
             health_threshold: config.health.idle_warning,
@@ -305,14 +288,14 @@ impl App {
         // managers across all EAs. This avoids running a tmux `capture-pane`
         // per unrelated shell session on hosts where the user has many tmux
         // sessions for their own work.
-        let mut health_snapshot: HashMap<String, HealthInfo> = HashMap::new();
+        let mut health_snapshot: HashMap<String, HealthState> = HashMap::new();
         for session in &all_sessions {
             if !self.base_prefix.is_empty() && !session.name.starts_with(&self.base_prefix) {
                 continue;
             }
             health_snapshot.insert(
                 session.name.clone(),
-                self.health_checker.check_detailed(&session.name),
+                self.health_checker.check(&session.name),
             );
         }
 
@@ -346,15 +329,13 @@ impl App {
 
         // Update manager info
         self.manager = managers_by_ea.get(&self.active_ea).cloned().map(|session| {
-            let health_info = health_snapshot
+            let health = health_snapshot
                 .get(&session.name)
-                .cloned()
-                .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
-            let health = health_info.state;
+                .copied()
+                .unwrap_or_else(|| self.health_checker.check(&session.name));
             AgentInfo {
                 session,
                 health,
-                health_info,
                 is_unresolved: false,
             }
         });
@@ -372,16 +353,14 @@ impl App {
         self.agents = active_agents
             .into_iter()
             .map(|session| {
-                let health_info = health_snapshot
+                let health = health_snapshot
                     .get(&session.name)
-                    .cloned()
-                    .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
-                let health = health_info.state;
+                    .copied()
+                    .unwrap_or_else(|| self.health_checker.check(&session.name));
                 let is_unresolved = unresolved_names.contains(&session.name);
                 AgentInfo {
                     session,
                     health,
-                    health_info,
                     is_unresolved,
                 }
             })
@@ -411,22 +390,6 @@ impl App {
         self.agent_parents = memory::load_agent_parents_from(&state_dir);
         self.worker_tasks = memory::load_worker_tasks_from(&state_dir);
 
-        // Cache agent statuses so render and API reads avoid per-frame disk I/O
-        {
-            let mut new_statuses = HashMap::new();
-            for agent in &self.agents {
-                if let Some(status) = memory::load_agent_status_in(&state_dir, &agent.session.name)
-                {
-                    new_statuses.insert(agent.session.name.clone(), status);
-                }
-            }
-            if let Some(ref mgr) = self.manager {
-                if let Some(status) = memory::load_agent_status_in(&state_dir, &mgr.session.name) {
-                    new_statuses.insert(mgr.session.name.clone(), status);
-                }
-            }
-            self.agent_statuses = new_statuses;
-        }
         // Build multi-EA CoC: all EAs sorted by ID, each with its real subtree and health.
 
         let mut sorted_eas = self.registered_eas.clone();
@@ -440,15 +403,13 @@ impl App {
             let ea_parents = memory::load_agent_parents_from(&ea_state_dir);
 
             let manager_info = managers_by_ea.get(&ea_info.id).cloned().map(|session| {
-                let health_info = health_snapshot
+                let health = health_snapshot
                     .get(&session.name)
-                    .cloned()
-                    .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
-                let health = health_info.state;
+                    .copied()
+                    .unwrap_or_else(|| self.health_checker.check(&session.name));
                 AgentInfo {
                     session,
                     health,
-                    health_info,
                     is_unresolved: false,
                 }
             });
@@ -458,15 +419,13 @@ impl App {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|session| {
-                    let health_info = health_snapshot
+                    let health = health_snapshot
                         .get(&session.name)
-                        .cloned()
-                        .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
-                    let health = health_info.state;
+                        .copied()
+                        .unwrap_or_else(|| self.health_checker.check(&session.name));
                     AgentInfo {
                         session: session.clone(),
                         health,
-                        health_info,
                         is_unresolved: unresolved_names.contains(&session.name)
                             && ea_info.id == self.active_ea,
                     }
@@ -475,15 +434,13 @@ impl App {
             let mut ea_agents = ea_agents;
             if ea_info.id == self.active_ea {
                 ea_agents.extend(unresolved_sessions.iter().cloned().map(|session| {
-                    let health_info = health_snapshot
+                    let health = health_snapshot
                         .get(&session.name)
-                        .cloned()
-                        .unwrap_or_else(|| self.health_checker.check_detailed(&session.name));
-                    let health = health_info.state;
+                        .copied()
+                        .unwrap_or_else(|| self.health_checker.check(&session.name));
                     AgentInfo {
                         session,
                         health,
-                        health_info,
                         is_unresolved: true,
                     }
                 }));
@@ -641,48 +598,9 @@ impl App {
         Ok(())
     }
 
-    /// Get filtered agents
-    pub fn visible_agents(&self) -> &[AgentInfo] {
-        &self.agents
-    }
-
-    /// Get all agents (for API)
-    pub fn agents(&self) -> &[AgentInfo] {
-        &self.agents
-    }
-
-    /// Get manager info (for API)
-    pub fn manager(&self) -> Option<&AgentInfo> {
-        self.manager.as_ref()
-    }
-
-    /// Get an agent's self-reported status
-    pub fn agent_status(&self, session: &str) -> Option<&String> {
-        self.agent_statuses.get(session)
-    }
-
-    /// Update an agent's self-reported status
-    pub fn set_agent_status(&mut self, session: String, status: String) {
-        self.agent_statuses.insert(session, status);
-    }
-
-    /// Group agents into PM → worker hierarchies for grid display
-    pub fn agent_groups(&self) -> Vec<AgentGroup<'_>> {
-        build_agent_groups(
-            &self.agents,
-            &self.agent_parents,
-            &self.config.dashboard.session_prefix,
-        )
-    }
-
     /// Get default command
     pub fn default_command(&self) -> &str {
         &self.default_command
-    }
-
-    /// Get the agent_parents map (for API/display)
-    pub fn agent_parents(&self) -> &HashMap<String, String> {
-        &self.agent_parents
     }
 
     /// Get the worker_tasks map (for display)
@@ -750,25 +668,6 @@ impl App {
             .values()
             .filter(|p| *p == session_name)
             .count()
-    }
-
-    /// Build breadcrumb path from root to current focus parent
-    pub fn breadcrumb(&self) -> Vec<String> {
-        let manager_session = self.manager_session_name();
-        let mut crumbs: Vec<String> = vec!["EA".to_string()];
-        for session in &self.focus_stack {
-            if *session == manager_session {
-                continue; // Already added EA
-            }
-            let short = self.short_session_name(session);
-            crumbs.push(short.to_string());
-        }
-        // Add current focus parent if not EA
-        if self.focus_parent != manager_session {
-            let short = self.short_session_name(&self.focus_parent);
-            crumbs.push(short.to_string());
-        }
-        crumbs
     }
 
     /// Drill down into the selected agent (Tab).
@@ -1449,102 +1348,6 @@ impl App {
     }
 }
 
-/// Separate tmux sessions into manager vs. agent sessions.
-///
-/// Filters out the dashboard session and sessions that don't match the
-/// configured prefix. Attached sessions are intentionally included —
-/// when a user opens the popup view, the agent session becomes "attached"
-/// but is still a valid agent.
-pub(crate) fn filter_sessions(
-    sessions: Vec<Session>,
-    prefix: &str,
-    manager_session_name: &str,
-) -> (Option<Session>, Vec<Session>) {
-    let mut manager_session = None;
-    let mut other_sessions = Vec::new();
-
-    for session in sessions {
-        if session.name == manager_session_name {
-            manager_session = Some(session);
-        } else if session.name == DASHBOARD_SESSION
-            || (!prefix.is_empty() && !session.name.starts_with(prefix))
-        {
-            continue;
-        } else {
-            other_sessions.push(session);
-        }
-    }
-
-    (manager_session, other_sessions)
-}
-
-/// Group agents into parent → children hierarchies for grid display.
-///
-/// Parents are agents that have children via the agent_parents map.
-/// Agents without a live parent go into an orphan group (pm: None).
-pub fn build_agent_groups<'a>(
-    agents: &'a [AgentInfo],
-    agent_parents: &HashMap<String, String>,
-    _session_prefix: &str,
-) -> Vec<AgentGroup<'a>> {
-    // Find agents that are parents (have children pointing to them)
-    let mut parent_agents: Vec<&AgentInfo> = Vec::new();
-    let mut leaf_agents: Vec<&AgentInfo> = Vec::new();
-
-    for agent in agents {
-        let has_children = agent_parents
-            .values()
-            .any(|parent| *parent == agent.session.name);
-        if has_children {
-            parent_agents.push(agent);
-        } else {
-            leaf_agents.push(agent);
-        }
-    }
-
-    let mut parent_children: HashMap<String, Vec<&AgentInfo>> = HashMap::new();
-    let mut orphans: Vec<&AgentInfo> = Vec::new();
-
-    for agent in leaf_agents {
-        if let Some(parent_session) = agent_parents.get(&agent.session.name) {
-            if parent_agents
-                .iter()
-                .any(|p| p.session.name == *parent_session)
-            {
-                parent_children
-                    .entry(parent_session.clone())
-                    .or_default()
-                    .push(agent);
-            } else {
-                orphans.push(agent);
-            }
-        } else {
-            orphans.push(agent);
-        }
-    }
-
-    let mut groups = Vec::new();
-
-    for parent in &parent_agents {
-        let workers = parent_children
-            .remove(&parent.session.name)
-            .unwrap_or_default();
-        groups.push(AgentGroup {
-            pm: Some(parent),
-            workers,
-        });
-    }
-
-    if !orphans.is_empty() {
-        groups.push(AgentGroup {
-            pm: None,
-            workers: orphans,
-        });
-    }
-
-    groups
-}
-
 /// Build the chain-of-command tree from current agents and parent mappings.
 ///
 /// Tree structure (recursive, arbitrary depth):
@@ -1814,7 +1617,7 @@ mod tests {
     use crate::config::{AgentConfig, DashboardConfig, HealthConfig, MetricsConfig};
     use crate::projects;
     use crate::scheduler;
-    use crate::tmux::{HealthInfo, HealthState, Session, TmuxClient};
+    use crate::tmux::{HealthState, Session, TmuxClient};
 
     /// Manager session name used in tests (EA 0 with "omar-agent-" prefix)
     const TEST_MANAGER: &str = "omar-agent-ea-0";
@@ -1874,10 +1677,6 @@ mod tests {
                 pane_pid: 0,
             },
             health,
-            health_info: HealthInfo {
-                state: health,
-                last_output: String::new(),
-            },
             is_unresolved: false,
         }
     }
@@ -2548,141 +2347,6 @@ default_workdir = "."
         );
     }
 
-    // ── build_agent_groups tests ──
-
-    #[test]
-    fn test_groups_parent_with_children() {
-        let agents = vec![
-            make_agent("omar-agent-rest-api", HealthState::Running),
-            make_agent("omar-agent-api", HealthState::Running),
-            make_agent("omar-agent-auth", HealthState::Idle),
-        ];
-        let mut parents = HashMap::new();
-        parents.insert(
-            "omar-agent-api".to_string(),
-            "omar-agent-rest-api".to_string(),
-        );
-        parents.insert(
-            "omar-agent-auth".to_string(),
-            "omar-agent-rest-api".to_string(),
-        );
-
-        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
-
-        // One parent group, no orphans
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].pm.unwrap().session.name, "omar-agent-rest-api");
-        assert_eq!(groups[0].workers.len(), 2);
-    }
-
-    #[test]
-    fn test_groups_all_orphans() {
-        let agents = vec![
-            make_agent("omar-agent-api", HealthState::Running),
-            make_agent("omar-agent-auth", HealthState::Idle),
-        ];
-        let parents = HashMap::new();
-
-        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
-
-        // One orphan group
-        assert_eq!(groups.len(), 1);
-        assert!(groups[0].pm.is_none());
-        assert_eq!(groups[0].workers.len(), 2);
-    }
-
-    #[test]
-    fn test_groups_parent_without_children() {
-        // An agent with no children and no parent → orphan (not a "parent" group)
-        let agents = vec![make_agent("omar-agent-rest-api", HealthState::Running)];
-        let parents = HashMap::new();
-
-        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
-
-        // No children means it's not detected as a parent → orphan
-        assert_eq!(groups.len(), 1);
-        assert!(groups[0].pm.is_none());
-        assert_eq!(groups[0].workers.len(), 1);
-    }
-
-    #[test]
-    fn test_groups_mixed_parent_and_orphans() {
-        let agents = vec![
-            make_agent("omar-agent-api", HealthState::Running),
-            make_agent("omar-agent-worker1", HealthState::Running),
-            make_agent("omar-agent-orphan1", HealthState::Idle),
-        ];
-        let mut parents = HashMap::new();
-        parents.insert(
-            "omar-agent-worker1".to_string(),
-            "omar-agent-api".to_string(),
-        );
-
-        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
-
-        // Parent group + orphan group
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].pm.unwrap().session.name, "omar-agent-api");
-        assert_eq!(groups[0].workers.len(), 1);
-        assert!(groups[1].pm.is_none());
-        assert_eq!(groups[1].workers.len(), 1);
-    }
-
-    #[test]
-    fn test_groups_stale_parent_becomes_orphan() {
-        let agents = vec![make_agent("omar-agent-worker1", HealthState::Running)];
-        let mut parents = HashMap::new();
-        parents.insert(
-            "omar-agent-worker1".to_string(),
-            "omar-agent-gone".to_string(),
-        );
-
-        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
-
-        assert_eq!(groups.len(), 1);
-        assert!(groups[0].pm.is_none());
-        assert_eq!(groups[0].workers.len(), 1);
-    }
-
-    #[test]
-    fn test_groups_two_parents_each_with_children() {
-        let agents = vec![
-            make_agent("omar-agent-api", HealthState::Running),
-            make_agent("omar-agent-frontend", HealthState::Running),
-            make_agent("omar-agent-api-worker", HealthState::Running),
-            make_agent("omar-agent-auth", HealthState::Running),
-            make_agent("omar-agent-ui", HealthState::Idle),
-        ];
-        let mut parents = HashMap::new();
-        parents.insert(
-            "omar-agent-api-worker".to_string(),
-            "omar-agent-api".to_string(),
-        );
-        parents.insert("omar-agent-auth".to_string(), "omar-agent-api".to_string());
-        parents.insert(
-            "omar-agent-ui".to_string(),
-            "omar-agent-frontend".to_string(),
-        );
-
-        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
-
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].pm.unwrap().session.name, "omar-agent-api");
-        assert_eq!(groups[0].workers.len(), 2);
-        assert_eq!(groups[1].pm.unwrap().session.name, "omar-agent-frontend");
-        assert_eq!(groups[1].workers.len(), 1);
-    }
-
-    #[test]
-    fn test_groups_empty_agents() {
-        let agents = vec![];
-        let parents = HashMap::new();
-
-        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
-
-        assert!(groups.is_empty());
-    }
-
     // ── build_tree tests ──
 
     #[test]
@@ -3029,22 +2693,6 @@ default_workdir = "."
     // ── attached session tests ──
 
     #[test]
-    fn test_attached_agent_included_in_groups() {
-        // Agents that are attached (e.g., via popup view) should still appear
-        let mut attached = make_agent("omar-agent-api", HealthState::Running);
-        attached.session.attached = true;
-        let agents = vec![attached, make_agent("omar-agent-auth", HealthState::Idle)];
-        let parents = HashMap::new();
-
-        let groups = build_agent_groups(&agents, &parents, "omar-agent-");
-
-        // Both agents should appear (attached agent is not filtered)
-        assert_eq!(groups.len(), 1);
-        assert!(groups[0].pm.is_none());
-        assert_eq!(groups[0].workers.len(), 2);
-    }
-
-    #[test]
     fn test_attached_agent_included_in_tree() {
         // An attached agent should still appear in the command tree
         let mut attached = make_agent("omar-agent-api", HealthState::Running);
@@ -3331,63 +2979,6 @@ default_workdir = "."
             !state_dir.exists(),
             "EA state should be removed after successful delete"
         );
-    }
-
-    // ── filter_sessions tests ──
-
-    fn make_session(name: &str, attached: bool) -> Session {
-        Session {
-            name: name.to_string(),
-            activity: 0,
-            attached,
-            pane_pid: 0,
-        }
-    }
-
-    #[test]
-    fn test_filter_sessions_basic() {
-        let sessions = vec![
-            make_session(TEST_MANAGER, false),
-            make_session(DASHBOARD_SESSION, false),
-            make_session("omar-agent-api", false),
-            make_session("omar-agent-auth", false),
-            make_session("unrelated-session", false),
-        ];
-
-        let (manager, agents) = filter_sessions(sessions, "omar-agent-", TEST_MANAGER);
-
-        assert!(manager.is_some());
-        assert_eq!(manager.unwrap().name, TEST_MANAGER);
-        assert_eq!(agents.len(), 2);
-        assert_eq!(agents[0].name, "omar-agent-api");
-        assert_eq!(agents[1].name, "omar-agent-auth");
-    }
-
-    #[test]
-    fn test_filter_sessions_includes_attached() {
-        let sessions = vec![
-            make_session(TEST_MANAGER, false),
-            make_session("omar-agent-api", false),
-            make_session("omar-agent-auth", true), // attached (user has popup open)
-        ];
-
-        let (_, agents) = filter_sessions(sessions, "omar-agent-", TEST_MANAGER);
-
-        // Attached sessions must NOT be filtered out
-        assert_eq!(agents.len(), 2);
-        assert!(agents
-            .iter()
-            .any(|a| a.name == "omar-agent-auth" && a.attached));
-    }
-
-    #[test]
-    fn test_filter_sessions_no_manager() {
-        let sessions = vec![make_session("omar-agent-worker", false)];
-
-        let (manager, agents) = filter_sessions(sessions, "omar-agent-", TEST_MANAGER);
-
-        assert!(manager.is_none());
-        assert_eq!(agents.len(), 1);
     }
 
     // ── popup_receiver_name_for tests ──

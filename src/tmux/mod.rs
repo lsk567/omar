@@ -3,7 +3,7 @@ mod health;
 mod session;
 
 pub use client::{tmux_command, DeliveryOptions, TmuxClient};
-pub use health::{HealthChecker, HealthInfo, HealthState};
+pub use health::{HealthChecker, HealthState};
 pub use session::Session;
 
 /// Readiness markers for each supported backend — strings that must ALL

@@ -20,13 +20,6 @@ impl HealthState {
             HealthState::Idle => "idle",
         }
     }
-
-    pub fn icon(&self) -> &'static str {
-        match self {
-            HealthState::Running => "●",
-            HealthState::Idle => "○",
-        }
-    }
 }
 
 /// Checks health of agent sessions by comparing pane content between frames.
@@ -68,39 +61,11 @@ impl HealthChecker {
         }
     }
 
-    /// Check health and return additional info
-    pub fn check_detailed(&mut self, session_name: &str) -> HealthInfo {
-        let state = self.check(session_name);
-
-        let frame = self.last_frames.get(session_name);
-
-        let last_output = frame
-            .map(|f| {
-                f.lines()
-                    .next_back()
-                    .unwrap_or("")
-                    .trim()
-                    .chars()
-                    .take(80)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        HealthInfo { state, last_output }
-    }
-
     /// Remove stale entries for sessions that no longer exist
     pub fn retain_sessions(&mut self, active_sessions: &[String]) {
         self.last_frames
             .retain(|name, _| active_sessions.contains(name));
     }
-}
-
-/// Detailed health information for a session
-#[derive(Debug, Clone)]
-pub struct HealthInfo {
-    pub state: HealthState,
-    pub last_output: String,
 }
 
 #[cfg(test)]
@@ -111,11 +76,5 @@ mod tests {
     fn test_health_state_display() {
         assert_eq!(HealthState::Running.as_str(), "running");
         assert_eq!(HealthState::Idle.as_str(), "idle");
-    }
-
-    #[test]
-    fn test_health_state_icons() {
-        assert_eq!(HealthState::Running.icon(), "●");
-        assert_eq!(HealthState::Idle.icon(), "○");
     }
 }
