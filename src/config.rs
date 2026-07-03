@@ -322,13 +322,6 @@ pub enum SettingItem<'a> {
 }
 
 impl SettingItem<'_> {
-    pub fn label(&self) -> &str {
-        match self {
-            SettingItem::Toggle { label, .. } => label,
-            SettingItem::Text { label, .. } => label,
-        }
-    }
-
     pub fn is_text(&self) -> bool {
         matches!(self, SettingItem::Text { .. })
     }

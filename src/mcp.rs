@@ -711,11 +711,9 @@ impl OmarMcpServer {
         let mut manager = None;
         let mut agents = Vec::new();
         for session in sessions {
-            let health_info = checker.check_detailed(&session.name);
             let info = AgentInfo {
                 session: session.clone(),
-                health: health_info.state,
-                health_info,
+                health: checker.check(&session.name),
                 is_unresolved: false,
             };
             if session.name == manager_session {
