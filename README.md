@@ -113,6 +113,14 @@ BSD 3-Clause
  </picture>
 </a>
 
+## Contributors
+
+Thanks to all of our amazing contributors!
+
+<a href="https://github.com/lsk567/omar/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=lsk567/omar" />
+</a>
+
 ---
 
 OMAR is made with ❤️ in Berkeley, CA.
