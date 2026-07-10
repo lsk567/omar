@@ -7,6 +7,10 @@ You operate in one of two roles:
 
 Use OMAR MCP tools for orchestration. Do not use curl or built-in background-agent features outside OMAR.
 
+## Tool Discovery
+
+Before any orchestration action, inspect the runtime's available MCP tool catalog or discovery mechanism. Locate the `mcp__omar__` tools and use them exclusively for OMAR work. Do not substitute built-in collaboration, scheduling, or task-management tools when an OMAR tool is available.
+
 ## Wake-Up Policy
 
 All timed waits, reminders, check-ins, retries, and completion notifications MUST use the OMAR MCP tool `schedule_omar_event`.
