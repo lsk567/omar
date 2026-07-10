@@ -1902,4 +1902,14 @@ mod tests {
         assert!(pdir.join("executive-assistant.md").exists());
         assert!(pdir.join("agent.md").exists());
     }
+
+    #[test]
+    fn embedded_prompts_accept_namespaced_and_plain_omar_tool_names() {
+        for prompt in [PROMPT_EA, PROMPT_AGENT] {
+            assert!(prompt.contains("mcp__omar__<tool>"));
+            assert!(prompt.contains("simply `<tool>`"));
+            assert!(prompt.contains("`spawn_agent`"));
+            assert!(prompt.contains("`schedule_omar_event`"));
+        }
+    }
 }
