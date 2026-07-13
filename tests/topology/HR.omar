@@ -1,7 +1,6 @@
-team HR of
-    manager   : ClaudeCode,
-    reviewer1 : Codex,
-    reviewer2 : Opencode
+team HR(manager   : ClaudeCode,
+        reviewer1 : Codex,
+        reviewer2 : Opencode)
 {
     input resume : path      // runtime validator checks if this is a valid file path.
     output hired : bool      // runtime validator checks if this is a valid true/false.
@@ -9,9 +8,8 @@ team HR of
     action opinion1 : string
     action opinion2 : string
     
-    prompt manager
-        on resume 
-        to (triage | hired = false), log? // can optionally not log, but must either triage or reject. Giving semantics to outputs seems useful.
+    prompt manager(resume)
+        -> (triage | hired = false), log? // can optionally not log, but must either triage or reject. Giving semantics to outputs seems useful.
     "
         We're hiring new employees and are looking for
         someone who can program and understand how quant trading works.
@@ -23,8 +21,23 @@ team HR of
         Give your initial assessment.
     "
 
-    prompt reviewer1 on triage to opinion1
+    prompt reviewer1(triage) -> opinion1
     "
-        
+        Review the resume as a senior engineer.
+        Focus on programming ability, systems thinking, and evidence of quantitative trading or similar analytical work.
+        Write a concise opinion in `opinion1`.
+    "
+
+    prompt reviewer2(triage) -> opinion2
+    "
+        Review the resume as a hiring partner.
+        Focus on communication quality, practical judgment, and whether the candidate seems likely to thrive on a small agentic team.
+        Write a concise opinion in `opinion2`.
+    "
+
+    prompt manager(opinion1, opinion2) -> hired
+    "
+        Review both reviewer opinions and decide whether to hire the candidate.
+        Write true to hire and false otherwise.
     "
 }
