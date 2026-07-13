@@ -7,6 +7,7 @@ team HR(manager   : ClaudeCode,
     action triage            // pure signal, but could in principle be typed
     action opinion1 : string
     action opinion2 : string
+    action log : string
     
     prompt manager(resume)
         -> (triage | hired = false), log? // can optionally not log, but must either triage or reject. Giving semantics to outputs seems useful.
