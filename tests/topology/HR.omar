@@ -1,0 +1,30 @@
+team HR of
+    manager   : ClaudeCode,
+    reviewer1 : Codex,
+    reviewer2 : Opencode
+{
+    input resume : path      // runtime validator checks if this is a valid file path.
+    output hired : bool      // runtime validator checks if this is a valid true/false.
+    action triage            // pure signal, but could in principle be typed
+    action opinion1 : string
+    action opinion2 : string
+    
+    prompt manager
+        on resume 
+        to (triage | hired = false), log? // can optionally not log, but must either triage or reject. Giving semantics to outputs seems useful.
+    "
+        We're hiring new employees and are looking for
+        someone who can program and understand how quant trading works.
+        Here is a resume.
+        $(resume
+        /* $(...) escapes from text. All inputs needs to be serializable */
+        // This is also a valid comment, since close paranthesis is on the next line.
+        )
+        Give your initial assessment.
+    "
+
+    prompt reviewer1 on triage to opinion1
+    "
+        
+    "
+}
