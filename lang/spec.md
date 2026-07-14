@@ -213,7 +213,7 @@ CREATE_CHANNEL channel_id source target
 RETAIN_CHANNEL channel_id
 DROP_CHANNEL channel_id
 
-INSTALL_REACTION reaction_id agent dependencies contract prompt
+INSTALL_REACTION reaction_id agent triggers effects contract prompt
 UPDATE_REACTION reaction_id contract prompt
 REMOVE_REACTION reaction_id
 

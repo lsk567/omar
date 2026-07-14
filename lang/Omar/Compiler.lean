@@ -79,8 +79,8 @@ structure Port where
 structure Reaction where
   id : String
   agent : String
-  dependencies : Array String
-  productions : Array String
+  triggers : Array String
+  effects : Array String
   contract : String
   prompt : String
   deriving Repr
@@ -192,14 +192,14 @@ private partial def parseDeclarations
   | Token.word "prompt" :: rest => do
       let (agent, rest) ← word rest
       let (_, rest) ← expectSym "(" rest
-      let (dependencies, rest) ← parseDependencies #[] rest
+      let (triggers, rest) ← parseDependencies #[] rest
       let (_, rest) ← expectSym "->" rest
       let (contractTokens, prompt, rest) ← takeContract [] rest
-      let productions := productionTargets contractTokens
+      let effects := productionTargets contractTokens
       let contract := String.intercalate " " (contractTokens.map tokenSource)
       let reaction := {
         id := s!"reaction.{reactionIndex}"
-        agent, dependencies, productions, contract, prompt
+        agent, triggers, effects, contract, prompt
       }
       parseDeclarations (reactionIndex + 1) ports (reactions.push reaction) rest
   | token :: _ => throw s!"unexpected token in team body: {reprStr token}"
@@ -224,14 +224,14 @@ private def validate (program : Program) : Except String Program := do
   for reaction in program.reactions do
     if !containsName agentNames reaction.agent then
       throw s!"reaction names unknown agent '{reaction.agent}'"
-    for dependency in reaction.dependencies do
+    for trigger in reaction.triggers do
       let valid := program.ports.any fun port =>
-        port.name == dependency && port.kind != .output
-      if !valid then throw s!"unknown input/action dependency '{dependency}'"
-    for production in reaction.productions do
+        port.name == trigger && port.kind != .output
+      if !valid then throw s!"unknown input/action dependency '{trigger}'"
+    for effect in reaction.effects do
       let valid := program.ports.any fun port =>
-        port.name == production && port.kind != .input
-      if !valid then throw s!"unknown output/action production '{production}'"
+        port.name == effect && port.kind != .input
+      if !valid then throw s!"unknown output/action production '{effect}'"
   pure program
 
 def parse (tokens : List Token) : Except String Program := do
@@ -248,10 +248,13 @@ def parse (tokens : List Token) : Except String Program := do
 private def jsonStringArray (values : Array String) : Json :=
   Json.arr (values.map toJson)
 
-private def instruction (op : String) (fields : List (String × Json) := []) : Json :=
-  Json.mkObj (("op", toJson op) :: fields)
+private def renderField (field : String × Json) : String :=
+  s!"{(toJson field.1).compress}: {field.2.compress}"
 
-def compile (program : Program) : Json :=
+private def instruction (op : String) (fields : List (String × Json) := []) : String :=
+  "{" ++ String.intercalate ", " ((("op", toJson op) :: fields).map renderField) ++ "}"
+
+def compile (program : Program) : String :=
   let begin := instruction "begin_plan" [("team", toJson program.team)]
   let agents := program.agents.map fun agent =>
     instruction "spawn_agent" [
@@ -260,41 +263,40 @@ def compile (program : Program) : Json :=
     ]
   let ports := program.ports.map fun port =>
     instruction "define_port" [
-      ("name", toJson port.name),
       ("kind", toJson (kindName port.kind)),
+      ("name", toJson port.name),
       ("type", toJson port.type)
     ]
   let reactions := program.reactions.map fun reaction =>
     instruction "install_reaction" [
       ("id", toJson reaction.id),
       ("agent", toJson reaction.agent),
-      ("dependencies", jsonStringArray reaction.dependencies),
-      ("productions", jsonStringArray reaction.productions),
+      ("triggers", jsonStringArray reaction.triggers),
+      ("effects", jsonStringArray reaction.effects),
       ("contract", toJson reaction.contract),
       ("prompt", toJson reaction.prompt)
     ]
   let consumeChannels := program.reactions.flatMap fun reaction =>
-    reaction.dependencies.mapIdx fun index dependency =>
+    reaction.triggers.mapIdx fun index trigger =>
       instruction "create_channel" [
         ("id", toJson s!"channel.consume.{reaction.id}.{index}"),
-        ("source", toJson dependency),
+        ("source", toJson trigger),
         ("target", toJson reaction.id)
       ]
   let produceChannels := program.reactions.flatMap fun reaction =>
-    reaction.productions.mapIdx fun index production =>
+    reaction.effects.mapIdx fun index effect =>
       instruction "create_channel" [
         ("id", toJson s!"channel.produce.{reaction.id}.{index}"),
         ("source", toJson reaction.id),
-        ("target", toJson production)
+        ("target", toJson effect)
       ]
   let commit := instruction "commit_plan"
-  Json.mkObj [
-    ("version", toJson (1 : Nat)),
-    ("team", toJson program.team),
-    ("instructions", Json.arr (#[begin] ++ agents ++ ports ++ reactions ++ consumeChannels ++ produceChannels ++ #[commit]))
-  ]
+  let instructions := #[begin] ++ agents ++ ports ++ reactions ++ consumeChannels ++ produceChannels ++ #[commit]
+  let rendered := String.intercalate ",\n    " instructions.toList
+  "{\n  \"version\": 1,\n  \"team\": " ++ (toJson program.team).compress ++
+    ",\n  \"instructions\": [\n    " ++ rendered ++ "\n  ]\n}\n"
 
-def compileSource (source : String) : Except String Json := do
+def compileSource (source : String) : Except String String := do
   pure (compile (← parse (← lex source)))
 
 end Omar

@@ -32,8 +32,8 @@ pub enum Instruction {
     InstallReaction {
         id: String,
         agent: String,
-        dependencies: Vec<String>,
-        productions: Vec<String>,
+        triggers: Vec<String>,
+        effects: Vec<String>,
         contract: String,
         prompt: String,
     },
@@ -68,8 +68,8 @@ pub struct PortState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReactionState {
     pub agent: String,
-    pub dependencies: Vec<String>,
-    pub productions: Vec<String>,
+    pub triggers: Vec<String>,
+    pub effects: Vec<String>,
     pub contract: String,
     pub prompt: String,
 }
@@ -242,28 +242,28 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
             Instruction::InstallReaction {
                 id,
                 agent,
-                dependencies,
-                productions,
+                triggers,
+                effects,
                 contract,
                 prompt,
             } => {
                 if !state.agents.contains_key(agent) {
                     bail!("reaction '{id}' references unknown agent '{agent}'");
                 }
-                for dependency in dependencies {
-                    let port = state.ports.get(dependency).with_context(|| {
-                        format!("reaction '{id}' has unknown dependency '{dependency}'")
+                for trigger in triggers {
+                    let port = state.ports.get(trigger).with_context(|| {
+                        format!("reaction '{id}' has unknown trigger '{trigger}'")
                     })?;
                     if port.kind == PortKind::Output {
-                        bail!("reaction '{id}' cannot depend on output '{dependency}'");
+                        bail!("reaction '{id}' cannot be triggered by output '{trigger}'");
                     }
                 }
-                for production in productions {
-                    let port = state.ports.get(production).with_context(|| {
-                        format!("reaction '{id}' has unknown production '{production}'")
+                for effect in effects {
+                    let port = state.ports.get(effect).with_context(|| {
+                        format!("reaction '{id}' has unknown effect '{effect}'")
                     })?;
                     if port.kind == PortKind::Input {
-                        bail!("reaction '{id}' cannot produce input '{production}'");
+                        bail!("reaction '{id}' cannot affect input '{effect}'");
                     }
                 }
                 if state
@@ -272,8 +272,8 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                         id.clone(),
                         ReactionState {
                             agent: agent.clone(),
-                            dependencies: dependencies.clone(),
-                            productions: productions.clone(),
+                            triggers: triggers.clone(),
+                            effects: effects.clone(),
                             contract: contract.clone(),
                             prompt: prompt.clone(),
                         },
@@ -320,14 +320,14 @@ fn verify_channels_match_reactions(state: &VmState) -> Result<()> {
         .map(|channel| (channel.source.as_str(), channel.target.as_str()))
         .collect();
     for (id, reaction) in &state.reactions {
-        for dependency in &reaction.dependencies {
-            if !edges.contains(&(dependency.as_str(), id.as_str())) {
-                bail!("reaction '{id}' is missing dependency channel from '{dependency}'");
+        for trigger in &reaction.triggers {
+            if !edges.contains(&(trigger.as_str(), id.as_str())) {
+                bail!("reaction '{id}' is missing trigger channel from '{trigger}'");
             }
         }
-        for production in &reaction.productions {
-            if !edges.contains(&(id.as_str(), production.as_str())) {
-                bail!("reaction '{id}' is missing production channel to '{production}'");
+        for effect in &reaction.effects {
+            if !edges.contains(&(id.as_str(), effect.as_str())) {
+                bail!("reaction '{id}' is missing effect channel to '{effect}'");
             }
         }
     }
@@ -371,9 +371,9 @@ mod tests {
               "instructions": [
                 {"op":"begin_plan","team":"Demo"},
                 {"op":"spawn_agent","name":"worker","backend":"Codex"},
-                {"op":"define_port","name":"request","kind":"input","type":"string"},
-                {"op":"define_port","name":"done","kind":"output","type":"bool"},
-                {"op":"install_reaction","id":"reaction.0","agent":"worker","dependencies":["request"],"productions":["done"],"contract":"done","prompt":"Work"},
+                {"op":"define_port","kind":"input","name":"request","type":"string"},
+                {"op":"define_port","kind":"output","name":"done","type":"bool"},
+                {"op":"install_reaction","id":"reaction.0","agent":"worker","triggers":["request"],"effects":["done"],"contract":"done","prompt":"Work"},
                 {"op":"create_channel","id":"in","source":"request","target":"reaction.0"},
                 {"op":"create_channel","id":"out","source":"reaction.0","target":"done"},
                 {"op":"commit_plan"}

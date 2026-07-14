@@ -1,5 +1,6 @@
 import Omar.Compiler
 
+open Lean
 open Omar
 
 def assertEqual [BEq α] [ToString α] (label : String) (actual expected : α) : IO Unit :=
@@ -19,7 +20,7 @@ def main : IO UInt32 := do
     let bytecode ← match compileSource source with
       | .ok bytecode => pure bytecode
       | .error message => throw (IO.userError message)
-    match bytecode.getObjVal? "instructions" with
+    match Json.parse bytecode >>= (·.getObjVal? "instructions") with
     | .ok (.arr instructions) => assertEqual "instruction count" instructions.size 26
     | _ => throw (IO.userError "compiler did not emit an instruction array")
     IO.println "HR.omar compiler test passed"

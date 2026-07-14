@@ -11,7 +11,7 @@ def main (args : List String) : IO UInt32 := do
         let source ← IO.FS.readFile input
         match compileSource source with
         | .ok bytecode =>
-            IO.FS.writeFile output bytecode.pretty
+            IO.FS.writeFile output bytecode
             IO.println s!"compiled {input} -> {output}"
             pure 0
         | .error message =>
