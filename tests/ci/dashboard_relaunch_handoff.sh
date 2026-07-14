@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # End-to-end check for the dashboard relaunch handoff wired up in
-# `relaunch_in_tmux` (src/main.rs). The unit tests cover the serde
+# `relaunch_in_tmux` (src/omar.rs). The unit tests cover the serde
 # round-trip and the App-side apply; this test runs the real `omar` binary
 # against a fake "already running" dashboard tmux session and asserts the
 # handoff JSON written to ~/.omar/dashboard_handoff.json carries the cwd,
