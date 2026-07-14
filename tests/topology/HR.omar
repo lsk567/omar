@@ -4,7 +4,7 @@ team HR(manager   : ClaudeCode,
 {
     input resume : path      // runtime validator checks if this is a valid file path.
     output hired : bool      // runtime validator checks if this is a valid true/false.
-    action triage            // pure signal, but could in principle be typed
+    action triage : string
     action opinion1 : string
     action opinion2 : string
     action log : string
@@ -19,12 +19,14 @@ team HR(manager   : ClaudeCode,
         /* $(...) escapes from text. All inputs needs to be serializable */
         // This is also a valid comment, since close paranthesis is on the next line.
         )
-        Give your initial assessment.
+        Set `triage` to your initial assessment, or set `hired` to false to reject immediately.
+        You may also set `log`.
     "
 
     prompt reviewer1(triage) -> opinion1
     "
         Review the resume as a senior engineer.
+        The manager's initial assessment is: $(triage)
         Focus on programming ability, systems thinking, and evidence of quantitative trading or similar analytical work.
         Write a concise opinion in `opinion1`.
     "
@@ -32,6 +34,7 @@ team HR(manager   : ClaudeCode,
     prompt reviewer2(triage) -> opinion2
     "
         Review the resume as a hiring partner.
+        The manager's initial assessment is: $(triage)
         Focus on communication quality, practical judgment, and whether the candidate seems likely to thrive on a small agentic team.
         Write a concise opinion in `opinion2`.
     "
@@ -39,6 +42,8 @@ team HR(manager   : ClaudeCode,
     prompt manager(opinion1, opinion2) -> hired
     "
         Review both reviewer opinions and decide whether to hire the candidate.
+        Senior engineer: $(opinion1)
+        Hiring partner: $(opinion2)
         Write true to hire and false otherwise.
     "
 }

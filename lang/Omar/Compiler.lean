@@ -276,22 +276,8 @@ def compile (program : Program) : String :=
       ("contract", toJson reaction.contract),
       ("prompt", toJson reaction.prompt)
     ]
-  let consumeChannels := program.reactions.flatMap fun reaction =>
-    reaction.triggers.mapIdx fun index trigger =>
-      instruction "create_channel" [
-        ("id", toJson s!"channel.consume.{reaction.id}.{index}"),
-        ("source", toJson trigger),
-        ("target", toJson reaction.id)
-      ]
-  let produceChannels := program.reactions.flatMap fun reaction =>
-    reaction.effects.mapIdx fun index effect =>
-      instruction "create_channel" [
-        ("id", toJson s!"channel.produce.{reaction.id}.{index}"),
-        ("source", toJson reaction.id),
-        ("target", toJson effect)
-      ]
   let commit := instruction "commit_plan"
-  let instructions := #[begin] ++ agents ++ ports ++ reactions ++ consumeChannels ++ produceChannels ++ #[commit]
+  let instructions := #[begin] ++ agents ++ ports ++ reactions ++ #[commit]
   let rendered := String.intercalate ",\n    " instructions.toList
   "{\n  \"version\": 1,\n  \"team\": " ++ (toJson program.team).compress ++
     ",\n  \"instructions\": [\n    " ++ rendered ++ "\n  ]\n}\n"

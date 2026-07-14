@@ -19,6 +19,14 @@ Verify the bytecode with the Rust VM without spawning agents:
 cargo run -- topology apply /tmp/HR.bytecode.json --dry-run
 ```
 
-Remove `--dry-run` to spawn the declared agents and persist the installed
-topology under the selected EA's state directory. The initial prototype only
-constructs a topology; event delivery and topology mutation are not implemented.
+Run the topology with an external input:
+
+```sh
+cargo run -- topology run /tmp/HR.bytecode.json \
+  --input resume=/absolute/path/to/resume.txt \
+  --replace
+```
+
+The runtime starts topology-scoped agents, delivers enabled prompts at each
+logical tag, waits at the global tag barrier, and prints the final outputs.
+`--replace` is required when sessions with the same agent names already exist.

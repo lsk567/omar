@@ -153,6 +153,24 @@ enum TopologyAction {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Start a topology and run it to completion
+    Run {
+        /// JSON bytecode produced by the Lean compiler
+        bytecode: PathBuf,
+
+        /// External input in NAME=VALUE form; repeat for multiple inputs
+        #[arg(long = "input", required = true)]
+        inputs: Vec<String>,
+
+        /// Replace existing agent sessions with topology-scoped sessions
+        #[arg(long)]
+        replace: bool,
+
+        /// Maximum time to wait for each prompt invocation
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -356,6 +374,28 @@ async fn async_main() -> Result<()> {
                 let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
                 apply_topology(&bytecode, dry_run, &target, &config, &omar_dir)
             }
+            TopologyAction::Run {
+                bytecode,
+                inputs,
+                replace,
+                timeout_seconds,
+            } => {
+                let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+                let bytecode = topology::load_bytecode(&bytecode)?;
+                topology::run_topology(
+                    &bytecode,
+                    topology::TopologyRunConfig {
+                        ea_id: target.id,
+                        omar_dir: &omar_dir,
+                        base_prefix: &config.dashboard.session_prefix,
+                        default_workdir: &config.agent.default_workdir,
+                        health_idle_warning: config.health.idle_warning,
+                        inputs: &inputs,
+                        replace,
+                        timeout: Duration::from_secs(timeout_seconds),
+                    },
+                )
+            }
         },
         None => {
             if cli.agent.is_some() {
@@ -417,12 +457,11 @@ fn apply_topology(
     };
 
     println!(
-        "Topology '{}': {} agents, {} ports, {} reactions, {} channels; executed {} instructions",
+        "Topology '{}': {} agents, {} ports, {} reactions; executed {} instructions",
         state.team,
         state.agents.len(),
         state.ports.len(),
         state.reactions.len(),
-        state.channels.len(),
         state.executed_instructions
     );
 

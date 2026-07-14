@@ -21,7 +21,7 @@ def main : IO UInt32 := do
       | .ok bytecode => pure bytecode
       | .error message => throw (IO.userError message)
     match Json.parse bytecode >>= (·.getObjVal? "instructions") with
-    | .ok (.arr instructions) => assertEqual "instruction count" instructions.size 26
+    | .ok (.arr instructions) => assertEqual "instruction count" instructions.size 15
     | _ => throw (IO.userError "compiler did not emit an instruction array")
     IO.println "HR.omar compiler test passed"
     pure 0

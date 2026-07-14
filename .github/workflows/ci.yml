@@ -144,7 +144,7 @@ jobs:
         run: |
           output=$(cargo run --quiet -- topology apply /tmp/HR.bytecode.json --dry-run)
           echo "$output"
-          grep -q "executed 26 instructions" <<<"$output"
+          grep -q "executed 15 instructions" <<<"$output"
 
   popup-quote-integration:
     name: Popup Quote Integration
