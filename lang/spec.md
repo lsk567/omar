@@ -6,12 +6,10 @@ Source extension: `.omar`
 
 ## 1. Purpose
 
-OMAR is a declarative language for agent workflows. A program defines a team of
-agents, typed data ports, internal actions, and prompts that react to data.
-
-Agents perform the work described by prompts. The OMAR runtime handles topology
-construction, agent lifecycle, routing, scheduling, validation, and topology
-mutation programmatically. These orchestration decisions do not use AI.
+OMAR is a declarative language for agent systems. A program defines agents,
+typed ports, and prompt reactions. The language controls topology startup,
+teardown, and mutation. A deterministic runtime coordinates the running system.
+AI is used only inside prompt reactions, never for orchestration.
 
 ## 2. Syntax
 
@@ -27,12 +25,12 @@ input       = "input", identifier, ":", type ;
 output      = "output", identifier, ":", type ;
 action      = "action", identifier, [ ":", type ] ;
 
-prompt      = "prompt", identifier, "(", dependencies, ")",
-              "->", productions, prompt-string ;
-dependencies = [ identifier, { ",", identifier } ] ;
+prompt      = "prompt", identifier, "(", triggers, ")",
+              "->", effects, prompt-string ;
+triggers    = [ identifier, { ",", identifier } ] ;
 
-productions = production, { ",", production } ;
-production  = atom, [ "?" ]
+effects     = effect, { ",", effect } ;
+effect      = atom, [ "?" ]
             | "(", atom, { "|", atom }, ")", [ "?" ] ;
 atom        = identifier, [ "=", literal ] ;
 
@@ -41,55 +39,24 @@ type        = "bool" | "int" | "float" | "string" | "path" | "bytes"
             | "option", "<", type, ">" ;
 ```
 
-Identifiers are case-sensitive. `//` introduces a line comment and `/* ... */`
-introduces a block comment.
+Identifiers are case-sensitive. `//` starts a line comment and `/* ... */`
+delimits a block comment.
 
-### 2.1 Team and agents
+### 2.1 Declarations
 
-```omar
-team Example(worker : Codex, reviewer : ClaudeCode) {
-    // declarations
-}
-```
-
-The team name identifies the topology. Each agent has a unique name and a
-backend. Backend names are resolved by the runtime.
-
-### 2.2 Ports and actions
-
-```omar
-input request : string
-output result : string
-action reviewed : bool
-action ready
-```
-
-- `input` declares a typed external input.
-- `output` declares a typed external result.
-- `action` declares an internal event.
+- `input` is a typed external entry point.
+- `output` is a typed externally observable result.
+- `action` is a typed internal port.
 - An action without a type is a signal carrying no value.
+- `prompt agent(a, b)` declares a reaction on `agent` triggered by ports `a`
+  and `b`.
 
-Input, output, and action names share one namespace and must be unique.
+The prompt body is delivered to the agent. `$(name)` interpolates a trigger
+value and may only reference that prompt's triggers.
 
-### 2.3 Prompts
+### 2.2 Effect contracts
 
-```omar
-prompt worker(request) -> result
-"
-    Process $(request).
-"
-```
-
-The name after `prompt` selects an agent. Parameters name the input or action
-values required to trigger the prompt. All dependencies must be available
-before the prompt runs.
-
-The quoted body is delivered to the agent. `$(name)` interpolates a parameter.
-Interpolation may only reference parameters of that prompt.
-
-### 2.4 Production contracts
-
-The expression after `->` declares what a prompt may produce:
+The expression after `->` declares the ports a reaction may set:
 
 ```omar
 -> result
@@ -97,186 +64,183 @@ The expression after `->` declares what a prompt may produce:
 -> (continue_work | accepted = false)
 ```
 
-- `a, b` requires both productions.
-- `(a | b)` requires exactly one production.
-- `a?` makes a production optional.
-- `a = value` emits a constant value.
-- A bare typed target requires the agent to supply a value.
+- `a, b` requires both effects.
+- `(a | b)` requires exactly one effect.
+- `a?` makes an effect optional.
+- `a = value` supplies a constant effect.
+- A bare typed effect requires the agent to set a value.
 - A bare untyped action emits a signal.
 
-Every production target must be a declared output or action. Produced values
-must match the target type.
+Every trigger must be an input or action. Every effect must be an output or
+action. Values must match their port types.
 
-## 3. Static semantics
+## 3. Compiled topology
 
-A program is valid when:
-
-1. all names are unique in their namespaces;
-2. every prompt names a declared agent;
-3. every dependency names an input or action;
-4. every interpolation names a dependency;
-5. every production names an output or action;
-6. constant productions match their target types; and
-7. all inferred connections join compatible types.
-
-The compiler lowers valid source into a canonical typed topology containing:
+The compiler produces a canonical topology containing:
 
 ```text
-Team
-Agents
-Ports
-Reactions
-Channels
+team
+agents
+typed ports
+prompt reactions in declaration order
 ```
 
-Channels are inferred from ports to dependent prompts and from prompts to their
-declared productions.
+There are no dedicated point-to-point channels. The runtime derives a
+port-to-reaction subscription index from reaction triggers.
 
-## 4. Runtime semantics
+Prompt declaration order is semantically significant. It orders reactions that
+may write the same port. Unrelated reactions remain unordered and may run in
+parallel.
 
-Submitting an external input creates a flow. Events produced while processing
-that input remain associated with the same flow.
-
-A reaction becomes ready when all its dependencies have values in one flow.
-When ready, the runtime:
-
-1. renders the prompt;
-2. sends it to the selected agent;
-3. waits for a structured completion;
-4. validates the completion against the production contract; and
-5. atomically publishes the resulting events.
-
-The runtime must not infer typed outputs by parsing conversational text. Agents
-return outputs through a structured completion operation.
-
-One event may wake several downstream reactions. A reaction with several
-dependencies joins values from the same flow. Reactions assigned to one agent
-run serially; different agents may run concurrently.
-
-External outputs are observable results. Actions remain internal and wake
-downstream reactions. A flow finishes when it has no running or ready reactions
-and no pending deliveries.
-
-## 5. Topology identity and mutation
-
-Every team, agent, port, reaction, and channel has a stable component ID derived
-from its qualified source name and role. Source ordering does not affect IDs.
-
-The compiler represents a topology canonically so two equivalent programs
-produce the same topology hash.
-
-To change a running topology, the reconciler compares the installed topology
-with the new desired topology and classifies components as:
+For each reaction and port, the compiler computes:
 
 ```text
-retain
-create
-update
-remove
-replace
+mayWrite(reaction, port)
+mustWrite(reaction, port)
 ```
 
-Compatible components are retained. In particular, an agent is retained when
-its identity and backend are unchanged. Retaining an agent preserves its live
-process, conversation context, memory, and current work.
+Optional effects and alternatives may write a port but do not necessarily write
+it. `mayWrite` determines scheduling conflicts; `mustWrite` determines whether
+a reaction is statically guaranteed to replace an earlier value.
 
-Changing prompts or connections does not replace an otherwise compatible
-agent. Changing an agent's identity or backend replaces it.
+## 4. Tagged runtime
 
-Mutation follows this order:
+The runtime owns one global event queue ordered by logical tag:
 
-1. verify the currently installed revision;
-2. create new agents and channels;
-3. install new or updated reactions;
-4. atomically activate the new topology revision;
-5. drain removed connections and reactions; and
-6. kill agents that are no longer needed.
+```text
+tag = (logical_time, microstep)
+event = (tag, flow, port, value)
+```
 
-An invocation already in progress finishes using the prompt and contract it
-started with. New invocations use the new revision.
+An external input creates an event. Effects produced at `(t, m)` are enqueued at
+`(t, m + 1)`: the same logical time, next microstep.
+
+At each tag, the runtime:
+
+1. pops all events at that tag;
+2. validates and groups values by flow and port;
+3. enables prompts whose declared triggers are present for the flow;
+4. builds an invocation dependency DAG;
+5. executes the DAG;
+6. waits for every invocation at the tag to complete; and
+7. atomically enqueues the resulting port values at the next microstep.
+
+The runtime advances only after the global tag barrier closes.
+
+### 4.1 Invocation DAG
+
+Each enabled prompt invocation is a DAG vertex. Add an edge `A -> B` when:
+
+- `A` is declared before `B`; and
+- both may write at least one common port.
+
+Invocations assigned to the same non-concurrent agent are also ordered by
+declaration order. Since all edges follow declaration order, the DAG is acyclic.
+
+The runtime repeatedly runs all zero-indegree vertices concurrently, waits for
+them to complete, removes them, and continues. Every firing order is therefore
+a topological ordering of the DAG.
+
+### 4.2 Agent protocol
+
+Topology agents do not address other agents. Each active invocation receives
+two scoped MCP tools:
+
+```text
+omar_set_port(invocation_id, port, value)
+omar_complete(invocation_id)
+```
+
+`omar_set_port`:
+
+- only accepts ports listed in the invocation's effect contract;
+- validates the value immediately;
+- may be called many times; and
+- uses last-writer-wins for repeated writes to the same port by that invocation.
+
+Writes remain private until `omar_complete`. Completion validates the final
+port snapshot against the contract. Calls after completion are rejected.
+
+If ordered invocations write the same port, the later declared invocation wins
+when it actually writes that port. A mandatory effect is guaranteed to replace
+the earlier value; an optional effect replaces it only when present.
+
+When every invocation at the tag has completed, final snapshots are committed
+in DAG order and routed through the subscription index. Agents send and forget;
+the runtime performs all downstream delivery.
+
+## 5. Topology lifecycle
+
+Components have stable IDs derived from their qualified names. A compatible
+agent retains its process, context, memory, and active work across topology
+updates.
+
+Mutation uses create-before-destroy:
+
+1. verify the installed revision;
+2. spawn new agents and install the new topology;
+3. atomically activate the new revision;
+4. drain obsolete reactions; and
+5. kill obsolete agents.
+
+An active invocation finishes against the topology revision on which it began.
 
 ## 6. Bytecode
 
-The compiler lowers initial deployment and topology diffs to typed bytecode.
-Bytecode operations correspond closely to runtime and MCP tool calls.
-
-### 6.1 Topology instructions
+Bytecode describes topology lifecycle. Runtime event coordination is not
+encoded as bytecode instructions.
 
 ```text
-BEGIN_PLAN expected_revision desired_hash
-SPAWN_AGENT agent_id backend
-RETAIN_AGENT agent_id
-KILL_AGENT agent_id
+BEGIN_PLAN team
 
-DEFINE_PORT port_id kind type
-CREATE_CHANNEL channel_id source target
-RETAIN_CHANNEL channel_id
-DROP_CHANNEL channel_id
+SPAWN_AGENT name backend
+KILL_AGENT name
 
-INSTALL_REACTION reaction_id agent triggers effects contract prompt
-UPDATE_REACTION reaction_id contract prompt
-REMOVE_REACTION reaction_id
+DEFINE_PORT kind name type
+REMOVE_PORT name
 
-ACTIVATE_REVISION revision
-COMMIT_PLAN revision
+INSTALL_REACTION id agent triggers effects contract prompt
+UPDATE_REACTION id triggers effects contract prompt
+REMOVE_REACTION id
+
+ACTIVATE_TOPOLOGY revision
+COMMIT_PLAN
 ABORT_PLAN reason
 ```
 
-### 6.2 Dataflow instructions
+The initial construction subset consists of `BEGIN_PLAN`, `SPAWN_AGENT`,
+`DEFINE_PORT`, `INSTALL_REACTION`, and `COMMIT_PLAN`. Mutation instructions are
+reserved for the next implementation stage.
+
+JSON instruction fields are emitted in deterministic order with `op` first.
+Reaction fields are ordered:
 
 ```text
-ACCEPT_INPUT port value
-EMIT_EVENT flow port value
-TRY_ACTIVATE reaction flow
-RENDER_PROMPT invocation
-DELIVER_PROMPT invocation agent
-VALIDATE_COMPLETION invocation result
-COMMIT_COMPLETION invocation
-FAIL_INVOCATION invocation error
+op, id, agent, triggers, effects, contract, prompt
 ```
 
-### 6.3 Instruction semantics
+The VM verifies the complete plan before performing effects. Unknown
+instructions, invalid references, invalid types, or inconsistent contracts are
+errors.
 
-- `SPAWN_AGENT` calls the MCP agent-spawn capability.
-- `KILL_AGENT` calls the MCP agent-kill capability.
-- `CREATE_CHANNEL` creates a typed route between two components.
-- `INSTALL_REACTION` registers a prompt and its trigger conditions.
-- `ACTIVATE_REVISION` atomically switches new inputs to the staged topology.
-- `DELIVER_PROMPT` sends the rendered prompt to an existing agent.
-- `COMMIT_COMPLETION` atomically publishes all validated outputs.
+## 7. Lean 4 boundary
 
-Instructions are verified before execution. Verification checks operand types,
-component existence, channel compatibility, ordering, and revision consistency.
-
-Effectful instructions use stable idempotency keys. The runtime journals each
-instruction so it can recover after a crash without spawning duplicate agents
-or repeating committed outputs.
-
-If a plan fails before activation, the old topology remains active. If cleanup
-fails after activation, the new topology remains active and cleanup is retried.
-Retained agents must never be removed during rollback.
-
-## 7. Lean 4 implementation
-
-The intended Lean 4 implementation separates pure compilation from effects:
+The compiler core is pure:
 
 ```lean
 parse          : String -> Except ParseError Syntax
 elaborate      : Syntax -> Except TypeError Topology
-diff           : InstalledTopology -> Topology -> TopologyDiff
-compile        : TopologyDiff -> Except CompileError Bytecode
+compile        : Topology -> Except CompileError Bytecode
 verifyBytecode : Bytecode -> Except VerifyError VerifiedBytecode
-execute        : VerifiedBytecode -> RuntimeM Result
 ```
 
-Parsing, type checking, canonicalization, topology diffing, compilation, and
-bytecode verification should be pure. MCP calls, persistence, and process
-observation belong to the runtime boundary.
+MCP calls, event persistence, scheduling, and process observation belong to the
+Rust runtime.
 
-The primary properties to verify are:
+Important verification targets are:
 
-- channels connect compatible types;
+- every trigger and effect references a compatible typed port;
+- every per-tag scheduling graph is acyclic;
 - bytecode never references an undefined component;
-- compatible retained agents are never spawned or killed;
-- successful plans produce the desired canonical topology; and
+- compatible retained agents are never unnecessarily restarted; and
 - equal compiler inputs produce equal bytecode.
