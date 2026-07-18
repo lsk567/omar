@@ -48,11 +48,13 @@ delimits a block comment.
 - `output` is a typed externally observable result.
 - `action` is a typed internal port.
 - An action without a type is a signal carrying no value.
-- `prompt agent(a, b)` declares a reaction on `agent` triggered by ports `a`
-  and `b`.
+- `prompt agent(a, b)` declares a reaction on `agent` triggered when port `a`
+  or port `b` is present. If both are present at the same tag, the reaction is
+  invoked once with both values.
 
 The prompt body is delivered to the agent. `$(name)` interpolates a trigger
-value and may only reference that prompt's triggers.
+value and may only reference that prompt's triggers. If a declared trigger is
+not present in an invocation, its interpolation expands to `<absent>`.
 
 ### 2.2 Effect contracts
 
@@ -119,7 +121,7 @@ At each tag, the runtime:
 
 1. pops all events at that tag;
 2. validates and groups values by flow and port;
-3. enables prompts whose declared triggers are present for the flow;
+3. enables prompts with at least one declared trigger present for the flow;
 4. builds an invocation dependency DAG;
 5. executes the DAG;
 6. waits for every invocation at the tag to complete; and
@@ -150,6 +152,10 @@ two scoped MCP tools:
 omar_set_port(invocation_id, port, value)
 omar_complete(invocation_id)
 ```
+
+The invocation's trigger map contains only the declared triggers present at
+that tag. An absent trigger is omitted, while a present signal has the JSON
+value `null`; this preserves the distinction between absence and a signal.
 
 `omar_set_port`:
 

@@ -766,7 +766,7 @@ fn run_event_loop<E: ReactionExecutor>(
                 reaction
                     .triggers
                     .iter()
-                    .all(|trigger| events.contains_key(trigger))
+                    .any(|trigger| events.contains_key(trigger))
             })
             .collect();
         enabled.sort_by_key(|(_, reaction)| reaction.order);
@@ -822,8 +822,12 @@ fn invocation_spec(
     let trigger_values = reaction
         .triggers
         .iter()
-        .map(|trigger| Ok((trigger.clone(), events[trigger].clone())))
-        .collect::<Result<_>>()?;
+        .filter_map(|trigger| {
+            events
+                .get(trigger)
+                .map(|value| (trigger.clone(), value.clone()))
+        })
+        .collect();
     let allowed_effects = reaction
         .effects
         .iter()
@@ -892,12 +896,10 @@ fn render_prompt(template: &str, values: &BTreeMap<String, Value>) -> Result<Str
         let expression = &remaining[start + 2..];
         let end = interpolation_end(expression).context("unterminated prompt interpolation")?;
         let identifier = interpolation_identifier(&expression[..end])?;
-        let value = values
-            .get(&identifier)
-            .with_context(|| format!("missing interpolation value '{identifier}'"))?;
-        match value {
-            Value::String(text) => rendered.push_str(text),
-            other => rendered.push_str(&other.to_string()),
+        match values.get(&identifier) {
+            Some(Value::String(text)) => rendered.push_str(text),
+            Some(other) => rendered.push_str(&other.to_string()),
+            None => rendered.push_str("<absent>"),
         }
         remaining = &expression[end + 1..];
     }
@@ -1200,6 +1202,73 @@ mod tests {
         assert_eq!(calls.last().map(String::as_str), Some("reaction.3"));
         assert!(calls[1..3].contains(&"reaction.1".to_string()));
         assert!(calls[1..3].contains(&"reaction.2".to_string()));
+    }
+
+    struct OrTriggerExecutor {
+        invocations: Mutex<Vec<InvocationSpec>>,
+    }
+
+    impl ReactionExecutor for OrTriggerExecutor {
+        fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+            self.invocations.lock().unwrap().push(invocation);
+            Ok(BTreeMap::from([("hired".to_string(), json!(true))]))
+        }
+    }
+
+    #[test]
+    fn reaction_fires_when_any_declared_trigger_is_present() {
+        let mut state = hr_state();
+        state.reactions.retain(|id, _| id.as_str() == "reaction.3");
+        let executor = OrTriggerExecutor {
+            invocations: Mutex::new(Vec::new()),
+        };
+
+        let outputs = run_event_loop(
+            &state,
+            BTreeMap::from([("opinion1".into(), json!("strong engineer"))]),
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outputs, BTreeMap::from([("hired".into(), json!(true))]));
+        let invocations = executor.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0].trigger_values,
+            BTreeMap::from([("opinion1".into(), json!("strong engineer"))])
+        );
+    }
+
+    #[test]
+    fn reaction_fires_once_when_multiple_triggers_share_a_tag() {
+        let mut state = hr_state();
+        state.reactions.retain(|id, _| id.as_str() == "reaction.3");
+        let executor = OrTriggerExecutor {
+            invocations: Mutex::new(Vec::new()),
+        };
+
+        run_event_loop(
+            &state,
+            BTreeMap::from([
+                ("opinion1".into(), json!("strong engineer")),
+                ("opinion2".into(), json!("good judgment")),
+            ]),
+            &executor,
+        )
+        .unwrap();
+
+        let invocations = executor.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].trigger_values.len(), 2);
+    }
+
+    #[test]
+    fn absent_trigger_interpolation_is_explicit() {
+        let values = BTreeMap::from([("left".into(), json!("ready"))]);
+        assert_eq!(
+            render_prompt("left=$(left), right=$(right)", &values).unwrap(),
+            "left=ready, right=<absent>"
+        );
     }
 
     #[test]
